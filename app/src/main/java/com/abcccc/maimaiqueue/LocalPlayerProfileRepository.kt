@@ -1,6 +1,10 @@
 package com.abcccc.maimaiqueue
 
 import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -10,18 +14,32 @@ interface PlayerProfileRepository {
 }
 
 class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
+    private val writeMutex = Mutex()
     private val preferences = context.applicationContext.getSharedPreferences(
         "player_profiles",
         Context.MODE_PRIVATE
     )
 
-    override suspend fun getProfiles(): List<PlayerProfile> = loadProfiles()
+    override suspend fun getProfiles(): List<PlayerProfile> = withContext(Dispatchers.IO) {
+        writeMutex.withLock {
+            loadProfiles().also { profiles ->
+                if (profiles.isNotEmpty()) saveProfiles(profiles)
+            }
+        }
+    }
 
-    override suspend fun upsertProfile(profile: PlayerProfile) {
-        val profiles = loadProfiles().toMutableList()
-        val existingIndex = profiles.indexOfFirst { it.id == profile.id }
-        if (existingIndex >= 0) profiles[existingIndex] = profile else profiles += profile
-        saveProfiles(profiles)
+    override suspend fun upsertProfile(profile: PlayerProfile) = withContext(Dispatchers.IO) {
+        writeMutex.withLock {
+            val profiles = loadProfiles().toMutableList()
+            val canonicalProfile = profile.withCanonicalContact()
+            val existingIndex = profiles.indexOfFirst { it.id == canonicalProfile.id }
+            if (existingIndex >= 0) {
+                profiles[existingIndex] = canonicalProfile
+            } else {
+                profiles += canonicalProfile
+            }
+            saveProfiles(profiles)
+        }
     }
 
     private fun loadProfiles(): List<PlayerProfile> {
@@ -58,7 +76,7 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                             createdAtMillis = createdAtMillis,
                             updatedAtMillis = item.optLong("updatedAtMillis", 0L)
                                 .takeIf { it > 0L } ?: createdAtMillis
-                        )
+                        ).withCanonicalContact()
                     )
                 }
             }
@@ -67,7 +85,8 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
 
     private fun saveProfiles(profiles: List<PlayerProfile>) {
         val array = JSONArray()
-        profiles.forEach { profile ->
+        profiles.forEach { rawProfile ->
+            val profile = rawProfile.withCanonicalContact()
             array.put(
                 JSONObject().apply {
                     put("id", profile.id)
@@ -84,7 +103,7 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                 }
             )
         }
-        preferences.edit().putString(KEY_PROFILES, array.toString()).apply()
+        preferences.edit().putString(KEY_PROFILES, array.toString()).commit()
     }
 
     private inline fun <reified T : Enum<T>> enumValueOrDefault(value: String, default: T): T =

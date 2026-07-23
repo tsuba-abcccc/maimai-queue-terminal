@@ -1,0 +1,18 @@
+services:
+  maimai-queue-status:
+    build: .
+    restart: unless-stopped
+    environment:
+      QUEUE_SYNC_TOKEN: ${QUEUE_SYNC_TOKEN:?QUEUE_SYNC_TOKEN is required}
+      QUEUE_DEVICE_ID: ${QUEUE_DEVICE_ID:-}
+      QUEUE_PRIMARY_DEVICE_ID: ${QUEUE_PRIMARY_DEVICE_ID:-}
+      QUEUE_DATABASE_PATH: /app/data/queue.db
+      QUEUE_ONLINE_TIMEOUT_SECONDS: ${QUEUE_ONLINE_TIMEOUT_SECONDS:-90}
+      QUEUE_CORS_ORIGIN: ${QUEUE_CORS_ORIGIN:-https://abcccc.top}
+    volumes:
+      - queue-status-data:/app/data
+    ports:
+      - "127.0.0.1:8081:8080"
+
+volumes:
+  queue-status-data:

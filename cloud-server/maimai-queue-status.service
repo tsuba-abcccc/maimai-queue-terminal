@@ -1,0 +1,21 @@
+[Unit]
+Description=maimai Queue Status API
+After=network.target
+
+[Service]
+Type=simple
+User=maimaiqueue
+Group=maimaiqueue
+WorkingDirectory=/opt/maimai-queue-status
+EnvironmentFile=/etc/maimai-queue-status.env
+ExecStart=/opt/maimai-queue-status/venv/bin/gunicorn --bind 127.0.0.1:8081 --workers 2 --threads 4 --access-logfile - --error-logfile - app:app
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/maimai-queue-status
+
+[Install]
+WantedBy=multi-user.target

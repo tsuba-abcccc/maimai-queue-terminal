@@ -22,6 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "maimai Queue"
+rootProject.name = "maimai Q"
 include(":app")
- 

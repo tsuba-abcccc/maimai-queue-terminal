@@ -1,6 +1,10 @@
 package com.abcccc.maimaiqueue
 
 import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -10,15 +14,20 @@ interface AuditLogRepository {
 }
 
 class LocalAuditLogRepository(context: Context) : AuditLogRepository {
+    private val writeMutex = Mutex()
     private val preferences = context.applicationContext.getSharedPreferences(
         "audit_logs",
         Context.MODE_PRIVATE
     )
 
-    override suspend fun getLogs(): List<AuditLogEntry> = loadLogs()
+    override suspend fun getLogs(): List<AuditLogEntry> = withContext(Dispatchers.IO) {
+        writeMutex.withLock { loadLogs() }
+    }
 
-    override suspend fun append(entry: AuditLogEntry) {
-        saveLogs((listOf(entry) + loadLogs().filterNot { it.id == entry.id }).take(MAX_LOGS))
+    override suspend fun append(entry: AuditLogEntry) = withContext(Dispatchers.IO) {
+        writeMutex.withLock {
+            saveLogs((listOf(entry) + loadLogs().filterNot { it.id == entry.id }).take(MAX_LOGS))
+        }
     }
 
     private fun loadLogs(): List<AuditLogEntry> {
@@ -40,7 +49,20 @@ class LocalAuditLogRepository(context: Context) : AuditLogRepository {
                                 it.name == item.optString("category")
                             } ?: AuditLogCategory.SYSTEM,
                             title = title,
-                            detail = item.optString("detail")
+                            detail = item.optString("detail"),
+                            queueId = item.optString("queueId").takeIf { it.isNotBlank() },
+                            publicEventType = enumValues<PublicQueueEventType>().firstOrNull {
+                                it.name == item.optString("publicEventType")
+                            },
+                            affectedRegistrationKeys = item.optJSONArray("affectedRegistrationKeys")
+                                ?.let { keys ->
+                                    buildList {
+                                        repeat(keys.length()) { keyIndex ->
+                                            keys.optInt(keyIndex).takeIf { it > 0 }?.let(::add)
+                                        }
+                                    }
+                                }
+                                .orEmpty()
                         )
                     )
                 }
@@ -58,10 +80,18 @@ class LocalAuditLogRepository(context: Context) : AuditLogRepository {
                     put("category", entry.category.name)
                     put("title", entry.title)
                     put("detail", entry.detail)
+                    put("queueId", entry.queueId ?: JSONObject.NULL)
+                    put("publicEventType", entry.publicEventType?.name ?: JSONObject.NULL)
+                    put(
+                        "affectedRegistrationKeys",
+                        JSONArray().apply {
+                            entry.affectedRegistrationKeys.forEach(::put)
+                        }
+                    )
                 }
             )
         }
-        preferences.edit().putString(KEY_LOGS, array.toString()).apply()
+        preferences.edit().putString(KEY_LOGS, array.toString()).commit()
     }
 
     private companion object {

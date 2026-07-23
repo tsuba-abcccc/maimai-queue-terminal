@@ -56,7 +56,7 @@ class AuditLogsTest {
         val changed = original.copy(
             displayId = "新昵称",
             preference = PlayPreference.SOLO,
-            deferredOnce = true,
+            absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND,
             noShowCount = 1
         )
         val log = queueLog(
@@ -66,8 +66,60 @@ class AuditLogsTest {
 
         assertTrue(log.detail.contains("“原昵称”更名为“新昵称”"))
         assertTrue(log.detail.contains("“新昵称”改为单人游玩"))
-        assertTrue(log.detail.contains("“新昵称”已暂缓一次"))
+        assertTrue(log.detail.contains("“新昵称”已暂缓一轮"))
         assertTrue(log.detail.contains("第 1 次未到场"))
+    }
+
+    @Test
+    fun noShowOnlyChangeUsesNoShowTitle() {
+        val original = registration(1, "玩家")
+        val changed = original.copy(noShowCount = 1)
+        val log = queueLog(
+            before = MachineQueue(waiting = listOf(original)),
+            after = MachineQueue(waiting = listOf(changed))
+        )!!
+
+        assertEquals("机台 A · 未到场状态已更新", log.title)
+        assertTrue(log.detail.contains("“玩家”已记录第 1 次未到场"))
+    }
+
+    @Test
+    fun temporaryAwaySkipAndAutomaticExitAreExplained() {
+        val away = registration(1, "暂离玩家").copy(
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            temporaryAwaySkippedTurns = 3
+        )
+        val skippedLog = queueLog(
+            before = MachineQueue(waiting = listOf(away.copy(temporaryAwaySkippedTurns = 2))),
+            after = MachineQueue(waiting = listOf(away))
+        )!!
+        val removedLog = queueLog(
+            before = MachineQueue(waiting = listOf(away)),
+            after = MachineQueue()
+        )!!
+
+        assertTrue(skippedLog.detail.contains("已轮空 3 次"))
+        assertTrue(removedLog.detail.contains("第四次轮到"))
+        assertTrue(removedLog.detail.contains("自动退出排队"))
+        assertEquals(PublicQueueEventType.TEMPORARY_AWAY_EXPIRED, removedLog.publicEventType)
+    }
+
+    @Test
+    fun profileGenderChangesAreRecordedAsARegistrationDetailUpdate() {
+        val original = registration(1).copy(
+            playerProfileId = "profile-1",
+            gender = PlayerGender.UNDISCLOSED,
+            isTemporary = false
+        )
+        val changed = original.copy(gender = PlayerGender.FEMALE)
+
+        val log = queueLog(
+            before = MachineQueue(waiting = listOf(original)),
+            after = MachineQueue(waiting = listOf(changed))
+        )!!
+
+        assertEquals("机台 A · 登记资料已更新", log.title)
+        assertTrue(log.detail.contains("性别标识已更新"))
     }
 
     @Test

@@ -9,25 +9,52 @@ enum class AuditLogCategory {
     PLAYER_PROFILE
 }
 
+enum class PublicQueueEventType {
+    REGISTRATION_ADDED,
+    REGISTRATION_REMOVED,
+    REGISTRATION_UPDATED,
+    QUEUE_REORDERED,
+    PLAYING_CHANGED,
+    NO_SHOW_DEFERRED,
+    NO_SHOW_MOVED_TO_TAIL,
+    NO_SHOW_REMOVED,
+    TEMPORARY_AWAY_EXPIRED,
+    ABSENCE_CHANGED,
+    MACHINE_STOPPED,
+    MACHINE_RESTORED,
+    REGISTRATION_OPENED,
+    REGISTRATION_CLOSED,
+    QUEUE_RESTORED,
+    QUEUE_RESET,
+    OTHER
+}
+
 data class AuditLogEntry(
     val id: String,
     val timestampMillis: Long,
     val category: AuditLogCategory,
     val title: String,
-    val detail: String
+    val detail: String,
+    val queueId: String? = null,
+    val publicEventType: PublicQueueEventType? = null,
+    val affectedRegistrationKeys: List<Int> = emptyList()
 )
 
 fun createAuditLogEntry(
     category: AuditLogCategory,
     title: String,
     detail: String,
-    timestampMillis: Long = System.currentTimeMillis()
+    timestampMillis: Long = System.currentTimeMillis(),
+    publicEventType: PublicQueueEventType? = null,
+    affectedRegistrationKeys: Collection<Int> = emptyList()
 ): AuditLogEntry = AuditLogEntry(
     id = UUID.randomUUID().toString(),
     timestampMillis = timestampMillis,
     category = category,
     title = title,
-    detail = detail
+    detail = detail,
+    publicEventType = publicEventType,
+    affectedRegistrationKeys = affectedRegistrationKeys.distinct()
 )
 
 fun createQueueAuditLog(
@@ -36,6 +63,8 @@ fun createQueueAuditLog(
     before: MachineQueue,
     after: MachineQueue,
     titleOverride: String? = null,
+    publicEventTypeOverride: PublicQueueEventType? = null,
+    affectedRegistrationKeysOverride: Collection<Int> = emptyList(),
     timestampMillis: Long = System.currentTimeMillis()
 ): AuditLogEntry? {
     if (before == after) return null
@@ -45,6 +74,11 @@ fun createQueueAuditLog(
     val afterByKey = after.allRegistrations.associateBy { it.key }
     val added = after.allRegistrations.filter { it.key !in beforeByKey }
     val removed = before.allRegistrations.filter { it.key !in afterByKey }
+    val affectedRegistrationKeys = mutableSetOf<Int>().apply {
+        addAll(added.map { it.key })
+        addAll(removed.map { it.key })
+        addAll(affectedRegistrationKeysOverride)
+    }
 
     if (added.isNotEmpty()) {
         changeKinds += "added"
@@ -53,32 +87,61 @@ fun createQueueAuditLog(
     if (removed.isNotEmpty()) {
         changeKinds += "removed"
         details += "移除 ${quotedNames(removed)}"
+        val temporaryAwayExpired = removed.filter {
+            it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
+                it.temporaryAwaySkippedTurns >= 3
+        }
+        if (temporaryAwayExpired.isNotEmpty()) {
+            details += "${quotedNames(temporaryAwayExpired)}在暂时离开期间第四次轮到，已自动退出排队"
+        }
     }
 
     beforeByKey.keys.intersect(afterByKey.keys).forEach { key ->
         val old = beforeByKey.getValue(key)
         val new = afterByKey.getValue(key)
         if (old.displayId != new.displayId) {
+            affectedRegistrationKeys += key
             changeKinds += "renamed"
             details += "“${old.displayId}”更名为“${new.displayId}”"
         }
+        if (old.gender != new.gender) {
+            affectedRegistrationKeys += key
+            changeKinds += "profile"
+            details += "“${new.displayId}”的性别标识已更新"
+        }
         if (old.preference != new.preference) {
+            affectedRegistrationKeys += key
             changeKinds += "preference"
             details += "“${new.displayId}”改为${queuePreferenceLabel(new.preference)}"
         }
         if (old.fixedPartnerKey != new.fixedPartnerKey) {
+            affectedRegistrationKeys += key
             changeKinds += "pair"
             details += "“${new.displayId}”的固定组合关系已变更"
         }
-        if (old.deferredOnce != new.deferredOnce) {
-            changeKinds += "deferred"
-            details += if (new.deferredOnce) {
-                "“${new.displayId}”已暂缓一次"
-            } else {
-                "“${new.displayId}”已取消暂缓"
+        if (old.absenceStatus != new.absenceStatus) {
+            affectedRegistrationKeys += key
+            changeKinds += "absence"
+            details += when (new.absenceStatus) {
+                QueueAbsenceStatus.DEFER_ONE_ROUND -> "“${new.displayId}”已暂缓一轮"
+                QueueAbsenceStatus.TEMPORARILY_AWAY -> "“${new.displayId}”已设为暂时离开"
+                QueueAbsenceStatus.NONE -> when (old.absenceStatus) {
+                    QueueAbsenceStatus.DEFER_ONE_ROUND -> "“${new.displayId}”的暂缓一轮已解除"
+                    QueueAbsenceStatus.TEMPORARILY_AWAY -> "“${new.displayId}”已取消暂时离开"
+                    QueueAbsenceStatus.NONE -> "“${new.displayId}”的暂缓或暂离状态已恢复"
+                }
             }
         }
+        if (
+            new.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
+            new.temporaryAwaySkippedTurns > old.temporaryAwaySkippedTurns
+        ) {
+            affectedRegistrationKeys += key
+            changeKinds += "absence"
+            details += "“${new.displayId}”暂时离开期间已轮空 ${new.temporaryAwaySkippedTurns} 次"
+        }
         if (old.isTemporary && !new.isTemporary) {
+            affectedRegistrationKeys += key
             changeKinds += "claimed"
             details += "“${new.displayId}”已认领登记"
         }
@@ -87,22 +150,27 @@ fun createQueueAuditLog(
             new.playerProfileId != null &&
             !(old.isTemporary && !new.isTemporary)
         ) {
+            affectedRegistrationKeys += key
             changeKinds += "claimed"
             details += "“${new.displayId}”已关联玩家资料"
         }
         if (new.noShowCount > old.noShowCount) {
+            affectedRegistrationKeys += key
             changeKinds += "no_show"
             details += "“${new.displayId}”已记录第 ${new.noShowCount} 次未到场"
         }
     }
 
     if (before.playing.map { it.key } != after.playing.map { it.key }) {
+        affectedRegistrationKeys += before.playing.map { it.key }
+        affectedRegistrationKeys += after.playing.map { it.key }
         changeKinds += "playing"
         details += "游玩位置由${positionNames(before.playing)}变为${positionNames(after.playing)}"
     }
     val beforeOrder = before.allRegistrations.map { it.key }
     val afterOrder = after.allRegistrations.map { it.key }
     if (beforeOrder.toSet() == afterOrder.toSet() && beforeOrder != afterOrder) {
+        affectedRegistrationKeys += afterOrder
         changeKinds += "order"
         details += "登记顺序已调整为${quotedNames(after.allRegistrations)}"
     }
@@ -117,16 +185,31 @@ fun createQueueAuditLog(
     val generatedTitle = when {
         "added" in changeKinds && "removed" !in changeKinds -> "新增登记"
         "removed" in changeKinds && "added" !in changeKinds -> "移除登记"
-        "renamed" in changeKinds -> "登记名称已修改"
+        "renamed" in changeKinds -> "登记昵称已修改"
         "claimed" in changeKinds -> "登记已认领"
-        "deferred" in changeKinds -> "暂缓状态已修改"
+        "profile" in changeKinds -> "登记资料已更新"
         "no_show" in changeKinds -> "未到场状态已更新"
+        "absence" in changeKinds -> "暂缓或暂离状态已修改"
         "preference" in changeKinds -> "游玩偏好已修改"
         "pair" in changeKinds -> "固定组合已修改"
         "playing" in changeKinds -> "游玩位置已更新"
         "order" in changeKinds -> "登记顺序已调整"
         "timer" in changeKinds -> "本轮计时已重置"
         else -> "队列已更新"
+    }
+    val publicEventType = publicEventTypeOverride ?: when {
+        removed.any {
+            it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
+                it.temporaryAwaySkippedTurns >= 3
+        } -> PublicQueueEventType.TEMPORARY_AWAY_EXPIRED
+        "no_show" in changeKinds -> PublicQueueEventType.REGISTRATION_UPDATED
+        "absence" in changeKinds -> PublicQueueEventType.ABSENCE_CHANGED
+        "added" in changeKinds && "removed" !in changeKinds -> PublicQueueEventType.REGISTRATION_ADDED
+        "removed" in changeKinds && "added" !in changeKinds -> PublicQueueEventType.REGISTRATION_REMOVED
+        "playing" in changeKinds -> PublicQueueEventType.PLAYING_CHANGED
+        "order" in changeKinds -> PublicQueueEventType.QUEUE_REORDERED
+        changeKinds.isNotEmpty() -> PublicQueueEventType.REGISTRATION_UPDATED
+        else -> PublicQueueEventType.OTHER
     }
     return createAuditLogEntry(
         category = category,
@@ -136,7 +219,9 @@ fun createQueueAuditLog(
         } else {
             details.distinct().joinToString(separator = "；", postfix = "。")
         },
-        timestampMillis = timestampMillis
+        timestampMillis = timestampMillis,
+        publicEventType = publicEventType,
+        affectedRegistrationKeys = affectedRegistrationKeys
     )
 }
 

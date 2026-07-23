@@ -39,9 +39,18 @@ data class PlayerProfile(
     val updatedAtMillis: Long = createdAtMillis
 ) {
     val hasValidContact: Boolean
-        get() = hasPlayerContact(qqNumber, phoneNumber) &&
-            isValidQqNumber(qqNumber) &&
-            isValidPhoneNumber(phoneNumber)
+        get() = canonicalContact().isValid
+
+    fun canonicalContact(): PlayerContact = canonicalPlayerContact(qqNumber, phoneNumber)
+
+    fun withCanonicalContact(): PlayerProfile {
+        val contact = canonicalContact()
+        return if (qqNumber == contact.qqNumber && phoneNumber == contact.phoneNumber) {
+            this
+        } else {
+            copy(qqNumber = contact.qqNumber, phoneNumber = contact.phoneNumber)
+        }
+    }
 
     fun recordUsage(
         atMillis: Long = System.currentTimeMillis(),
@@ -66,14 +75,41 @@ fun createPlayerProfile(
     nickname = nickname.trim(),
     gender = gender,
     defaultPreference = defaultPreference,
-    qqNumber = normalizeOptionalContact(qqNumber),
-    phoneNumber = normalizeOptionalContact(phoneNumber),
+    qqNumber = qqNumber,
+    phoneNumber = phoneNumber,
     createdAtMillis = createdAtMillis,
     updatedAtMillis = createdAtMillis
-)
+).withCanonicalContact()
 
-fun hasPlayerContact(qqNumber: String?, phoneNumber: String?): Boolean =
-    !qqNumber.isNullOrBlank() || !phoneNumber.isNullOrBlank()
+data class PlayerContact(
+    val qqNumber: String? = null,
+    val phoneNumber: String? = null
+) {
+    val isPresent: Boolean
+        get() = qqNumber != null || phoneNumber != null
+
+    val isValid: Boolean
+        get() = isPresent && isValidQqNumber(qqNumber) && isValidPhoneNumber(phoneNumber)
+}
+
+fun canonicalPlayerContact(qqNumber: String?, phoneNumber: String?): PlayerContact {
+    val normalizedQq = normalizeOptionalContact(qqNumber)
+    val normalizedPhone = normalizeOptionalContact(phoneNumber)
+    return if (normalizedQq != null) {
+        PlayerContact(qqNumber = normalizedQq)
+    } else {
+        PlayerContact(phoneNumber = normalizedPhone)
+    }
+}
+
+fun playerContactFromInput(value: String, allowPhoneNumber: Boolean): PlayerContact {
+    val normalized = normalizeOptionalContact(value)
+    return if (allowPhoneNumber && isMainlandChinaMobileNumber(normalized)) {
+        PlayerContact(phoneNumber = normalized)
+    } else {
+        PlayerContact(qqNumber = normalized)
+    }
+}
 
 fun isValidQqNumber(value: String?): Boolean {
     val normalized = value?.trim().orEmpty()
@@ -83,22 +119,21 @@ fun isValidQqNumber(value: String?): Boolean {
 
 fun isValidPhoneNumber(value: String?): Boolean {
     val normalized = value?.trim().orEmpty()
-    if (normalized.isEmpty()) return true
-    if (normalized.length > MAX_PHONE_NUMBER_LENGTH) return false
-    if (normalized.any { it !in PHONE_NUMBER_CHARACTERS }) return false
-    if ('+' in normalized && (normalized.first() != '+' || normalized.count { it == '+' } > 1)) {
-        return false
-    }
-    return normalized.count { it in '0'..'9' } in PHONE_DIGIT_COUNT_RANGE
+    return normalized.isEmpty() || isMainlandChinaMobileNumber(normalized)
+}
+
+fun isMainlandChinaMobileNumber(value: String?): Boolean {
+    val normalized = value?.trim().orEmpty()
+    return normalized.length == MAX_PHONE_NUMBER_LENGTH &&
+        normalized[0] == '1' && normalized[1] in '3'..'9' &&
+        normalized.all { it in '0'..'9' }
 }
 
 fun normalizeOptionalContact(value: String?): String? = value?.trim()?.takeIf { it.isNotEmpty() }
 
 const val MAX_QQ_NUMBER_LENGTH = 12
-const val MAX_PHONE_NUMBER_LENGTH = 20
+const val MAX_PHONE_NUMBER_LENGTH = 11
 private val QQ_NUMBER_LENGTH_RANGE = 5..MAX_QQ_NUMBER_LENGTH
-private val PHONE_DIGIT_COUNT_RANGE = 7..15
-private val PHONE_NUMBER_CHARACTERS = ('0'..'9').toSet() + setOf('+', '-', ' ', '(', ')')
 
 fun filterAndSortPlayerProfiles(
     profiles: List<PlayerProfile>,

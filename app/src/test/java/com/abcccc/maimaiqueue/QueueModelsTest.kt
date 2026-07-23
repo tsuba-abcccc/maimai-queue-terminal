@@ -42,28 +42,173 @@ class QueueModelsTest {
     }
 
     @Test
-    fun deferSkipsOneOpportunityWithoutRemovingRegistration() {
+    fun deferOneRoundFromPlayingKeepsRegistrationAtFrontAndStartsFollowingGroup() {
         val queue = MachineQueue(
             playing = listOf(registration(1, PlayPreference.SOLO)),
             waiting = listOf(registration(2, PlayPreference.SOLO))
-        ).defer(1)
+        ).deferOneRound(1)
 
         assertEquals(listOf(2), queue.playing.map { it.key })
-        assertTrue(queue.waiting.any { it.key == 1 })
+        assertEquals(listOf(1), queue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.NONE, queue.waiting.single().absenceStatus)
     }
 
     @Test
-    fun cancelDeferKeepsCurrentOrderAndRestoresNextOpportunity() {
+    fun deferOneRoundFromPlayingDoesNotReserveAnOpenPartnerSlot() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1)),
+            waiting = listOf(registration(2), registration(3))
+        ).deferOneRound(1)
+
+        assertEquals(listOf(2, 3), queue.playing.map { it.key })
+        assertEquals(listOf(1), queue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.NONE, queue.waiting.single().absenceStatus)
+    }
+
+    @Test
+    fun deferOneRoundWithNoFollowingGroupConsumesTheDeferralAndStaysAtFront() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO))
+        ).deferOneRound(1)
+
+        assertTrue(queue.playing.isEmpty())
+        assertEquals(listOf(1), queue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.NONE, queue.waiting.single().absenceStatus)
+    }
+
+    @Test
+    fun waitingDeferralLetsFollowingGroupPlayThenClearsWithoutMovingToTail() {
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                ),
+                registration(2, PlayPreference.SOLO)
+            )
+        ).finishRound(1_000L)
+
+        assertEquals(listOf(2), queue.playing.map { it.key })
+        assertEquals(listOf(1, 9), queue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.NONE, queue.waiting.first().absenceStatus)
+    }
+
+    @Test
+    fun cancelDeferOneRoundKeepsCurrentOrderAndRestoresNextOpportunity() {
         val queue = MachineQueue(
             playing = listOf(registration(1, PlayPreference.SOLO)),
             waiting = listOf(
-                registration(2, PlayPreference.SOLO).copy(deferredOnce = true),
+                registration(2, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                ),
                 registration(3, PlayPreference.SOLO)
             )
-        ).cancelDefer(2)
+        ).cancelDeferOneRound(2)
 
         assertEquals(listOf(2, 3), queue.waiting.map { it.key })
-        assertTrue(queue.waiting.none { it.deferredOnce })
+        assertTrue(queue.waiting.all { it.absenceStatus == QueueAbsenceStatus.NONE })
+    }
+
+    @Test
+    fun consecutiveOneRoundDeferralsAreConsumedTogetherWithoutChangingTheirOrder() {
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                ),
+                registration(2, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                ),
+                registration(3, PlayPreference.SOLO)
+            )
+        ).finishRound(1_000L)
+
+        assertEquals(listOf(3), queue.playing.map { it.key })
+        assertEquals(listOf(1, 2, 9), queue.waiting.map { it.key })
+        assertTrue(queue.waiting.take(2).all { it.absenceStatus == QueueAbsenceStatus.NONE })
+    }
+
+    @Test
+    fun temporarilyAwayRegistrationMovesToTailAndIncrementsSkippedTurns() {
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY
+                ),
+                registration(2, PlayPreference.SOLO),
+                registration(3, PlayPreference.SOLO)
+            )
+        ).finishRound(1_000L)
+
+        assertEquals(listOf(2), queue.playing.map { it.key })
+        assertEquals(listOf(3, 9, 1), queue.waiting.map { it.key })
+        assertEquals(1, queue.waiting.last().temporaryAwaySkippedTurns)
+    }
+
+    @Test
+    fun temporarilyLeavingFromPlayingCountsOnceAndDoesNotRepeatInSameAdvance() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO)),
+            waiting = listOf(registration(2, PlayPreference.SOLO))
+        ).temporarilyLeave(1)
+
+        assertEquals(listOf(2), queue.playing.map { it.key })
+        assertEquals(listOf(1), queue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.TEMPORARILY_AWAY, queue.waiting.single().absenceStatus)
+        assertEquals(1, queue.waiting.single().temporaryAwaySkippedTurns)
+    }
+
+    @Test
+    fun fourthTemporarilyAwayOpportunityRemovesRegistration() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+                    temporaryAwaySkippedTurns = 3
+                ),
+                registration(2, PlayPreference.SOLO)
+            )
+        ).enterPlayingPosition()
+
+        assertEquals(listOf(2), queue.playing.map { it.key })
+        assertTrue(queue.allRegistrations.none { it.key == 1 })
+    }
+
+    @Test
+    fun allTemporarilyAwayRegistrationsOnlyCountOncePerAdvanceAttempt() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY
+                ),
+                registration(2, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY
+                )
+            )
+        ).enterPlayingPosition()
+
+        assertTrue(queue.playing.isEmpty())
+        assertEquals(listOf(1, 2), queue.waiting.map { it.key })
+        assertTrue(queue.waiting.all { it.temporaryAwaySkippedTurns == 1 })
+    }
+
+    @Test
+    fun cancellingTemporaryLeaveClearsCountWithoutChangingOrder() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+                    temporaryAwaySkippedTurns = 2
+                ),
+                registration(2, PlayPreference.SOLO)
+            )
+        ).cancelTemporaryLeave(1)
+
+        assertEquals(listOf(1, 2), queue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.NONE, queue.waiting.first().absenceStatus)
+        assertEquals(0, queue.waiting.first().temporaryAwaySkippedTurns)
     }
 
     @Test
@@ -157,12 +302,18 @@ class QueueModelsTest {
     }
 
     @Test
-    fun overtimeCorrectionReplaysMissedRoundsInPhysicalQueueOrder() {
+    fun overtimeCorrectionConsumesDeferralWithoutTreatingItAsPlayed() {
         val correctedAt = 9_000L
         val queue = MachineQueue(
-            playing = listOf(registration(1, PlayPreference.SOLO).copy(deferredOnce = true)),
+            playing = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                )
+            ),
             waiting = listOf(
-                registration(2, PlayPreference.SOLO).copy(deferredOnce = true),
+                registration(2, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                ),
                 registration(3, PlayPreference.SOLO),
                 registration(4, PlayPreference.SOLO)
             ),
@@ -170,13 +321,34 @@ class QueueModelsTest {
         ).advanceToWaitingPosition(setOf(3), correctedAt)
 
         assertEquals(listOf(3), queue.playing.map { it.key })
-        assertEquals(listOf(4, 1, 2), queue.waiting.map { it.key })
+        assertEquals(listOf(2, 4, 1), queue.waiting.map { it.key })
         assertEquals(correctedAt, queue.playingStartedAtMillis)
-        assertEquals(
-            listOf(correctedAt, correctedAt),
-            queue.waiting.filter { it.key in setOf(1, 2) }.map { it.lastPlayedAtMillis }
-        )
-        assertTrue(queue.allRegistrations.none { it.deferredOnce })
+        assertEquals(correctedAt, queue.waiting.first { it.key == 1 }.lastPlayedAtMillis)
+        assertEquals(null, queue.waiting.first { it.key == 2 }.lastPlayedAtMillis)
+        assertTrue(queue.allRegistrations.all { it.absenceStatus == QueueAbsenceStatus.NONE })
+    }
+
+    @Test
+    fun overtimeCorrectionKeepsTemporaryLeaveAndCountsTheSkippedOpportunity() {
+        val correctedAt = 9_000L
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+                    temporaryAwaySkippedTurns = 1
+                ),
+                registration(2, PlayPreference.SOLO),
+                registration(3, PlayPreference.SOLO)
+            )
+        ).advanceToWaitingPosition(setOf(3), correctedAt)
+
+        assertEquals(listOf(3), queue.playing.map { it.key })
+        assertEquals(listOf(9, 2, 1), queue.waiting.map { it.key })
+        val temporarilyAway = queue.waiting.last()
+        assertEquals(QueueAbsenceStatus.TEMPORARILY_AWAY, temporarilyAway.absenceStatus)
+        assertEquals(2, temporarilyAway.temporaryAwaySkippedTurns)
+        assertEquals(null, temporarilyAway.lastPlayedAtMillis)
     }
 
     @Test
@@ -207,6 +379,441 @@ class QueueModelsTest {
         assertTrue(queue.canMarkNoShow(2))
         assertTrue(!queue.canMarkNoShow(3))
         assertTrue(!queue.canMarkNoShow(999))
+    }
+
+    @Test
+    fun noShowDeferOneRoundKeepsFirstWaitingPositionUntilItIsSkipped() {
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO),
+                registration(2, PlayPreference.SOLO)
+            )
+        ).markNoShowDeferOneRound(1)
+
+        assertEquals(listOf(1, 2), queue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.DEFER_ONE_ROUND, queue.waiting.first().absenceStatus)
+        assertEquals(1, queue.waiting.first().noShowCount)
+
+        val advanced = queue.finishRound(1_000L)
+        assertEquals(listOf(2), advanced.playing.map { it.key })
+        assertEquals(listOf(1, 9), advanced.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.NONE, advanced.waiting.first().absenceStatus)
+    }
+
+    @Test
+    fun noShowInPlayingPositionConsumesDeferralAndAdvancesExactlyOnce() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(2, PlayPreference.SOLO)
+            )
+        ).markNoShowDeferOneRound(1)
+
+        assertEquals(listOf(2), queue.playing.map { it.key })
+        assertEquals(listOf(1), queue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.NONE, queue.waiting.single().absenceStatus)
+        assertEquals(1, queue.waiting.single().noShowCount)
+    }
+
+    @Test
+    fun matchingAbsenceStatesKeepOpenRegistrationsInOnePosition() {
+        val deferred = listOf(
+            registration(1).copy(absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND),
+            registration(2).copy(absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND),
+            registration(3, PlayPreference.SOLO)
+        )
+
+        assertEquals(listOf(2, 1), groupIntoPositions(deferred).map { it.size })
+    }
+
+    @Test
+    fun unavailableOpenRegistrationDoesNotBreakFollowingSharedPosition() {
+        val registrations = listOf(
+            registration(1),
+            registration(2).copy(absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY),
+            registration(3),
+            registration(4)
+        )
+
+        assertEquals(
+            listOf(listOf(1, 3), listOf(2), listOf(4)),
+            groupIntoPositions(registrations).map { position -> position.map { it.key } }
+        )
+    }
+
+    @Test
+    fun nextPlayingPreviewExplainsOpenPlayersRegroupedAroundTemporaryLeave() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1),
+                registration(2).copy(absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY),
+                registration(3),
+                registration(4)
+            )
+        )
+
+        val preview = queue.nextPlayingPositionPreview()!!
+
+        assertEquals(listOf(1, 2), preview.nominalRegistrations.map { it.key })
+        assertEquals(listOf(1, 3), preview.nextRegistrations.map { it.key })
+        assertEquals(listOf(2), preview.unavailableRegistrations.map { it.key })
+        assertTrue(preview.changedByAbsence)
+    }
+
+    @Test
+    fun fixedPairIsSkippedTogetherWithoutBlockingFollowingOpenPlayers() {
+        val firstPartner = registration(1).copy(
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            fixedPartnerKey = 2
+        )
+        val secondPartner = registration(2).copy(
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            fixedPartnerKey = 1
+        )
+        val queue = MachineQueue(
+            waiting = listOf(firstPartner, secondPartner, registration(3), registration(4))
+        )
+
+        assertEquals(
+            listOf(listOf(1, 2), listOf(3, 4)),
+            queue.waitingPositions().map { position -> position.map { it.key } }
+        )
+        assertEquals(listOf(3, 4), queue.nextPlayingPositionPreview()!!.nextRegistrations.map { it.key })
+    }
+
+    @Test
+    fun fixedPairTemporaryLeaveAdvancesAndExpiresAsOneGroup() {
+        val firstPartner = registration(1).copy(
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            temporaryAwaySkippedTurns = 1,
+            fixedPartnerKey = 2
+        )
+        val secondPartner = registration(2).copy(
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            temporaryAwaySkippedTurns = 2,
+            fixedPartnerKey = 1
+        )
+        val queue = MachineQueue(
+            waiting = listOf(firstPartner, secondPartner, registration(3, PlayPreference.SOLO))
+        ).enterPlayingPosition()
+
+        assertEquals(listOf(3), queue.playing.map { it.key })
+        assertEquals(listOf(1, 2), queue.waiting.map { it.key })
+        assertTrue(queue.waiting.all {
+            it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
+                it.temporaryAwaySkippedTurns == 3
+        })
+        val expired = queue.finishRound(1_000L)
+        assertTrue(expired.allRegistrations.none { it.key == 1 || it.key == 2 })
+    }
+
+    @Test
+    fun deferredOpenRegistrationDoesNotBreakFollowingSharedPosition() {
+        val registrations = listOf(
+            registration(1),
+            registration(2).copy(absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND),
+            registration(3),
+            registration(4)
+        )
+
+        assertEquals(
+            listOf(listOf(1, 3), listOf(2), listOf(4)),
+            groupIntoPositions(registrations).map { position -> position.map { it.key } }
+        )
+    }
+
+    @Test
+    fun regroupedRoundConsumesCrossedOneRoundDeferralImmediately() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1),
+                registration(2).copy(absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND),
+                registration(3),
+                registration(4)
+            )
+        ).enterPlayingPosition()
+
+        assertEquals(listOf(1, 3), queue.playing.map { it.key })
+        assertEquals(listOf(2, 4), queue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.NONE, queue.waiting.first().absenceStatus)
+    }
+
+    @Test
+    fun regroupedRoundMovesCrossedTemporaryLeaveToTailAndCountsItImmediately() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1),
+                registration(2).copy(absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY),
+                registration(3),
+                registration(4)
+            )
+        ).enterPlayingPosition()
+
+        assertEquals(listOf(1, 3), queue.playing.map { it.key })
+        assertEquals(listOf(4, 2), queue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.TEMPORARILY_AWAY, queue.waiting.last().absenceStatus)
+        assertEquals(1, queue.waiting.last().temporaryAwaySkippedTurns)
+    }
+
+    @Test
+    fun regroupedRoundRemovesCrossedTemporaryLeaveOnFourthOpportunity() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1),
+                registration(2).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+                    temporaryAwaySkippedTurns = 3
+                ),
+                registration(3),
+                registration(4)
+            )
+        ).enterPlayingPosition()
+
+        assertEquals(listOf(1, 3), queue.playing.map { it.key })
+        assertEquals(listOf(4), queue.waiting.map { it.key })
+        assertTrue(queue.allRegistrations.none { it.key == 2 })
+    }
+
+    @Test
+    fun regroupedRoundCountsCrossedTemporarilyAwayFixedPairTogether() {
+        val firstPartner = registration(2).copy(
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            temporaryAwaySkippedTurns = 1,
+            fixedPartnerKey = 3
+        )
+        val secondPartner = registration(3).copy(
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            temporaryAwaySkippedTurns = 2,
+            fixedPartnerKey = 2
+        )
+        val queue = MachineQueue(
+            waiting = listOf(registration(1), firstPartner, secondPartner, registration(4))
+        ).enterPlayingPosition()
+
+        assertEquals(listOf(1, 4), queue.playing.map { it.key })
+        assertEquals(listOf(2, 3), queue.waiting.map { it.key })
+        assertTrue(queue.waiting.all {
+            it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
+                it.temporaryAwaySkippedTurns == 3
+        })
+    }
+
+    @Test
+    fun unavailableRegistrationsAfterNextSoloRoundRemainUnchanged() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO),
+                registration(2, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                ),
+                registration(3, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+                    temporaryAwaySkippedTurns = 2
+                )
+            )
+        ).enterPlayingPosition()
+
+        assertEquals(listOf(1), queue.playing.map { it.key })
+        assertEquals(QueueAbsenceStatus.DEFER_ONE_ROUND, queue.waiting[0].absenceStatus)
+        assertEquals(QueueAbsenceStatus.TEMPORARILY_AWAY, queue.waiting[1].absenceStatus)
+        assertEquals(2, queue.waiting[1].temporaryAwaySkippedTurns)
+    }
+
+    @Test
+    fun noShowCanTargetFirstAvailablePositionAfterSkippedPositions() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1).copy(absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY),
+                registration(2, PlayPreference.SOLO),
+                registration(3, PlayPreference.SOLO)
+            )
+        )
+
+        assertTrue(!queue.canMarkNoShow(1))
+        assertTrue(queue.canMarkNoShow(2))
+        assertTrue(!queue.canMarkNoShow(3))
+    }
+
+    @Test
+    fun noShowCanPassSeveralDeferredOrTemporarilyAwayPositions() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY
+                ),
+                registration(2, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                ),
+                registration(3, PlayPreference.SOLO),
+                registration(4, PlayPreference.SOLO)
+            )
+        )
+
+        assertTrue(!queue.canMarkNoShow(1))
+        assertTrue(!queue.canMarkNoShow(2))
+        assertTrue(queue.canMarkNoShow(3))
+        assertTrue(!queue.canMarkNoShow(4))
+    }
+
+    @Test
+    fun deferredAndTemporarilyAwayRegistrationsCannotBeMarkedNoShow() {
+        val queue = MachineQueue(
+            playing = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                )
+            ),
+            waiting = listOf(
+                registration(2, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY
+                ),
+                registration(3, PlayPreference.SOLO)
+            )
+        )
+
+        assertTrue(!queue.canMarkNoShow(1))
+        assertTrue(!queue.canMarkNoShow(2))
+        assertTrue(queue.canMarkNoShow(3))
+        assertEquals(queue, queue.markNoShowDeferOneRound(1))
+        assertEquals(queue, queue.markNoShowMoveToEnd(setOf(2)))
+        assertEquals(queue, queue.markNoShowGroupDeferOneRound(setOf(1, 2)))
+    }
+
+    @Test
+    fun noShowDefersAnOpenSharedPositionAsOneGroup() {
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1),
+                registration(2),
+                registration(3, PlayPreference.SOLO)
+            )
+        ).markNoShowGroupDeferOneRound(setOf(1, 2))
+
+        assertEquals(2, queue.waitingPositions().first().size)
+        assertTrue(
+            queue.waiting.take(2).all {
+                it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND && it.noShowCount == 1
+            }
+        )
+
+        val advanced = queue.finishRound(1_000L)
+        assertEquals(listOf(3), advanced.playing.map { it.key })
+        assertEquals(listOf(1, 2, 9), advanced.waiting.map { it.key })
+        assertTrue(advanced.waiting.take(2).all { it.absenceStatus == QueueAbsenceStatus.NONE })
+    }
+
+    @Test
+    fun noShowDefersAPlayingGroupAndAdvancesTheNextPositionExactlyOnce() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1), registration(2)),
+            waiting = listOf(registration(3, PlayPreference.SOLO))
+        ).markNoShowGroupDeferOneRound(setOf(1, 2))
+
+        assertEquals(listOf(3), queue.playing.map { it.key })
+        assertEquals(listOf(1, 2), queue.waiting.map { it.key })
+        assertTrue(queue.waiting.all { it.absenceStatus == QueueAbsenceStatus.NONE })
+        assertTrue(queue.waiting.all { it.noShowCount == 1 })
+    }
+
+    @Test
+    fun movingNoShowFromPlayingToTailAdvancesTheNextPosition() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO)),
+            waiting = listOf(registration(2, PlayPreference.SOLO))
+        ).markNoShowMoveToEnd(setOf(1))
+
+        assertEquals(listOf(2), queue.playing.map { it.key })
+        assertEquals(listOf(1), queue.waiting.map { it.key })
+        assertEquals(1, queue.waiting.single().noShowCount)
+    }
+
+    @Test
+    fun noShowDeferralFromPlayingCanLeavePositionEmptyUntilManualAdvance() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO)),
+            waiting = listOf(registration(2, PlayPreference.SOLO)),
+            playingStartedAtMillis = 100L
+        ).markNoShowDeferOneRound(
+            1,
+            startNextWhenPlayingBecomesEmpty = false
+        )
+
+        assertTrue(queue.playing.isEmpty())
+        assertEquals(null, queue.playingStartedAtMillis)
+        assertEquals(listOf(1, 2), queue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.DEFER_ONE_ROUND, queue.waiting.first().absenceStatus)
+
+        val manuallyAdvanced = queue.enterPlayingPosition()
+        assertEquals(listOf(2), manuallyAdvanced.playing.map { it.key })
+        assertEquals(listOf(1), manuallyAdvanced.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.NONE, manuallyAdvanced.waiting.single().absenceStatus)
+    }
+
+    @Test
+    fun groupNoShowDeferralFromPlayingCanLeavePositionEmptyUntilManualAdvance() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1), registration(2)),
+            waiting = listOf(registration(3, PlayPreference.SOLO)),
+            playingStartedAtMillis = 100L
+        ).markNoShowGroupDeferOneRound(
+            setOf(1, 2),
+            startNextWhenPlayingBecomesEmpty = false
+        )
+
+        assertTrue(queue.playing.isEmpty())
+        assertEquals(null, queue.playingStartedAtMillis)
+        assertEquals(listOf(1, 2, 3), queue.waiting.map { it.key })
+        assertTrue(queue.waiting.take(2).all {
+            it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND && it.noShowCount == 1
+        })
+
+        val manuallyAdvanced = queue.enterPlayingPosition()
+        assertEquals(listOf(3), manuallyAdvanced.playing.map { it.key })
+        assertEquals(listOf(1, 2), manuallyAdvanced.waiting.map { it.key })
+        assertTrue(manuallyAdvanced.waiting.all { it.absenceStatus == QueueAbsenceStatus.NONE })
+    }
+
+    @Test
+    fun movingNoShowFromPlayingToTailCanLeavePositionEmptyUntilManualAdvance() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO)),
+            waiting = listOf(registration(2, PlayPreference.SOLO)),
+            playingStartedAtMillis = 100L
+        ).markNoShowMoveToEnd(
+            setOf(1),
+            startNextWhenPlayingBecomesEmpty = false
+        )
+
+        assertTrue(queue.playing.isEmpty())
+        assertEquals(null, queue.playingStartedAtMillis)
+        assertEquals(listOf(2, 1), queue.waiting.map { it.key })
+        assertEquals(1, queue.waiting.last().noShowCount)
+
+        val manuallyAdvanced = queue.enterPlayingPosition()
+        assertEquals(listOf(2), manuallyAdvanced.playing.map { it.key })
+        assertEquals(listOf(1), manuallyAdvanced.waiting.map { it.key })
+    }
+
+    @Test
+    fun removingNoShowFromPlayingCanLeavePositionEmptyUntilManualAdvance() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO)),
+            waiting = listOf(registration(2, PlayPreference.SOLO)),
+            playingStartedAtMillis = 100L
+        ).markNoShowAndRemove(
+            setOf(1),
+            startNextWhenPlayingBecomesEmpty = false
+        )
+
+        assertTrue(queue.playing.isEmpty())
+        assertEquals(null, queue.playingStartedAtMillis)
+        assertEquals(listOf(2), queue.waiting.map { it.key })
+
+        val manuallyAdvanced = queue.enterPlayingPosition()
+        assertEquals(listOf(2), manuallyAdvanced.playing.map { it.key })
+        assertTrue(manuallyAdvanced.waiting.isEmpty())
     }
 
     @Test
@@ -326,6 +933,28 @@ class QueueModelsTest {
     }
 
     @Test
+    fun nicknameLengthLimitDoesNotSplitSupplementaryUnicodeCharacters() {
+        assertEquals("甲乙😀丁", limitCodePointLength("甲乙😀丁", 4))
+        assertEquals("甲乙😀", limitCodePointLength("甲乙😀丁", 3))
+        assertEquals("", limitCodePointLength("甲乙", 0))
+    }
+
+    @Test
+    fun joiningRejectsDuplicateAndInvalidRegistrationKeys() {
+        val queue = MachineQueue().joinAll(
+            listOf(
+                registration(1, PlayPreference.SOLO),
+                Registration(1, "另一名玩家", PlayPreference.SOLO),
+                Registration(0, "无效登记", PlayPreference.SOLO),
+                registration(2, PlayPreference.SOLO)
+            )
+        )
+
+        assertEquals(listOf(1, 2), queue.allRegistrations.map { it.key })
+        assertEquals(2, queue.allRegistrations.map { it.key }.distinct().size)
+    }
+
+    @Test
     fun replacingWithTheOriginalOrderDoesNotResetTheCurrentRound() {
         val queue = MachineQueue(
             playing = listOf(registration(1, PlayPreference.SOLO)),
@@ -334,6 +963,303 @@ class QueueModelsTest {
         )
 
         assertEquals(queue, queue.replaceOrder(queue.allRegistrations))
+    }
+
+    @Test
+    fun replacingWithAnIncompleteOrderDoesNotDropRegistrations() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1),
+                registration(2, PlayPreference.SOLO)
+            )
+        )
+
+        assertEquals(queue, queue.replaceOrder(listOf(queue.waiting.first())))
+        assertEquals(queue, queue.replaceOrder(queue.allRegistrations + queue.waiting.first()))
+    }
+
+    @Test
+    fun reorderingWaitingPlayersDoesNotMovePlayingPositionOrResetTimer() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(2, PlayPreference.SOLO),
+                registration(3, PlayPreference.SOLO)
+            ),
+            playingStartedAtMillis = 123L
+        )
+
+        val reordered = queue.replaceOrder(listOf(queue.playing.single(), queue.waiting[1], queue.waiting[0]))
+
+        assertEquals(listOf(1), reordered.playing.map { it.key })
+        assertEquals(listOf(3, 2), reordered.waiting.map { it.key })
+        assertEquals(123L, reordered.playingStartedAtMillis)
+    }
+
+    @Test
+    fun reorderingCannotReplaceTheCurrentPlayingPosition() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(2, PlayPreference.SOLO),
+                registration(3, PlayPreference.SOLO)
+            ),
+            playingStartedAtMillis = 123L
+        )
+
+        val invalidOrder = listOf(queue.waiting[0], queue.playing[0], queue.waiting[1])
+
+        assertEquals(queue, queue.replaceOrder(invalidOrder))
+    }
+
+    @Test
+    fun reorderingCannotSwapRegistrationsInsideTheCurrentPlayingPosition() {
+        val queue = MachineQueue(
+            playing = listOf(
+                registration(1, PlayPreference.OPEN_TO_JOIN),
+                registration(2, PlayPreference.OPEN_TO_JOIN)
+            ),
+            waiting = listOf(registration(3, PlayPreference.SOLO)),
+            playingStartedAtMillis = 123L
+        )
+
+        val invalidOrder = listOf(queue.playing[1], queue.playing[0], queue.waiting[0])
+
+        assertEquals(queue, queue.replaceOrder(invalidOrder))
+    }
+
+    @Test
+    fun reorderingAnIntentionallyEmptyPlayingPositionDoesNotStartARound() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO),
+                registration(2, PlayPreference.SOLO)
+            )
+        ).copy(playing = emptyList(), playingStartedAtMillis = null)
+
+        val reordered = queue.replaceOrder(listOf(queue.waiting[1], queue.waiting[0]))
+
+        assertTrue(reordered.playing.isEmpty())
+        assertEquals(listOf(2, 1), reordered.waiting.map { it.key })
+    }
+
+    @Test
+    fun movingAWaitingPositionInsertsItAtTheChosenPosition() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO),
+                registration(2, PlayPreference.SOLO),
+                registration(3, PlayPreference.SOLO)
+            )
+        )
+
+        val reordered = queue.moveWaitingPosition(sourceIndex = 2, destinationIndex = 0)
+
+        assertEquals(listOf(3, 1, 2), reordered.waiting.map { it.key })
+    }
+
+    @Test
+    fun movingAWaitingPositionKeepsItsRegistrationsTogether() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.OPEN_TO_JOIN),
+                registration(2, PlayPreference.OPEN_TO_JOIN),
+                registration(3, PlayPreference.SOLO),
+                registration(4, PlayPreference.SOLO)
+            )
+        )
+
+        val reordered = queue.moveWaitingPosition(sourceIndex = 0, destinationIndex = 2)
+
+        assertEquals(listOf(3, 4, 1, 2), reordered.waiting.map { it.key })
+        assertEquals(listOf(1, 2), reordered.waitingPositions()[2].map { it.key })
+    }
+
+    @Test
+    fun movingAWaitingPositionNeverChangesThePlayingPositionOrAcceptsAnInvalidDrop() {
+        val queue = MachineQueue(
+            playing = listOf(registration(10, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO),
+                registration(2, PlayPreference.SOLO),
+                registration(3, PlayPreference.SOLO)
+            ),
+            playingStartedAtMillis = 123L
+        )
+
+        val reordered = queue.moveWaitingPosition(sourceIndex = 0, destinationIndex = 2)
+
+        assertEquals(listOf(10), reordered.playing.map { it.key })
+        assertEquals(listOf(2, 3, 1), reordered.waiting.map { it.key })
+        assertEquals(123L, reordered.playingStartedAtMillis)
+        assertEquals(queue, queue.moveWaitingPosition(sourceIndex = 1, destinationIndex = 1))
+        assertEquals(queue, queue.moveWaitingPosition(sourceIndex = -1, destinationIndex = 1))
+        assertEquals(queue, queue.moveWaitingPosition(sourceIndex = 1, destinationIndex = 3))
+    }
+
+    @Test
+    fun dragReorderCrossesSeveralVariableWidthItemsWithoutLosingFingerOffset() {
+        val update = calculateDragReorder(
+            sourceIndex = 0,
+            dragOffset = 230f,
+            itemSizes = listOf(100f, 140f, 80f),
+            spacing = 10f
+        )
+
+        assertEquals(2, update.destinationIndex)
+        assertEquals(-10f, update.remainingOffset)
+    }
+
+    @Test
+    fun dragReorderKeepsFingerOffsetWhenCrossingVariableWidthItemsToTheLeft() {
+        val update = calculateDragReorder(
+            sourceIndex = 2,
+            dragOffset = -230f,
+            itemSizes = listOf(100f, 140f, 80f),
+            spacing = 10f
+        )
+
+        assertEquals(0, update.destinationIndex)
+        assertEquals(30f, update.remainingOffset)
+    }
+
+    @Test
+    fun dragReorderUsesHysteresisInsteadOfOscillatingAfterAPlacementChange() {
+        val movedRight = calculateDragReorder(
+            sourceIndex = 0,
+            dragOffset = 70f,
+            itemSizes = listOf(100f, 100f),
+            spacing = 10f
+        )
+        val stillRight = calculateDragReorder(
+            sourceIndex = movedRight.destinationIndex,
+            dragOffset = -45f,
+            itemSizes = listOf(100f, 100f),
+            spacing = 10f
+        )
+
+        assertEquals(1, movedRight.destinationIndex)
+        assertEquals(-40f, movedRight.remainingOffset)
+        assertEquals(1, stillRight.destinationIndex)
+        assertEquals(-45f, stillRight.remainingOffset)
+    }
+
+    @Test
+    fun dragReorderDoesNotBounceBackAfterCrossingAMuchWiderItem() {
+        val movedRight = calculateDragReorder(
+            sourceIndex = 0,
+            dragOffset = 170f,
+            itemSizes = listOf(100f, 300f),
+            spacing = 10f
+        )
+        val remainsRight = calculateDragReorder(
+            sourceIndex = movedRight.destinationIndex,
+            dragOffset = movedRight.remainingOffset,
+            itemSizes = listOf(300f, 100f),
+            spacing = 10f
+        )
+
+        assertEquals(1, movedRight.destinationIndex)
+        assertEquals(-140f, movedRight.remainingOffset)
+        assertEquals(1, remainsRight.destinationIndex)
+        assertEquals(-140f, remainsRight.remainingOffset)
+    }
+
+    @Test
+    fun dragReorderCannotEnterTheLockedPrefixOrPassTheListBoundary() {
+        val lockedPrefix = calculateDragReorder(
+            sourceIndex = 1,
+            dragOffset = -500f,
+            itemSizes = listOf(100f, 100f, 100f),
+            spacing = 10f,
+            minimumIndex = 1
+        )
+        val listEnd = calculateDragReorder(
+            sourceIndex = 2,
+            dragOffset = 500f,
+            itemSizes = listOf(100f, 100f, 100f),
+            spacing = 10f,
+            minimumIndex = 1
+        )
+
+        assertEquals(1, lockedPrefix.destinationIndex)
+        assertEquals(-500f, lockedPrefix.remainingOffset)
+        assertEquals(2, listEnd.destinationIndex)
+        assertEquals(500f, listEnd.remainingOffset)
+    }
+
+    @Test
+    fun deferringOneFixedPartnerDefersAndCancelsTheWholePair() {
+        val first = registration(1).copy(fixedPartnerKey = 2)
+        val second = registration(2).copy(fixedPartnerKey = 1)
+        val queue = MachineQueue(
+            waiting = listOf(first, second, registration(3, PlayPreference.SOLO))
+        )
+
+        val deferred = queue.deferOneRound(1)
+        assertTrue(
+            deferred.waiting.take(2).all {
+                it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
+            }
+        )
+        val restored = deferred.cancelDeferOneRound(2)
+        assertTrue(restored.waiting.all { it.absenceStatus == QueueAbsenceStatus.NONE })
+    }
+
+    @Test
+    fun temporarilyLeavingOneFixedPartnerAppliesToAndCancelsForTheWholePair() {
+        val first = registration(1).copy(fixedPartnerKey = 2)
+        val second = registration(2).copy(fixedPartnerKey = 1)
+        val queue = MachineQueue(
+            waiting = listOf(first, second, registration(3, PlayPreference.SOLO))
+        )
+
+        val away = queue.temporarilyLeave(1)
+        assertTrue(
+            away.waiting.take(2).all {
+                it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
+            }
+        )
+        val restored = away.cancelTemporaryLeave(2)
+        assertTrue(restored.waiting.all { it.absenceStatus == QueueAbsenceStatus.NONE })
+        assertTrue(restored.waiting.all { it.temporaryAwaySkippedTurns == 0 })
+    }
+
+    @Test
+    fun editingAPlayerProfileUpdatesItsActiveRegistrationsWithoutChangingPreference() {
+        val registration = registration(1, PlayPreference.SOLO).copy(
+            displayId = "旧昵称",
+            playerProfileId = "profile-1",
+            gender = PlayerGender.MALE,
+            isTemporary = false
+        )
+        val queue = MachineQueue(waiting = listOf(registration))
+
+        val updated = queue.syncPlayerProfileDetails(
+            playerProfileId = "profile-1",
+            playerNickname = "新昵称",
+            gender = PlayerGender.FEMALE
+        )
+
+        assertEquals("新昵称", updated.waiting.single().displayId)
+        assertEquals(PlayerGender.FEMALE, updated.waiting.single().gender)
+        assertEquals(PlayPreference.SOLO, updated.waiting.single().preference)
+        assertEquals("profile-1", updated.waiting.single().playerProfileId)
+    }
+
+    @Test
+    fun editingAPlayerProfileDoesNotCreateDuplicateNickname() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1).copy(displayId = "旧昵称", playerProfileId = "profile-1"),
+                registration(2).copy(displayId = "现有昵称")
+            )
+        )
+
+        assertEquals(
+            queue,
+            queue.syncPlayerProfileDetails("profile-1", "现有昵称", PlayerGender.UNDISCLOSED)
+        )
     }
 
     @Test
@@ -347,9 +1273,9 @@ class QueueModelsTest {
             )
         )
         val original = queue.allRegistrations
-        val proposed = listOf(original[3], original[0], original[1], original[2])
+        val proposed = listOf(original[0], original[3], original[1], original[2])
 
-        assertEquals(listOf(1, 2, 3), delayedRegistrationsForMove(queue, proposed, 4).map { it.key })
+        assertEquals(listOf(2, 3), delayedRegistrationsForMove(queue, proposed, 4).map { it.key })
         assertTrue(hasRegistrationOrderChanged(original, proposed))
         assertTrue(!hasRegistrationOrderChanged(original, original.toList()))
     }
@@ -363,13 +1289,14 @@ class QueueModelsTest {
             ),
             waiting = listOf(
                 registration(3, PlayPreference.OPEN_TO_JOIN),
-                registration(4, PlayPreference.OPEN_TO_JOIN)
+                registration(4, PlayPreference.OPEN_TO_JOIN),
+                registration(5, PlayPreference.SOLO)
             )
         )
         val original = queue.allRegistrations
-        val proposed = listOf(original[3], original[0], original[1], original[2])
+        val proposed = listOf(original[0], original[1], original[4], original[2], original[3])
 
-        assertEquals(listOf(2), delayedRegistrationsForMove(queue, proposed, 4).map { it.key })
+        assertEquals(listOf(3, 4), delayedRegistrationsForMove(queue, proposed, 5).map { it.key })
     }
 
     @Test
@@ -405,13 +1332,138 @@ class QueueModelsTest {
         val queue = MachineQueue(
             playing = listOf(registration(1, PlayPreference.SOLO)),
             waiting = listOf(
-                registration(2, PlayPreference.SOLO).copy(deferredOnce = true),
+                registration(2, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                ),
                 registration(3, PlayPreference.SOLO)
             ),
             playingStartedAtMillis = nowMillis
         )
 
         assertEquals(12L, estimatedMinutesUntilPlaying(queue, setOf(3), nowMillis))
+    }
+
+    @Test
+    fun waitEstimateAddsTheSkippedRoundForDeferredRegistrationItself() {
+        val nowMillis = 3_100_000L
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                ),
+                registration(2, PlayPreference.SOLO)
+            ),
+            playingStartedAtMillis = nowMillis
+        )
+
+        assertEquals(24L, estimatedMinutesUntilPlaying(queue, setOf(1), nowMillis))
+    }
+
+    @Test
+    fun waitEstimateUsesNextRoundAfterCrossedOpenDeferralIsConsumed() {
+        val nowMillis = 3_150_000L
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1),
+                registration(2).copy(absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND),
+                registration(3),
+                registration(4)
+            ),
+            playingStartedAtMillis = nowMillis
+        )
+
+        assertEquals(27L, estimatedMinutesUntilPlaying(queue, setOf(2), nowMillis))
+        assertEquals(27L, estimatedMinutesUntilPlaying(queue, setOf(4), nowMillis))
+    }
+
+    @Test
+    fun waitEstimateSkipsTemporarilyAwayRegistrationAndDeductsElapsedRoundTime() {
+        val nowMillis = 3_200_000L
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY
+                ),
+                registration(2, PlayPreference.SOLO)
+            ),
+            playingStartedAtMillis = nowMillis - 5 * 60_000L
+        )
+
+        assertEquals(7L, estimatedMinutesUntilPlaying(queue, setOf(2), nowMillis))
+        assertEquals(null, estimatedMinutesUntilPlaying(queue, setOf(1), nowMillis))
+    }
+
+    @Test
+    fun waitEstimateUsesRegroupedOpenPlayersAndDoesNotChargeForTemporaryLeave() {
+        val nowMillis = 3_250_000L
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1),
+                registration(2).copy(absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY),
+                registration(3),
+                registration(4)
+            ),
+            playingStartedAtMillis = nowMillis
+        )
+
+        assertEquals(12L, estimatedMinutesUntilPlaying(queue, setOf(1), nowMillis))
+        assertEquals(12L, estimatedMinutesUntilPlaying(queue, setOf(3), nowMillis))
+        assertEquals(27L, estimatedMinutesUntilPlaying(queue, setOf(4), nowMillis))
+        assertEquals(null, estimatedMinutesUntilPlaying(queue, setOf(2), nowMillis))
+    }
+
+    @Test
+    fun waitEstimateProcessesSeveralTemporarilyAwayPositionsWithoutDelayingFollowingPlayer() {
+        val nowMillis = 3_300_000L
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+                    temporaryAwaySkippedTurns = 2
+                ),
+                registration(2, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+                    temporaryAwaySkippedTurns = 1
+                ),
+                registration(3, PlayPreference.SOLO)
+            ),
+            playingStartedAtMillis = nowMillis - 5 * 60_000L
+        )
+
+        assertEquals(7L, estimatedMinutesUntilPlaying(queue, setOf(3), nowMillis))
+        assertEquals(QueueAbsenceStatus.TEMPORARILY_AWAY, queue.waiting[0].absenceStatus)
+        assertEquals(2, queue.waiting[0].temporaryAwaySkippedTurns)
+        assertEquals(1, queue.waiting[1].temporaryAwaySkippedTurns)
+    }
+
+    @Test
+    fun waitEstimateDoesNotMutateDeferredOrTemporarilyAwayState() {
+        val nowMillis = 3_400_000L
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                ),
+                registration(2, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+                    temporaryAwaySkippedTurns = 2
+                ),
+                registration(3, PlayPreference.SOLO)
+            ),
+            playingStartedAtMillis = nowMillis
+        )
+
+        estimatedMinutesUntilPlaying(queue, setOf(3), nowMillis)
+
+        assertEquals(QueueAbsenceStatus.DEFER_ONE_ROUND, queue.waiting[0].absenceStatus)
+        assertEquals(QueueAbsenceStatus.TEMPORARILY_AWAY, queue.waiting[1].absenceStatus)
+        assertEquals(2, queue.waiting[1].temporaryAwaySkippedTurns)
     }
 
     @Test

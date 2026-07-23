@@ -103,7 +103,7 @@ class PlayerProfilesTest {
 
         assertEquals("小雨", first.nickname)
         assertEquals("12345678", first.qqNumber)
-        assertEquals("+86 138-0000-0000", first.phoneNumber)
+        assertNull(first.phoneNumber)
         assertTrue(first.hasValidContact)
         assertNotEquals(first.id, second.id)
         assertEquals(700L, first.updatedAtMillis)
@@ -115,17 +115,18 @@ class PlayerProfilesTest {
 
         assertFalse(legacyProfile.hasValidContact)
         assertTrue(legacyProfile.copy(qqNumber = "12345").hasValidContact)
-        assertTrue(legacyProfile.copy(phoneNumber = "010-12345678").hasValidContact)
+        assertTrue(legacyProfile.copy(phoneNumber = "13800138000").hasValidContact)
         assertFalse(legacyProfile.copy(qqNumber = "1234").hasValidContact)
         assertFalse(legacyProfile.copy(phoneNumber = "123456").hasValidContact)
     }
 
     @Test
-    fun contactValidationPreservesPhoneFormattingButRejectsInvalidCharacters() {
+    fun contactValidationAcceptsQqAndMainlandChinaMobileNumbersOnly() {
         assertTrue(isValidQqNumber("123456789012"))
         assertFalse(isValidQqNumber("1234567890123"))
-        assertTrue(isValidPhoneNumber("+86 (10) 1234-5678"))
-        assertFalse(isValidPhoneNumber("13800000000 ext 2"))
+        assertTrue(isValidPhoneNumber("13800138000"))
+        assertFalse(isValidPhoneNumber("+8613800138000"))
+        assertFalse(isValidPhoneNumber("01012345678"))
     }
 
     @Test
