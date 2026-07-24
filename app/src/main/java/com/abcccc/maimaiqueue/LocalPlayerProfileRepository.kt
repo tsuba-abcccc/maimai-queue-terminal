@@ -10,7 +10,7 @@ import org.json.JSONObject
 
 interface PlayerProfileRepository {
     suspend fun getProfiles(): List<PlayerProfile>
-    suspend fun upsertProfile(profile: PlayerProfile)
+    suspend fun upsertProfile(profile: PlayerProfile): Boolean
 }
 
 class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
@@ -22,13 +22,13 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
 
     override suspend fun getProfiles(): List<PlayerProfile> = withContext(Dispatchers.IO) {
         writeMutex.withLock {
-            loadProfiles().also { profiles ->
+            clearAmbiguousQqBindings(loadProfiles()).also { profiles ->
                 if (profiles.isNotEmpty()) saveProfiles(profiles)
             }
         }
     }
 
-    override suspend fun upsertProfile(profile: PlayerProfile) = withContext(Dispatchers.IO) {
+    override suspend fun upsertProfile(profile: PlayerProfile): Boolean = withContext(Dispatchers.IO) {
         writeMutex.withLock {
             val profiles = loadProfiles().toMutableList()
             val canonicalProfile = profile.withCanonicalContact()
@@ -69,7 +69,6 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                             gender = gender,
                             defaultPreference = preference,
                             qqNumber = item.optNullableString("qqNumber"),
-                            phoneNumber = item.optNullableString("phoneNumber"),
                             avatarReference = item.optNullableString("avatarReference"),
                             usageCount = item.optInt("usageCount", 0).coerceAtLeast(0),
                             lastUsedAtMillis = item.optLongOrNull("lastUsedAtMillis"),
@@ -83,7 +82,7 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
         }.getOrDefault(emptyList())
     }
 
-    private fun saveProfiles(profiles: List<PlayerProfile>) {
+    private fun saveProfiles(profiles: List<PlayerProfile>): Boolean {
         val array = JSONArray()
         profiles.forEach { rawProfile ->
             val profile = rawProfile.withCanonicalContact()
@@ -94,7 +93,6 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                     put("gender", profile.gender.name)
                     put("defaultPreference", profile.defaultPreference.name)
                     put("qqNumber", profile.qqNumber ?: JSONObject.NULL)
-                    put("phoneNumber", profile.phoneNumber ?: JSONObject.NULL)
                     put("avatarReference", profile.avatarReference ?: JSONObject.NULL)
                     put("usageCount", profile.usageCount)
                     put("lastUsedAtMillis", profile.lastUsedAtMillis ?: JSONObject.NULL)
@@ -103,7 +101,7 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                 }
             )
         }
-        preferences.edit().putString(KEY_PROFILES, array.toString()).commit()
+        return preferences.edit().putString(KEY_PROFILES, array.toString()).commit()
     }
 
     private inline fun <reified T : Enum<T>> enumValueOrDefault(value: String, default: T): T =

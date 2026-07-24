@@ -31,7 +31,6 @@ data class PlayerProfile(
     val gender: PlayerGender,
     val defaultPreference: ProfilePlayPreference,
     val qqNumber: String? = null,
-    val phoneNumber: String? = null,
     val avatarReference: String? = null,
     val usageCount: Int = 0,
     val lastUsedAtMillis: Long? = null,
@@ -39,16 +38,16 @@ data class PlayerProfile(
     val updatedAtMillis: Long = createdAtMillis
 ) {
     val hasValidContact: Boolean
-        get() = canonicalContact().isValid
+        get() = normalizedQqNumber() != null && isValidQqNumber(normalizedQqNumber())
 
-    fun canonicalContact(): PlayerContact = canonicalPlayerContact(qqNumber, phoneNumber)
+    fun normalizedQqNumber(): String? = normalizeOptionalContact(qqNumber)
 
     fun withCanonicalContact(): PlayerProfile {
-        val contact = canonicalContact()
-        return if (qqNumber == contact.qqNumber && phoneNumber == contact.phoneNumber) {
+        val normalizedQqNumber = normalizedQqNumber()
+        return if (qqNumber == normalizedQqNumber) {
             this
         } else {
-            copy(qqNumber = contact.qqNumber, phoneNumber = contact.phoneNumber)
+            copy(qqNumber = normalizedQqNumber)
         }
     }
 
@@ -68,7 +67,6 @@ fun createPlayerProfile(
     gender: PlayerGender,
     defaultPreference: ProfilePlayPreference,
     qqNumber: String? = null,
-    phoneNumber: String? = null,
     createdAtMillis: Long = System.currentTimeMillis()
 ): PlayerProfile = PlayerProfile(
     id = UUID.randomUUID().toString(),
@@ -76,40 +74,9 @@ fun createPlayerProfile(
     gender = gender,
     defaultPreference = defaultPreference,
     qqNumber = qqNumber,
-    phoneNumber = phoneNumber,
     createdAtMillis = createdAtMillis,
     updatedAtMillis = createdAtMillis
 ).withCanonicalContact()
-
-data class PlayerContact(
-    val qqNumber: String? = null,
-    val phoneNumber: String? = null
-) {
-    val isPresent: Boolean
-        get() = qqNumber != null || phoneNumber != null
-
-    val isValid: Boolean
-        get() = isPresent && isValidQqNumber(qqNumber) && isValidPhoneNumber(phoneNumber)
-}
-
-fun canonicalPlayerContact(qqNumber: String?, phoneNumber: String?): PlayerContact {
-    val normalizedQq = normalizeOptionalContact(qqNumber)
-    val normalizedPhone = normalizeOptionalContact(phoneNumber)
-    return if (normalizedQq != null) {
-        PlayerContact(qqNumber = normalizedQq)
-    } else {
-        PlayerContact(phoneNumber = normalizedPhone)
-    }
-}
-
-fun playerContactFromInput(value: String, allowPhoneNumber: Boolean): PlayerContact {
-    val normalized = normalizeOptionalContact(value)
-    return if (allowPhoneNumber && isMainlandChinaMobileNumber(normalized)) {
-        PlayerContact(phoneNumber = normalized)
-    } else {
-        PlayerContact(qqNumber = normalized)
-    }
-}
 
 fun isValidQqNumber(value: String?): Boolean {
     val normalized = value?.trim().orEmpty()
@@ -117,22 +84,32 @@ fun isValidQqNumber(value: String?): Boolean {
         (normalized.length in QQ_NUMBER_LENGTH_RANGE && normalized.all { it in '0'..'9' })
 }
 
-fun isValidPhoneNumber(value: String?): Boolean {
-    val normalized = value?.trim().orEmpty()
-    return normalized.isEmpty() || isMainlandChinaMobileNumber(normalized)
-}
-
-fun isMainlandChinaMobileNumber(value: String?): Boolean {
-    val normalized = value?.trim().orEmpty()
-    return normalized.length == MAX_PHONE_NUMBER_LENGTH &&
-        normalized[0] == '1' && normalized[1] in '3'..'9' &&
-        normalized.all { it in '0'..'9' }
-}
-
 fun normalizeOptionalContact(value: String?): String? = value?.trim()?.takeIf { it.isNotEmpty() }
 
+internal fun clearAmbiguousQqBindings(
+    profiles: List<PlayerProfile>,
+    migratedAtMillis: Long = System.currentTimeMillis()
+): List<PlayerProfile> {
+    val duplicateQqNumbers = profiles.asSequence()
+        .mapNotNull(PlayerProfile::normalizedQqNumber)
+        .groupingBy { it }
+        .eachCount()
+        .filterValues { count -> count > 1 }
+        .keys
+    if (duplicateQqNumbers.isEmpty()) return profiles
+    return profiles.map { profile ->
+        if (profile.normalizedQqNumber() in duplicateQqNumbers) {
+            profile.copy(
+                qqNumber = null,
+                updatedAtMillis = maxOf(profile.updatedAtMillis, migratedAtMillis)
+            )
+        } else {
+            profile
+        }
+    }
+}
+
 const val MAX_QQ_NUMBER_LENGTH = 12
-const val MAX_PHONE_NUMBER_LENGTH = 11
 private val QQ_NUMBER_LENGTH_RANGE = 5..MAX_QQ_NUMBER_LENGTH
 
 fun filterAndSortPlayerProfiles(

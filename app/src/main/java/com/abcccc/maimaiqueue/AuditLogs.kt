@@ -9,6 +9,13 @@ enum class AuditLogCategory {
     PLAYER_PROFILE
 }
 
+enum class AuditLogSource {
+    ON_SITE_TERMINAL,
+    QQ_BOT,
+    SYSTEM_AUTOMATIC,
+    WEBSITE_REMOTE
+}
+
 enum class PublicQueueEventType {
     REGISTRATION_ADDED,
     REGISTRATION_REMOVED,
@@ -35,6 +42,7 @@ data class AuditLogEntry(
     val category: AuditLogCategory,
     val title: String,
     val detail: String,
+    val source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
     val queueId: String? = null,
     val publicEventType: PublicQueueEventType? = null,
     val affectedRegistrationKeys: List<Int> = emptyList()
@@ -44,6 +52,7 @@ fun createAuditLogEntry(
     category: AuditLogCategory,
     title: String,
     detail: String,
+    source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
     timestampMillis: Long = System.currentTimeMillis(),
     publicEventType: PublicQueueEventType? = null,
     affectedRegistrationKeys: Collection<Int> = emptyList()
@@ -53,6 +62,7 @@ fun createAuditLogEntry(
     category = category,
     title = title,
     detail = detail,
+    source = source,
     publicEventType = publicEventType,
     affectedRegistrationKeys = affectedRegistrationKeys.distinct()
 )
@@ -65,6 +75,7 @@ fun createQueueAuditLog(
     titleOverride: String? = null,
     publicEventTypeOverride: PublicQueueEventType? = null,
     affectedRegistrationKeysOverride: Collection<Int> = emptyList(),
+    source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
     timestampMillis: Long = System.currentTimeMillis()
 ): AuditLogEntry? {
     if (before == after) return null
@@ -219,6 +230,7 @@ fun createQueueAuditLog(
         } else {
             details.distinct().joinToString(separator = "；", postfix = "。")
         },
+        source = source,
         timestampMillis = timestampMillis,
         publicEventType = publicEventType,
         affectedRegistrationKeys = affectedRegistrationKeys
@@ -228,6 +240,7 @@ fun createQueueAuditLog(
 fun createPlayerProfileAuditLog(
     before: PlayerProfile?,
     after: PlayerProfile,
+    source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
     timestampMillis: Long = System.currentTimeMillis()
 ): AuditLogEntry {
     if (before == null) {
@@ -235,6 +248,7 @@ fun createPlayerProfileAuditLog(
             category = AuditLogCategory.PLAYER_PROFILE,
             title = "新建玩家资料",
             detail = "已创建“${after.nickname}”，默认偏好为${profilePreferenceAuditLabel(after.defaultPreference)}。",
+            source = source,
             timestampMillis = timestampMillis
         )
     }
@@ -244,14 +258,15 @@ fun createPlayerProfileAuditLog(
         if (before.defaultPreference != after.defaultPreference) {
             add("默认偏好改为${profilePreferenceAuditLabel(after.defaultPreference)}")
         }
-        if (before.qqNumber != after.qqNumber || before.phoneNumber != after.phoneNumber) {
-            add("联系方式已更新")
+        if (before.qqNumber != after.qqNumber) {
+            add("QQ 号已更新")
         }
     }
     return createAuditLogEntry(
         category = AuditLogCategory.PLAYER_PROFILE,
         title = "编辑玩家资料",
         detail = if (details.isEmpty()) "“${after.nickname}”的资料已保存。" else details.joinToString("；") + "。",
+        source = source,
         timestampMillis = timestampMillis
     )
 }

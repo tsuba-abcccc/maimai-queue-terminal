@@ -1,5 +1,6 @@
 package com.abcccc.maimaiqueue
 
+import android.app.TimePickerDialog
 import android.content.pm.ActivityInfo
 import android.os.BatteryManager
 import android.os.Bundle
@@ -135,6 +136,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.abcccc.maimaiqueue.ui.theme.MaimaiQueueTheme
 import java.text.SimpleDateFormat
+import java.time.DayOfWeek
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
@@ -164,6 +166,8 @@ private val QueueViewportHeight = 154.dp
 private val QueueRegistrationTileHeight = 96.dp
 private const val SOLO_ROUND_DURATION_MILLIS = 12 * 60_000L
 private const val SHARED_ROUND_DURATION_MILLIS = 15 * 60_000L
+private const val REMOTE_COMMAND_POLL_INTERVAL_MILLIS = 3_000L
+private const val CLOUD_PROFILE_REFRESH_INTERVAL_MILLIS = 30_000L
 
 private enum class Screen {
     HOME,
@@ -343,11 +347,15 @@ class MainActivity : ComponentActivity() {
 private fun RegistrationApp() {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
+    val cloudSyncAvailable = BuildConfig.CLOUD_SYNC_AVAILABLE
     val queueSoundPlayer = remember { QueueSoundPlayer() }
     DisposableEffect(queueSoundPlayer) {
         onDispose(queueSoundPlayer::close)
     }
     val playerProfileRepository = remember(context) { LocalPlayerProfileRepository(context) }
+    val playerProfilePersistence = remember(playerProfileRepository) {
+        PlayerProfilePersistenceCoordinator(playerProfileRepository)
+    }
     val auditLogRepository = remember(context) { LocalAuditLogRepository(context) }
     val queueStateRepository = remember(context) { LocalQueueStateRepository(context) }
     val queueRuleSettingsRepository = remember(context) { LocalQueueRuleSettingsRepository(context) }
@@ -361,6 +369,13 @@ private fun RegistrationApp() {
             token = BuildConfig.QUEUE_SYNC_TOKEN
         )
     }
+    val queueCommandClient = remember(context) {
+        HttpQueueCommandClient(
+            context = context,
+            queueStatusEndpoint = BuildConfig.QUEUE_SYNC_URL,
+            token = BuildConfig.QUEUE_SYNC_TOKEN
+        )
+    }
     var cloudSyncStatus by remember(
         queueStatePublisher.isConfigured,
         initialQueueRuleSettings.websiteSyncEnabled
@@ -368,6 +383,7 @@ private fun RegistrationApp() {
         mutableStateOf(
             QueueCloudSyncStatus(
                 phase = when {
+                    !cloudSyncAvailable -> QueueCloudSyncPhase.NOT_CONFIGURED
                     !initialQueueRuleSettings.websiteSyncEnabled -> QueueCloudSyncPhase.DISABLED
                     queueStatePublisher.isConfigured -> QueueCloudSyncPhase.CONFIGURED
                     else -> QueueCloudSyncPhase.NOT_CONFIGURED
@@ -375,11 +391,12 @@ private fun RegistrationApp() {
             )
         )
     }
+    var privateSyncFailureDetail by remember { mutableStateOf<String?>(null) }
     val cloudSyncController = remember(queueStatePublisher, coroutineScope) {
         QueueCloudSyncController(
             scope = coroutineScope,
             publisher = queueStatePublisher,
-            initiallyEnabled = initialQueueRuleSettings.websiteSyncEnabled,
+            initiallyEnabled = cloudSyncAvailable && initialQueueRuleSettings.websiteSyncEnabled,
             onStatusChange = { cloudSyncStatus = it }
         )
     }
@@ -398,6 +415,7 @@ private fun RegistrationApp() {
     var queueId by remember { mutableStateOf(newQueueId()) }
     val queueRevision = remember { AtomicLong(0L) }
     var playerProfiles by remember { mutableStateOf<List<PlayerProfile>>(emptyList()) }
+    var playerProfilesLoaded by remember { mutableStateOf(false) }
     var auditLogs by remember { mutableStateOf<List<AuditLogEntry>>(emptyList()) }
     var queueRuleSettings by remember { mutableStateOf(initialQueueRuleSettings) }
     var playerProfileSearch by remember { mutableStateOf("") }
@@ -408,12 +426,14 @@ private fun RegistrationApp() {
     var profileGenderDraft by remember { mutableStateOf(PlayerGender.UNDISCLOSED) }
     var profilePreferenceDraft by remember { mutableStateOf(ProfilePlayPreference.ASK_EVERY_TIME) }
     var profileQqDraft by remember { mutableStateOf("") }
-    var profileAllowsPhoneDraft by remember { mutableStateOf(false) }
     var profileJoinPreference by remember { mutableStateOf<PlayPreference?>(null) }
     var rememberProfileJoinPreference by remember { mutableStateOf(false) }
     var playerProfileContext by remember { mutableStateOf(PlayerProfileContext.JOIN_QUEUE) }
     var playerProfileEditorReturnScreen by remember { mutableStateOf(Screen.PLAYER_LIBRARY) }
     var claimPreferenceMismatchProfileId by remember { mutableStateOf<String?>(null) }
+    var playerProfileWriteInProgress by remember { mutableStateOf(false) }
+    var playerProfileWriteFailureDetail by remember { mutableStateOf<String?>(null) }
+    var cloudProfileRestoreFailureDetail by remember { mutableStateOf<String?>(null) }
 
     var selectedRegistration by remember { mutableStateOf<SelectedRegistration?>(null) }
     var moveIntoPlayingTarget by remember { mutableStateOf<SelectedRegistration?>(null) }
@@ -424,6 +444,7 @@ private fun RegistrationApp() {
     var enterPlayingConfirmation by remember { mutableStateOf<MachineId?>(null) }
     var moreMenuVisible by remember { mutableStateOf(false) }
     var appDetailsVisible by remember { mutableStateOf(false) }
+    var versionHistoryVisible by remember { mutableStateOf(false) }
     var editMachineChoiceVisible by remember { mutableStateOf(false) }
     var stopMachineChoiceVisible by remember { mutableStateOf(false) }
     var stopReasonTarget by remember { mutableStateOf<MachineId?>(null) }
@@ -451,9 +472,12 @@ private fun RegistrationApp() {
     var nextQueueUndoId by remember { mutableLongStateOf(1L) }
     var pendingQueueRestore by remember { mutableStateOf<PersistedQueueState?>(null) }
     var queuePersistenceReady by remember { mutableStateOf(false) }
+    val nowMillis = rememberCurrentTimeMillis()
+    val businessHoursStatus = evaluateBusinessHours(queueRuleSettings.businessHours, nowMillis)
 
     LaunchedEffect(playerProfileRepository) {
         playerProfiles = playerProfileRepository.getProfiles()
+        playerProfilesLoaded = true
     }
 
     LaunchedEffect(auditLogRepository) {
@@ -468,6 +492,7 @@ private fun RegistrationApp() {
 
     LaunchedEffect(
         queuePersistenceReady,
+        playerProfilesLoaded,
         pendingQueueRestore,
         machineA,
         machineB,
@@ -477,11 +502,16 @@ private fun RegistrationApp() {
         nextKey,
         queueId,
         auditLogs,
+        playerProfiles,
         queueRuleSettings.websiteSyncEnabled,
+        queueRuleSettings.oneBotSyncEnabled,
         queueRuleSettings.machineARemark,
-        queueRuleSettings.machineBRemark
+        queueRuleSettings.machineBRemark,
+        businessHoursStatus
     ) {
-        if (!queuePersistenceReady || pendingQueueRestore != null) return@LaunchedEffect
+        if (!queuePersistenceReady || !playerProfilesLoaded || pendingQueueRestore != null) {
+            return@LaunchedEffect
+        }
         val snapshot = PersistedQueueState(
             queueId = queueId,
             revision = queueRevision.incrementAndGet(),
@@ -499,8 +529,17 @@ private fun RegistrationApp() {
             auditLogs = auditLogs,
             displaySettings = QueuePublicDisplaySettings(
                 machineARemark = queueRuleSettings.machineARemark,
-                machineBRemark = queueRuleSettings.machineBRemark
-            )
+                machineBRemark = queueRuleSettings.machineBRemark,
+                oneBotSyncEnabled = queueRuleSettings.websiteSyncEnabled &&
+                    queueRuleSettings.oneBotSyncEnabled,
+                businessHours = QueuePublicBusinessHours(
+                    enabled = businessHoursStatus.enabled,
+                    outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
+                    closingSoon = businessHoursStatus.closingSoon,
+                    closesAtMillis = businessHoursStatus.activeClosingAtMillis
+                )
+            ),
+            playerProfiles = playerProfiles
         )
     }
 
@@ -522,13 +561,57 @@ private fun RegistrationApp() {
         coroutineScope.launch { auditLogRepository.append(queueScopedEntry) }
     }
 
-    fun updateQueueRuleSettings(settings: QueueRuleSettings) {
+    fun updateQueueRuleSettings(requestedSettings: QueueRuleSettings) {
+        val settings = requestedSettings.copy(
+            oneBotSyncEnabled = requestedSettings.websiteSyncEnabled &&
+                requestedSettings.oneBotSyncEnabled
+        )
         if (settings == queueRuleSettings) return
         val previousSettings = queueRuleSettings
         queueRuleSettings = settings
         queueRuleSettingsRepository.saveSettings(settings)
         if (previousSettings.websiteSyncEnabled != settings.websiteSyncEnabled) {
-            cloudSyncController.setEnabled(settings.websiteSyncEnabled)
+            cloudSyncController.setEnabled(cloudSyncAvailable && settings.websiteSyncEnabled)
+            if (
+                cloudSyncAvailable &&
+                previousSettings.websiteSyncEnabled &&
+                !settings.websiteSyncEnabled &&
+                queueStatePublisher.isConfigured
+            ) {
+                val closingStatus = evaluateBusinessHours(
+                    settings.businessHours,
+                    System.currentTimeMillis()
+                )
+                val finalSnapshot = PersistedQueueState(
+                    queueId = queueId,
+                    revision = queueRevision.incrementAndGet(),
+                    machineA = machineA,
+                    machineB = machineB,
+                    machineAStatus = machineAStatus,
+                    machineBStatus = machineBStatus,
+                    registrationOpen = registrationOpen,
+                    nextRegistrationKey = nextKey,
+                    savedAtMillis = System.currentTimeMillis()
+                )
+                coroutineScope.launch {
+                    queueStatePublisher.publish(
+                        state = finalSnapshot,
+                        auditLogs = auditLogs,
+                        displaySettings = QueuePublicDisplaySettings(
+                            machineARemark = settings.machineARemark,
+                            machineBRemark = settings.machineBRemark,
+                            oneBotSyncEnabled = false,
+                            businessHours = QueuePublicBusinessHours(
+                                enabled = closingStatus.enabled,
+                                outsideBusinessHours = closingStatus.outsideBusinessHours,
+                                closingSoon = closingStatus.closingSoon,
+                                closesAtMillis = closingStatus.activeClosingAtMillis
+                            )
+                        ),
+                        playerProfiles = playerProfiles
+                    )
+                }
+            }
         }
         val changeDescriptions = buildList {
             if (previousSettings.allowDeferOneRound != settings.allowDeferOneRound) {
@@ -537,8 +620,16 @@ private fun RegistrationApp() {
             if (previousSettings.allowTemporaryLeave != settings.allowTemporaryLeave) {
                 add("暂时离开：${if (settings.allowTemporaryLeave) "允许" else "不允许"}")
             }
-            if (previousSettings.websiteSyncEnabled != settings.websiteSyncEnabled) {
+            if (cloudSyncAvailable && previousSettings.websiteSyncEnabled != settings.websiteSyncEnabled) {
                 add("网站同步：${if (settings.websiteSyncEnabled) "已开启" else "已关闭"}")
+            }
+            if (cloudSyncAvailable && previousSettings.oneBotSyncEnabled != settings.oneBotSyncEnabled) {
+                add("QQ Bot 联动：${if (settings.oneBotSyncEnabled) "已开启" else "已关闭"}")
+            }
+            if (previousSettings.businessHours != settings.businessHours) {
+                add(
+                    "营业时间：${if (settings.businessHours.enabled) "已开启" else "已关闭"}"
+                )
             }
             if (previousSettings.machineARemark != settings.machineARemark) {
                 add("机台 A 备注改为“${settings.machineARemark}”")
@@ -646,9 +737,13 @@ private fun RegistrationApp() {
         else machineBStatus = transform(machineBStatus)
     }
 
-    fun reportMachineStopped(machineId: MachineId, reason: MachineStopReason) {
+    fun reportMachineStopped(
+        machineId: MachineId,
+        reason: MachineStopReason,
+        reasonDetail: String? = null
+    ) {
         val currentStatus = statusFor(machineId)
-        val stoppedStatus = currentStatus.stop(reason, System.currentTimeMillis())
+        val stoppedStatus = currentStatus.stop(reason, System.currentTimeMillis(), reasonDetail)
         if (stoppedStatus == currentStatus) return
         updateStatus(machineId) { stoppedStatus }
         queueSoundPlayer.play(QueueSoundCue.CAUTION)
@@ -658,7 +753,9 @@ private fun RegistrationApp() {
                 category = auditCategoryFor(machineId),
                 title = "${machineName(machineId)} 已停止使用",
                 detail = buildString {
-                    append("原因：${machineStopReasonLabel(reason)}。")
+                    append(
+                        "原因：${machineStopReasonLabel(stoppedStatus.stopReason, stoppedStatus.stopReasonDetail)}。"
+                    )
                     if (registrationCount > 0) {
                         append("现有 $registrationCount 份登记及其顺序已保留；恢复正常使用后，本轮计时会从头开始。")
                     }
@@ -732,6 +829,11 @@ private fun RegistrationApp() {
             it.id != exceptProfileId && it.nickname.equals(nickname.trim(), ignoreCase = true)
         }
 
+    fun playerProfileQqExists(qqNumber: String, exceptProfileId: String? = null): Boolean =
+        playerProfiles.any {
+            it.id != exceptProfileId && it.normalizedQqNumber() == qqNumber.trim()
+        }
+
     fun playerProfileNicknameConflictsWithQueue(
         nickname: String,
         profileId: String? = editingPlayerProfileId
@@ -758,7 +860,11 @@ private fun RegistrationApp() {
                 )
         }
 
-    fun upsertPlayerProfile(profile: PlayerProfile) {
+    fun applyPlayerProfileToState(
+        profile: PlayerProfile,
+        recordAudit: Boolean = true,
+        source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL
+    ) {
         val existingIndex = playerProfiles.indexOfFirst { it.id == profile.id }
         val existingProfile = playerProfiles.getOrNull(existingIndex)
         playerProfiles = if (existingIndex >= 0) {
@@ -766,7 +872,6 @@ private fun RegistrationApp() {
         } else {
             playerProfiles + profile
         }
-        coroutineScope.launch { playerProfileRepository.upsertProfile(profile) }
         if (
             existingProfile != null &&
             (existingProfile.nickname != profile.nickname || existingProfile.gender != profile.gender)
@@ -778,15 +883,77 @@ private fun RegistrationApp() {
                 it.syncPlayerProfileDetails(profile.id, profile.nickname, profile.gender)
             }
         }
-        if (
+        if (recordAudit && (
             existingProfile == null ||
             existingProfile.nickname != profile.nickname ||
             existingProfile.gender != profile.gender ||
             existingProfile.defaultPreference != profile.defaultPreference ||
-            existingProfile.qqNumber != profile.qqNumber ||
-            existingProfile.phoneNumber != profile.phoneNumber
-        ) {
-            appendAuditLog(createPlayerProfileAuditLog(existingProfile, profile))
+            existingProfile.qqNumber != profile.qqNumber
+        )) {
+            appendAuditLog(createPlayerProfileAuditLog(existingProfile, profile, source = source))
+        }
+    }
+
+    fun persistPlayerProfileForUser(
+        profile: PlayerProfile,
+        failureDetail: String,
+        onPersisted: () -> Unit
+    ) {
+        if (playerProfileWriteInProgress) return
+        playerProfileWriteInProgress = true
+        playerProfileWriteFailureDetail = null
+        coroutineScope.launch {
+            try {
+                val persisted = playerProfilePersistence.persistAndApply(
+                    profile = profile,
+                    onPersisted = { persistedProfile ->
+                        applyPlayerProfileToState(persistedProfile)
+                    }
+                )
+                if (persisted) {
+                    onPersisted()
+                } else {
+                    playerProfileWriteFailureDetail = failureDetail
+                }
+            } finally {
+                playerProfileWriteInProgress = false
+            }
+        }
+    }
+
+    suspend fun mergeMissingCloudPlayerProfiles(cloudProfiles: List<PlayerProfile>) {
+        if (cloudProfiles.isEmpty()) {
+            cloudProfileRestoreFailureDetail = null
+            return
+        }
+        val result = playerProfilePersistence.persistIndividually(
+            profiles = cloudProfiles,
+            shouldPersist = { profile ->
+                val qqNumber = profile.normalizedQqNumber()
+                playerProfiles.none { current ->
+                    current.id == profile.id ||
+                        current.nickname.equals(profile.nickname.trim(), ignoreCase = true) ||
+                        (qqNumber != null && current.normalizedQqNumber() == qqNumber)
+                } && !playerProfileNicknameConflictsWithQueue(profile.nickname, profile.id)
+            },
+            onPersisted = { profile ->
+                applyPlayerProfileToState(profile, recordAudit = false)
+            }
+        )
+        cloudProfileRestoreFailureDetail = result.failedProfiles
+            .takeIf { it.isNotEmpty() }
+            ?.let { failed ->
+                "有 ${failed.size} 份云端玩家资料暂时无法写入本机，将继续重试。"
+            }
+        if (result.persistedProfiles.isNotEmpty()) {
+            appendAuditLog(
+                createAuditLogEntry(
+                    category = AuditLogCategory.PLAYER_PROFILE,
+                    title = "恢复云端玩家资料",
+                    detail = "已从服务器补回 ${result.persistedProfiles.size} 份本机缺失的玩家资料。",
+                    source = AuditLogSource.SYSTEM_AUTOMATIC
+                )
+            )
         }
     }
 
@@ -804,7 +971,7 @@ private fun RegistrationApp() {
         )
     }
 
-    fun closeRegistration() {
+    fun closeRegistration(automaticBusinessHours: Boolean = false) {
         if (!registrationOpen) return
         val removedCount = machineA.registrationCount + machineB.registrationCount
         val removedRegistrationKeys = (machineA.allRegistrations + machineB.allRegistrations)
@@ -816,11 +983,24 @@ private fun RegistrationApp() {
         appendAuditLog(
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
-                title = "关闭登记排队",
+                title = if (automaticBusinessHours) "到达闭店时间，关闭登记排队" else "关闭登记排队",
                 detail = if (removedCount == 0) {
-                    "新的排队登记已停止接收。"
+                    if (automaticBusinessHours) {
+                        "现在已进入非营业时间，新的排队登记已停止接收。"
+                    } else {
+                        "新的排队登记已停止接收。"
+                    }
                 } else {
-                    "新的排队登记已停止接收，并清除了两台机台的 $removedCount 份登记。"
+                    if (automaticBusinessHours) {
+                        "现在已进入非营业时间，新的排队登记已停止接收，并清除了两台机台的 $removedCount 份登记。"
+                    } else {
+                        "新的排队登记已停止接收，并清除了两台机台的 $removedCount 份登记。"
+                    }
+                },
+                source = if (automaticBusinessHours) {
+                    AuditLogSource.SYSTEM_AUTOMATIC
+                } else {
+                    AuditLogSource.ON_SITE_TERMINAL
                 },
                 publicEventType = PublicQueueEventType.REGISTRATION_CLOSED,
                 affectedRegistrationKeys = removedRegistrationKeys
@@ -829,10 +1009,14 @@ private fun RegistrationApp() {
     }
 
     fun restorePreviousQueue(savedState: PersistedQueueState) {
+        fun syncKnownProfiles(queue: MachineQueue): MachineQueue = playerProfiles.fold(queue) {
+            updatedQueue, profile ->
+            updatedQueue.syncPlayerProfileDetails(profile.id, profile.nickname, profile.gender)
+        }
         queueId = savedState.queueId
         queueRevision.set(savedState.revision)
-        machineA = savedState.machineA
-        machineB = savedState.machineB
+        machineA = syncKnownProfiles(savedState.machineA)
+        machineB = syncKnownProfiles(savedState.machineB)
         machineAStatus = savedState.machineAStatus
         machineBStatus = savedState.machineBStatus
         registrationOpen = savedState.registrationOpen
@@ -887,7 +1071,6 @@ private fun RegistrationApp() {
         profileGenderDraft = PlayerGender.UNDISCLOSED
         profilePreferenceDraft = ProfilePlayPreference.ASK_EVERY_TIME
         profileQqDraft = ""
-        profileAllowsPhoneDraft = false
         screen = Screen.PLAYER_PROFILE_EDITOR
     }
 
@@ -900,8 +1083,7 @@ private fun RegistrationApp() {
         profileNicknameDraft = profile.nickname
         profileGenderDraft = profile.gender
         profilePreferenceDraft = profile.defaultPreference
-        profileQqDraft = profile.qqNumber ?: profile.phoneNumber.orEmpty()
-        profileAllowsPhoneDraft = !profile.phoneNumber.isNullOrBlank()
+        profileQqDraft = profile.qqNumber.orEmpty()
         screen = Screen.PLAYER_PROFILE_EDITOR
     }
 
@@ -914,12 +1096,14 @@ private fun RegistrationApp() {
 
     fun savePlayerProfileDraft() {
         val normalizedNickname = profileNicknameDraft.trim()
-        val contact = playerContactFromInput(profileQqDraft, profileAllowsPhoneDraft)
+        val normalizedQqNumber = normalizeOptionalContact(profileQqDraft)
         if (
             normalizedNickname.isBlank() ||
             playerProfileNicknameExists(normalizedNickname, editingPlayerProfileId) ||
             playerProfileNicknameConflictsWithQueue(normalizedNickname) ||
-            !contact.isValid
+            normalizedQqNumber == null ||
+            !isValidQqNumber(normalizedQqNumber) ||
+            playerProfileQqExists(normalizedQqNumber, editingPlayerProfileId)
         ) return
         val nowMillis = System.currentTimeMillis()
         val existingProfile = editingPlayerProfileId?.let { profileId ->
@@ -929,21 +1113,22 @@ private fun RegistrationApp() {
             nickname = normalizedNickname,
             gender = profileGenderDraft,
             defaultPreference = profilePreferenceDraft,
-            qqNumber = contact.qqNumber,
-            phoneNumber = contact.phoneNumber,
+            qqNumber = normalizedQqNumber,
             updatedAtMillis = nowMillis
         ) ?: createPlayerProfile(
             nickname = normalizedNickname,
             gender = profileGenderDraft,
             defaultPreference = profilePreferenceDraft,
-            qqNumber = contact.qqNumber,
-            phoneNumber = contact.phoneNumber,
+            qqNumber = normalizedQqNumber,
             createdAtMillis = nowMillis
         )
-        upsertPlayerProfile(savedProfile)
-        profileAllowsPhoneDraft = false
-        if (existingProfile == null) openPlayerProfile(savedProfile)
-        else screen = playerProfileEditorReturnScreen
+        persistPlayerProfileForUser(
+            profile = savedProfile,
+            failureDetail = "玩家资料未能保存到本机。当前修改尚未生效，请稍后重试。"
+        ) {
+            if (existingProfile == null) openPlayerProfile(savedProfile)
+            else screen = playerProfileEditorReturnScreen
+        }
     }
 
     fun completePlayerProfileRegistration() {
@@ -958,29 +1143,32 @@ private fun RegistrationApp() {
             !statusFor(machineId).isOperational ||
             queueFor(machineId).registrationCount >= 20
         ) return
-        updateQueue(machineId, QueueSoundCue.CONFIRM) {
-            it.join(
-                Registration(
-                    key = nextKey++,
-                    displayId = profile.nickname,
-                    preference = preference,
-                    isTemporary = false,
-                    gender = profile.gender,
-                    playerProfileId = profile.id
-                )
-            )
-        }
-        upsertPlayerProfile(
-            profile.recordUsage(
-                preferenceToRemember = preference.takeIf {
-                    profile.defaultPreference == ProfilePlayPreference.ASK_EVERY_TIME &&
-                        rememberProfileJoinPreference
-                }
-            )
+        val usedProfile = profile.recordUsage(
+            preferenceToRemember = preference.takeIf {
+                profile.defaultPreference == ProfilePlayPreference.ASK_EVERY_TIME &&
+                    rememberProfileJoinPreference
+            }
         )
-        selectedPlayerProfileId = null
-        rememberProfileJoinPreference = false
-        screen = Screen.HOME
+        persistPlayerProfileForUser(
+            profile = usedProfile,
+            failureDetail = "玩家资料的本次使用记录未能保存，因此尚未加入排队。请稍后重试。"
+        ) {
+            updateQueue(machineId, QueueSoundCue.CONFIRM) {
+                it.join(
+                    Registration(
+                        key = nextKey++,
+                        displayId = usedProfile.nickname,
+                        preference = preference,
+                        isTemporary = false,
+                        gender = usedProfile.gender,
+                        playerProfileId = usedProfile.id
+                    )
+                )
+            }
+            selectedPlayerProfileId = null
+            rememberProfileJoinPreference = false
+            screen = Screen.HOME
+        }
     }
 
     fun completePlayerProfileClaim(preferenceOverride: PlayPreference? = null) {
@@ -996,21 +1184,26 @@ private fun RegistrationApp() {
             !statusFor(selection.machineId).isOperational ||
             playerProfileAlreadyRegistered(profile, exceptKey = registration.key)
         ) return
-        updateQueue(selection.machineId, QueueSoundCue.CONFIRM) {
-            it.claimWithPlayerProfile(
-                registrationKey = registration.key,
-                playerProfileId = profile.id,
-                playerNickname = profile.nickname,
-                gender = profile.gender,
-                preferenceOverride = preferenceOverride
-            )
+        val usedProfile = profile.recordUsage()
+        persistPlayerProfileForUser(
+            profile = usedProfile,
+            failureDetail = "玩家资料的本次使用记录未能保存，因此尚未认领登记。请稍后重试。"
+        ) {
+            updateQueue(selection.machineId, QueueSoundCue.CONFIRM) {
+                it.claimWithPlayerProfile(
+                    registrationKey = registration.key,
+                    playerProfileId = usedProfile.id,
+                    playerNickname = usedProfile.nickname,
+                    gender = usedProfile.gender,
+                    preferenceOverride = preferenceOverride
+                )
+            }
+            claimPreferenceMismatchProfileId = null
+            claimTarget = null
+            selectedPlayerProfileId = null
+            playerProfileContext = PlayerProfileContext.JOIN_QUEUE
+            screen = Screen.HOME
         }
-        upsertPlayerProfile(profile.recordUsage())
-        claimPreferenceMismatchProfileId = null
-        claimTarget = null
-        selectedPlayerProfileId = null
-        playerProfileContext = PlayerProfileContext.JOIN_QUEUE
-        screen = Screen.HOME
     }
 
     fun beginRegistration(batch: Boolean) {
@@ -1128,6 +1321,120 @@ private fun RegistrationApp() {
         reorderSession = ReorderSession(machineId, queue, explicit, initialRegistrationKey)
     }
 
+    LaunchedEffect(
+        queueRuleSettings.businessHours,
+        registrationOpen,
+        queuePersistenceReady,
+        pendingQueueRestore
+    ) {
+        if (!queuePersistenceReady || pendingQueueRestore != null) return@LaunchedEffect
+        while (true) {
+            val status = evaluateBusinessHours(
+                queueRuleSettings.businessHours,
+                System.currentTimeMillis()
+            )
+            val occurrenceId = status.mostRecentClosingOccurrenceId
+                ?.takeIf { status.outsideBusinessHours }
+            if (occurrenceId != null &&
+                queueRuleSettingsRepository.getLastHandledClosingOccurrenceId() != occurrenceId
+            ) {
+                queueRuleSettingsRepository.markClosingOccurrenceHandled(occurrenceId)
+                if (registrationOpen) closeRegistration(automaticBusinessHours = true)
+            }
+            delay(30_000L)
+        }
+    }
+
+    LaunchedEffect(
+        queueCommandClient,
+        queueRuleSettings.websiteSyncEnabled,
+        queueRuleSettings.oneBotSyncEnabled,
+        playerProfilesLoaded,
+        queuePersistenceReady,
+        pendingQueueRestore
+    ) {
+        var nextCloudProfileRefreshAtMillis = 0L
+        var localWriteFailureDetail: String? = null
+        while (true) {
+            if (
+                playerProfilesLoaded &&
+                queuePersistenceReady &&
+                pendingQueueRestore == null &&
+                cloudSyncAvailable &&
+                queueRuleSettings.websiteSyncEnabled &&
+                queueCommandClient.isConfigured
+            ) {
+                val nowMillis = System.currentTimeMillis()
+                if (nowMillis >= nextCloudProfileRefreshAtMillis) {
+                    queueCommandClient.fetchPlayerProfiles()?.let { cloudProfiles ->
+                        mergeMissingCloudPlayerProfiles(cloudProfiles)
+                        nextCloudProfileRefreshAtMillis = nowMillis +
+                            CLOUD_PROFILE_REFRESH_INTERVAL_MILLIS
+                    }
+                }
+                if (queueRuleSettings.oneBotSyncEnabled) {
+                    queueCommandClient.fetchPlayerProfileUpdates()?.forEach { command ->
+                        when (val result = playerProfilePersistence.processCommand(
+                            command = command,
+                            currentProfiles = { playerProfiles },
+                            nicknameConflictsWithQueue = ::playerProfileNicknameConflictsWithQueue,
+                            onPersisted = { profile ->
+                                applyPlayerProfileToState(
+                                    profile,
+                                    source = AuditLogSource.QQ_BOT
+                                )
+                            }
+                        )) {
+                            is PlayerProfileCommandPersistenceResult.Applied -> {
+                                localWriteFailureDetail = null
+                                queueCommandClient.complete(
+                                    command.commandId,
+                                    applied = true,
+                                    detail = "玩家资料已由终端更新。"
+                                )
+                            }
+
+                            PlayerProfileCommandPersistenceResult.AlreadyApplied -> {
+                                localWriteFailureDetail = null
+                                queueCommandClient.complete(
+                                    command.commandId,
+                                    applied = true,
+                                    detail = "玩家资料已经是请求的内容。"
+                                )
+                            }
+
+                            is PlayerProfileCommandPersistenceResult.Rejected -> {
+                                queueCommandClient.complete(
+                                    command.commandId,
+                                    applied = false,
+                                    detail = result.detail
+                                )
+                            }
+
+                            PlayerProfileCommandPersistenceResult.PersistenceFailed ->
+                                localWriteFailureDetail =
+                                    "玩家资料暂时无法写入本机，应用将继续重试。"
+                        }
+                    }
+                } else {
+                    localWriteFailureDetail = null
+                }
+                privateSyncFailureDetail = localWriteFailureDetail
+                    ?: queueCommandClient.profileSyncFailureDetail
+                    ?: queueCommandClient.commandSyncFailureDetail
+                        ?.takeIf { queueRuleSettings.oneBotSyncEnabled }
+            } else {
+                privateSyncFailureDetail = null
+            }
+            delay(REMOTE_COMMAND_POLL_INTERVAL_MILLIS)
+        }
+    }
+
+    val displayedCloudSyncStatus = combinedQueueCloudSyncStatus(
+        cloudSyncStatus,
+        cloudProfileRestoreFailureDetail ?: privateSyncFailureDetail
+    )
+
     LaunchedEffect(queueUndoAction?.id) {
         val action = queueUndoAction ?: return@LaunchedEffect
         delay(5_000L)
@@ -1173,7 +1480,8 @@ private fun RegistrationApp() {
                             machineARemark = queueRuleSettings.machineARemark,
                             machineBRemark = queueRuleSettings.machineBRemark,
                             registrationOpen = registrationOpen,
-                            cloudSyncStatus = cloudSyncStatus,
+                            businessHoursStatus = businessHoursStatus,
+                            cloudSyncStatus = displayedCloudSyncStatus.takeIf { cloudSyncAvailable },
                             queueUndoAction = queueUndoAction,
                             onUndoQueueAction = ::undoLatestQueueAction,
                             inlineReorderSession = activeReorder?.takeIf { !it.explicitEditMode },
@@ -1242,6 +1550,7 @@ private fun RegistrationApp() {
 
                         Screen.SETTINGS -> QueueRuleSettingsScreen(
                             settings = queueRuleSettings,
+                            cloudSyncAvailable = cloudSyncAvailable,
                             onSettingsChange = ::updateQueueRuleSettings,
                             onBack = { screen = Screen.HOME }
                         )
@@ -1332,7 +1641,8 @@ private fun RegistrationApp() {
                             gender = profileGenderDraft,
                             defaultPreference = profilePreferenceDraft,
                             qqNumber = profileQqDraft,
-                            allowPhoneNumber = profileAllowsPhoneDraft,
+                            qqAlreadyExists = profileQqDraft.isNotBlank() &&
+                                playerProfileQqExists(profileQqDraft, editingPlayerProfileId),
                             editingExisting = editingPlayerProfileId != null,
                             onNicknameChange = {
                                 profileNicknameDraft = limitCodePointLength(it, 18)
@@ -1342,9 +1652,6 @@ private fun RegistrationApp() {
                             onQqNumberChange = { value ->
                                 profileQqDraft = value.filter { it in '0'..'9' }
                                     .take(MAX_QQ_NUMBER_LENGTH)
-                            },
-                            onAllowPhoneNumberChange = { allowPhoneNumber ->
-                                profileAllowsPhoneDraft = allowPhoneNumber
                             },
                             onSave = ::savePlayerProfileDraft,
                             onBack = { screen = playerProfileEditorReturnScreen }
@@ -1523,7 +1830,6 @@ private fun RegistrationApp() {
                             registration = registration,
                             playerProfileGender = linkedPlayerProfile?.gender ?: registration.gender,
                             playerProfileQqNumber = linkedPlayerProfile?.qqNumber,
-                            playerProfilePhoneNumber = linkedPlayerProfile?.phoneNumber,
                             fixedPartnerDisplayId = registration.fixedPartnerKey?.let { partnerKey ->
                                 queue.allRegistrations
                                     .firstOrNull { it.key == partnerKey }?.displayId
@@ -1803,12 +2109,16 @@ private fun RegistrationApp() {
                 }
 
                 finishConfirmation?.let { machineId ->
+                    val playingRegistrations = queueFor(machineId).playing
                     val nextPlayingNotice = nextPlayingChangeMessage(
-                        queueFor(machineId).nextPlayingPositionPreview()
+                        queueFor(machineId).nextPlayingPositionPreviewAfterRoundEnd()
                     )
                     RoundEndConfirmation(
                         machineName = machineName(machineId),
                         playingPositionLabel = playingPositionName(machineId),
+                        playingRegistrationNames = playingRegistrations.joinToString("、") {
+                            "“${it.displayId}”"
+                        },
                         nextPlayingNotice = nextPlayingNotice,
                         onDismiss = { finishConfirmation = null },
                         onConfirm = {
@@ -1823,6 +2133,13 @@ private fun RegistrationApp() {
                                 machineId,
                                 "${machineName(machineId)} 的本轮已结束"
                             ) { it.endRoundWithoutStartingNext() }
+                            finishConfirmation = null
+                        },
+                        onRemoveRegistrations = {
+                            val playingKeys = queueFor(machineId).playing.mapTo(mutableSetOf()) { it.key }
+                            updateQueue(machineId, QueueSoundCue.CAUTION) {
+                                it.removeAll(playingKeys)
+                            }
                             finishConfirmation = null
                         }
                     )
@@ -1887,8 +2204,21 @@ private fun RegistrationApp() {
 
                 if (appDetailsVisible) {
                     AppDetailsDialog(
-                        cloudSyncStatus = cloudSyncStatus,
+                        cloudSyncStatus = displayedCloudSyncStatus.takeIf { cloudSyncAvailable },
+                        onOpenVersionHistory = {
+                            appDetailsVisible = false
+                            versionHistoryVisible = true
+                        },
                         onDismiss = { appDetailsVisible = false }
+                    )
+                }
+
+                if (versionHistoryVisible) {
+                    VersionHistoryDialog(
+                        onDismiss = {
+                            versionHistoryVisible = false
+                            appDetailsVisible = true
+                        }
                     )
                 }
 
@@ -1925,8 +2255,8 @@ private fun RegistrationApp() {
                         machineName = machineName(machineId),
                         registrationCount = queueFor(machineId).registrationCount,
                         onDismiss = { stopReasonTarget = null },
-                        onSelect = { reason ->
-                            reportMachineStopped(machineId, reason)
+                        onSelect = { reason, reasonDetail ->
+                            reportMachineStopped(machineId, reason, reasonDetail)
                             stopReasonTarget = null
                         }
                     )
@@ -2349,7 +2679,18 @@ private fun RegistrationApp() {
                     )
                 }
 
-                if (!queuePersistenceReady) {
+                if (playerProfileWriteInProgress) {
+                    PlayerProfileSavingOverlay()
+                }
+
+                playerProfileWriteFailureDetail?.let { detail ->
+                    PlayerProfileWriteFailureDialog(
+                        detail = detail,
+                        onDismiss = { playerProfileWriteFailureDetail = null }
+                    )
+                }
+
+                if (!queuePersistenceReady || !playerProfilesLoaded) {
                     QueueStateLoadingOverlay()
                 } else {
                     pendingQueueRestore?.let { savedState ->
@@ -2373,6 +2714,7 @@ private fun AuditLogScreen(
     onBack: () -> Unit
 ) {
     var selectedCategory by remember { mutableStateOf<AuditLogCategory?>(null) }
+    var selectedSource by remember { mutableStateOf<AuditLogSource?>(null) }
     val filters: List<Pair<AuditLogCategory?, String>> = listOf(
         null to "全部",
         AuditLogCategory.MACHINE_A to "机台 A",
@@ -2380,9 +2722,17 @@ private fun AuditLogScreen(
         AuditLogCategory.SYSTEM to "系统",
         AuditLogCategory.PLAYER_PROFILE to "玩家资料"
     )
-    val displayedLogs = selectedCategory?.let { category ->
-        logs.filter { it.category == category }
-    } ?: logs
+    val sourceFilters: List<Pair<AuditLogSource?, String>> = listOf(
+        null to "全部来源",
+        AuditLogSource.ON_SITE_TERMINAL to "现场终端",
+        AuditLogSource.QQ_BOT to "QQ Bot",
+        AuditLogSource.SYSTEM_AUTOMATIC to "系统自动",
+        AuditLogSource.WEBSITE_REMOTE to "网站远程"
+    )
+    val displayedLogs = logs.filter { entry ->
+        (selectedCategory == null || entry.category == selectedCategory) &&
+            (selectedSource == null || entry.source == selectedSource)
+    }
 
     Column(Modifier.fillMaxSize().padding(horizontal = 36.dp, vertical = 24.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -2425,6 +2775,34 @@ private fun AuditLogScreen(
                     }
                 }
             }
+            Spacer(Modifier.height(8.dp))
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                sourceFilters.forEach { (source, label) ->
+                    val selected = selectedSource == source
+                    Box(
+                        Modifier.width(112.dp).height(36.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (selected) SoftBlue else CardBackground)
+                            .border(
+                                1.dp,
+                                if (selected) SystemBlue.copy(alpha = .38f) else Separator,
+                                RoundedCornerShape(8.dp)
+                            )
+                            .clickable(enabled = !selected) { selectedSource = source },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            label,
+                            color = if (selected) SystemBlue else SecondaryText,
+                            fontSize = 11.sp,
+                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                        )
+                    }
+                }
+            }
             Spacer(Modifier.height(14.dp))
             if (displayedLogs.isEmpty()) {
                 Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
@@ -2456,9 +2834,11 @@ private fun AuditLogScreen(
 @Composable
 private fun QueueRuleSettingsScreen(
     settings: QueueRuleSettings,
+    cloudSyncAvailable: Boolean,
     onSettingsChange: (QueueRuleSettings) -> Unit,
     onBack: () -> Unit
 ) {
+    val context = LocalContext.current
     var machineARemarkDraft by remember(settings.machineARemark) {
         mutableStateOf(settings.machineARemark)
     }
@@ -2487,29 +2867,190 @@ private fun QueueRuleSettingsScreen(
             Text("应用设置", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(6.dp))
             Text(
-                "调整网站同步、排队规则和首页机台备注。机台 A 与机台 B 是固定标识，不能修改。",
+                if (cloudSyncAvailable) {
+                    "调整网站同步、排队规则和首页机台备注。机台 A 与机台 B 是固定标识，不能修改。"
+                } else {
+                    "调整排队规则和首页机台备注。机台 A 与机台 B 是固定标识，不能修改。"
+                },
                 color = SecondaryText,
                 fontSize = 12.sp,
                 lineHeight = 18.sp
             )
             Spacer(Modifier.height(20.dp))
-            MenuSectionHeader("网站连接")
+            if (cloudSyncAvailable) {
+                MenuSectionHeader("网站连接")
+                Column(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
+                        .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
+                ) {
+                    QueueRuleSettingRow(
+                        title = "网站同步",
+                        description = if (settings.websiteSyncEnabled) {
+                            "上传最新队列和玩家资料，并接收服务器待执行的修改。公开网站不会显示 QQ。"
+                        } else {
+                            "队列与玩家资料只在本机更新。重新开启后，会同步当前完整数据。"
+                        },
+                        checked = settings.websiteSyncEnabled,
+                        onCheckedChange = {
+                            onSettingsChange(
+                                settings.copy(
+                                    websiteSyncEnabled = it,
+                                    oneBotSyncEnabled = settings.oneBotSyncEnabled && it
+                                )
+                            )
+                        }
+                    )
+                    HorizontalDivider(color = Separator.copy(alpha = .72f))
+                    QueueRuleSettingRow(
+                        title = "QQ Bot 联动",
+                        description = when {
+                            !settings.websiteSyncEnabled ->
+                                "需要先开启网站同步，QQ Bot 才能读取队列、修改玩家资料和发送通知。"
+                            settings.oneBotSyncEnabled ->
+                                "允许 QQ Bot 读取队列、修改玩家资料，并发送与玩家有关的通知。"
+                            else ->
+                                "QQ Bot 无法读取队列或修改资料，也不会补发关闭期间产生的通知。"
+                        },
+                        checked = settings.oneBotSyncEnabled,
+                        enabled = settings.websiteSyncEnabled,
+                        onCheckedChange = {
+                            onSettingsChange(settings.copy(oneBotSyncEnabled = it))
+                        }
+                    )
+                }
+                Spacer(Modifier.height(20.dp))
+            }
+            MenuSectionHeader("营业时间")
             Column(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
                     .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
             ) {
                 QueueRuleSettingRow(
-                    title = "网站同步",
-                    description = if (settings.websiteSyncEnabled) {
-                        "将最新队列状态上传到网站。关闭后，网站会保留最后一次已同步的内容。"
+                    title = "设置营业时间",
+                    description = if (settings.businessHours.enabled) {
+                        "到闭店时间会自动关闭登记排队；到开店时间不会自动重新开启。"
                     } else {
-                        "队列只在本机更新。重新开启后，会立即上传当前完整队列。"
+                        "不开启时，登记排队不会受到营业时间影响。"
                     },
-                    checked = settings.websiteSyncEnabled,
+                    checked = settings.businessHours.enabled,
                     onCheckedChange = {
-                        onSettingsChange(settings.copy(websiteSyncEnabled = it))
+                        onSettingsChange(
+                            settings.copy(
+                                businessHours = settings.businessHours.copy(enabled = it)
+                            )
+                        )
                     }
                 )
+                if (settings.businessHours.enabled) {
+                    HorizontalDivider(color = Separator.copy(alpha = .72f))
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp)) {
+                        Text("默认营业时间", color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                        Spacer(Modifier.height(8.dp))
+                        BusinessHoursTimeRow(
+                            hours = settings.businessHours.defaultHours,
+                            onOpeningClick = {
+                                showBusinessTimePicker(context, settings.businessHours.defaultHours.openingMinutes) { minutes ->
+                                    onSettingsChange(
+                                        settings.copy(
+                                            businessHours = settings.businessHours.copy(
+                                                defaultHours = settings.businessHours.defaultHours.copy(
+                                                    openingMinutes = minutes
+                                                )
+                                            )
+                                        )
+                                    )
+                                }
+                            },
+                            onClosingClick = {
+                                showBusinessTimePicker(context, settings.businessHours.defaultHours.closingMinutes) { minutes ->
+                                    onSettingsChange(
+                                        settings.copy(
+                                            businessHours = settings.businessHours.copy(
+                                                defaultHours = settings.businessHours.defaultHours.copy(
+                                                    closingMinutes = minutes
+                                                )
+                                            )
+                                        )
+                                    )
+                                }
+                            }
+                        )
+                        Spacer(Modifier.height(7.dp))
+                        Text(
+                            "闭店时间早于开店时间时，按次日闭店计算；两者相同时按全天营业计算。",
+                            color = TertiaryText,
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp
+                        )
+                    }
+                    HorizontalDivider(color = Separator.copy(alpha = .72f))
+                    QueueRuleSettingRow(
+                        title = "按星期分别设置",
+                        description = "为周一至周日分别指定开店和闭店时间。",
+                        checked = settings.businessHours.useWeeklySchedule,
+                        onCheckedChange = {
+                            onSettingsChange(
+                                settings.copy(
+                                    businessHours = settings.businessHours.copy(useWeeklySchedule = it)
+                                )
+                            )
+                        }
+                    )
+                    if (settings.businessHours.useWeeklySchedule) {
+                        Column(
+                            Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            DayOfWeek.entries.forEach { day ->
+                                val hours = settings.businessHours.hoursFor(day)
+                                Row(
+                                    Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        businessDayLabel(day),
+                                        color = PrimaryText,
+                                        fontSize = 13.sp,
+                                        modifier = Modifier.width(58.dp)
+                                    )
+                                    BusinessTimeButton(
+                                        label = "开店 ${formatBusinessTime(hours.openingMinutes)}",
+                                        onClick = {
+                                            showBusinessTimePicker(context, hours.openingMinutes) { minutes ->
+                                                onSettingsChange(
+                                                    settings.copy(
+                                                        businessHours = settings.businessHours.copy(
+                                                            weeklyHours = settings.businessHours.weeklyHours +
+                                                                (day to hours.copy(openingMinutes = minutes))
+                                                        )
+                                                    )
+                                                )
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    BusinessTimeButton(
+                                        label = "闭店 ${formatBusinessTime(hours.closingMinutes)}",
+                                        onClick = {
+                                            showBusinessTimePicker(context, hours.closingMinutes) { minutes ->
+                                                onSettingsChange(
+                                                    settings.copy(
+                                                        businessHours = settings.businessHours.copy(
+                                                            weeklyHours = settings.businessHours.weeklyHours +
+                                                                (day to hours.copy(closingMinutes = minutes))
+                                                        )
+                                                    )
+                                                )
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Spacer(Modifier.height(20.dp))
             MenuSectionHeader("排队规则")
@@ -2627,11 +3168,13 @@ private fun QueueRuleSettingRow(
     title: String,
     description: String,
     checked: Boolean,
+    enabled: Boolean = true,
     onCheckedChange: (Boolean) -> Unit
 ) {
     Row(
         Modifier.fillMaxWidth().toggleable(
             value = checked,
+            enabled = enabled,
             role = Role.Switch,
             onValueChange = onCheckedChange
         )
@@ -2639,14 +3182,25 @@ private fun QueueRuleSettingRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(Modifier.weight(1f)) {
-            Text(title, color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Text(
+                title,
+                color = if (enabled) PrimaryText else TertiaryText,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium
+            )
             Spacer(Modifier.height(4.dp))
-            Text(description, color = SecondaryText, fontSize = 11.sp, lineHeight = 16.sp)
+            Text(
+                description,
+                color = if (enabled) SecondaryText else TertiaryText,
+                fontSize = 11.sp,
+                lineHeight = 16.sp
+            )
         }
         Spacer(Modifier.width(16.dp))
         Switch(
             checked = checked,
             onCheckedChange = null,
+            enabled = enabled,
             colors = SwitchDefaults.colors(
                 checkedThumbColor = Color.White,
                 checkedTrackColor = SystemBlue,
@@ -2655,6 +3209,81 @@ private fun QueueRuleSettingRow(
             )
         )
     }
+}
+
+@Composable
+private fun BusinessHoursTimeRow(
+    hours: DailyBusinessHours,
+    onOpeningClick: () -> Unit,
+    onClosingClick: () -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        BusinessTimeButton(
+            label = "开店 ${formatBusinessTime(hours.openingMinutes)}",
+            onClick = onOpeningClick,
+            modifier = Modifier.weight(1f)
+        )
+        BusinessTimeButton(
+            label = "闭店 ${formatBusinessTime(hours.closingMinutes)}",
+            onClick = onClosingClick,
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+@Composable
+private fun BusinessTimeButton(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier.height(42.dp)
+            .clip(RoundedCornerShape(9.dp))
+            .background(PageBackground)
+            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(9.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            label,
+            color = PrimaryText,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1
+        )
+        Spacer(Modifier.weight(1f))
+        Text("›", color = TertiaryText, fontSize = 17.sp)
+    }
+}
+
+private fun showBusinessTimePicker(
+    context: android.content.Context,
+    initialMinutes: Int,
+    onSelected: (Int) -> Unit
+) {
+    val normalized = initialMinutes.coerceIn(0, MINUTES_PER_DAY - 1)
+    TimePickerDialog(
+        context,
+        { _, hourOfDay, minute -> onSelected(hourOfDay * 60 + minute) },
+        normalized / 60,
+        normalized % 60,
+        true
+    ).show()
+}
+
+private fun businessDayLabel(day: DayOfWeek): String = when (day) {
+    DayOfWeek.MONDAY -> "周一"
+    DayOfWeek.TUESDAY -> "周二"
+    DayOfWeek.WEDNESDAY -> "周三"
+    DayOfWeek.THURSDAY -> "周四"
+    DayOfWeek.FRIDAY -> "周五"
+    DayOfWeek.SATURDAY -> "周六"
+    DayOfWeek.SUNDAY -> "周日"
 }
 
 @Composable
@@ -2688,7 +3317,23 @@ private fun AuditLogRow(entry: AuditLogEntry) {
         }
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(entry.title, color = PrimaryText, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    entry.title,
+                    color = PrimaryText,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    auditLogSourceLabel(entry.source),
+                    color = SecondaryText,
+                    fontSize = 9.sp,
+                    modifier = Modifier.clip(RoundedCornerShape(5.dp))
+                        .background(PageBackground)
+                        .padding(horizontal = 6.dp, vertical = 3.dp)
+                )
+            }
             if (entry.detail.isNotBlank()) {
                 Spacer(Modifier.height(4.dp))
                 Text(entry.detail, color = SecondaryText, fontSize = 12.sp, lineHeight = 18.sp)
@@ -2712,6 +3357,13 @@ private fun auditLogCategoryLabel(category: AuditLogCategory): String = when (ca
     AuditLogCategory.PLAYER_PROFILE -> "玩家资料"
 }
 
+private fun auditLogSourceLabel(source: AuditLogSource): String = when (source) {
+    AuditLogSource.ON_SITE_TERMINAL -> "现场终端"
+    AuditLogSource.QQ_BOT -> "QQ Bot"
+    AuditLogSource.SYSTEM_AUTOMATIC -> "系统自动"
+    AuditLogSource.WEBSITE_REMOTE -> "网站远程"
+}
+
 private fun formatAuditLogTimestamp(timestampMillis: Long): String =
     SimpleDateFormat("yyyy 年 M 月 d 日 HH:mm:ss", Locale.CHINA).format(Date(timestampMillis))
 
@@ -2724,7 +3376,8 @@ private fun HomeScreen(
     machineARemark: String,
     machineBRemark: String,
     registrationOpen: Boolean,
-    cloudSyncStatus: QueueCloudSyncStatus,
+    businessHoursStatus: BusinessHoursStatus,
+    cloudSyncStatus: QueueCloudSyncStatus?,
     queueUndoAction: QueueUndoAction?,
     onUndoQueueAction: () -> Unit,
     inlineReorderSession: ReorderSession?,
@@ -2754,6 +3407,7 @@ private fun HomeScreen(
             AppHeader(
                 nowMillis = nowMillis,
                 registrationOpen = registrationOpen,
+                outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
                 totalRegistrationCount = machineA.registrationCount + machineB.registrationCount,
                 cloudSyncStatus = cloudSyncStatus,
                 onCloudSyncClick = { cloudSyncInfoVisible = true },
@@ -2763,9 +3417,16 @@ private fun HomeScreen(
             HorizontalDivider(color = Separator.copy(alpha = .72f))
             Spacer(Modifier.height(12.dp))
             if (!registrationOpen && !hasStoppedMachine) {
-                ClosedHome(onEnableRegistration)
+                ClosedHome(
+                    outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
+                    onEnableRegistration = onEnableRegistration
+                )
             } else if (isEmpty && !hasStoppedMachine) {
-                EmptyHome(onJoin, onBatch)
+                EmptyHome(
+                    outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
+                    onJoin = onJoin,
+                    onBatch = onBatch
+                )
             } else {
                 Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(18.dp)) {
                     Column(Modifier.weight(1.9f).fillMaxHeight()) {
@@ -2775,6 +3436,7 @@ private fun HomeScreen(
                             queue = machineA,
                             status = machineAStatus,
                             registrationOpen = registrationOpen,
+                            businessHoursClosingSoon = businessHoursStatus.closingSoon,
                             nowMillis = nowMillis,
                             inlineReorderSession = inlineReorderSession?.takeIf { it.machineId == MachineId.A },
                             inlineReorderResetToken = inlineReorderResetToken,
@@ -2804,6 +3466,7 @@ private fun HomeScreen(
                             queue = machineB,
                             status = machineBStatus,
                             registrationOpen = registrationOpen,
+                            businessHoursClosingSoon = businessHoursStatus.closingSoon,
                             nowMillis = nowMillis,
                             inlineReorderSession = inlineReorderSession?.takeIf { it.machineId == MachineId.B },
                             inlineReorderResetToken = inlineReorderResetToken,
@@ -2856,7 +3519,7 @@ private fun HomeScreen(
                 QueueUndoBar(action.message, onUndoQueueAction)
             }
         }
-        if (cloudSyncInfoVisible) {
+        if (cloudSyncInfoVisible && cloudSyncStatus != null) {
             CloudSyncInfoDialog(
                 status = cloudSyncStatus,
                 onDismiss = { cloudSyncInfoVisible = false }
@@ -2903,8 +3566,9 @@ private fun QueueUndoBar(message: String, onUndo: () -> Unit) {
 private fun AppHeader(
     nowMillis: Long,
     registrationOpen: Boolean,
+    outsideBusinessHours: Boolean,
     totalRegistrationCount: Int,
-    cloudSyncStatus: QueueCloudSyncStatus,
+    cloudSyncStatus: QueueCloudSyncStatus?,
     onCloudSyncClick: () -> Unit,
     onMore: () -> Unit
 ) {
@@ -2944,18 +3608,27 @@ private fun AppHeader(
             fontSize = 13.sp,
             fontWeight = FontWeight.Medium
         )
-        Spacer(Modifier.width(16.dp))
-        CloudSyncIndicator(cloudSyncStatus, onCloudSyncClick)
+        if (cloudSyncStatus != null) {
+            Spacer(Modifier.width(16.dp))
+            CloudSyncIndicator(cloudSyncStatus, onCloudSyncClick)
+        }
         AnimatedVisibility(
-            visible = !registrationOpen,
+            visible = !registrationOpen || outsideBusinessHours,
             enter = fadeIn(tween(180)) + expandHorizontally(tween(220), expandFrom = Alignment.End),
             exit = fadeOut(tween(140)) + shrinkHorizontally(tween(180), shrinkTowards = Alignment.End)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Spacer(Modifier.width(18.dp))
-                Box(Modifier.size(8.dp).clip(CircleShape).background(Color(0xFFFF9500)))
+                Box(
+                    Modifier.size(8.dp).clip(CircleShape)
+                        .background(if (outsideBusinessHours) Color(0xFFFF3B30) else Color(0xFFFF9500))
+                )
                 Spacer(Modifier.width(7.dp))
-                Text("未使用登记排队", color = SecondaryText, fontSize = 12.sp)
+                Text(
+                    if (outsideBusinessHours) "不在营业时间" else "未使用登记排队",
+                    color = SecondaryText,
+                    fontSize = 12.sp
+                )
             }
         }
         Spacer(Modifier.width(18.dp))
@@ -3003,7 +3676,11 @@ private fun CloudSyncIndicator(status: QueueCloudSyncStatus, onClick: () -> Unit
 }
 
 @Composable
-private fun EmptyHome(onJoin: () -> Unit, onBatch: () -> Unit) {
+private fun EmptyHome(
+    outsideBusinessHours: Boolean,
+    onJoin: () -> Unit,
+    onBatch: () -> Unit
+) {
     Column(
         Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -3011,7 +3688,15 @@ private fun EmptyHome(onJoin: () -> Unit, onBatch: () -> Unit) {
     ) {
         Text("目前没有登记", color = PrimaryText, fontSize = 34.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(10.dp))
-        VisuallyCenteredSentence("两台机台都没有正在等待的玩家。", SecondaryText, 16.sp)
+        VisuallyCenteredSentence(
+            if (outsideBusinessHours) {
+                "当前不在营业时间，手动开启登记排队后仍可使用。"
+            } else {
+                "两台机台都没有正在等待的玩家。"
+            },
+            SecondaryText,
+            16.sp
+        )
         Spacer(Modifier.height(30.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             PrimaryButton("加入排队", onJoin, Modifier.width(260.dp))
@@ -3023,15 +3708,31 @@ private fun EmptyHome(onJoin: () -> Unit, onBatch: () -> Unit) {
 }
 
 @Composable
-private fun ClosedHome(onEnableRegistration: () -> Unit) {
+private fun ClosedHome(
+    outsideBusinessHours: Boolean,
+    onEnableRegistration: () -> Unit
+) {
     Column(
         Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Text("请在现场自然排队", color = PrimaryText, fontSize = 34.sp, fontWeight = FontWeight.SemiBold)
+        Text(
+            if (outsideBusinessHours) "不在营业时间" else "请在现场自然排队",
+            color = PrimaryText,
+            fontSize = 34.sp,
+            fontWeight = FontWeight.SemiBold
+        )
         Spacer(Modifier.height(10.dp))
-        VisuallyCenteredSentence("当前未使用登记排队，请按照现场顺序依次游玩。", SecondaryText, 16.sp)
+        VisuallyCenteredSentence(
+            if (outsideBusinessHours) {
+                "现在已过闭店时间；你仍可以手动开启登记排队。"
+            } else {
+                "当前未使用登记排队，请按照现场顺序依次游玩。"
+            },
+            SecondaryText,
+            16.sp
+        )
         Spacer(Modifier.height(30.dp))
         PrimaryButton("启用登记排队", onEnableRegistration, Modifier.width(260.dp))
     }
@@ -3082,6 +3783,7 @@ private fun MachineLane(
     queue: MachineQueue,
     status: MachineStatus,
     registrationOpen: Boolean,
+    businessHoursClosingSoon: Boolean,
     nowMillis: Long,
     inlineReorderSession: ReorderSession?,
     inlineReorderResetToken: Int,
@@ -3129,7 +3831,8 @@ private fun MachineLane(
                         queue.registrationCount > 0 && !status.isOperational ->
                             "$queueCountSummary · 已停止使用"
                         queue.registrationCount > 0 -> queueCountSummary
-                        !status.isOperational -> "已停止使用 · ${machineStopReasonLabel(status.stopReason)}"
+                        !status.isOperational ->
+                            "已停止使用 · ${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}"
                         else -> "当前空闲"
                     },
                     color = SecondaryText,
@@ -3163,9 +3866,9 @@ private fun MachineLane(
                 Spacer(Modifier.height(6.dp))
                 Text(
                     if (queue.registrationCount > 0) {
-                        "停止原因：${machineStopReasonLabel(status.stopReason)}。现有 ${queue.registrationCount} 份登记、游玩位置和等待顺序均已保留。"
+                        "停止原因：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}。现有 ${queue.registrationCount} 份登记、游玩位置和等待顺序均已保留。"
                     } else {
-                        "停止原因：${machineStopReasonLabel(status.stopReason)}。当前没有排队登记。"
+                        "停止原因：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}。当前没有排队登记。"
                     },
                     color = SecondaryText,
                     fontSize = 12.sp,
@@ -3340,6 +4043,12 @@ private fun MachineLane(
                             registrations = displayedQueue.playing,
                             isPlaying = true,
                             overtimeWarning = playingOvertime,
+                            warningTitle = if (businessHoursClosingSoon && !playingOvertime) {
+                                "距离闭店不足 15 分钟"
+                            } else null,
+                            warningDescription = if (businessHoursClosingSoon && !playingOvertime) {
+                                "请在闭店前确认当前游玩状态。"
+                            } else null,
                             onRegistrationClick = onRegistrationClick,
                             onRegistrationLongPress = onRegistrationLongPress,
                             onPositionClick = {
@@ -3769,6 +4478,8 @@ private fun QueuePosition(
     registrations: List<Registration>,
     isPlaying: Boolean,
     overtimeWarning: Boolean,
+    warningTitle: String? = null,
+    warningDescription: String? = null,
     modifier: Modifier = Modifier,
     dragEnabled: Boolean = false,
     isDragging: Boolean = false,
@@ -3787,8 +4498,9 @@ private fun QueuePosition(
     val tileWidths = registrations.map { registrationTileWidth(it.displayId) }
     val registrationContentWidth = tileWidths.fold(0.dp) { total, width -> total + width } +
         if (tileWidths.size > 1) 7.dp * (tileWidths.size - 1) else 0.dp
-    val warningWidth = if (overtimeWarning) 178.dp else 0.dp
-    val contentSpacing = if (overtimeWarning && registrations.isNotEmpty()) 7.dp else 0.dp
+    val hasWarning = overtimeWarning || warningTitle != null
+    val warningWidth = if (hasWarning) 178.dp else 0.dp
+    val contentSpacing = if (hasWarning && registrations.isNotEmpty()) 7.dp else 0.dp
     val playingHeaderWidth = if (isPlaying && registrations.isNotEmpty()) {
         val labelWidth = with(density) {
             textMeasurer.measure(
@@ -3852,6 +4564,8 @@ private fun QueuePosition(
                                 registrations = registrations,
                                 isPlaying = isPlaying,
                                 overtimeWarning = overtimeWarning,
+                                warningTitle = warningTitle,
+                                warningDescription = warningDescription,
                                 dragEnabled = false,
                                 isDragging = true,
                                 isDragOverlay = true,
@@ -3937,7 +4651,7 @@ private fun QueuePosition(
             }
         }
         Spacer(Modifier.height(5.dp))
-        if (registrations.isEmpty()) {
+        if (registrations.isEmpty() && !hasWarning) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("暂无登记", color = TertiaryText, fontSize = 13.sp)
             }
@@ -3947,16 +4661,26 @@ private fun QueuePosition(
                 horizontalArrangement = Arrangement.spacedBy(7.dp, Alignment.CenterHorizontally),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                if (overtimeWarning) {
+                if (hasWarning) {
                     Column(
                         Modifier.width(178.dp).height(QueueRegistrationTileHeight)
                             .clip(RoundedCornerShape(11.dp))
                             .background(Color(0xFFFFF4E5)).padding(11.dp),
                         verticalArrangement = Arrangement.Center
                     ) {
-                        Text("本轮已超过 20 分钟", color = Color(0xFF9A5B00), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            warningTitle ?: "本轮已超过 20 分钟",
+                            color = Color(0xFF9A5B00),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
                         Spacer(Modifier.height(4.dp))
-                        Text("请确认机台是否仍在正常游玩。", color = Color(0xFF9A5B00), fontSize = 9.sp, lineHeight = 14.sp)
+                        Text(
+                            warningDescription ?: "请确认机台是否仍在正常游玩。",
+                            color = Color(0xFF9A5B00),
+                            fontSize = 9.sp,
+                            lineHeight = 14.sp
+                        )
                     }
                 }
                 registrations.forEachIndexed { index, registration ->
@@ -4199,7 +4923,9 @@ private fun MachineChoice(
         Text(name, color = if (available) PrimaryText else TertiaryText, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
         Text(
-            if (!status.isOperational) "机台已停止使用：${machineStopReasonLabel(status.stopReason)}。"
+            if (!status.isOperational) {
+                "机台已停止使用：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}。"
+            }
             else if (queue.registrationCount == 0) "目前没有登记，可以直接开始。"
             else if (available) "现有 ${queue.registrationCount} 份有效登记。"
             else "已达到 20 人上限，暂时不能新增登记。",
@@ -4513,32 +5239,23 @@ private fun PlayerProfileEditorScreen(
     gender: PlayerGender,
     defaultPreference: ProfilePlayPreference,
     qqNumber: String,
-    allowPhoneNumber: Boolean,
+    qqAlreadyExists: Boolean,
     editingExisting: Boolean,
     onNicknameChange: (String) -> Unit,
     onGenderChange: (PlayerGender) -> Unit,
     onDefaultPreferenceChange: (ProfilePlayPreference) -> Unit,
     onQqNumberChange: (String) -> Unit,
-    onAllowPhoneNumberChange: (Boolean) -> Unit,
     onSave: () -> Unit,
     onBack: () -> Unit
 ) {
-    val contact = playerContactFromInput(qqNumber, allowPhoneNumber)
-    val contactValid = contact.isValid
+    val normalizedQqNumber = normalizeOptionalContact(qqNumber)
+    val qqSyntaxValid = normalizedQqNumber != null && isValidQqNumber(normalizedQqNumber)
+    val contactValid = qqSyntaxValid && !qqAlreadyExists
     val contactMessage = when {
-        !contact.isPresent -> if (allowPhoneNumber) {
-            "请输入 QQ 号或中国大陆手机号。"
-        } else {
-            "请输入 QQ 号。"
-        }
-        allowPhoneNumber && isMainlandChinaMobileNumber(qqNumber) ->
-            "已识别为手机号。联系方式只会保存在玩家资料中。"
-        !contactValid -> if (allowPhoneNumber) {
-            "请输入 5 至 12 位 QQ 号，或 1 开头的 11 位中国大陆手机号。"
-        } else {
-            "QQ 号应为 5 至 12 位数字。"
-        }
-        else -> "联系方式只会保存在玩家资料中。"
+        normalizedQqNumber == null -> "请输入 QQ 号。"
+        !qqSyntaxValid -> "QQ 号应为 5 至 12 位数字。"
+        qqAlreadyExists -> "这个 QQ 号已经用于另一份玩家资料。"
+        else -> "QQ 号用于现场联系，并可用于接收排队提醒。"
     }
     WizardPage(
         step = if (editingExisting) "编辑资料" else "新建资料",
@@ -4604,7 +5321,11 @@ private fun PlayerProfileEditorScreen(
                 Text("联系方式", color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "资料仅保存一个联系方式；手机号仅支持中国大陆手机号码。",
+                    if (BuildConfig.CLOUD_SYNC_AVAILABLE) {
+                        "QQ 号会与玩家资料绑定。开启网站同步后，可用于 QQ Bot 识别玩家、查询个人排队状态和发送相关提醒；不会在公开队列中显示。"
+                    } else {
+                        "QQ 号会与玩家资料绑定，并仅保存在本机；本地版不会连接 QQ Bot。"
+                    },
                     color = SecondaryText,
                     fontSize = 11.sp
                 )
@@ -4612,10 +5333,8 @@ private fun PlayerProfileEditorScreen(
                 OutlinedTextField(
                     value = qqNumber,
                     onValueChange = onQqNumberChange,
-                    label = { Text(if (allowPhoneNumber) "QQ 号或手机号" else "QQ 号") },
-                    placeholder = {
-                        Text(if (allowPhoneNumber) "QQ 号或 11 位中国大陆手机号" else "5 至 12 位数字")
-                    },
+                    label = { Text("QQ 号") },
+                    placeholder = { Text("5 至 12 位数字") },
                     singleLine = true,
                     isError = qqNumber.isNotBlank() && !contactValid,
                     keyboardOptions = KeyboardOptions(
@@ -4626,14 +5345,6 @@ private fun PlayerProfileEditorScreen(
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(6.dp))
-                Text(
-                    text = if (allowPhoneNumber) "改为只填写 QQ 号" else "没有 QQ？使用手机号作为联系方式",
-                    color = SystemBlue,
-                    fontSize = 12.sp,
-                    modifier = Modifier
-                        .clickable { onAllowPhoneNumberChange(!allowPhoneNumber) }
-                        .padding(vertical = 4.dp)
-                )
                 Text(
                     contactMessage,
                     color = if (contactValid) SecondaryText else Destructive,
@@ -4982,7 +5693,7 @@ private fun IncompletePlayerContactScreen(
     WizardPage(
         step = "资料待补充",
         title = "需要补充玩家信息",
-        subtitle = "“${profile.nickname}”的玩家资料还没有有效的 QQ 号或手机号。请先完成编辑，再继续$continuation。",
+        subtitle = "“${profile.nickname}”的玩家资料还没有有效的 QQ 号。请先完成编辑，再继续$continuation。",
         onBack = onBack
     ) {
         Row(
@@ -4996,21 +5707,18 @@ private fun IncompletePlayerContactScreen(
             Column(Modifier.weight(1f)) {
                 Text(profile.nickname, color = PrimaryText, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(4.dp))
-                Text("这份资料还没有可用的联系方式。", color = Destructive, fontSize = 12.sp)
+                Text("这份资料还没有可用的 QQ 号。", color = Destructive, fontSize = 12.sp)
             }
         }
         Spacer(Modifier.height(16.dp))
-        PrimaryButton("编辑并补充联系方式", onEditProfile, Modifier.fillMaxWidth())
+        PrimaryButton("编辑并补充 QQ 号", onEditProfile, Modifier.fillMaxWidth())
         Spacer(Modifier.height(9.dp))
         SecondaryButton("返回玩家资料库", onBack, Modifier.fillMaxWidth())
     }
 }
 
-private fun profileContactSummary(profile: PlayerProfile): String = when {
-    profile.qqNumber?.isNotBlank() == true -> "QQ：${profile.qqNumber}"
-    profile.phoneNumber?.isNotBlank() == true -> "手机号：${profile.phoneNumber}"
-    else -> ""
-}
+private fun profileContactSummary(profile: PlayerProfile): String =
+    profile.normalizedQqNumber()?.let { "QQ：$it" }.orEmpty()
 
 @Composable
 private fun ClaimPreferenceMismatchDialog(
@@ -5684,7 +6392,6 @@ private fun RegistrationActions(
     registration: Registration,
     playerProfileGender: PlayerGender?,
     playerProfileQqNumber: String?,
-    playerProfilePhoneNumber: String?,
     fixedPartnerDisplayId: String?,
     playingPartnerDisplayId: String?,
     isPlayingPosition: Boolean,
@@ -5848,14 +6555,10 @@ private fun RegistrationActions(
                         }
                     }
                 }
-                val contact = canonicalPlayerContact(playerProfileQqNumber, playerProfilePhoneNumber)
-                if (registration.playerProfileId != null && contact.isPresent) {
+                val qqNumber = normalizeOptionalContact(playerProfileQqNumber)
+                if (registration.playerProfileId != null && qqNumber != null) {
                     Spacer(Modifier.height(7.dp))
-                    DetailPill(
-                        contact.qqNumber?.let { "QQ：$it" }
-                            ?: contact.phoneNumber?.let { "手机号：$it" }
-                            ?: ""
-                    )
+                    DetailPill("QQ：$qqNumber")
                 }
                 Spacer(Modifier.height(14.dp))
                 MetadataRow("创建时间", formatRegistrationTime(registration.createdAtMillis))
@@ -6107,14 +6810,30 @@ private fun MetadataRow(label: String, value: String) {
 private fun RoundEndConfirmation(
     machineName: String,
     playingPositionLabel: String,
+    playingRegistrationNames: String,
     nextPlayingNotice: String?,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
-    onEndOnly: () -> Unit
+    onEndOnly: () -> Unit,
+    onRemoveRegistrations: () -> Unit
 ) {
     var confirmEndOnly by remember { mutableStateOf(false) }
+    var confirmRemoveRegistrations by remember { mutableStateOf(false) }
     ModalSurface(onDismiss, width = 480.dp) {
-        if (confirmEndOnly) {
+        if (confirmRemoveRegistrations) {
+                Text("移除本轮玩家的登记？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "$playingRegistrationNames 的登记会从$machineName 队列中移除，而不是回到队尾。$playingPositionLabel 将保持空缺，下一组不会自动开始；这些玩家之后仍要游玩时，需要重新加入排队。",
+                    color = SecondaryText,
+                    fontSize = 13.sp,
+                    lineHeight = 20.sp
+                )
+                Spacer(Modifier.height(18.dp))
+                DestructiveButton("确认移除本轮登记", onRemoveRegistrations, Modifier.fillMaxWidth())
+                Spacer(Modifier.height(8.dp))
+                CancelAction { confirmRemoveRegistrations = false }
+        } else if (confirmEndOnly) {
                 Text("仅结束本轮？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(8.dp))
                 Text(
@@ -6154,6 +6873,12 @@ private fun RoundEndConfirmation(
                 SecondaryButton(
                     "仅结束本轮",
                     { confirmEndOnly = true },
+                    Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(9.dp))
+                DestructiveButton(
+                    "移除本轮玩家的登记",
+                    { confirmRemoveRegistrations = true },
                     Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(12.dp))
@@ -6327,7 +7052,11 @@ private fun PositionActions(
     val playActions = buildList {
         when {
             selection.isPlayingPosition && registrations.isNotEmpty() -> add(
-                MenuAction("本轮结束", "结束当前游玩，并选择是否开始下一轮。", onFinishRound)
+                MenuAction(
+                    "本轮结束",
+                    "结束当前游玩，并选择登记与下一轮的处理方式。",
+                    onFinishRound
+                )
             )
             selection.isPlayingPosition -> add(
                 MenuAction(
@@ -6342,7 +7071,7 @@ private fun PositionActions(
             add(
                 MenuAction(
                     "本轮结束",
-                    "结束$playingPositionLabel 中的本轮游玩，并选择是否开始下一轮。此位置中的登记不会被视为本轮玩家。",
+                    "结束$playingPositionLabel 中的本轮游玩，并选择本轮登记与下一轮的处理方式。此位置中的登记不会被视为本轮玩家。",
                     onFinishRound
                 )
             )
@@ -7011,10 +7740,45 @@ private fun QueueStateLoadingOverlay() {
         contentAlignment = Alignment.Center
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("正在读取本机队列", color = PrimaryText, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+            Text("正在读取本机数据", color = PrimaryText, fontSize = 18.sp, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(6.dp))
             Text("请稍候。", color = SecondaryText, fontSize = 12.sp)
         }
+    }
+}
+
+@Composable
+private fun PlayerProfileSavingOverlay() {
+    Box(
+        Modifier.fillMaxSize()
+            .zIndex(900f)
+            .background(Color.Black.copy(alpha = .2f))
+            .pointerInput(Unit) { detectTapGestures(onTap = {}) },
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            Modifier.width(320.dp)
+                .clip(RoundedCornerShape(DialogRadius))
+                .background(CardBackground)
+                .border(1.dp, Separator.copy(alpha = .55f), RoundedCornerShape(DialogRadius))
+                .padding(horizontal = 24.dp, vertical = 22.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text("正在保存玩家资料", color = PrimaryText, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(7.dp))
+            Text("保存完成后会继续当前操作。", color = SecondaryText, fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun PlayerProfileWriteFailureDialog(detail: String, onDismiss: () -> Unit) {
+    ModalSurface(onDismiss) {
+        Text("玩家资料未能保存", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(8.dp))
+        Text(detail, color = SecondaryText, fontSize = 13.sp, lineHeight = 20.sp)
+        Spacer(Modifier.height(18.dp))
+        PrimaryButton("我知道了", onDismiss, Modifier.fillMaxWidth())
     }
 }
 
@@ -7207,16 +7971,17 @@ private fun MoreMenu(
 
 @Composable
 private fun AppDetailsDialog(
-    cloudSyncStatus: QueueCloudSyncStatus,
+    cloudSyncStatus: QueueCloudSyncStatus?,
+    onOpenVersionHistory: () -> Unit,
     onDismiss: () -> Unit
 ) {
     ModalSurface(onDismiss, width = 500.dp) {
         Text("应用详情", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(5.dp))
-        Text("maimai Q · 舞萌机台排队管理终端", color = SecondaryText, fontSize = 13.sp)
+        Text("maimai Q", color = SecondaryText, fontSize = 13.sp)
         Spacer(Modifier.height(18.dp))
         AppDetailSectionTitle("版本信息")
-        AppDetailRow("版本", BuildConfig.VERSION_NAME)
+        AppDetailLinkRow("版本", BuildConfig.VERSION_NAME, "查看更新记录", onOpenVersionHistory)
         HorizontalDivider(color = Separator.copy(alpha = .72f))
         AppDetailRow("构建编号", BuildConfig.VERSION_CODE.toString())
         Spacer(Modifier.height(15.dp))
@@ -7228,22 +7993,104 @@ private fun AppDetailsDialog(
         AppDetailRow("系统要求", "Android 10 或更高版本")
         Spacer(Modifier.height(15.dp))
         AppDetailSectionTitle("数据说明")
-        AppDetailRow("资料与日志", "保存在当前设备")
+        AppDetailRow("资料与日志", "本机优先保存")
         HorizontalDivider(color = Separator.copy(alpha = .72f))
         AppDetailRow("日志保留", "最近 1,000 条操作")
         HorizontalDivider(color = Separator.copy(alpha = .72f))
         AppDetailRow("队列恢复", "保留最近一次本机队列状态")
-        HorizontalDivider(color = Separator.copy(alpha = .72f))
-        AppDetailRow("网站同步", queueCloudSyncStatusLabel(cloudSyncStatus))
+        if (cloudSyncStatus != null) {
+            HorizontalDivider(color = Separator.copy(alpha = .72f))
+            AppDetailRow("网站同步", queueCloudSyncStatusLabel(cloudSyncStatus))
+        }
         Spacer(Modifier.height(13.dp))
         Text(
-            "玩家资料、操作日志和最近一次队列状态保存在本机。开启网站同步时，队列会先写入本机，再尝试上传；网络不可用时不会阻止现场操作。公开队列不会上传 QQ 号、手机号、性别或玩家资料内部编号。",
+            if (cloudSyncStatus != null) {
+                "队列、玩家资料和日志始终先保存在本机。开启网站同步后，公开队列状态会上传供网页查看；玩家资料与 QQ 会通过私有接口保存，用于身份确认和排队通知。公开网页不会显示 QQ、性别或资料内部编号。"
+            } else {
+                "这是不连接网站的纯本地版本。队列、玩家资料和日志只保存在本机，不会上传到服务器。"
+            },
             color = SecondaryText,
             fontSize = 12.sp,
             lineHeight = 18.sp
         )
         Spacer(Modifier.height(18.dp))
         SecondaryButton("关闭", onDismiss, Modifier.fillMaxWidth())
+    }
+}
+
+@Composable
+private fun VersionHistoryDialog(onDismiss: () -> Unit) {
+    val releases = listOf(
+        Triple(
+            "0.3.0",
+            "营业时间与远程联动",
+            "加入营业时间、QQ Bot 联动开关、操作来源和闭店提醒；本轮结束现在可以选择开始下一轮、仅结束本轮或移除本轮登记。"
+        ),
+        Triple(
+            "0.2.19",
+            "机台停止原因补充",
+            "加入机台维护和其他原因说明，并统一终端、网站与日志中的停止状态。"
+        ),
+        Triple(
+            "0.2.18",
+            "启动恢复与轮次预览",
+            "恢复队列时同步玩家资料，并修正结束本轮前对下一组玩家的预览。"
+        ),
+        Triple(
+            "0.2.17",
+            "玩家资料持久化",
+            "资料只有在本机保存成功后才参与队列和网站同步，写入失败时可以明确重试。"
+        ),
+        Triple(
+            "0.2.16",
+            "发布构建与同步边界",
+            "拆分纯本地版和现场终端版；本地版不申请联网权限，终端版需要显式启用构建。"
+        ),
+        Triple(
+            "0.2.15",
+            "QQ 与玩家资料云同步",
+            "玩家资料改用 QQ 联系方式，并加入私有云端备份、身份识别、通知和资料修改通道。"
+        )
+    )
+    ModalSurface(onDismiss, width = 560.dp) {
+        Text("更新记录", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(5.dp))
+        Text(
+            "这里列出近期版本中会直接影响现场使用的变化。",
+            color = SecondaryText,
+            fontSize = 12.sp
+        )
+        Spacer(Modifier.height(16.dp))
+        releases.forEachIndexed { index, (version, title, detail) ->
+            if (index > 0) HorizontalDivider(color = Separator.copy(alpha = .72f))
+            Column(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        version,
+                        color = if (index == 0) SystemBlue else PrimaryText,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text(title, color = PrimaryText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    if (index == 0) {
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "当前版本",
+                            color = SystemBlue,
+                            fontSize = 10.sp,
+                            modifier = Modifier.clip(RoundedCornerShape(5.dp))
+                                .background(SoftBlue)
+                                .padding(horizontal = 7.dp, vertical = 3.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(detail, color = SecondaryText, fontSize = 11.sp, lineHeight = 17.sp)
+            }
+        }
+        Spacer(Modifier.height(10.dp))
+        SecondaryButton("返回应用详情", onDismiss, Modifier.fillMaxWidth())
     }
 }
 
@@ -7257,7 +8104,7 @@ private fun CloudSyncInfoDialog(
         Text("网站同步状态", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(7.dp))
         Text(
-            "开启网站同步后，每次队列变动会先保存在本机，再尝试上传。关闭同步或网络不可用时，都不会阻止现场的排队操作。",
+            "开启网站同步后，每次变动会先保存在本机，再尝试上传。终端也会接收服务器待执行的资料修改，并按本地规则校验后应用。关闭同步或网络不可用时，不会阻止现场排队。",
             color = SecondaryText,
             fontSize = 12.sp,
             lineHeight = 18.sp
@@ -7316,7 +8163,7 @@ private fun CloudSyncInfoDialog(
 
         Spacer(Modifier.height(13.dp))
         Text(
-            "网站只会收到公开展示队列所需的信息，例如登记昵称、队列位置、游玩状态和时间估算。QQ 号、手机号、性别、操作日志及玩家资料内部编号不会上传。",
+            "公开网站只会显示登记昵称、队列位置、游玩状态和时间估算。玩家资料与 QQ 通过需要专用令牌的私有接口同步，不会出现在公开队列或公开日志中。",
             color = SecondaryText,
             fontSize = 11.sp,
             lineHeight = 17.sp
@@ -7413,6 +8260,32 @@ private fun AppDetailRow(label: String, value: String) {
 }
 
 @Composable
+private fun AppDetailLinkRow(
+    label: String,
+    value: String,
+    actionLabel: String,
+    onClick: () -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable(onClick = onClick)
+            .padding(vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, color = TertiaryText, fontSize = 12.sp, modifier = Modifier.width(92.dp))
+        Text(
+            value,
+            color = PrimaryText,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
+            textAlign = TextAlign.End,
+            modifier = Modifier.weight(1f)
+        )
+        Spacer(Modifier.width(12.dp))
+        Text(actionLabel, color = SystemBlue, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+    }
+}
+
+@Composable
 private fun StopMachineChooser(
     machineAStatus: MachineStatus,
     machineBStatus: MachineStatus,
@@ -7443,7 +8316,7 @@ private fun MachineStopChoice(machineId: MachineId, status: MachineStatus, onCli
         description = if (status.isOperational) {
             "选择后继续说明停止使用的原因。"
         } else {
-            "已停止使用 · ${machineStopReasonLabel(status.stopReason)}"
+            "已停止使用 · ${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}"
         },
         destructive = status.isOperational,
         enabled = status.isOperational,
@@ -7456,38 +8329,96 @@ private fun StopMachineReasonDialog(
     machineName: String,
     registrationCount: Int,
     onDismiss: () -> Unit,
-    onSelect: (MachineStopReason) -> Unit
+    onSelect: (MachineStopReason, String?) -> Unit
 ) {
+    var enteringOtherReason by remember(machineName) { mutableStateOf(false) }
+    var otherReasonDetail by remember(machineName) { mutableStateOf("") }
     ModalSurface(onDismiss, width = 470.dp) {
-        Text("选择停止使用原因", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(6.dp))
-        Text(
-            if (registrationCount > 0) {
-                "选择原因后，$machineName 将立即停止使用。现有 $registrationCount 份登记、游玩位置和等待顺序会被保留；恢复正常使用后，将按原顺序继续，本轮计时从头开始。"
-            } else {
-                "选择原因后，$machineName 将立即停止使用。恢复正常使用前，这台机台不能接收新的登记。"
-            },
-            color = SecondaryText,
-            fontSize = 12.sp,
-            lineHeight = 18.sp
-        )
-        Spacer(Modifier.height(16.dp))
-        CompactActionButton(
-            MenuAction("机台未开机", "", { onSelect(MachineStopReason.NOT_POWERED_ON) }, destructive = true),
-            Modifier.fillMaxWidth()
-        )
-        Spacer(Modifier.height(9.dp))
-        CompactActionButton(
-            MenuAction("机台断网", "", { onSelect(MachineStopReason.NETWORK_DISCONNECTED) }, destructive = true),
-            Modifier.fillMaxWidth()
-        )
-        Spacer(Modifier.height(9.dp))
-        CompactActionButton(
-            MenuAction("其他原因", "", { onSelect(MachineStopReason.OTHER) }, destructive = true),
-            Modifier.fillMaxWidth()
-        )
-        Spacer(Modifier.height(13.dp))
-        CancelAction(onDismiss)
+        if (enteringOtherReason) {
+            Text("补充其他原因", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "可以填写便于现场识别的具体原因。此项为选填；留空时将只显示“其他原因”。",
+                color = SecondaryText,
+                fontSize = 12.sp,
+                lineHeight = 18.sp
+            )
+            Spacer(Modifier.height(14.dp))
+            OutlinedTextField(
+                value = otherReasonDetail,
+                onValueChange = { value ->
+                    otherReasonDetail = value.filterNot { it.isISOControl() }
+                        .take(MAX_MACHINE_STOP_REASON_DETAIL_CHARACTERS)
+                },
+                label = { Text("原因说明（选填）") },
+                placeholder = { Text("例如：按钮失灵") },
+                singleLine = true,
+                supportingText = {
+                    Text("${otherReasonDetail.length} / $MAX_MACHINE_STOP_REASON_DETAIL_CHARACTERS")
+                },
+                shape = RoundedCornerShape(ControlRadius),
+                colors = playerProfileTextFieldColors(),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(14.dp))
+            DestructiveButton(
+                "确认停止使用",
+                { onSelect(MachineStopReason.OTHER, otherReasonDetail) },
+                Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            CancelAction("返回选择原因") { enteringOtherReason = false }
+        } else {
+            Text("选择停止使用原因", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                if (registrationCount > 0) {
+                    "选择固定原因后，$machineName 将立即停止使用。现有 $registrationCount 份登记、游玩位置和等待顺序会被保留；恢复正常使用后，将按原顺序继续，本轮计时从头开始。"
+                } else {
+                    "选择固定原因后，$machineName 将立即停止使用。恢复正常使用前，这台机台不能接收新的登记。"
+                },
+                color = SecondaryText,
+                fontSize = 12.sp,
+                lineHeight = 18.sp
+            )
+            Spacer(Modifier.height(16.dp))
+            CompactActionButton(
+                MenuAction(
+                    "机台断网",
+                    "",
+                    { onSelect(MachineStopReason.NETWORK_DISCONNECTED, null) },
+                    destructive = true
+                ),
+                Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(9.dp))
+            CompactActionButton(
+                MenuAction(
+                    "机台维护",
+                    "",
+                    { onSelect(MachineStopReason.MAINTENANCE, null) },
+                    destructive = true
+                ),
+                Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(9.dp))
+            CompactActionButton(
+                MenuAction(
+                    "机台未开机",
+                    "",
+                    { onSelect(MachineStopReason.NOT_POWERED_ON, null) },
+                    destructive = true
+                ),
+                Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(9.dp))
+            CompactActionButton(
+                MenuAction("其他原因", "", { enteringOtherReason = true }, destructive = true),
+                Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(13.dp))
+            CancelAction(onDismiss)
+        }
     }
 }
 
@@ -8835,10 +9766,16 @@ private fun playingPositionName(machineId: MachineId): String = "游玩位置 ${
 
 private fun waitingFrontPositionName(machineId: MachineId): String = "队列位置 ${machineId.name}1"
 
-private fun machineStopReasonLabel(reason: MachineStopReason?): String = when (reason) {
+private fun machineStopReasonLabel(
+    reason: MachineStopReason?,
+    reasonDetail: String? = null
+): String = when (reason) {
     MachineStopReason.NOT_POWERED_ON -> "机台未开机"
     MachineStopReason.NETWORK_DISCONNECTED -> "机台断网"
-    MachineStopReason.OTHER -> "其他原因"
+    MachineStopReason.MAINTENANCE -> "机台维护"
+    MachineStopReason.OTHER -> normalizeMachineStopReasonDetail(reason, reasonDetail)
+        ?.let { "其他原因（$it）" }
+        ?: "其他原因"
     null -> "原因未记录"
 }
 

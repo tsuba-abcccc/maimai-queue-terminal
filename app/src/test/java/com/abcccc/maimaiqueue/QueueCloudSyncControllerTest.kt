@@ -9,6 +9,31 @@ import org.junit.Test
 
 class QueueCloudSyncControllerTest {
     @Test
+    fun privateChannelFailureOverridesAHealthyPublicUploadStatus() {
+        val combined = combinedQueueCloudSyncStatus(
+            QueueCloudSyncStatus(
+                phase = QueueCloudSyncPhase.SYNCED,
+                lastSuccessfulAtMillis = 123L
+            ),
+            "服务器没有转发终端命令接口。"
+        )
+
+        assertEquals(QueueCloudSyncPhase.WAITING_TO_RETRY, combined.phase)
+        assertEquals(123L, combined.lastSuccessfulAtMillis)
+        assertTrue(combined.retryDetail.orEmpty().contains("资料与命令同步"))
+    }
+
+    @Test
+    fun privateChannelFailureDoesNotOverrideDisabledStatus() {
+        val disabled = QueueCloudSyncStatus(QueueCloudSyncPhase.DISABLED)
+
+        assertEquals(
+            disabled,
+            combinedQueueCloudSyncStatus(disabled, "网络错误")
+        )
+    }
+
+    @Test
     fun disabledControllerIgnoresUpdatesAndCanResumeWithCurrentState() = runBlocking {
         val publisher = RecordingPublisher()
         val statuses = mutableListOf<QueueCloudSyncStatus>()
@@ -62,7 +87,8 @@ class QueueCloudSyncControllerTest {
         override suspend fun publish(
             state: PersistedQueueState,
             auditLogs: List<AuditLogEntry>,
-            displaySettings: QueuePublicDisplaySettings
+            displaySettings: QueuePublicDisplaySettings,
+            playerProfiles: List<PlayerProfile>
         ): QueuePublishResult {
             publishedStates.send(state)
             return QueuePublishResult.Success

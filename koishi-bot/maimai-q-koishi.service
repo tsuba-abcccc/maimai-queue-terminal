@@ -1,0 +1,17 @@
+[Unit]
+Description=maimai Q Koishi Bot
+Wants=network-online.target
+After=network-online.target maimai-queue-status.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/maimai-q-koishi
+Environment="PATH=/root/.local/npm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/root/.local/npm/bin/pnpm start
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

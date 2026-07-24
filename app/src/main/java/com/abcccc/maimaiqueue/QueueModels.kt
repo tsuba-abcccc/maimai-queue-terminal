@@ -12,13 +12,17 @@ enum class QueueAbsenceStatus {
 }
 
 enum class MachineStopReason {
-    NOT_POWERED_ON,
     NETWORK_DISCONNECTED,
+    MAINTENANCE,
+    NOT_POWERED_ON,
     OTHER
 }
 
+const val MAX_MACHINE_STOP_REASON_DETAIL_CHARACTERS = 40
+
 data class MachineStatus(
     val stopReason: MachineStopReason? = null,
+    val stopReasonDetail: String? = null,
     val stoppedAtMillis: Long? = null
 ) {
     val isOperational: Boolean
@@ -26,14 +30,31 @@ data class MachineStatus(
 
     fun stop(
         reason: MachineStopReason,
-        atMillis: Long = System.currentTimeMillis()
+        atMillis: Long = System.currentTimeMillis(),
+        reasonDetail: String? = null
     ): MachineStatus = if (isOperational) {
-        copy(stopReason = reason, stoppedAtMillis = atMillis)
+        copy(
+            stopReason = reason,
+            stopReasonDetail = normalizeMachineStopReasonDetail(reason, reasonDetail),
+            stoppedAtMillis = atMillis
+        )
     } else {
         this
     }
 
     fun restore(): MachineStatus = MachineStatus()
+}
+
+fun normalizeMachineStopReasonDetail(
+    reason: MachineStopReason?,
+    detail: String?
+): String? = if (reason == MachineStopReason.OTHER) {
+    detail?.filterNot { it.isISOControl() }
+        ?.trim()
+        ?.take(MAX_MACHINE_STOP_REASON_DETAIL_CHARACTERS)
+        ?.takeIf { it.isNotEmpty() }
+} else {
+    null
 }
 
 data class Registration(
@@ -124,6 +145,14 @@ data class MachineQueue(
         )
     }
 
+    /** Previews the next group after the current players return to the waiting tail. */
+    fun nextPlayingPositionPreviewAfterRoundEnd(): NextPlayingPositionPreview? =
+        if (playing.isEmpty()) {
+            nextPlayingPositionPreview()
+        } else {
+            endRoundWithoutStartingNext(atMillis = 0L).nextPlayingPositionPreview()
+        }
+
     fun canMarkNoShow(registrationKey: Int): Boolean {
         val registration = allRegistrations.firstOrNull { it.key == registrationKey }
             ?: return false
@@ -184,6 +213,8 @@ data class MachineQueue(
             it.copy(
                 absenceStatus = QueueAbsenceStatus.NONE,
                 temporaryAwaySkippedTurns = 0,
+                noShowCount = 0,
+                lastNoShowActionWasDefer = false,
                 lastPlayedAtMillis = atMillis
             )
         }
@@ -267,6 +298,8 @@ data class MachineQueue(
             registration.copy(
                 absenceStatus = QueueAbsenceStatus.NONE,
                 temporaryAwaySkippedTurns = 0,
+                noShowCount = 0,
+                lastNoShowActionWasDefer = false,
                 lastPlayedAtMillis = atMillis
             )
         }.toMutableList()
@@ -330,6 +363,8 @@ data class MachineQueue(
                     registration.copy(
                         absenceStatus = QueueAbsenceStatus.NONE,
                         temporaryAwaySkippedTurns = 0,
+                        noShowCount = 0,
+                        lastNoShowActionWasDefer = false,
                         lastPlayedAtMillis = atMillis
                     )
                 }

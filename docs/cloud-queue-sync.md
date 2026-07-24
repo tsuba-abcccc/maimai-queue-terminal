@@ -1,146 +1,181 @@
-# 队列云端同步接口
+# 队列与玩家资料云端同步协议
 
-## 边界
+## 原则
 
-- Android 终端是队列状态的唯一写入方。
-- 现场操作始终先保存到本机。云端不可用时，终端继续正常工作并在后台重试。
-- 网站只读取公开快照，不提供远程修改操作。
-- 玩家资料库、QQ、电话、性别、玩家资料内部编号和资料编辑日志不上传。
-- 终端只上传经过字段白名单过滤的公开队列事件，用于网站日志和“标记为自己”后的处理结果。
+- Android 终端是队列与玩家资料的最终数据源。
+- 现场修改先在本机生效，再异步上传；网络故障不能阻止排队。
+- 服务器修改以待执行命令返回终端，经本地规则校验和落盘后才算生效。
+- 公开队列数据与私有玩家资料严格分离。
+- QQ 是玩家在 Bot 中的身份键；当前版本不再保存手机号。
 
-## 接口
+## 协议版本
 
-### 终端发布
+新版终端发布 `schema_version: 3`，服务端继续接受版本 `1` 和 `2` 的公开队列快照。
 
-`POST /api/queue-status`
-
-请求头：
+完整请求体限制为 `1 MiB`，单次最多包含 `500` 份玩家资料和 `200` 条公开事件。
 
 ```text
 Authorization: Bearer <QUEUE_SYNC_TOKEN>
-X-Device-ID: <本机生成的终端 UUID>
-X-Queue-Schema-Version: 2
+X-Device-ID: <终端 UUID>
+X-Queue-Schema-Version: 3
 Content-Type: application/json; charset=utf-8
 ```
 
-成功时返回 `204 No Content` 或任意 `2xx`。建议限制请求体不超过 128 KiB。
-服务器继续接受不含公开事件的 `schema_version: 1` 快照，便于旧终端平稳升级；新版终端固定发布版本 2。
+版本 3 在原有公开字段之外增加以下顶层字段：
 
-服务器必须完成以下处理：
+- `onebot_sync_enabled`：现场终端当前是否允许 QQ Bot 联动。
+- `business_hours`：只包含 `enabled`、`outside`、`closing_soon` 和 `closes_at` 四个计算结果，不上传完整营业时间表。
 
-1. 校验令牌和允许的终端编号。
-2. 按公开字段白名单重新构造数据，不能原样保存未知字段。
-3. `queue_id` 相同时，只接受 `revision` 不小于当前版本的快照。
-4. `queue_id` 变化表示终端已开始新的队列，可以从较小的 `revision` 重新计数。
-5. 使用服务器接收时间记录 `received_at`，不要使用终端时间判断在线状态。
-6. 原子替换当前快照，避免网站读取到半份数据。
+- `private_player_profiles`：完整玩家资料库。
+- `private_player_contacts`：当前登记与玩家资料、QQ 的关联。
 
-### 网站读取
+服务端在写入公开快照前必须移除这两个字段，`GET /api/queue-status` 绝不能返回它们。
 
-`GET /api/queue-status`
-
-返回最近一次公开快照。服务器应根据 `received_at` 设置 `terminal.online`：超过 90 秒没有收到终端心跳时返回 `false`。响应必须包含：
-
-```text
-Cache-Control: no-store
-Access-Control-Allow-Origin: https://abcccc.top
-```
-
-没有任何快照时建议返回 `404`：
-
-```json
-{"ok":false,"error":"排队终端暂未同步"}
-```
-
-### 网站读取日志
-
-`GET /api/queue-logs?queue_id=<队列 UUID>&limit=50&before=<游标>`
-
-`queue_id` 省略时读取当前队列。`limit` 可设为 1 至 100，`before` 使用上一次响应的 `next_cursor`。接口只返回公开队列事件，不包含联系方式、性别或玩家资料内部编号。
-
-## 公开快照示例
+## 玩家资料字段
 
 ```json
 {
-  "schema_version": 2,
-  "queue_id": "37e41698-46f8-489b-92dc-d29c71f00f7d",
-  "revision": 18,
-  "captured_at": 1784682000000,
-  "registration_open": true,
-  "terminal": {
-    "id": "1e21d828-2454-4568-8078-154f84e165c7",
-    "online": true,
-    "app_version": "0.2.12",
-    "last_seen_at": 1784682000000
-  },
-  "machines": {
-    "A": {
-      "id": "A",
-      "name": "左侧 · 机台 A",
-      "operational": true,
-      "stop_reason": null,
-      "stopped_at": null,
-      "playing_started_at": 1784681700000,
-      "registration_count": 3,
-      "waiting_position_count": 1,
-      "playing": [
-        {
-          "registration_id": "a10f5015a2e85b12e20af507",
-          "display_id": "示例玩家一",
-          "preference": "OPEN_TO_JOIN",
-          "deferred_once": false,
-          "temporarily_away": false,
-          "temporary_away_skipped_turns": 0,
-          "fixed_pair": false,
-          "fixed_pair_id": null,
-          "no_show_count": 0,
-          "last_no_show_action_was_defer": false,
-          "registration_type": "TEMPORARY",
-          "created_at": 1784681000000,
-          "last_played_at": null
-        }
-      ],
-      "waiting_positions": [
-        {
-          "index": 1,
-          "position_id": "43a5a2eeef0f4da5e470efbd",
-          "fixed_pair": false,
-          "estimated_wait_minutes": 7,
-          "registrations": []
-        }
-      ]
-    },
-    "B": {}
-  },
-  "recent_events": [
-    {
-      "event_id": "9f5b84ac-b678-42c7-8bfd-95e617d7229c",
-      "occurred_at": 1784682010000,
-      "machine_id": "A",
-      "type": "NO_SHOW_MOVED_TO_TAIL",
-      "title": "机台 A · 未到场状态已更新",
-      "detail": "“示例玩家一”已记录第 1 次未到场，并移至队尾。",
-      "registration_ids": ["a10f5015a2e85b12e20af507"]
-    }
-  ]
+  "profile_id": "37e41698-46f8-489b-92dc-d29c71f00f7d",
+  "nickname": "示例玩家",
+  "gender": "UNDISCLOSED",
+  "default_preference": "OPEN_TO_JOIN",
+  "qq_number": "12345678",
+  "usage_count": 12,
+  "last_used_at": 1784681000000,
+  "created_at": 1780000000000,
+  "updated_at": 1784681000000
 }
 ```
 
-实际机台 A、B 都会包含完整结构。`estimated_wait_minutes` 已由终端按照单人 12 分钟、共同游玩 15 分钟计算，并扣除当前轮次已经经过的时间。
+`qq_number` 对尚未补充资料的旧记录可以为 `null`；创建和编辑资料时必须填写 `5` 至 `12` 位 QQ。云端按 `QUEUE_PROFILE_SCOPE_ID` 保存机厅资料库，终端上传采用增量覆盖，不会因一次空列表误删服务器备份。
 
-## 终端构建配置
+## 当前登记绑定
 
-正式令牌不要写入仓库。可以放在当前开发账户的 `~/.gradle/gradle.properties`：
-
-```properties
-QUEUE_SYNC_URL=https://abcccc.top/api/queue-status
-QUEUE_SYNC_TOKEN=<由服务器生成的高强度随机令牌>
+```json
+{
+  "registration_id": "a10f5015a2e85b12e20af507",
+  "profile_id": "37e41698-46f8-489b-92dc-d29c71f00f7d",
+  "qq_number": "12345678"
+}
 ```
 
-也可以使用同名环境变量。未配置令牌时，应用保持纯本地运行，并在“应用详情”中显示“等待服务器配置”。
+只有使用玩家资料且 QQ 有效的当前登记会产生绑定。绑定必须引用同一负载中的资料，QQ 也必须一致。登记离队后，绑定在当前队列批次内保留，用于发送与本人有关的处理日志；开始新队列时清除。
 
-构建令牌会进入 APK。若 APK 需要公开分发，应将终端版与公开安装版分开签名，并在令牌泄漏后立即轮换。
+## 公开接口
 
-## “标记为自己”的后续兼容
+### 当前队列
 
-网站把 `queue_id`、`registration_id` 和用于离线提示的昵称写入 `localStorage`。开始新队列后 `queue_id` 会变化，旧标记不会错误匹配到复用编号的新登记。浏览器本地标记不保存联系方式；服务器日志通过稳定的 `registration_id` 关联登记，即使登记被移除，也能显示最后一次公开处理结果。
+`GET /api/queue-status`
+
+返回机台名称、游玩位置、等待位置、昵称、状态、时间估算、QQ Bot 联动状态和营业时间计算结果。服务端使用接收时间计算 `terminal.online`，响应包含 `Cache-Control: no-store`。
+
+### 公开日志
+
+`GET /api/queue-logs?queue_id=<UUID>&limit=50&before=<游标>`
+
+只返回白名单内的队列事件，不包含 QQ、性别、资料 UUID 或私有资料编辑日志。每条事件包含 `operation_source`，取值为 `ON_SITE_TERMINAL`、`QQ_BOT`、`SYSTEM_AUTOMATIC` 或预留的 `WEBSITE_REMOTE`。
+
+## 私有 Bot 接口
+
+所有请求使用：
+
+```text
+Authorization: Bearer <QUEUE_BOT_TOKEN>
+```
+
+`QUEUE_BOT_TOKEN` 必须与终端同步令牌不同，只能配置在 Koishi 服务端。它是服务级凭据，不是某一名玩家的登录凭据：持有者可以读取完整玩家资料库中的 QQ、性别和资料 UUID，读取当前登记绑定及通知事件的全部 QQ 收件人，并请求创建玩家资料修改命令。限制玩家只能查询和修改本人资料的是 Koishi 对 OneBot 会话身份的校验，因此 Bot 令牌不能交给玩家、浏览器或其他不受控客户端。
+
+现场终端关闭“QQ Bot 联动”后，所有 `/api/queue-bot/` 接口返回 `503`。服务器会立即拒绝尚未完成的命令并删除当前队列的通知收件关系；关闭期间不创建新收件关系，重新开启后也不会补发旧事件。玩家资料库与公开队列快照仍然保留。
+
+### 查询玩家
+
+`POST /api/queue-bot/players`，JSON 请求体为 `{"qq":"<QQ号>"}`
+
+返回该 QQ 当前是否在队列、所在机台、游玩或等待位置、时间估算、暂缓、暂离和未到场状态。
+
+受控服务也可以使用不含 QQ 查询条件的 `GET /api/queue-bot/players` 读取全部当前登记绑定。响应包含登记对应的 QQ，仅供 Bot 服务内部处理。
+
+### 查询资料
+
+`POST /api/queue-bot/profiles`，JSON 请求体为 `{"qq":"<QQ号>"}`
+
+返回该 QQ 对应的私有玩家资料。若旧数据存在重复 QQ，可能返回多份，Bot 应提示人工选择，而不能任意取第一份。
+
+`GET /api/queue-bot/profiles` 返回完整私有玩家资料库，包括 QQ、性别、默认偏好和资料 UUID。该接口不得从网站前端调用。
+
+### 查询通知事件
+
+`POST /api/queue-bot/events`，JSON 请求体为 `{"qq":"<QQ号>","after":<游标>,"limit":50}`
+
+事件按递增游标返回。Koishi 保存 `next_cursor` 后只轮询新增事件，避免重复通知。`latest_cursor` 用于首次启动或切换队列时跳过既有日志，防止集中补发历史消息。`affected_players` 用于投递本人相关日志，`operation_source` 说明操作来源，`PLAYING_CHANGED` 可触发上机通知。
+
+通知服务使用 `GET /api/queue-bot/events?after=<游标>&limit=50` 全量读取事件。每条事件的 `affected_players` 会包含当时固定的全部 QQ 收件人，因此该响应属于私有数据，不能转发到群聊或公开日志。
+
+### 请求修改玩家资料
+
+`PATCH /api/queue-bot/profiles/<profile_id>`
+
+```json
+{
+  "request_id": "d4a50f7f-e37c-43fd-b5a8-bd8fd79dd274",
+  "actor_qq": "12345678",
+  "nickname": "新昵称",
+  "gender": "UNDISCLOSED",
+  "default_preference": "OPEN_TO_JOIN"
+}
+```
+
+服务器验证 `actor_qq` 与资料一致后创建命令，并返回 `202`。QQ 不能通过此接口修改。相同 `request_id` 保证幂等。
+
+### 查询命令
+
+`GET /api/queue-bot/commands/<command_id>`
+
+状态包括 `PENDING`、`APPLIED` 和 `REJECTED`。拒绝原因位于 `result_detail`。
+
+## 终端回流接口
+
+### 恢复缺失资料
+
+`GET /api/queue-terminal/profiles`
+
+终端仅补回本地不存在的 UUID。同 UUID 以本地内容为准；与本地昵称或 QQ 冲突的云端资料不会自动合并。
+
+### 拉取命令
+
+`GET /api/queue-terminal/commands`
+
+终端约每 `3` 秒读取待执行命令。资料命令同时校验：
+
+1. 资料 UUID 和 QQ 与本地一致。
+2. `expected_updated_at` 与本地版本一致。
+3. 新昵称不与资料库或当前队列冲突。
+4. 字段符合本机模型允许的枚举和长度。
+
+本地资料已经等于命令目标时，终端视为幂等成功并补发回执。
+
+### 命令回执
+
+`POST /api/queue-terminal/commands/<command_id>/result`
+
+```json
+{"status":"APPLIED","detail":"玩家资料已由终端更新。"}
+```
+
+终端写入本机后再返回 `APPLIED`，随后正常上传新的资料快照。服务器不能自行把待执行命令直接改成正式资料。
+
+## 尚未开放的能力
+
+QQ Bot 修改排队顺序、加入、退出、暂缓或暂离尚未开放。它们将复用同一命令通道，但必须逐项定义身份校验、机台规则、确认语义和冲突处理；当前私有接口明确返回 `remote_actions: false`。
+
+## 构建与安全
+
+终端配置保存在开发账户的 `~/.gradle/gradle.properties`：
+
+```properties
+ENABLE_TERMINAL_BUILD=true
+QUEUE_SYNC_URL=https://abcccc.top/api/queue-status
+QUEUE_SYNC_TOKEN=<终端令牌>
+```
+
+同步令牌只会写入显式开启的 `terminal` 产品变体。公开发行必须构建 `assembleLocalRelease`；`local` 变体在 Gradle 中强制使用空地址和空令牌，不能因开发机保存了生产配置而意外带出凭据。现场终端使用 `packageTerminalDebugApk` 或 `assembleTerminalRelease`，生成物不得公开上传。QQ 与玩家资料通过 HTTPS 传输并存入私有数据库；数据库备份、Bot 令牌和终端令牌都应限制读取权限。

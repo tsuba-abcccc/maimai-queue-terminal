@@ -1,13 +1,13 @@
 # maimai Q
 
-[![Version](https://img.shields.io/badge/version-0.2.13-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
+[![Version](https://img.shields.io/badge/version-0.3.0-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
 [![Android](https://img.shields.io/badge/Android-10%2B-34C759?logo=android&logoColor=white)](https://developer.android.com/about/versions/10)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-007AFF)](https://developer.android.com/compose)
 
 面向机厅现场的双机台电子排队终端。maimai Q 用电子队列模拟现场“挪东西排卡”的流程，在保留玩家游玩偏好和现场调整能力的同时，提供等待时间估算、本机持久化、操作日志和可选的网站同步。
 
-项目以 Android 横屏终端为现场唯一操作端。网络不可用时，排队仍然完整运行在本机；开启同步后，公开队列会上传到只读网站供玩家查看。
+项目以 Android 横屏终端为现场最终操作端。网络不可用时，排队仍然完整运行在本机；开启同步后，公开队列供网站查看，玩家资料通过私有接口备份，并可接收经过本地校验的 QQ Bot 资料修改。
 
 > 当前版本仍处于 `0.x` 阶段。用于真实现场前，请先根据本机厅规则完成测试，并安排能够处理误操作和机台故障的现场人员。
 
@@ -16,7 +16,7 @@
 - [在线查看当前队列](https://abcccc.top/queue-status)
 - [玩家使用手册](docs/user-manual.md)
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
-- [0.1.0 至 0.2.13 更新日志](docs/update.md)
+- [0.1.0 至 0.3.0 更新日志](docs/update.md)
 - [云端同步协议](docs/cloud-queue-sync.md)
 - [后端部署说明](cloud-server/README.md)
 
@@ -41,7 +41,7 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将两�
 - 机台 A、机台 B 两条完全独立的登记顺序。
 - 游玩位置、等待位置、登记人数和总人数统计。
 - 单人游玩、允许他人加入和与朋友固定组合。
-- 结束本轮并自动开始下一轮，或仅结束当前轮次。
+- 本轮结束可选择自动开始下一轮、仅结束当前轮次，或经二次确认移除本轮玩家的登记。
 - 将误进入游玩位置的玩家撤回等待顺序前端。
 - 将实际已经共同上机的等待玩家补入当前游玩位置。
 - 游玩超过 20 分钟时提醒，并支持补记现场已完成但忘记操作的轮次。
@@ -54,17 +54,18 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将两�
 - 暂离连续轮空 3 次后仍保留，第 4 次轮到时仍未返回则自动退出。
 - 暂缓或暂离玩家不会被错误标记为未到场。
 - 未到场仅适用于游玩位置和当前真正轮到的首个有效等待位置。
+- 未到场次数和上次处理方式属于当前轮次状态；真正完成一轮并正常轮转后自动清除，误操作回退时保留。
 - 系统会结合单人、开放加入、固定组合和离开状态重新计算游玩组合与时间。
 
 ### 玩家资料和登记
 
 - 临时登记、玩家资料库和预留的二维码入口。
 - 玩家资料搜索、推荐排序、首字母排序和四列紧凑布局。
-- 玩家昵称、性别、默认游玩偏好，以及 QQ 号或中国大陆手机号中的一种联系方式。
+- 玩家昵称、性别、默认游玩偏好和 QQ 号。
 - 默认偏好可设为“每次询问”，也可把本次选择保存为以后默认。
 - 使用玩家资料认领临时登记，保留原机台和位置，并将昵称更新为资料昵称。
 - 修改本次游玩偏好时，不会意外覆盖玩家资料的默认偏好。
-- 性别和联系方式只在需要的详情页面显示，不出现在公开排队表面。
+- 性别和 QQ 只在需要的详情页面显示，不出现在公开排队表面。
 
 ### 队列编辑和纠错
 
@@ -82,14 +83,21 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将两�
 - 最多保留最近 1,000 条本机详细操作日志。
 - 机台停止使用时保留全部登记；恢复后本轮计时从头开始。
 - 可分别设置是否允许暂缓一轮、是否允许暂时离开。
+- 可统一设置营业时间，也可按星期分别设置；到闭店时间自动关闭登记并清空队列，开店时间不会自动开启。
+- 操作日志区分现场终端、QQ Bot、系统自动和预留的网站远程来源，并可按来源筛选。
 - 支持自定义机台现场备注，固定名称“机台 A / B”保持不变。
 - 重要操作使用确认弹窗、状态动画和克制的操作音效。
 
 ### 网站同步
 
 - 现场变化先保存到本机，再异步上传公开快照。
+- 完整玩家资料库通过鉴权后的私有通道同步，QQ 不进入公开网站。
+- Koishi Bot 可以查询本人状态、读取相关事件并请求修改玩家资料。
+- 服务器修改先成为待执行命令，终端校验并落盘后才正式生效。
 - 网络失败不会阻止现场操作，应用会在后台自动重试。
 - 首页显示已同步、同步中、待重试、已关闭或未配置等状态。
+- 现场终端版可单独关闭“QQ Bot 联动”；关闭后不接受 Bot 查询或资料修改，也不会补发关闭期间的通知。
+- App 与网站会在闭店前 15 分钟显示提醒，并在非营业时段保留“不在营业时间”状态。
 - 网站提供两台队列、位置详情、时间估算、公开日志和“标记为自己”。
 - 标记后可查看自己的位置、预计时间、共同游玩对象和未到场等处理结果。
 - 网站目前只读，不能远程改变现场队列。
@@ -106,18 +114,21 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将两�
 flowchart LR
     Player[现场玩家] --> Terminal[Android 横屏终端]
     Terminal --> Local[(本机队列与玩家资料)]
-    Terminal -->|HTTPS POST<br/>公开字段白名单| API[Flask 队列 API]
+    Terminal -->|HTTPS POST<br/>公开队列 + 私有资料| API[Flask 队列 API]
     API --> PublicDB[(公开快照与公开事件)]
+    API --> PrivateDB[(私有玩家资料与命令)]
     Web[只读队列网站] -->|HTTPS GET| API
     Viewer[玩家手机] --> Web
+    Bot[Koishi OneBot] <-->|私有查询与待执行命令| API
+    Terminal -->|拉取并回执命令| API
 ```
 
 边界设计：
 
-- Android 终端是队列状态的唯一写入方。
+- Android 终端是队列与玩家资料的最终数据源。
 - 本机保存优先于云端同步，服务器故障不会中断现场排队。
 - 后端再次按白名单构造公开数据，不原样保存终端传来的未知字段。
-- 当前网站不提供写接口，为以后动态网站和远程交互保留协议扩展空间。
+- Bot 不能直接覆盖正式数据，只能提交由终端校验的待执行命令。
 - 仓库包含 Android 应用和队列 API；当前在线网站前端由独立站点项目托管。
 
 ## 运行要求
@@ -150,41 +161,95 @@ flowchart LR
 ```powershell
 git clone https://github.com/tsuba-abcccc/maimai-queue-terminal.git
 Set-Location maimai-queue-terminal
-.\gradlew.bat :app:assembleDebug
+.\gradlew.bat :app:assembleLocalDebug
 ```
 
 调试 APK 生成在：
 
 ```text
-app/build/outputs/apk/debug/app-debug.apk
+app/build/outputs/apk/local/debug/app-local-debug.apk
 ```
+
+生成带版本号、可直接辨认的本地版交付文件：
+
+```powershell
+.\gradlew.bat :app:packageLocalDebugApk
+```
+
+文件会复制到 `output/apk/maimai-Q-0.3.0-local.apk`。
 
 macOS 或 Linux 使用：
 
 ```bash
-./gradlew :app:assembleDebug
+./gradlew :app:assembleLocalDebug
 ```
 
 第一次构建需要联网下载 Android 和 Gradle 依赖。
 
 ### 纯本地模式
 
-不配置同步令牌即可使用纯本地模式。应用仍会保存队列、玩家资料和操作日志，只是不向网站上传。
+公开构建固定使用 `local` 变体。它的应用 ID 为 `com.abcccc.maimaiqueue.local`，不申请 Android 联网权限，构建内容中也强制写入空的服务器地址和令牌；即使构建机器保存了生产配置，公开 APK 也不能调用同步接口。应用仍会在本机保存队列、玩家资料和操作日志，界面中不会显示网站同步状态或开关。
+
+生成纯本地正式版候选：
+
+```powershell
+.\gradlew.bat :app:assembleLocalRelease
+```
+
+当前项目没有在 Gradle 中保存正式签名配置，因此该命令生成的是尚未签名、不能直接发布的候选文件：
+
+```text
+app/build/outputs/apk/local/release/app-local-release-unsigned.apk
+```
+
+#### 推荐：使用 Android Studio 签名
+
+1. 选择“Build” → “Generate Signed App Bundle or APK”。
+2. 选择“APK”和 `app` 模块，新建或选择仅由发布者保管的 keystore。
+3. 将构建变体设为 `localRelease`，完成向导并记下签名 APK 的输出位置。
+4. 妥善离线备份 keystore；以后发布更新必须继续使用同一签名，否则已安装用户无法直接升级。
+
+keystore、别名和密码不得写入仓库。Android Studio 可以直接构建签名包，不要求预先执行 `assembleLocalRelease`。
+
+#### 备选：使用 Android SDK 命令行工具签名
+
+以下 PowerShell 示例不会把密码写入命令；`apksigner` 会在执行时安全地询问密码。请把 Android SDK、keystore 和别名占位符替换为本机实际值：
+
+```powershell
+$unsignedApk = 'app\build\outputs\apk\local\release\app-local-release-unsigned.apk'
+$alignedApk = 'app\build\outputs\apk\local\release\app-local-release-aligned.apk'
+$signedApk = 'app\build\outputs\apk\local\release\app-local-release-signed.apk'
+
+& '<Android SDK>\build-tools\<已安装版本>\zipalign.exe' -p -f 4 $unsignedApk $alignedApk
+& '<Android SDK>\build-tools\<已安装版本>\apksigner.bat' sign --ks '<keystore 路径>' --ks-key-alias '<密钥别名>' --out $signedApk $alignedApk
+& '<Android SDK>\build-tools\<已安装版本>\apksigner.bat' verify --verbose --print-certs $signedApk
+```
+
+公开渠道只能上传已经验证签名的 `localRelease` APK，例如上述 `app-local-release-signed.apk`。禁止上传 `app-local-debug.apk`、`app-local-release-unsigned.apk`、旧版 `app-debug.apk`，以及任何 `app-terminal-*` 文件。
 
 ### 配置网站同步
 
 不要把正式令牌写入仓库。推荐放在开发账户的 `~/.gradle/gradle.properties`：
 
 ```properties
+ENABLE_TERMINAL_BUILD=true
 QUEUE_SYNC_URL=https://your-domain.example/api/queue-status
 QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 ```
 
-也可以使用同名环境变量。构建时令牌会进入 APK，因此：
+也可以使用同名环境变量。现场终端调试包使用：
 
+```powershell
+.\gradlew.bat :app:packageTerminalDebugApk -PENABLE_TERMINAL_BUILD=true
+```
+
+`terminal` 变体必须通过 `ENABLE_TERMINAL_BUILD=true` 显式开启，应用 ID 保持 `com.abcccc.maimaiqueue`，可覆盖安装现有现场版本。构建时令牌会进入该 APK，因此：
+
+- GitHub 或其他公开渠道不得上传任何 `app-terminal-*`。
 - 公开分发版与现场终端版应使用不同签名和不同配置。
-- 不要在公开 APK 中放入仍有生产写入权限的令牌。
-- 令牌泄漏后应立即在服务端轮换。
+- 现场终端 APK 只在受控设备间传递；令牌泄漏后立即在服务端轮换。
+
+现场终端文件会复制到 `output/apk/maimai-Q-0.3.0-terminal.apk`，不得作为 GitHub 公开 Release 附件。
 
 ## 部署队列 API
 
@@ -193,7 +258,7 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 ```bash
 cd cloud-server
 cp .env.example .env
-# 编辑 .env，至少设置 QUEUE_SYNC_TOKEN
+# 编辑 .env，分别设置 QUEUE_SYNC_TOKEN、QUEUE_BOT_TOKEN 和资料库作用域
 docker compose up -d --build
 ```
 
@@ -213,24 +278,25 @@ curl https://your-domain.example/queue-api-healthz
 
 ## 数据和隐私
 
-| 数据 | 本机保存 | 上传公开服务 |
-| --- | --- | --- |
-| 昵称、机台、队列位置 | 是 | 是 |
-| 游玩偏好、暂缓、暂离、未到场 | 是 | 是 |
-| 公开队列事件 | 是 | 是 |
-| QQ 号或手机号 | 是 | 否 |
-| 性别 | 是 | 否 |
-| 玩家资料内部编号 | 是 | 否 |
-| 玩家资料编辑日志 | 是 | 否 |
+| 数据 | 本机保存 | 私有云端 | 公开网站 |
+| --- | --- | --- | --- |
+| 昵称、机台、队列位置 | 是 | 是 | 是 |
+| 游玩偏好、暂缓、暂离、未到场 | 是 | 是 | 是 |
+| 公开队列事件 | 是 | 是 | 是 |
+| QQ 号 | 是 | 是 | 否 |
+| 性别、默认资料偏好 | 是 | 是 | 否 |
+| 玩家资料 UUID | 是 | 是 | 否 |
+| 本机资料编辑日志 | 是 | 否 | 否 |
 
-应用已关闭 Android 系统备份，避免玩家资料通过系统备份离开受控终端。公开网站不会显示联系方式。
+应用已关闭 Android 系统备份。开启网站同步后，玩家资料和 QQ 通过需要专用令牌的私有接口保存，用于 Koishi Bot 身份、日志通知和上机提醒；公开网站不会显示这些字段。服务器修改会先成为待执行命令，只有终端按本地规则接受后才生效。
 
 ## 测试
 
 运行 Android 单元测试：
 
 ```powershell
-.\gradlew.bat :app:testDebugUnitTest
+.\gradlew.bat :app:testLocalDebugUnitTest
+.\gradlew.bat :app:testTerminalDebugUnitTest -PENABLE_TERMINAL_BUILD=true
 ```
 
 运行后端测试：
@@ -240,7 +306,15 @@ Set-Location cloud-server
 python -m unittest -v
 ```
 
-测试覆盖队列演化、暂缓和暂离、玩家联系方式、资料认领、时间估算、队列持久化、同步控制器、公开快照、操作日志和后端接口。
+运行 Koishi OneBot 插件测试：
+
+```powershell
+Set-Location koishi-bot
+pnpm install
+pnpm test
+```
+
+测试覆盖队列演化、暂缓和暂离、QQ 资料、资料认领、时间估算、队列持久化、公开快照、私有资料同步、命令冲突、操作日志、后端接口和 Bot 消息格式。
 
 ## 项目结构
 
@@ -248,24 +322,27 @@ python -m unittest -v
 maimai-queue-terminal/
 ├─ app/                    Android 终端、排队模型和单元测试
 ├─ cloud-server/           可选的 Flask 同步 API 与部署配置
+├─ koishi-bot/             Koishi OneBot 插件、接入说明和测试
 ├─ docs/
 │  ├─ cloud-queue-sync.md  同步协议和公开字段边界
 │  ├─ update.md            累计更新日志
 │  ├─ user-manual.md       玩家使用手册
 │  └─ images/              README 使用的公开界面图片
 ├─ output/pdf/             排版后的玩家手册 PDF
+├─ output/apk/             本机构建的版本化 APK（不进入 Git）
 └─ gradle/                 Gradle Wrapper 与版本目录
 ```
 
 ## 当前限制和后续方向
 
 - 二维码入口已经预留，但当前版本尚未启用。
-- 玩家资料目前保存在终端本机，尚未提供云端资料库。
+- 玩家资料以终端本机为准，并可私有同步到服务器；云端只补回本机缺失资料。
+- Koishi Bot 已具备玩家查询、相关事件通知和资料修改 API，队列远程操作仍待逐项开放。
 - 网站目前只读，远程排队和远程修改队列尚未开放。
 - 当前公开站点的前端源码不在本仓库中。
 - 仓库没有包含可公开使用的生产同步令牌或正式签名密钥。
 
-后续计划包括云端玩家资料、权限明确的动态网站交互、二维码身份入口，以及将公开安装版与现场终端版分离。
+后续计划包括逐项开放 QQ Bot 排队命令、权限明确的动态网站交互、二维码身份入口，以及将公开安装版与现场终端版分离。
 
 ## 参与开发
 

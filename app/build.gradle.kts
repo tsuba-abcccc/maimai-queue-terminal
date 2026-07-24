@@ -12,6 +12,13 @@ val queueSyncUrl = providers.gradleProperty("QUEUE_SYNC_URL")
 val queueSyncToken = providers.gradleProperty("QUEUE_SYNC_TOKEN")
     .orElse(providers.environmentVariable("QUEUE_SYNC_TOKEN"))
     .orElse("")
+val terminalBuildEnabled = providers.gradleProperty("ENABLE_TERMINAL_BUILD")
+    .orElse(providers.environmentVariable("ENABLE_TERMINAL_BUILD"))
+    .map { it.equals("true", ignoreCase = true) }
+    .orElse(false)
+val terminalQueueSyncUrl = if (terminalBuildEnabled.get()) queueSyncUrl.get() else ""
+val terminalQueueSyncToken = if (terminalBuildEnabled.get()) queueSyncToken.get() else ""
+val appVersionName = "0.3.0"
 
 android {
     namespace = "com.abcccc.maimaiqueue"
@@ -25,13 +32,29 @@ android {
         applicationId = "com.abcccc.maimaiqueue"
         minSdk = 29
         targetSdk = 36
-        versionCode = 15
-        versionName = "0.2.13"
-
-        buildConfigField("String", "QUEUE_SYNC_URL", queueSyncUrl.get().asBuildConfigString())
-        buildConfigField("String", "QUEUE_SYNC_TOKEN", queueSyncToken.get().asBuildConfigString())
+        versionCode = 22
+        versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    flavorDimensions += "deployment"
+    productFlavors {
+        create("local") {
+            dimension = "deployment"
+            applicationIdSuffix = ".local"
+            resValue("string", "app_name", "maimai Q 本地版")
+            buildConfigField("Boolean", "CLOUD_SYNC_AVAILABLE", "false")
+            buildConfigField("String", "QUEUE_SYNC_URL", "\"\"")
+            buildConfigField("String", "QUEUE_SYNC_TOKEN", "\"\"")
+        }
+        create("terminal") {
+            dimension = "deployment"
+            resValue("string", "app_name", "maimai Q")
+            buildConfigField("Boolean", "CLOUD_SYNC_AVAILABLE", "true")
+            buildConfigField("String", "QUEUE_SYNC_URL", terminalQueueSyncUrl.asBuildConfigString())
+            buildConfigField("String", "QUEUE_SYNC_TOKEN", terminalQueueSyncToken.asBuildConfigString())
+        }
     }
 
     buildTypes {
@@ -48,7 +71,28 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+        resValues = true
     }
+}
+
+androidComponents {
+    beforeVariants(selector().withFlavor("deployment" to "terminal")) { variantBuilder ->
+        variantBuilder.enable = terminalBuildEnabled.get()
+    }
+}
+
+tasks.register<Copy>("packageLocalDebugApk") {
+    dependsOn("assembleLocalDebug")
+    from(layout.buildDirectory.file("outputs/apk/local/debug/app-local-debug.apk"))
+    into(rootProject.layout.projectDirectory.dir("output/apk"))
+    rename("app-local-debug\\.apk", "maimai-Q-$appVersionName-local.apk")
+}
+
+tasks.register<Copy>("packageTerminalDebugApk") {
+    dependsOn("assembleTerminalDebug")
+    from(layout.buildDirectory.file("outputs/apk/terminal/debug/app-terminal-debug.apk"))
+    into(rootProject.layout.projectDirectory.dir("output/apk"))
+    rename("app-terminal-debug\\.apk", "maimai-Q-$appVersionName-terminal.apk")
 }
 
 dependencies {

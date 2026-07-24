@@ -1,6 +1,5 @@
 package com.abcccc.maimaiqueue
 
-import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -8,60 +7,56 @@ import org.junit.Test
 
 class PlayerContactTest {
     @Test
-    fun oldProfileWithTwoContactsKeepsQqAndDropsPhoneNumber() {
-        val profile = profile(qqNumber = "12345678", phoneNumber = "13800138000")
+    fun qqNumberIsTrimmedWhenProfileIsCanonicalized() {
+        val profile = profile(qqNumber = " 12345678 ")
 
         val canonical = profile.withCanonicalContact()
 
-        assertEquals("12345678", canonical.qqNumber)
-        assertNull(canonical.phoneNumber)
+        assertTrue(canonical.qqNumber == "12345678")
         assertTrue(canonical.hasValidContact)
     }
 
     @Test
-    fun profileWithoutQqKeepsMainlandChinaMobileNumber() {
-        val canonical = profile(phoneNumber = "13800138000").withCanonicalContact()
+    fun profileWithoutQqMustBeCompletedBeforeUse() {
+        val canonical = profile().withCanonicalContact()
 
-        assertNull(canonical.qqNumber)
-        assertEquals("13800138000", canonical.phoneNumber)
-        assertTrue(canonical.hasValidContact)
+        assertFalse(canonical.hasValidContact)
     }
 
     @Test
-    fun flexibleInputRecognizesMainlandChinaMobileNumber() {
-        val contact = playerContactFromInput("13800138000", allowPhoneNumber = true)
-
-        assertNull(contact.qqNumber)
-        assertEquals("13800138000", contact.phoneNumber)
-        assertTrue(contact.isValid)
+    fun qqValidationRejectsNonDigitsAndOutOfRangeLengths() {
+        assertTrue(isValidQqNumber("12345"))
+        assertTrue(isValidQqNumber("123456789012"))
+        assertFalse(isValidQqNumber("1234"))
+        assertFalse(isValidQqNumber("1234567890123"))
+        assertFalse(isValidQqNumber("12345a"))
     }
 
     @Test
-    fun defaultInputTreatsElevenDigitsAsQq() {
-        val contact = playerContactFromInput("13800138000", allowPhoneNumber = false)
+    fun duplicateLegacyQqBindingsAreClearedFromEveryAmbiguousProfile() {
+        val migrated = clearAmbiguousQqBindings(
+            listOf(
+                profile(id = "profile-1", qqNumber = "12345678"),
+                profile(id = "profile-2", qqNumber = " 12345678 "),
+                profile(id = "profile-3", qqNumber = "87654321")
+            ),
+            migratedAtMillis = 900L
+        )
 
-        assertEquals("13800138000", contact.qqNumber)
-        assertNull(contact.phoneNumber)
-        assertTrue(contact.isValid)
+        assertNull(migrated[0].qqNumber)
+        assertNull(migrated[1].qqNumber)
+        assertTrue(migrated[0].updatedAtMillis == 900L)
+        assertTrue(migrated[1].updatedAtMillis == 900L)
+        assertTrue(migrated[2].qqNumber == "87654321")
     }
 
-    @Test
-    fun phoneNumberRejectsInternationalAndLandlineFormats() {
-        assertFalse(isValidPhoneNumber("+8613800138000"))
-        assertFalse(isValidPhoneNumber("01012345678"))
-        assertFalse(isValidPhoneNumber("12800138000"))
-        assertTrue(isValidPhoneNumber("19912345678"))
-    }
-
-    private fun profile(
-        qqNumber: String? = null,
-        phoneNumber: String? = null
-    ) = PlayerProfile(
-        id = "profile-1",
+    private fun profile(id: String = "profile-1", qqNumber: String? = null) = PlayerProfile(
+        id = id,
         nickname = "测试玩家",
         gender = PlayerGender.UNDISCLOSED,
         defaultPreference = ProfilePlayPreference.ASK_EVERY_TIME,
         qqNumber = qqNumber,
-        phoneNumber = phoneNumber
+        createdAtMillis = 100L,
+        updatedAtMillis = 100L
     )
 }

@@ -103,6 +103,7 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
 
     private fun encodeStatus(status: MachineStatus): JSONObject = JSONObject().apply {
         put("stopReason", status.stopReason?.name ?: JSONObject.NULL)
+        put("stopReasonDetail", status.stopReasonDetail ?: JSONObject.NULL)
         put("stoppedAtMillis", status.stoppedAtMillis ?: JSONObject.NULL)
     }
 
@@ -210,6 +211,10 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
         } ?: return MachineStatus()
         return MachineStatus(
             stopReason = reason,
+            stopReasonDetail = normalizeMachineStopReasonDetail(
+                reason,
+                value.optNullableString("stopReasonDetail")
+            ),
             stoppedAtMillis = value.optLongOrNull("stoppedAtMillis")
         )
     }

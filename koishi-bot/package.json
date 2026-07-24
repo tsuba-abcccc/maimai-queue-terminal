@@ -1,0 +1,43 @@
+{
+  "name": "koishi-plugin-maimai-q",
+  "version": "0.1.4",
+  "description": "Queue queries, player profile management, and private notifications for Koishi OneBot",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm run build && node --test test/format.test.js test/notification-state.test.js test/security.test.js",
+    "prepack": "pnpm run build"
+  },
+  "keywords": [
+    "koishi",
+    "onebot",
+    "maimai",
+    "queue"
+  ],
+  "license": "UNLICENSED",
+  "peerDependencies": {
+    "koishi": "^4.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "koishi": "^4.18.0",
+    "typescript": "^5.7.0"
+  },
+  "koishi": {
+    "description": {
+      "zh": "连接现场排队终端，查询队列、管理玩家资料并发送私信通知。"
+    },
+    "service": {
+      "required": [
+        "database",
+        "http"
+      ]
+    }
+  }
+}

@@ -50,6 +50,9 @@ class LocalAuditLogRepository(context: Context) : AuditLogRepository {
                             } ?: AuditLogCategory.SYSTEM,
                             title = title,
                             detail = item.optString("detail"),
+                            source = enumValues<AuditLogSource>().firstOrNull {
+                                it.name == item.optString("source")
+                            } ?: AuditLogSource.ON_SITE_TERMINAL,
                             queueId = item.optString("queueId").takeIf { it.isNotBlank() },
                             publicEventType = enumValues<PublicQueueEventType>().firstOrNull {
                                 it.name == item.optString("publicEventType")
@@ -80,6 +83,7 @@ class LocalAuditLogRepository(context: Context) : AuditLogRepository {
                     put("category", entry.category.name)
                     put("title", entry.title)
                     put("detail", entry.detail)
+                    put("source", entry.source.name)
                     put("queueId", entry.queueId ?: JSONObject.NULL)
                     put("publicEventType", entry.publicEventType?.name ?: JSONObject.NULL)
                     put(

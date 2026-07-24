@@ -84,6 +84,37 @@ class AuditLogsTest {
     }
 
     @Test
+    fun operationSourceIsKeptOnQueueAndPlayerProfileLogs() {
+        val queueLog = createQueueAuditLog(
+            category = AuditLogCategory.MACHINE_A,
+            machineLabel = "机台 A",
+            before = MachineQueue(),
+            after = MachineQueue(waiting = listOf(registration(1))),
+            source = AuditLogSource.QQ_BOT,
+            timestampMillis = 1_000L
+        )
+        val profile = PlayerProfile(
+            id = "profile-1",
+            nickname = "玩家",
+            gender = PlayerGender.UNDISCLOSED,
+            defaultPreference = ProfilePlayPreference.ASK_EVERY_TIME,
+            createdAtMillis = 100L,
+            updatedAtMillis = 100L
+        )
+
+        assertEquals(AuditLogSource.QQ_BOT, queueLog?.source)
+        assertEquals(
+            AuditLogSource.SYSTEM_AUTOMATIC,
+            createPlayerProfileAuditLog(
+                before = null,
+                after = profile,
+                source = AuditLogSource.SYSTEM_AUTOMATIC,
+                timestampMillis = 1_000L
+            ).source
+        )
+    }
+
+    @Test
     fun temporaryAwaySkipAndAutomaticExitAreExplained() {
         val away = registration(1, "暂离玩家").copy(
             absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
@@ -163,7 +194,7 @@ class AuditLogsTest {
         assertEquals("编辑玩家资料", editedLog.title)
         assertTrue(editedLog.detail.contains("昵称由“小红”改为“小虹”"))
         assertTrue(editedLog.detail.contains("默认偏好改为允许他人加入"))
-        assertTrue(editedLog.detail.contains("联系方式已更新"))
+        assertTrue(editedLog.detail.contains("QQ 号已更新"))
         assertTrue(!editedLog.detail.contains("12345678"))
     }
 }

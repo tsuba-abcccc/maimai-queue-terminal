@@ -91,7 +91,6 @@ class PlayerProfilesTest {
             gender = PlayerGender.FEMALE,
             defaultPreference = ProfilePlayPreference.OPEN_TO_JOIN,
             qqNumber = "  12345678  ",
-            phoneNumber = "  +86 138-0000-0000  ",
             createdAtMillis = 700L
         )
         val second = createPlayerProfile(
@@ -103,30 +102,27 @@ class PlayerProfilesTest {
 
         assertEquals("小雨", first.nickname)
         assertEquals("12345678", first.qqNumber)
-        assertNull(first.phoneNumber)
         assertTrue(first.hasValidContact)
         assertNotEquals(first.id, second.id)
         assertEquals(700L, first.updatedAtMillis)
     }
 
     @Test
-    fun legacyProfilesNeedAtLeastOneValidContactMethod() {
+    fun legacyProfilesNeedAValidQqNumber() {
         val legacyProfile = profile("1", "旧资料")
 
         assertFalse(legacyProfile.hasValidContact)
         assertTrue(legacyProfile.copy(qqNumber = "12345").hasValidContact)
-        assertTrue(legacyProfile.copy(phoneNumber = "13800138000").hasValidContact)
         assertFalse(legacyProfile.copy(qqNumber = "1234").hasValidContact)
-        assertFalse(legacyProfile.copy(phoneNumber = "123456").hasValidContact)
     }
 
     @Test
-    fun contactValidationAcceptsQqAndMainlandChinaMobileNumbersOnly() {
+    fun contactValidationAcceptsOnlyFiveToTwelveDigitQqNumbers() {
+        assertTrue(isValidQqNumber("12345"))
         assertTrue(isValidQqNumber("123456789012"))
+        assertFalse(isValidQqNumber("1234"))
         assertFalse(isValidQqNumber("1234567890123"))
-        assertTrue(isValidPhoneNumber("13800138000"))
-        assertFalse(isValidPhoneNumber("+8613800138000"))
-        assertFalse(isValidPhoneNumber("01012345678"))
+        assertFalse(isValidQqNumber("12345a"))
     }
 
     @Test

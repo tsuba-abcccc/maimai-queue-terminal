@@ -38,9 +38,101 @@ data class QueueCloudSyncStatus(
     val retryDetail: String? = null
 )
 
+internal fun combinedQueueCloudSyncStatus(
+    publicStatus: QueueCloudSyncStatus,
+    privateFailureDetail: String?
+): QueueCloudSyncStatus {
+    val privateDetail = privateFailureDetail?.trim()?.takeIf { it.isNotEmpty() }
+        ?: return publicStatus
+    if (publicStatus.phase == QueueCloudSyncPhase.DISABLED ||
+        publicStatus.phase == QueueCloudSyncPhase.NOT_CONFIGURED
+    ) {
+        return publicStatus
+    }
+    val combinedDetail = listOfNotNull(
+        publicStatus.retryDetail?.takeIf {
+            publicStatus.phase == QueueCloudSyncPhase.WAITING_TO_RETRY
+        },
+        "资料与命令同步：$privateDetail"
+    ).distinct().joinToString("；")
+    return publicStatus.copy(
+        phase = QueueCloudSyncPhase.WAITING_TO_RETRY,
+        retryDetail = combinedDetail
+    )
+}
+
 internal sealed interface QueuePublishResult {
     data object Success : QueuePublishResult
     data class Failure(val detail: String) : QueuePublishResult
+}
+
+internal data class PlayerProfileUpdateCommand(
+    val commandId: String,
+    val profileId: String,
+    val qqNumber: String,
+    val expectedUpdatedAtMillis: Long,
+    val nickname: String,
+    val gender: PlayerGender,
+    val defaultPreference: ProfilePlayPreference
+)
+
+internal sealed interface PlayerProfileCommandDecision {
+    data class Apply(val profile: PlayerProfile) : PlayerProfileCommandDecision
+    data object AlreadyApplied : PlayerProfileCommandDecision
+    data class Reject(val detail: String) : PlayerProfileCommandDecision
+}
+
+internal fun decidePlayerProfileUpdate(
+    command: PlayerProfileUpdateCommand,
+    profiles: List<PlayerProfile>,
+    nicknameConflictsWithQueue: (nickname: String, profileId: String) -> Boolean,
+    nowMillis: Long = System.currentTimeMillis()
+): PlayerProfileCommandDecision {
+    val profile = profiles.firstOrNull { it.id == command.profileId }
+        ?: return PlayerProfileCommandDecision.Reject("玩家资料已不存在。")
+    if (profile.normalizedQqNumber() != command.qqNumber) {
+        return PlayerProfileCommandDecision.Reject("玩家资料绑定的 QQ 已发生变化。")
+    }
+    val desiredAlreadyPresent = profile.nickname == command.nickname &&
+        profile.gender == command.gender &&
+        profile.defaultPreference == command.defaultPreference
+    if (profile.updatedAtMillis != command.expectedUpdatedAtMillis) {
+        return if (desiredAlreadyPresent) {
+            PlayerProfileCommandDecision.AlreadyApplied
+        } else {
+            PlayerProfileCommandDecision.Reject("玩家资料已在终端发生更新，请重新提交修改。")
+        }
+    }
+    if (profiles.any {
+            it.id != profile.id && it.nickname.equals(command.nickname, ignoreCase = true)
+        }
+    ) {
+        return PlayerProfileCommandDecision.Reject("这个昵称已经用于其他玩家资料。")
+    }
+    if (nicknameConflictsWithQueue(command.nickname, profile.id)) {
+        return PlayerProfileCommandDecision.Reject("这个昵称已经用于当前队列中的其他登记。")
+    }
+    return if (desiredAlreadyPresent) {
+        PlayerProfileCommandDecision.AlreadyApplied
+    } else {
+        PlayerProfileCommandDecision.Apply(
+            profile.copy(
+                nickname = command.nickname,
+                gender = command.gender,
+                defaultPreference = command.defaultPreference,
+                updatedAtMillis = nowMillis
+            )
+        )
+    }
+}
+
+internal interface QueueCommandClient {
+    val isConfigured: Boolean
+    val profileSyncFailureDetail: String?
+    val commandSyncFailureDetail: String?
+    suspend fun fetchPlayerProfiles(): List<PlayerProfile>?
+    suspend fun fetchPlayerProfileUpdates(): List<PlayerProfileUpdateCommand>?
+    suspend fun complete(commandId: String, applied: Boolean, detail: String): Boolean
 }
 
 internal interface QueueStatePublisher {
@@ -48,19 +140,30 @@ internal interface QueueStatePublisher {
     suspend fun publish(
         state: PersistedQueueState,
         auditLogs: List<AuditLogEntry> = emptyList(),
-        displaySettings: QueuePublicDisplaySettings = QueuePublicDisplaySettings()
+        displaySettings: QueuePublicDisplaySettings = QueuePublicDisplaySettings(),
+        playerProfiles: List<PlayerProfile> = emptyList()
     ): QueuePublishResult
 }
 
 internal data class QueuePublicDisplaySettings(
     val machineARemark: String = DEFAULT_MACHINE_A_REMARK,
-    val machineBRemark: String = DEFAULT_MACHINE_B_REMARK
+    val machineBRemark: String = DEFAULT_MACHINE_B_REMARK,
+    val oneBotSyncEnabled: Boolean = true,
+    val businessHours: QueuePublicBusinessHours = QueuePublicBusinessHours()
+)
+
+internal data class QueuePublicBusinessHours(
+    val enabled: Boolean = false,
+    val outsideBusinessHours: Boolean = false,
+    val closingSoon: Boolean = false,
+    val closesAtMillis: Long? = null
 )
 
 private data class QueuePublishPayload(
     val state: PersistedQueueState,
     val auditLogs: List<AuditLogEntry>,
-    val displaySettings: QueuePublicDisplaySettings
+    val displaySettings: QueuePublicDisplaySettings,
+    val playerProfiles: List<PlayerProfile>
 )
 
 internal class HttpQueueStatePublisher(
@@ -76,16 +179,18 @@ internal class HttpQueueStatePublisher(
     override suspend fun publish(
         state: PersistedQueueState,
         auditLogs: List<AuditLogEntry>,
-        displaySettings: QueuePublicDisplaySettings
+        displaySettings: QueuePublicDisplaySettings,
+        playerProfiles: List<PlayerProfile>
     ): QueuePublishResult =
         withContext(Dispatchers.IO) {
             runCatching {
-                val body = buildPublicQueueSnapshot(
+                val body = buildQueueSyncSnapshot(
                     state = state,
                     terminalId = terminalId,
                     capturedAtMillis = System.currentTimeMillis(),
                     auditLogs = auditLogs,
-                    displaySettings = displaySettings
+                    displaySettings = displaySettings,
+                    playerProfiles = playerProfiles
                 ).toString().toByteArray(Charsets.UTF_8)
                 val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
@@ -98,7 +203,7 @@ internal class HttpQueueStatePublisher(
                     setRequestProperty("Content-Type", "application/json; charset=utf-8")
                     setRequestProperty("Authorization", "Bearer $token")
                     setRequestProperty("X-Device-ID", terminalId)
-                    setRequestProperty("X-Queue-Schema-Version", PUBLIC_SCHEMA_VERSION.toString())
+                    setRequestProperty("X-Queue-Schema-Version", SYNC_SCHEMA_VERSION.toString())
                 }
                 try {
                     connection.outputStream.use { it.write(body) }
@@ -128,6 +233,220 @@ internal class HttpQueueStatePublisher(
 
     private companion object {
         const val LOG_TAG = "QueueCloudSync"
+        const val MAX_ERROR_BODY_LENGTH = 512
+    }
+}
+
+internal class HttpQueueCommandClient(
+    context: Context,
+    private val queueStatusEndpoint: String,
+    private val token: String
+) : QueueCommandClient {
+    private val terminalId = LocalTerminalIdentity(context).getOrCreateId()
+    private val endpointBase = queueStatusEndpoint.trimEnd('/').substringBeforeLast('/')
+    private val commandsEndpoint = endpointBase +
+        "/queue-terminal/commands"
+    private val profilesEndpoint = endpointBase +
+        "/queue-terminal/profiles"
+
+    @Volatile
+    override var profileSyncFailureDetail: String? = null
+        private set
+
+    @Volatile
+    override var commandSyncFailureDetail: String? = null
+        private set
+
+    override val isConfigured: Boolean =
+        queueStatusEndpoint.startsWith("https://") && token.isNotBlank()
+
+    override suspend fun fetchPlayerProfiles(): List<PlayerProfile>? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val connection = openConnection(profilesEndpoint, "GET")
+                try {
+                    requireSuccessfulResponse(connection)
+                    val response = connection.inputStream.bufferedReader(Charsets.UTF_8)
+                        .use { it.readText() }
+                    val profiles = JSONObject(response).getJSONArray("profiles")
+                    buildList {
+                        repeat(profiles.length()) { index ->
+                            parsePlayerProfile(profiles.optJSONObject(index))?.let(::add)
+                        }
+                    }
+                } finally {
+                    connection.disconnect()
+                }
+            }.fold(
+                onSuccess = { profiles ->
+                    profileSyncFailureDetail = null
+                    profiles
+                },
+                onFailure = { error ->
+                    Log.w(LOG_TAG, "Player profile fetch failed", error)
+                    profileSyncFailureDetail = queuePublishFailureDetail(error)
+                    null
+                }
+            )
+        }
+
+    override suspend fun fetchPlayerProfileUpdates(): List<PlayerProfileUpdateCommand>? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val connection = openConnection(commandsEndpoint, "GET")
+                try {
+                    requireSuccessfulResponse(connection)
+                    val response = connection.inputStream.bufferedReader(Charsets.UTF_8)
+                        .use { it.readText() }
+                    val commands = JSONObject(response).getJSONArray("commands")
+                    buildList {
+                        repeat(commands.length()) { index ->
+                            parsePlayerProfileUpdate(commands.optJSONObject(index))?.let(::add)
+                        }
+                    }
+                } finally {
+                    connection.disconnect()
+                }
+            }.fold(
+                onSuccess = { commands ->
+                    commandSyncFailureDetail = null
+                    commands
+                },
+                onFailure = { error ->
+                    Log.w(LOG_TAG, "Queue command fetch failed", error)
+                    commandSyncFailureDetail = queuePublishFailureDetail(error)
+                    null
+                }
+            )
+        }
+
+    override suspend fun complete(
+        commandId: String,
+        applied: Boolean,
+        detail: String
+    ): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            val body = JSONObject().apply {
+                put("status", if (applied) "APPLIED" else "REJECTED")
+                put("detail", detail.take(MAX_COMMAND_DETAIL_LENGTH))
+            }.toString().toByteArray(Charsets.UTF_8)
+            val endpoint = "$commandsEndpoint/$commandId/result"
+            val connection = openConnection(endpoint, "POST").apply {
+                doOutput = true
+                setFixedLengthStreamingMode(body.size)
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            }
+            try {
+                connection.outputStream.use { it.write(body) }
+                requireSuccessfulResponse(connection)
+            } finally {
+                connection.disconnect()
+            }
+        }.fold(
+            onSuccess = {
+                commandSyncFailureDetail = null
+                true
+            },
+            onFailure = { error ->
+                Log.w(LOG_TAG, "Queue command completion failed", error)
+                commandSyncFailureDetail = queuePublishFailureDetail(error)
+                false
+            }
+        )
+    }
+
+    private fun openConnection(endpoint: String, method: String): HttpURLConnection =
+        (URL(endpoint).openConnection() as HttpURLConnection).apply {
+            requestMethod = method
+            connectTimeout = NETWORK_TIMEOUT_MILLIS
+            readTimeout = NETWORK_TIMEOUT_MILLIS
+            useCaches = false
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("Authorization", "Bearer $token")
+            setRequestProperty("X-Device-ID", terminalId)
+            setRequestProperty("X-Queue-Schema-Version", SYNC_SCHEMA_VERSION.toString())
+        }
+
+    private fun requireSuccessfulResponse(connection: HttpURLConnection) {
+        val responseCode = connection.responseCode
+        if (responseCode !in 200..299) {
+            val serverMessage = connection.errorStream?.bufferedReader(Charsets.UTF_8)
+                ?.use { reader -> reader.readText().take(MAX_ERROR_BODY_LENGTH) }
+                ?.let { responseBody ->
+                    runCatching {
+                        JSONObject(responseBody).optString("error").trim()
+                            .takeIf { it.isNotEmpty() }
+                    }.getOrNull()
+                }
+            throw QueueEndpointException(responseCode, serverMessage)
+        }
+    }
+
+    private fun parsePlayerProfileUpdate(command: JSONObject?): PlayerProfileUpdateCommand? {
+        if (command == null || command.optString("type") != PROFILE_UPDATE_COMMAND) return null
+        val payload = command.optJSONObject("payload") ?: return null
+        return runCatching {
+            PlayerProfileUpdateCommand(
+                commandId = command.getString("command_id"),
+                profileId = payload.getString("profile_id"),
+                qqNumber = payload.getString("qq_number"),
+                expectedUpdatedAtMillis = payload.getLong("expected_updated_at"),
+                nickname = payload.getString("nickname").trim(),
+                gender = PlayerGender.valueOf(payload.getString("gender")),
+                defaultPreference = ProfilePlayPreference.valueOf(
+                    payload.getString("default_preference")
+                )
+            )
+        }.getOrNull()?.takeIf { parsed ->
+            runCatching { UUID.fromString(parsed.commandId) }.isSuccess &&
+                runCatching { UUID.fromString(parsed.profileId) }.isSuccess &&
+                isValidQqNumber(parsed.qqNumber) &&
+                parsed.expectedUpdatedAtMillis > 0L &&
+                parsed.nickname.isNotBlank() &&
+                parsed.nickname.codePointCount(0, parsed.nickname.length) <= 18
+        }
+    }
+
+    private fun parsePlayerProfile(source: JSONObject?): PlayerProfile? {
+        if (source == null) return null
+        return runCatching {
+            val qqNumber = if (source.isNull("qq_number")) {
+                null
+            } else {
+                source.getString("qq_number")
+            }
+            PlayerProfile(
+                id = source.getString("profile_id"),
+                nickname = source.getString("nickname").trim(),
+                gender = PlayerGender.valueOf(source.getString("gender")),
+                defaultPreference = ProfilePlayPreference.valueOf(
+                    source.getString("default_preference")
+                ),
+                qqNumber = qqNumber,
+                usageCount = source.getInt("usage_count"),
+                lastUsedAtMillis = if (source.isNull("last_used_at")) {
+                    null
+                } else {
+                    source.getLong("last_used_at")
+                },
+                createdAtMillis = source.getLong("created_at"),
+                updatedAtMillis = source.getLong("updated_at")
+            ).withCanonicalContact()
+        }.getOrNull()?.takeIf { profile ->
+            runCatching { UUID.fromString(profile.id) }.isSuccess &&
+                profile.nickname.isNotBlank() &&
+                profile.nickname.codePointCount(0, profile.nickname.length) <= 18 &&
+                profile.usageCount >= 0 &&
+                profile.createdAtMillis > 0L &&
+                profile.updatedAtMillis > 0L &&
+                (profile.qqNumber == null || isValidQqNumber(profile.qqNumber))
+        }
+    }
+
+    private companion object {
+        const val LOG_TAG = "QueueCommandSync"
+        const val PROFILE_UPDATE_COMMAND = "UPDATE_PLAYER_PROFILE"
+        const val MAX_COMMAND_DETAIL_LENGTH = 500
         const val MAX_ERROR_BODY_LENGTH = 512
     }
 }
@@ -202,7 +521,8 @@ internal class QueueCloudSyncController(
     fun submit(
         state: PersistedQueueState,
         auditLogs: List<AuditLogEntry> = emptyList(),
-        displaySettings: QueuePublicDisplaySettings = QueuePublicDisplaySettings()
+        displaySettings: QueuePublicDisplaySettings = QueuePublicDisplaySettings(),
+        playerProfiles: List<PlayerProfile> = emptyList()
     ) {
         if (!enabled) return
         if (!publisher.isConfigured) {
@@ -210,7 +530,7 @@ internal class QueueCloudSyncController(
             return
         }
         startPublishLoop()
-        updates.trySend(QueuePublishPayload(state, auditLogs, displaySettings))
+        updates.trySend(QueuePublishPayload(state, auditLogs, displaySettings, playerProfiles))
     }
 
     private fun startPublishLoop() {
@@ -250,7 +570,8 @@ internal class QueueCloudSyncController(
             when (val result = publisher.publish(
                 payloadToPublish.state,
                 payloadToPublish.auditLogs,
-                payloadToPublish.displaySettings
+                payloadToPublish.displaySettings,
+                payloadToPublish.playerProfiles
             )) {
                 QueuePublishResult.Success -> {
                     if (!enabled) return
@@ -288,6 +609,69 @@ internal class QueueCloudSyncController(
     }
 }
 
+internal fun buildQueueSyncSnapshot(
+    state: PersistedQueueState,
+    terminalId: String,
+    capturedAtMillis: Long,
+    auditLogs: List<AuditLogEntry> = emptyList(),
+    displaySettings: QueuePublicDisplaySettings = QueuePublicDisplaySettings(),
+    playerProfiles: List<PlayerProfile> = emptyList()
+): JSONObject = buildPublicQueueSnapshot(
+    state = state,
+    terminalId = terminalId,
+    capturedAtMillis = capturedAtMillis,
+    auditLogs = auditLogs,
+    displaySettings = displaySettings
+).apply {
+    put("schema_version", SYNC_SCHEMA_VERSION)
+    val profilesById = playerProfiles.associateBy(PlayerProfile::id)
+    put(
+        "private_player_profiles",
+        JSONArray().apply {
+            playerProfiles.forEach { profile ->
+                put(
+                    JSONObject().apply {
+                        put("profile_id", profile.id)
+                        put("nickname", profile.nickname)
+                        put("gender", profile.gender.name)
+                        put("default_preference", profile.defaultPreference.name)
+                        put(
+                            "qq_number",
+                            profile.normalizedQqNumber()
+                                ?.takeIf(::isValidQqNumber)
+                                ?: JSONObject.NULL
+                        )
+                        put("usage_count", profile.usageCount)
+                        put("last_used_at", profile.lastUsedAtMillis ?: JSONObject.NULL)
+                        put("created_at", profile.createdAtMillis)
+                        put("updated_at", profile.updatedAtMillis)
+                    }
+                )
+            }
+        }
+    )
+    put(
+        "private_player_contacts",
+        JSONArray().apply {
+            sequenceOf(state.machineA, state.machineB)
+                .flatMap { machine -> machine.allRegistrations.asSequence() }
+                .mapNotNull { registration ->
+                    val profileId = registration.playerProfileId ?: return@mapNotNull null
+                    val qqNumber = profilesById[profileId]
+                        ?.normalizedQqNumber()
+                        ?.takeIf(::isValidQqNumber)
+                        ?: return@mapNotNull null
+                    JSONObject().apply {
+                        put("registration_id", publicRegistrationId(state.queueId, registration.key))
+                        put("profile_id", profileId)
+                        put("qq_number", qqNumber)
+                    }
+                }
+                .forEach(::put)
+        }
+    )
+}
+
 internal fun buildPublicQueueSnapshot(
     state: PersistedQueueState,
     terminalId: String,
@@ -300,6 +684,16 @@ internal fun buildPublicQueueSnapshot(
     put("revision", state.revision)
     put("captured_at", capturedAtMillis)
     put("registration_open", state.registrationOpen)
+    put("onebot_sync_enabled", displaySettings.oneBotSyncEnabled)
+    put(
+        "business_hours",
+        JSONObject().apply {
+            put("enabled", displaySettings.businessHours.enabled)
+            put("outside", displaySettings.businessHours.outsideBusinessHours)
+            put("closing_soon", displaySettings.businessHours.closingSoon)
+            put("closes_at", displaySettings.businessHours.closesAtMillis ?: JSONObject.NULL)
+        }
+    )
     put(
         "terminal",
         JSONObject().apply {
@@ -376,6 +770,7 @@ private fun buildPublicQueueEvent(queueId: String, event: AuditLogEntry): JSONOb
         )
         put("title", event.title.take(MAX_PUBLIC_EVENT_TITLE_LENGTH))
         put("detail", event.detail.take(MAX_PUBLIC_EVENT_DETAIL_LENGTH))
+        put("operation_source", event.source.name)
         put(
             "registration_ids",
             JSONArray().apply {
@@ -398,6 +793,7 @@ private fun buildPublicMachine(
     put("name", machineName)
     put("operational", status.isOperational)
     put("stop_reason", status.stopReason?.name ?: JSONObject.NULL)
+    put("stop_reason_detail", status.stopReasonDetail ?: JSONObject.NULL)
     put("stopped_at", status.stoppedAtMillis ?: JSONObject.NULL)
     put("playing_started_at", queue.playingStartedAtMillis ?: JSONObject.NULL)
     put("registration_count", queue.registrationCount)
@@ -506,7 +902,8 @@ private class LocalTerminalIdentity(context: Context) {
     }
 }
 
-private const val PUBLIC_SCHEMA_VERSION = 2
+private const val PUBLIC_SCHEMA_VERSION = 3
+private const val SYNC_SCHEMA_VERSION = 3
 private const val MAX_PUBLIC_EVENTS_PER_SNAPSHOT = 200
 private const val MAX_PUBLIC_EVENT_TITLE_LENGTH = 120
 private const val MAX_PUBLIC_EVENT_DETAIL_LENGTH = 2_000

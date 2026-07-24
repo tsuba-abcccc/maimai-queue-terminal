@@ -5,6 +5,28 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class QueueModelsTest {
+    @Test
+    fun roundEndPreviewIncludesCurrentPlayersWhenEveryWaitingRegistrationIsUnavailable() {
+        val current = registration(1, PlayPreference.SOLO)
+        val deferred = registration(2, PlayPreference.SOLO).copy(
+            absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+        )
+        val away = registration(3, PlayPreference.SOLO).copy(
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY
+        )
+        val queue = MachineQueue(
+            playing = listOf(current),
+            waiting = listOf(deferred, away),
+            playingStartedAtMillis = 100L
+        )
+
+        val preview = queue.nextPlayingPositionPreviewAfterRoundEnd()
+
+        assertEquals(listOf(1), preview?.nextRegistrations?.map { it.key })
+        assertEquals(setOf(2, 3), preview?.unavailableRegistrations?.map { it.key }?.toSet())
+        assertTrue(preview?.changedByAbsence == true)
+    }
+
     private fun registration(
         key: Int,
         preference: PlayPreference = PlayPreference.OPEN_TO_JOIN
@@ -39,6 +61,59 @@ class QueueModelsTest {
 
         assertEquals(listOf(3), queue.playing.map { it.key })
         assertEquals(listOf(1, 2), queue.waiting.map { it.key })
+    }
+
+    @Test
+    fun completingARoundClearsOnlyTheCompletedPlayersCurrentNoShowState() {
+        val completed = registration(1, PlayPreference.SOLO).copy(
+            noShowCount = 2,
+            lastNoShowActionWasDefer = true
+        )
+        val next = registration(2, PlayPreference.SOLO).copy(
+            noShowCount = 1,
+            lastNoShowActionWasDefer = true
+        )
+
+        val queue = MachineQueue(
+            playing = listOf(completed),
+            waiting = listOf(next)
+        ).finishRound(8_000L)
+
+        assertEquals(1, queue.playing.single().noShowCount)
+        assertTrue(queue.playing.single().lastNoShowActionWasDefer)
+        assertEquals(0, queue.waiting.single().noShowCount)
+        assertTrue(!queue.waiting.single().lastNoShowActionWasDefer)
+        assertEquals(8_000L, queue.waiting.single().lastPlayedAtMillis)
+    }
+
+    @Test
+    fun removingCurrentRoundRegistrationsLeavesTheNextRoundWaiting() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1), registration(2)),
+            waiting = listOf(registration(3, PlayPreference.SOLO))
+        )
+
+        val removed = queue.removeAll(queue.playing.mapTo(mutableSetOf()) { it.key })
+
+        assertTrue(removed.playing.isEmpty())
+        assertEquals(listOf(3), removed.waiting.map { it.key })
+        assertEquals(null, removed.playingStartedAtMillis)
+    }
+
+    @Test
+    fun correctingAnErroneousPlayingPlacementDoesNotClearNoShowState() {
+        val registration = registration(1, PlayPreference.SOLO).copy(
+            noShowCount = 2,
+            lastNoShowActionWasDefer = true
+        )
+
+        val corrected = MachineQueue(playing = listOf(registration))
+            .returnPlayingRegistrationsToWaitingFront(setOf(1))
+            .waiting
+            .single()
+
+        assertEquals(2, corrected.noShowCount)
+        assertTrue(corrected.lastNoShowActionWasDefer)
     }
 
     @Test
@@ -905,6 +980,24 @@ class QueueModelsTest {
         assertEquals(MachineStopReason.NOT_POWERED_ON, repeatedStop.stopReason)
         assertEquals(100L, repeatedStop.stoppedAtMillis)
         assertTrue(repeatedStop.restore().isOperational)
+    }
+
+    @Test
+    fun machineStopDetailIsNormalizedAndKeptOnlyForOtherReason() {
+        val other = MachineStatus().stop(
+            MachineStopReason.OTHER,
+            100L,
+            "  按钮\n失灵  "
+        )
+        val maintenance = MachineStatus().stop(
+            MachineStopReason.MAINTENANCE,
+            200L,
+            "不应保留"
+        )
+
+        assertEquals("按钮失灵", other.stopReasonDetail)
+        assertEquals(null, maintenance.stopReasonDetail)
+        assertEquals(MachineStopReason.MAINTENANCE, maintenance.stopReason)
     }
 
     @Test

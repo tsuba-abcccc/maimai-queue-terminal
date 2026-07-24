@@ -6,6 +6,11 @@
 /.idea/
 /.kotlin/
 /tmp/
+/koishi-bot/node_modules/
+/koishi-bot/lib/
+/koishi-bot/*.tsbuildinfo
+/koishi-bot/*.tgz
+/koishi-bot/package-lock.json
 .DS_Store
 /build
 /captures
