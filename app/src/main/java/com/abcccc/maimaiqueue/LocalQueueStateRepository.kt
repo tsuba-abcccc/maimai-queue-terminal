@@ -11,7 +11,13 @@ import java.util.UUID
 
 interface QueueStateRepository {
     suspend fun getState(): PersistedQueueState?
-    suspend fun saveState(state: PersistedQueueState)
+    suspend fun saveState(state: PersistedQueueState): QueueStateSaveResult
+}
+
+enum class QueueStateSaveResult {
+    SAVED,
+    SUPERSEDED,
+    FAILED
 }
 
 data class PersistedQueueState(
@@ -50,14 +56,25 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
     )
 
     override suspend fun getState(): PersistedQueueState? = withContext(Dispatchers.IO) {
-        preferences.getString(KEY_STATE, null)?.let(::decodeState)
+        saveMutex.withLock {
+            preferences.getString(KEY_STATE, null)?.let(::decodeState)
+        }
     }
 
-    override suspend fun saveState(state: PersistedQueueState) = withContext(Dispatchers.IO) {
+    override suspend fun saveState(state: PersistedQueueState): QueueStateSaveResult =
+        withContext(Dispatchers.IO) {
         saveMutex.withLock {
-            preferences.edit().putString(KEY_STATE, encodeState(state).toString()).commit()
+            val persistedState = preferences.getString(KEY_STATE, null)?.let(::decodeState)
+            if (!shouldPersistQueueState(state, persistedState)) {
+                return@withLock QueueStateSaveResult.SUPERSEDED
+            }
+            val saved = runCatching {
+                preferences.edit()
+                    .putString(KEY_STATE, encodeState(state).toString())
+                    .commit()
+            }.getOrDefault(false)
+            if (saved) QueueStateSaveResult.SAVED else QueueStateSaveResult.FAILED
         }
-        Unit
     }
 
     private fun encodeState(state: PersistedQueueState): JSONObject = JSONObject().apply {
@@ -148,12 +165,11 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
         val playing = decodeRegistrations(value.optJSONArray("playing")) ?: return null
         val waiting = decodeRegistrations(value.optJSONArray("waiting")) ?: return null
         if (playing.size > 2) return null
-        return MachineQueue(
+        return normalizeRestoredMachineQueue(MachineQueue(
             playing = playing,
             waiting = waiting,
             playingStartedAtMillis = value.optLongOrNull("playingStartedAtMillis")
-                ?.takeIf { playing.isNotEmpty() }
-        )
+        ))
     }
 
     private fun decodeRegistrations(value: JSONArray?): List<Registration>? {
@@ -176,6 +192,7 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
             } else {
                 QueueAbsenceStatus.NONE
             }
+            val noShowCount = item.optInt("noShowCount").coerceIn(0, MAX_SYNCED_NO_SHOW_COUNT)
             registrations += Registration(
                 key = key,
                 displayId = displayId,
@@ -191,10 +208,12 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                 isTemporary = item.optBoolean("isTemporary", true),
                 createdAtMillis = item.optLong("createdAtMillis").takeIf { it > 0L }
                     ?: return null,
-                lastPlayedAtMillis = item.optLongOrNull("lastPlayedAtMillis"),
-                noShowCount = item.optInt("noShowCount").coerceAtLeast(0),
-                lastNoShowActionWasDefer = item.optBoolean("lastNoShowActionWasDefer"),
-                fixedPartnerKey = item.optIntOrNull("fixedPartnerKey"),
+                lastPlayedAtMillis = item.optLongOrNull("lastPlayedAtMillis")
+                    ?.takeIf { it > 0L },
+                noShowCount = noShowCount,
+                lastNoShowActionWasDefer = noShowCount > 0 &&
+                    item.optBoolean("lastNoShowActionWasDefer"),
+                fixedPartnerKey = item.optIntOrNull("fixedPartnerKey")?.takeIf { it > 0 },
                 gender = item.optNullableString("gender")?.let { name ->
                     enumValues<PlayerGender>().firstOrNull { it.name == name }
                 },
@@ -209,14 +228,14 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
         val reason = value.optNullableString("stopReason")?.let { name ->
             enumValues<MachineStopReason>().firstOrNull { it.name == name }
         } ?: return MachineStatus()
-        return MachineStatus(
+        return normalizeRestoredMachineStatus(MachineStatus(
             stopReason = reason,
             stopReasonDetail = normalizeMachineStopReasonDetail(
                 reason,
                 value.optNullableString("stopReasonDetail")
             ),
             stoppedAtMillis = value.optLongOrNull("stoppedAtMillis")
-        )
+        ))
     }
 
     private fun JSONObject.optLongOrNull(name: String): Long? =
@@ -236,7 +255,102 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
     }
 }
 
+internal fun normalizeRestoredMachineStatus(status: MachineStatus): MachineStatus =
+    if (status.isOperational) {
+        MachineStatus()
+    } else {
+        status.copy(
+            stopReasonDetail = normalizeMachineStopReasonDetail(
+                status.stopReason,
+                status.stopReasonDetail
+            ),
+            stoppedAtMillis = status.stoppedAtMillis?.takeIf { it > 0L }
+        )
+    }
+
+internal fun normalizeRestoredMachineQueue(queue: MachineQueue): MachineQueue {
+    val playing = normalizeRestoredRegistrations(queue.playing)
+    val waiting = normalizeRestoredRegistrations(queue.waiting)
+    return queue.copy(
+        playing = playing,
+        waiting = waiting,
+        playingStartedAtMillis = queue.playingStartedAtMillis
+            ?.takeIf { it > 0L && playing.isNotEmpty() }
+    )
+}
+
+private fun normalizeRestoredRegistrations(
+    registrations: List<Registration>
+): List<Registration> {
+    val individuallyNormalized = registrations.map { registration ->
+        val displayId = registration.displayId.trim().takeCodePoints(MAX_SYNCED_NICKNAME_CODE_POINTS)
+        val noShowCount = registration.noShowCount.coerceIn(0, MAX_SYNCED_NO_SHOW_COUNT)
+        registration.copy(
+            displayId = displayId,
+            temporaryAwaySkippedTurns = if (
+                registration.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
+            ) {
+                registration.temporaryAwaySkippedTurns.coerceIn(0, 3)
+            } else {
+                0
+            },
+            createdAtMillis = registration.createdAtMillis.coerceAtLeast(1L),
+            lastPlayedAtMillis = registration.lastPlayedAtMillis?.takeIf { it > 0L },
+            noShowCount = noShowCount,
+            lastNoShowActionWasDefer = noShowCount > 0 &&
+                registration.lastNoShowActionWasDefer,
+            fixedPartnerKey = registration.fixedPartnerKey?.takeIf { it > 0 },
+            playerProfileId = registration.playerProfileId?.trim()?.takeIf { it.isNotEmpty() }
+        )
+    }
+    val paired = sanitizeFriendPairs(individuallyNormalized)
+    val registrationsByKey = paired.associateBy(Registration::key)
+    return paired.map { registration ->
+        val partner = registration.fixedPartnerKey?.let(registrationsByKey::get)
+            ?.takeIf { it.fixedPartnerKey == registration.key }
+            ?: return@map registration
+        val pairAbsenceStatus = when {
+            registration.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY ||
+                partner.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY ->
+                QueueAbsenceStatus.TEMPORARILY_AWAY
+            registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND ||
+                partner.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND ->
+                QueueAbsenceStatus.DEFER_ONE_ROUND
+            else -> QueueAbsenceStatus.NONE
+        }
+        registration.copy(
+            preference = PlayPreference.OPEN_TO_JOIN,
+            absenceStatus = pairAbsenceStatus,
+            temporaryAwaySkippedTurns = if (
+                pairAbsenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
+            ) {
+                maxOf(
+                    registration.temporaryAwaySkippedTurns,
+                    partner.temporaryAwaySkippedTurns
+                )
+            } else {
+                0
+            }
+        )
+    }
+}
+
+private fun String.takeCodePoints(maximum: Int): String =
+    if (codePointCount(0, length) <= maximum) {
+        this
+    } else {
+        substring(0, offsetByCodePoints(0, maximum))
+    }
+
+private const val MAX_SYNCED_NICKNAME_CODE_POINTS = 18
+private const val MAX_SYNCED_NO_SHOW_COUNT = 10_000
+
 internal fun newQueueId(): String = UUID.randomUUID().toString()
+
+internal fun shouldPersistQueueState(
+    candidate: PersistedQueueState,
+    persisted: PersistedQueueState?
+): Boolean = persisted == null || candidate.revision > persisted.revision
 
 private fun isValidQueueId(value: String): Boolean = runCatching {
     UUID.fromString(value)

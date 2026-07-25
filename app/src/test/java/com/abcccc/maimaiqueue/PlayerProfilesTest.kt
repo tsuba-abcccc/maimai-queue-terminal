@@ -13,12 +13,14 @@ class PlayerProfilesTest {
         nickname: String,
         usageCount: Int = 0,
         lastUsedAtMillis: Long? = null,
-        preference: ProfilePlayPreference = ProfilePlayPreference.OPEN_TO_JOIN
+        preference: ProfilePlayPreference = ProfilePlayPreference.OPEN_TO_JOIN,
+        qqNumber: String? = null
     ) = PlayerProfile(
         id = id,
         nickname = nickname,
         gender = PlayerGender.UNDISCLOSED,
         defaultPreference = preference,
+        qqNumber = qqNumber,
         usageCount = usageCount,
         lastUsedAtMillis = lastUsedAtMillis,
         createdAtMillis = 100L,
@@ -58,6 +60,18 @@ class PlayerProfilesTest {
         val result = filterAndSortPlayerProfiles(profiles, "  RI  ", ProfileSortMode.RECOMMENDED)
 
         assertEquals(listOf("Rin"), result.map { it.nickname })
+    }
+
+    @Test
+    fun searchMatchesPlayerQqNumber() {
+        val profiles = listOf(
+            profile("1", "小雨", qqNumber = "12345678"),
+            profile("2", "青空", qqNumber = "87654321")
+        )
+
+        val result = filterAndSortPlayerProfiles(profiles, " 3456 ", ProfileSortMode.RECOMMENDED)
+
+        assertEquals(listOf("小雨"), result.map { it.nickname })
     }
 
     @Test

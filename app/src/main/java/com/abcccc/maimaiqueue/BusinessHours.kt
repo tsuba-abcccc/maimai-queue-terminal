@@ -10,6 +10,7 @@ import java.time.ZonedDateTime
 internal const val MINUTES_PER_DAY = 24 * 60
 internal const val DEFAULT_OPENING_MINUTES = 10 * 60
 internal const val DEFAULT_CLOSING_MINUTES = 22 * 60
+internal const val CLOSING_WARNING_MINUTES = 30L
 internal const val CLOSING_GRACE_MINUTES = 20L
 internal const val CLOSING_GRACE_MILLIS = CLOSING_GRACE_MINUTES * 60_000L
 
@@ -105,9 +106,9 @@ internal fun evaluateBusinessHours(
     return BusinessHoursStatus(
         enabled = true,
         outsideBusinessHours = activeInterval == null,
-        // Kept in the public payload for compatibility with older clients.
-        // 0.3.1 replaces the pre-closing warning with the post-closing grace state.
-        closingSoon = false,
+        closingSoon = activeInterval?.let { interval ->
+            !now.isBefore(interval.closing.minusMinutes(CLOSING_WARNING_MINUTES))
+        } == true,
         closingGracePeriod = closingGracePeriod,
         activeClosingAtMillis = activeInterval?.closing?.toInstant()?.toEpochMilli(),
         registrationClosesAtMillis = closingGraceEndsAt?.toInstant()?.toEpochMilli(),
@@ -147,6 +148,20 @@ internal fun businessHoursCloseTrigger(
         else -> null
     }
 }
+
+internal fun hasUnhandledClosingOccurrence(
+    status: BusinessHoursStatus,
+    lastHandledOccurrenceId: String?
+): Boolean = status.enabled &&
+    status.outsideBusinessHours &&
+    status.mostRecentClosingOccurrenceId != null &&
+    status.mostRecentClosingOccurrenceId != lastHandledOccurrenceId
+
+internal fun isActiveClosingGracePeriod(
+    status: BusinessHoursStatus,
+    lastHandledOccurrenceId: String?
+): Boolean = status.closingGracePeriod &&
+    hasUnhandledClosingOccurrence(status, lastHandledOccurrenceId)
 
 internal fun formatBusinessTime(minutes: Int): String {
     val normalized = minutes.coerceIn(0, MINUTES_PER_DAY - 1)

@@ -2,10 +2,14 @@ package com.abcccc.maimaiqueue.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-val Purple80 = Color(0xFFD0BCFF)
-val PurpleGrey80 = Color(0xFFCCC2DC)
-val Pink80 = Color(0xFFEFB8C8)
-
-val Purple40 = Color(0xFF6650a4)
-val PurpleGrey40 = Color(0xFF625b71)
-val Pink40 = Color(0xFF7D5260)
+val AppBlue = Color(0xFF007AFF)
+val AppBlueDark = Color(0xFF0A84FF)
+val AppSoftBlue = Color(0xFFEAF3FF)
+val AppBackground = Color(0xFFF5F5F7)
+val AppSurface = Color.White
+val AppSurfaceVariant = Color(0xFFFAFAFC)
+val AppText = Color(0xFF1D1D1F)
+val AppSecondaryText = Color(0xFF6E6E73)
+val AppSeparator = Color(0xFFD2D2D7)
+val AppDestructive = Color(0xFFFF3B30)
+val AppWarning = Color(0xFFB85C00)

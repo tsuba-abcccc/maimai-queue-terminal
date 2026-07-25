@@ -1,6 +1,7 @@
 package com.abcccc.maimaiqueue
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -1045,6 +1046,13 @@ class QueueModelsTest {
         assertEquals("按钮失灵", other.stopReasonDetail)
         assertEquals(null, maintenance.stopReasonDetail)
         assertEquals(MachineStopReason.MAINTENANCE, maintenance.stopReason)
+        assertEquals(
+            "😀".repeat(MAX_MACHINE_STOP_REASON_DETAIL_CHARACTERS),
+            normalizeMachineStopReasonDetail(
+                MachineStopReason.OTHER,
+                "😀".repeat(MAX_MACHINE_STOP_REASON_DETAIL_CHARACTERS + 1)
+            )
+        )
     }
 
     @Test
@@ -1184,6 +1192,32 @@ class QueueModelsTest {
     }
 
     @Test
+    fun reorderUsesCurrentRegistrationDetailsInsteadOfStaleProposalCopies() {
+        val original = MachineQueue(
+            waiting = listOf(
+                registration(1).copy(
+                    displayId = "旧昵称",
+                    playerProfileId = "profile-1",
+                    gender = PlayerGender.MALE
+                ),
+                registration(2, PlayPreference.SOLO)
+            )
+        )
+        val staleProposal = original.waiting.reversed()
+        val updated = original.syncPlayerProfileDetails(
+            playerProfileId = "profile-1",
+            playerNickname = "新昵称",
+            gender = PlayerGender.FEMALE
+        )
+
+        val reordered = updated.replaceOrder(staleProposal)
+
+        assertEquals(listOf(2, 1), reordered.waiting.map { it.key })
+        assertEquals("新昵称", reordered.waiting.last().displayId)
+        assertEquals(PlayerGender.FEMALE, reordered.waiting.last().gender)
+    }
+
+    @Test
     fun movingAWaitingPositionInsertsItAtTheChosenPosition() {
         val queue = MachineQueue(
             waiting = listOf(
@@ -1235,6 +1269,92 @@ class QueueModelsTest {
         assertEquals(queue, queue.moveWaitingPosition(sourceIndex = 1, destinationIndex = 1))
         assertEquals(queue, queue.moveWaitingPosition(sourceIndex = -1, destinationIndex = 1))
         assertEquals(queue, queue.moveWaitingPosition(sourceIndex = 1, destinationIndex = 3))
+    }
+
+    @Test
+    fun staleFriendPairPlanCannotOverwriteAChangedWaitingQueue() {
+        val original = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO),
+                registration(2, PlayPreference.SOLO)
+            )
+        )
+        val plan = original.planFriendPair(1, 2)!!
+        val changed = original.copy(
+            waiting = original.waiting + registration(3, PlayPreference.SOLO)
+        )
+
+        assertEquals(changed, changed.applyFriendPair(plan))
+        assertEquals(setOf(1, 2, 3), changed.applyFriendPair(plan).waiting.map { it.key }.toSet())
+    }
+
+    @Test
+    fun friendPairPlanUsesCurrentProfileDetailsInsteadOfStaleCopies() {
+        val original = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    displayId = "旧昵称",
+                    playerProfileId = "profile-1",
+                    gender = PlayerGender.MALE
+                ),
+                registration(2, PlayPreference.SOLO)
+            )
+        )
+        val plan = original.planFriendPair(1, 2)!!
+        val updated = original.syncPlayerProfileDetails(
+            playerProfileId = "profile-1",
+            playerNickname = "新昵称",
+            gender = PlayerGender.FEMALE
+        )
+
+        val paired = updated.applyFriendPair(plan)
+
+        assertEquals(listOf(1, 2), paired.waiting.map { it.key })
+        assertEquals("新昵称", paired.waiting.first().displayId)
+        assertEquals(PlayerGender.FEMALE, paired.waiting.first().gender)
+        assertEquals(2, paired.waiting.first().fixedPartnerKey)
+        assertEquals(1, paired.waiting.last().fixedPartnerKey)
+    }
+
+    @Test
+    fun staleFriendPairPlanIsRejectedWhenQueueBehaviorChanged() {
+        val original = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO),
+                registration(2, PlayPreference.SOLO)
+            )
+        )
+        val plan = original.planFriendPair(1, 2)!!
+        val changed = original.changePreference(1, PlayPreference.OPEN_TO_JOIN)
+
+        assertEquals(changed, changed.applyFriendPair(plan))
+    }
+
+    @Test
+    fun queueOperationStateIgnoresProfileDetailsButNotQueueBehavior() {
+        val original = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    displayId = "旧昵称",
+                    isTemporary = true,
+                    gender = PlayerGender.MALE
+                )
+            )
+        )
+        val profileUpdated = original.copy(
+            waiting = listOf(
+                original.waiting.single().copy(
+                    displayId = "新昵称",
+                    isTemporary = false,
+                    gender = PlayerGender.FEMALE,
+                    playerProfileId = "profile-1"
+                )
+            )
+        )
+        val preferenceUpdated = profileUpdated.changePreference(1, PlayPreference.OPEN_TO_JOIN)
+
+        assertTrue(original.hasSameQueueOperationState(profileUpdated))
+        assertFalse(original.hasSameQueueOperationState(preferenceUpdated))
     }
 
     @Test

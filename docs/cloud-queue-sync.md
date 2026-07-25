@@ -24,7 +24,7 @@ Content-Type: application/json; charset=utf-8
 版本 3 在原有公开字段之外增加以下顶层字段：
 
 - `onebot_sync_enabled`：现场终端当前是否允许 QQ Bot 联动。
-- `business_hours`：只包含 `enabled`、`outside`、`closing_soon`、`closing_grace`、`closes_at` 和 `registration_closes_at` 六个计算结果，不上传完整营业时间表。`closing_soon` 为旧客户端兼容字段，在 `0.3.1` 中固定为 `false`；`closing_grace` 表示已到闭店时间但现有队列仍在收尾，`registration_closes_at` 是最迟收尾时间。
+- `business_hours`：只包含 `enabled`、`outside`、`closing_soon`、`closing_grace`、`closes_at` 和 `registration_closes_at` 六个计算结果，不上传完整营业时间表。`closing_soon` 在营业时段进入闭店前 30 分钟后为 `true`，`closes_at` 是本次闭店时间；`closing_grace` 表示已到闭店时间但现有队列仍在收尾，`registration_closes_at` 是最迟收尾时间。
 
 - `private_player_profiles`：完整玩家资料库。
 - `private_player_contacts`：当前登记与玩家资料、QQ 的关联。
@@ -92,6 +92,8 @@ Authorization: Bearer <QUEUE_BOT_TOKEN>
 `POST /api/queue-bot/players`，JSON 请求体为 `{"qq":"<QQ号>"}`
 
 返回该 QQ 当前是否在队列、所在机台、游玩或等待位置、时间估算、暂缓、暂离和未到场状态。
+
+公开 `GET /api/queue-status` 仅在当前有效登记上附带 `qq_number`，供网站登记详情显示。完整玩家资料、性别、默认偏好和资料 UUID 仍只通过鉴权接口提供；登记离开队列后，其 QQ 不再出现在公开快照中。
 
 受控服务也可以使用不含 QQ 查询条件的 `GET /api/queue-bot/players` 读取全部当前登记绑定。响应包含登记对应的 QQ，仅供 Bot 服务内部处理。
 

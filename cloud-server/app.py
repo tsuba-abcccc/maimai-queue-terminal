@@ -489,6 +489,14 @@ def publish_snapshot():
     queue_id = normalized["queue_id"]
     revision = normalized["revision"]
     onebot_sync_enabled = normalized["onebot_sync_enabled"]
+    current_registration_ids = {
+        registration["registration_id"]
+        for machine in normalized["machines"].values()
+        for registration in all_machine_registrations(machine)
+    }
+    current_contact_ids = {
+        contact["registration_id"] for contact in private_contacts
+    }
     now = int(time.time())
     serialized = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
 
@@ -498,6 +506,19 @@ def publish_snapshot():
         current = connection.execute(
             "SELECT queue_id, revision, device_id, received_at FROM queue_snapshot WHERE id = 1"
         ).fetchone()
+        previous_queue_contacts = {}
+        if current is not None and current["queue_id"] != queue_id:
+            previous_queue_contacts = {
+                row["registration_id"]: row
+                for row in connection.execute(
+                    """
+                    SELECT registration_id, player_id, qq_number
+                    FROM queue_private_contact
+                    WHERE queue_id = ?
+                    """,
+                    (current["queue_id"],),
+                ).fetchall()
+            }
         retired = connection.execute(
             "SELECT 1 FROM retired_queue WHERE queue_id = ?", (queue_id,)
         ).fetchone()
@@ -600,6 +621,12 @@ def publish_snapshot():
                 for contact in private_contacts
             }
         )
+        event_contacts = {
+            registration_id: contact
+            for registration_id, contact in stored_contacts.items()
+            if registration_id not in current_registration_ids
+            or registration_id in current_contact_ids
+        }
         if private_profiles is not None:
             profile_scope_id = current_app.config["PROFILE_SCOPE_ID"]
             connection.executemany(
@@ -664,6 +691,11 @@ def publish_snapshot():
                 (now, BOT_DISABLED_DETAIL, RESULT_SOURCE_BOT_DISABLED),
             )
         for event in sorted(events, key=lambda value: value["occurred_at"]):
+            event_registration_ids = (
+                list(previous_queue_contacts)
+                if event["type"] == "QUEUE_RESET" and previous_queue_contacts
+                else event["registration_ids"]
+            )
             inserted_event = connection.execute(
                 """
                 INSERT OR IGNORE INTO queue_event
@@ -680,10 +712,18 @@ def publish_snapshot():
                     event["title"],
                     event["detail"],
                     event["operation_source"],
-                    json.dumps(event["registration_ids"], separators=(",", ":")),
+                    json.dumps(event_registration_ids, separators=(",", ":")),
                 ),
             )
             if inserted_event.rowcount == 1 and onebot_sync_enabled:
+                if event["type"] == "QUEUE_RESET" and previous_queue_contacts:
+                    recipient_contacts = previous_queue_contacts.values()
+                else:
+                    recipient_contacts = (
+                        event_contacts[registration_id]
+                        for registration_id in event_registration_ids
+                        if registration_id in event_contacts
+                    )
                 connection.executemany(
                     """
                     INSERT INTO queue_event_recipient
@@ -695,15 +735,22 @@ def publish_snapshot():
                         (
                             queue_id,
                             event["event_id"],
-                            registration_id,
-                            stored_contacts[registration_id]["player_id"],
-                            stored_contacts[registration_id]["qq_number"],
+                            contact["registration_id"],
+                            contact["player_id"],
+                            contact["qq_number"],
                             now,
                         )
-                        for registration_id in event["registration_ids"]
-                        if registration_id in stored_contacts
+                        for contact in recipient_contacts
                     ],
                 )
+        stale_current_contact_ids = current_registration_ids - current_contact_ids
+        connection.executemany(
+            """
+            DELETE FROM queue_private_contact
+            WHERE queue_id = ? AND registration_id = ?
+            """,
+            [(queue_id, registration_id) for registration_id in stale_current_contact_ids],
+        )
         connection.execute(
             """
             DELETE FROM queue_event
@@ -862,6 +909,7 @@ def read_bot_players():
         contacts = connection.execute(query, parameters).fetchall()
 
     snapshot = json.loads(snapshot_row["payload"])
+    last_seen_seconds = max(0, int(time.time()) - snapshot_row["received_at"])
     registration_context = index_snapshot_registrations(snapshot)
     players = []
     for contact in contacts:
@@ -875,9 +923,25 @@ def read_bot_players():
                 "qq_number": contact["qq_number"],
                 "display_id": context["registration"]["display_id"],
                 "machine_id": context["machine_id"],
+                "machine_name": context["machine_name"],
+                "machine_operational": context["machine_operational"],
+                "machine_stop_reason": context["machine_stop_reason"],
+                "machine_stop_reason_detail": context[
+                    "machine_stop_reason_detail"
+                ],
+                "playing_started_at": context["playing_started_at"],
                 "position": context["position"],
                 "position_index": context["position_index"],
                 "estimated_wait_minutes": context["estimated_wait_minutes"],
+                "co_player_display_ids": [
+                    registration["display_id"]
+                    for registration in context["position_registrations"]
+                    if registration["registration_id"] != contact["registration_id"]
+                ],
+                "preference": context["registration"]["preference"],
+                "fixed_pair": context["registration"]["fixed_pair"],
+                "registration_type": context["registration"]["registration_type"],
+                "last_played_at": context["registration"]["last_played_at"],
                 "deferred_once": context["registration"]["deferred_once"],
                 "temporarily_away": context["registration"]["temporarily_away"],
                 "temporary_away_skipped_turns": context["registration"][
@@ -895,6 +959,14 @@ def read_bot_players():
             "queue_id": snapshot_row["queue_id"],
             "revision": snapshot_row["revision"],
             "received_at": snapshot_row["received_at"] * 1000,
+            "registration_open": snapshot.get("registration_open", True),
+            "business_hours": snapshot.get("business_hours")
+            or normalize_public_business_hours(None),
+            "terminal": {
+                "online": last_seen_seconds
+                <= current_app.config["ONLINE_TIMEOUT_SECONDS"],
+                "last_seen_seconds": last_seen_seconds,
+            },
             "players": players,
             "capabilities": {"read_players": True, "remote_actions": False},
         }
@@ -1409,24 +1481,35 @@ def cleanup_expired_event_recipients(
 def index_snapshot_registrations(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
     indexed: dict[str, dict[str, Any]] = {}
     for machine_id, machine in snapshot.get("machines", {}).items():
+        machine_context = {
+            "machine_name": machine["name"],
+            "machine_operational": machine["operational"],
+            "machine_stop_reason": machine["stop_reason"],
+            "machine_stop_reason_detail": machine["stop_reason_detail"],
+            "playing_started_at": machine["playing_started_at"],
+        }
         for registration in machine.get("playing", []):
             indexed[registration["registration_id"]] = {
                 "registration": registration,
+                "position_registrations": machine.get("playing", []),
                 "machine_id": machine_id,
                 "position": "PLAYING",
                 "position_index": None,
-                "estimated_wait_minutes": 0,
+                "estimated_wait_minutes": 0 if machine["operational"] else None,
+                **machine_context,
             }
         for waiting_position in machine.get("waiting_positions", []):
             for registration in waiting_position.get("registrations", []):
                 indexed[registration["registration_id"]] = {
                     "registration": registration,
+                    "position_registrations": waiting_position.get("registrations", []),
                     "machine_id": machine_id,
                     "position": "WAITING",
                     "position_index": waiting_position["index"],
                     "estimated_wait_minutes": waiting_position[
                         "estimated_wait_minutes"
                     ],
+                    **machine_context,
                 }
     return indexed
 
@@ -1435,6 +1518,7 @@ def public_capabilities() -> dict[str, Any]:
     return {
         "public_logs": True,
         "local_self_marking": True,
+        "registration_qq": True,
         "remote_actions": False,
         "transport": "polling",
     }
@@ -1565,6 +1649,7 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
         machines,
         private_player_profiles or [],
     )
+    attach_public_registration_contacts(machines, private_player_contacts)
 
     return {
         "schema_version": PUBLIC_SCHEMA_VERSION,
@@ -1828,6 +1913,16 @@ def normalize_machine(
     if len(position_ids) != len(set(position_ids)):
         raise ValidationError(f"机台 {machine_id} 的等待位置编号不能重复")
 
+    playing_started_at = read_optional_integer(
+        source, "playing_started_at", minimum=1
+    )
+    if not operational:
+        playing_started_at = None
+        waiting_positions = [
+            {**position, "estimated_wait_minutes": None}
+            for position in waiting_positions
+        ]
+
     return {
         "id": machine_id,
         "name": normalize_machine_name(machine_id, source, allow_custom_name),
@@ -1835,9 +1930,7 @@ def normalize_machine(
         "stop_reason": stop_reason,
         "stop_reason_detail": stop_reason_detail,
         "stopped_at": read_optional_integer(source, "stopped_at", minimum=1),
-        "playing_started_at": read_optional_integer(
-            source, "playing_started_at", minimum=1
-        ),
+        "playing_started_at": playing_started_at,
         "registration_count": registration_count,
         "waiting_position_count": len(waiting_positions),
         "playing": playing,
@@ -1916,20 +2009,27 @@ def normalize_registration(source: Any, label: str) -> dict[str, Any]:
         raise ValidationError("temporary_away_skipped_turns 数值无效")
     if not temporarily_away and temporary_away_skipped_turns != 0:
         raise ValidationError("非暂时离开登记不能包含轮空次数")
+    deferred_once = read_boolean(source, "deferred_once")
+    if deferred_once and temporarily_away:
+        raise ValidationError("登记不能同时处于暂缓一轮和暂时离开状态")
+    no_show_count = read_integer(source, "no_show_count", minimum=0, maximum=10_000)
+    last_no_show_action_was_defer = read_boolean(
+        source, "last_no_show_action_was_defer"
+    )
+    if no_show_count == 0 and last_no_show_action_was_defer:
+        raise ValidationError("没有未到场记录时不能包含上次处理方式")
 
     return {
         "registration_id": read_public_id(source, "registration_id"),
         "display_id": read_string(source, "display_id", maximum_length=18),
         "preference": read_choice(source, "preference", PREFERENCES),
-        "deferred_once": read_boolean(source, "deferred_once"),
+        "deferred_once": deferred_once,
         "temporarily_away": temporarily_away,
         "temporary_away_skipped_turns": temporary_away_skipped_turns,
         "fixed_pair": fixed_pair,
         "fixed_pair_id": fixed_pair_id,
-        "no_show_count": read_integer(source, "no_show_count", minimum=0, maximum=10_000),
-        "last_no_show_action_was_defer": read_boolean(
-            source, "last_no_show_action_was_defer"
-        ),
+        "no_show_count": no_show_count,
+        "last_no_show_action_was_defer": last_no_show_action_was_defer,
         "registration_type": read_choice(
             source, "registration_type", REGISTRATION_TYPES
         ),
@@ -1947,12 +2047,35 @@ def validate_registration_group(registrations: list[dict[str, Any]], label: str)
     pair_ids = {registration["fixed_pair_id"] for registration in fixed_registrations}
     if len(pair_ids) != 1:
         raise ValidationError(f"{label}的固定组合编号不一致")
+    absence_states = {
+        (
+            registration["deferred_once"],
+            registration["temporarily_away"],
+            registration["temporary_away_skipped_turns"],
+        )
+        for registration in fixed_registrations
+    }
+    if len(absence_states) != 1:
+        raise ValidationError(f"{label}的固定组合暂缓或暂离状态不一致")
 
 
 def all_machine_registrations(machine: dict[str, Any]):
     yield from machine["playing"]
     for position in machine["waiting_positions"]:
         yield from position["registrations"]
+
+
+def attach_public_registration_contacts(
+    machines: dict[str, dict[str, Any]], contacts: list[dict[str, str]]
+) -> None:
+    qq_by_registration_id = {
+        contact["registration_id"]: contact["qq_number"] for contact in contacts
+    }
+    for machine in machines.values():
+        for registration in all_machine_registrations(machine):
+            registration["qq_number"] = qq_by_registration_id.get(
+                registration["registration_id"]
+            )
 
 
 def read_string(source: dict[str, Any], key: str, maximum_length: int) -> str:

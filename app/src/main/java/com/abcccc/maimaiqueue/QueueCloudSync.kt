@@ -20,6 +20,7 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.net.URL
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.UUID
 import javax.net.ssl.SSLException
 
@@ -626,11 +627,12 @@ internal fun buildQueueSyncSnapshot(
     displaySettings = displaySettings
 ).apply {
     put("schema_version", SYNC_SCHEMA_VERSION)
-    val profilesById = playerProfiles.associateBy(PlayerProfile::id)
+    val syncableProfiles = playerProfilesForCloudSync(playerProfiles)
+    val profilesById = syncableProfiles.associateBy(PlayerProfile::id)
     put(
         "private_player_profiles",
         JSONArray().apply {
-            playerProfiles.forEach { profile ->
+            syncableProfiles.forEach { profile ->
                 put(
                     JSONObject().apply {
                         put("profile_id", profile.id)
@@ -673,6 +675,55 @@ internal fun buildQueueSyncSnapshot(
         }
     )
 }
+
+internal fun playerProfilesForCloudSync(profiles: List<PlayerProfile>): List<PlayerProfile> {
+    val normalized = profiles.mapNotNull { profile ->
+        val nickname = profile.nickname.trim().takeCodePointsForSync(18)
+        if (!isValidUuidForSync(profile.id) || nickname.isBlank()) return@mapNotNull null
+        profile.copy(
+            nickname = nickname,
+            qqNumber = profile.normalizedQqNumber()?.takeIf(::isValidQqNumber),
+            usageCount = profile.usageCount.coerceAtLeast(0),
+            lastUsedAtMillis = profile.lastUsedAtMillis?.takeIf { it > 0L },
+            createdAtMillis = profile.createdAtMillis.coerceAtLeast(1L),
+            updatedAtMillis = profile.updatedAtMillis.coerceAtLeast(1L)
+        )
+    }
+    val newestById = normalized.groupBy(PlayerProfile::id).mapValues { (_, matches) ->
+        matches.maxBy(PlayerProfile::updatedAtMillis)
+    }
+    val newestByNickname = newestById.values
+        .groupBy { it.nickname.lowercase(Locale.ROOT) }
+        .mapValues { (_, matches) -> matches.maxBy(PlayerProfile::updatedAtMillis) }
+    val deduplicated = normalized.filter { profile ->
+        newestById[profile.id] === profile &&
+            newestByNickname[profile.nickname.lowercase(Locale.ROOT)] === profile
+    }
+    val duplicateQqNumbers = deduplicated.asSequence()
+        .mapNotNull(PlayerProfile::normalizedQqNumber)
+        .groupingBy { it }
+        .eachCount()
+        .filterValues { count -> count > 1 }
+        .keys
+    return deduplicated.map { profile ->
+        if (profile.normalizedQqNumber() in duplicateQqNumbers) {
+            profile.copy(qqNumber = null)
+        } else {
+            profile
+        }
+    }
+}
+
+private fun isValidUuidForSync(value: String): Boolean = runCatching {
+    UUID.fromString(value)
+}.isSuccess
+
+private fun String.takeCodePointsForSync(maximum: Int): String =
+    if (codePointCount(0, length) <= maximum) {
+        this
+    } else {
+        substring(0, offsetByCodePoints(0, maximum))
+    }
 
 internal fun buildPublicQueueSnapshot(
     state: PersistedQueueState,
@@ -775,8 +826,8 @@ private fun buildPublicQueueEvent(queueId: String, event: AuditLogEntry): JSONOb
                 else -> JSONObject.NULL
             }
         )
-        put("title", event.title.take(MAX_PUBLIC_EVENT_TITLE_LENGTH))
-        put("detail", event.detail.take(MAX_PUBLIC_EVENT_DETAIL_LENGTH))
+        put("title", event.title.takeCodePointsForSync(MAX_PUBLIC_EVENT_TITLE_LENGTH))
+        put("detail", event.detail.takeCodePointsForSync(MAX_PUBLIC_EVENT_DETAIL_LENGTH))
         put("operation_source", event.source.name)
         put(
             "registration_ids",
@@ -802,7 +853,10 @@ private fun buildPublicMachine(
     put("stop_reason", status.stopReason?.name ?: JSONObject.NULL)
     put("stop_reason_detail", status.stopReasonDetail ?: JSONObject.NULL)
     put("stopped_at", status.stoppedAtMillis ?: JSONObject.NULL)
-    put("playing_started_at", queue.playingStartedAtMillis ?: JSONObject.NULL)
+    put(
+        "playing_started_at",
+        queue.playingStartedAtMillis.takeIf { status.isOperational } ?: JSONObject.NULL
+    )
     put("registration_count", queue.registrationCount)
     put("waiting_position_count", queue.waitingPositions().size)
     put(
@@ -827,11 +881,15 @@ private fun buildPublicMachine(
                         })
                         put(
                             "estimated_wait_minutes",
-                            estimatedMinutesUntilPlaying(
-                                queue = queue,
-                                targetRegistrationKeys = registrationKeys,
-                                nowMillis = capturedAtMillis
-                            ) ?: JSONObject.NULL
+                            if (status.isOperational) {
+                                estimatedMinutesUntilPlaying(
+                                    queue = queue,
+                                    targetRegistrationKeys = registrationKeys,
+                                    nowMillis = capturedAtMillis
+                                ) ?: JSONObject.NULL
+                            } else {
+                                JSONObject.NULL
+                            }
                         )
                         put(
                             "registrations",

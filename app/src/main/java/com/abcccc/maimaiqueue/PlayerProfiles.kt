@@ -121,7 +121,10 @@ fun filterAndSortPlayerProfiles(
     val filtered = if (normalizedQuery.isEmpty()) {
         profiles
     } else {
-        profiles.filter { it.nickname.contains(normalizedQuery, ignoreCase = true) }
+        profiles.filter { profile ->
+            profile.nickname.contains(normalizedQuery, ignoreCase = true) ||
+                profile.normalizedQqNumber()?.contains(normalizedQuery) == true
+        }
     }
     val nicknameComparator = Comparator<PlayerProfile> { first, second ->
         chineseNicknameCollator.compare(first.nickname, second.nickname)

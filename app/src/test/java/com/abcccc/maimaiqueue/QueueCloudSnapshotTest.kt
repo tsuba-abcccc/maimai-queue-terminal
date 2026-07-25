@@ -157,6 +157,36 @@ class QueueCloudSnapshotTest {
     }
 
     @Test
+    fun stoppedMachineDoesNotPublishARunningTimerOrWaitEstimate() {
+        val nowMillis = 1_000_000L
+        val state = state(
+            machineA = MachineQueue(
+                playing = listOf(registration(1, "正在游玩")),
+                waiting = listOf(registration(2, "等待玩家")),
+                playingStartedAtMillis = nowMillis - 5 * 60_000L
+            )
+        ).copy(
+            machineAStatus = MachineStatus().stop(
+                reason = MachineStopReason.MAINTENANCE,
+                atMillis = nowMillis - 60_000L
+            )
+        )
+
+        val machine = buildPublicQueueSnapshot(state, "terminal-1", nowMillis)
+            .getJSONObject("machines")
+            .getJSONObject("A")
+
+        assertFalse(machine.getBoolean("operational"))
+        assertTrue(machine.isNull("playing_started_at"))
+        assertTrue(
+            machine.getJSONArray("waiting_positions")
+                .getJSONObject(0)
+                .isNull("estimated_wait_minutes")
+        )
+        assertEquals(2, machine.getInt("registration_count"))
+    }
+
+    @Test
     fun publicSnapshotIncludesOnlyQueueScopedPublicEvents() {
         val state = state(machineA = MachineQueue(waiting = listOf(
             Registration(
@@ -288,6 +318,74 @@ class QueueCloudSnapshotTest {
         )
     }
 
+    @Test
+    fun malformedLegacyProfilesCannotBlockTheQueueSnapshot() {
+        val validId = "00000000-0000-0000-0000-000000000920"
+        val profiles = playerProfilesForCloudSync(
+            listOf(
+                PlayerProfile(
+                    id = validId,
+                    nickname = "  一二三四五六七八九十一二三四五六七八九十  ",
+                    gender = PlayerGender.UNDISCLOSED,
+                    defaultPreference = ProfilePlayPreference.ASK_EVERY_TIME,
+                    qqNumber = "1234",
+                    usageCount = -1,
+                    lastUsedAtMillis = 0L,
+                    createdAtMillis = 0L,
+                    updatedAtMillis = 0L
+                ),
+                PlayerProfile(
+                    id = "旧版资料编号",
+                    nickname = "旧资料",
+                    gender = PlayerGender.UNDISCLOSED,
+                    defaultPreference = ProfilePlayPreference.ASK_EVERY_TIME,
+                    qqNumber = "12345678",
+                    createdAtMillis = 100L,
+                    updatedAtMillis = 100L
+                )
+            )
+        )
+        val profile = profiles.single()
+
+        assertEquals(validId, profile.id)
+        assertEquals(18, profile.nickname.codePointCount(0, profile.nickname.length))
+        assertEquals(null, profile.qqNumber)
+        assertEquals(0, profile.usageCount)
+        assertEquals(null, profile.lastUsedAtMillis)
+        assertEquals(1L, profile.createdAtMillis)
+        assertEquals(1L, profile.updatedAtMillis)
+    }
+
+    @Test
+    fun ambiguousLegacyProfileBindingsAreNotSentToTheCloud() {
+        val firstId = "00000000-0000-0000-0000-000000000921"
+        val secondId = "00000000-0000-0000-0000-000000000922"
+        val profiles = playerProfilesForCloudSync(
+            listOf(
+                PlayerProfile(
+                    id = firstId,
+                    nickname = "同名玩家",
+                    gender = PlayerGender.UNDISCLOSED,
+                    defaultPreference = ProfilePlayPreference.ASK_EVERY_TIME,
+                    qqNumber = "12345678",
+                    createdAtMillis = 100L,
+                    updatedAtMillis = 100L
+                ),
+                PlayerProfile(
+                    id = secondId,
+                    nickname = "同名玩家",
+                    gender = PlayerGender.UNDISCLOSED,
+                    defaultPreference = ProfilePlayPreference.ASK_EVERY_TIME,
+                    qqNumber = "87654321",
+                    createdAtMillis = 200L,
+                    updatedAtMillis = 200L
+                )
+            )
+        )
+
+        assertEquals(listOf(secondId), profiles.map(PlayerProfile::id))
+    }
+
     private fun state(
         machineA: MachineQueue = MachineQueue(),
         machineB: MachineQueue = MachineQueue()
@@ -301,5 +399,12 @@ class QueueCloudSnapshotTest {
         registrationOpen = true,
         nextRegistrationKey = 20,
         savedAtMillis = 900L
+    )
+
+    private fun registration(key: Int, displayId: String) = Registration(
+        key = key,
+        displayId = displayId,
+        preference = PlayPreference.SOLO,
+        createdAtMillis = 100L + key
     )
 }

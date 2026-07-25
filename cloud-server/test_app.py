@@ -302,6 +302,24 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual(400, rejected.status_code)
 
+        conflicting = self.snapshot(revision=6)
+        conflicting_registration = conflicting["machines"]["A"]["playing"][0]
+        conflicting_registration["deferred_once"] = True
+        conflicting_registration["temporarily_away"] = True
+        rejected_conflict = self.client.post(
+            "/api/queue-status", json=conflicting, headers=self.headers
+        )
+        self.assertEqual(400, rejected_conflict.status_code)
+
+        stale_no_show_action = self.snapshot(revision=7)
+        stale_no_show_action["machines"]["A"]["playing"][0][
+            "last_no_show_action_was_defer"
+        ] = True
+        rejected_stale_action = self.client.post(
+            "/api/queue-status", json=stale_no_show_action, headers=self.headers
+        )
+        self.assertEqual(400, rejected_stale_action.status_code)
+
     def test_stores_public_events_once_and_exposes_paginated_logs(self):
         first = self.snapshot(revision=4)
         first["schema_version"] = 2
@@ -372,10 +390,16 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertNotIn("13800138000", serialized)
         self.assertNotIn("12345678", serialized)
 
-    def test_v3_stores_qq_bindings_privately_for_authenticated_bot(self):
+    def test_v3_exposes_only_the_active_registration_qq_and_keeps_profiles_private(self):
         snapshot = self.snapshot()
         snapshot["schema_version"] = 3
         registration = snapshot["machines"]["A"]["playing"][0]
+        companion = self.registration("b" * 24, "同行玩家")
+        for fixed_registration in (registration, companion):
+            fixed_registration["preference"] = "OPEN_TO_JOIN"
+            fixed_registration["fixed_pair"] = True
+            fixed_registration["fixed_pair_id"] = "f" * 24
+        snapshot["machines"]["A"]["playing"].append(companion)
         snapshot["private_player_profiles"] = [self.player_profile()]
         snapshot["private_player_contacts"] = [
             {
@@ -400,7 +424,10 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertEqual(204, published.status_code)
         self.assertEqual(3, public_response.get_json()["schema_version"])
-        self.assertNotIn("12345678", public_response.get_data(as_text=True))
+        public_registration = public_response.get_json()["machines"]["A"]["playing"][0]
+        public_companion = public_response.get_json()["machines"]["A"]["playing"][1]
+        self.assertEqual("12345678", public_registration["qq_number"])
+        self.assertIsNone(public_companion["qq_number"])
         self.assertNotIn("private_player_contacts", public_response.get_data(as_text=True))
         self.assertNotIn("private_player_profiles", public_response.get_data(as_text=True))
         self.assertEqual(401, unauthenticated.status_code)
@@ -408,13 +435,25 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(200, bot_response.status_code)
         body = bot_response.get_json()
         self.assertEqual(snapshot["queue_id"], body["queue_id"])
+        self.assertTrue(body["terminal"]["online"])
+        self.assertLessEqual(body["terminal"]["last_seen_seconds"], 1)
         self.assertEqual(1, len(body["players"]))
         player = body["players"][0]
         self.assertEqual("12345678", player["qq_number"])
         self.assertEqual("公开昵称", player["display_id"])
         self.assertEqual("A", player["machine_id"])
+        self.assertEqual("左侧 · 机台 A", player["machine_name"])
+        self.assertTrue(player["machine_operational"])
+        self.assertIsNone(player["machine_stop_reason"])
+        self.assertIsNone(player["machine_stop_reason_detail"])
+        self.assertEqual(900_000, player["playing_started_at"])
         self.assertEqual("PLAYING", player["position"])
         self.assertEqual(0, player["estimated_wait_minutes"])
+        self.assertEqual(["同行玩家"], player["co_player_display_ids"])
+        self.assertEqual("OPEN_TO_JOIN", player["preference"])
+        self.assertTrue(player["fixed_pair"])
+        self.assertEqual("PLAYER_PROFILE", player["registration_type"])
+        self.assertIsNone(player["last_played_at"])
         profiles = self.client.post(
             "/api/queue-bot/profiles", json={"qq": "12345678"}, headers=self.bot_headers
         ).get_json()["profiles"]
@@ -425,6 +464,57 @@ class QueueStatusApiTest(unittest.TestCase):
             "/api/queue-bot/players?qq=12345678", headers=self.bot_headers
         )
         self.assertEqual(400, legacy_query.status_code)
+
+    def test_stopped_machine_suppresses_playing_timer_and_all_wait_estimates(self):
+        snapshot = self.snapshot()
+        snapshot["schema_version"] = 3
+        playing_registration = snapshot["machines"]["A"]["playing"][0]
+        waiting_registration = self.registration("b" * 24, "等待玩家")
+        machine = snapshot["machines"]["A"]
+        machine.update(
+            {
+                "operational": False,
+                "stop_reason": "NETWORK_DISCONNECTED",
+                "stopped_at": 950_000,
+                "registration_count": 2,
+                "waiting_position_count": 1,
+                "waiting_positions": [
+                    {
+                        "position_id": "c" * 24,
+                        "fixed_pair": False,
+                        "estimated_wait_minutes": 12,
+                        "registrations": [waiting_registration],
+                    }
+                ],
+            }
+        )
+        snapshot["private_player_profiles"] = [self.player_profile()]
+        snapshot["private_player_contacts"] = [
+            {
+                "registration_id": playing_registration["registration_id"],
+                "profile_id": self.profile_id,
+                "qq_number": "12345678",
+            }
+        ]
+
+        published = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        public_machine = self.client.get("/api/queue-status").get_json()["machines"]["A"]
+        bot_player = self.client.post(
+            "/api/queue-bot/players",
+            json={"qq": "12345678"},
+            headers=self.bot_headers,
+        ).get_json()["players"][0]
+
+        self.assertEqual(204, published.status_code)
+        self.assertIsNone(public_machine["playing_started_at"])
+        self.assertIsNone(
+            public_machine["waiting_positions"][0]["estimated_wait_minutes"]
+        )
+        self.assertFalse(bot_player["machine_operational"])
+        self.assertIsNone(bot_player["playing_started_at"])
+        self.assertIsNone(bot_player["estimated_wait_minutes"])
 
     def test_exposes_only_computed_business_hours_state(self):
         snapshot = self.snapshot()
@@ -449,6 +539,11 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(snapshot["business_hours"], public_snapshot["business_hours"])
         self.assertNotIn("weekly_hours", public_snapshot["business_hours"])
         self.assertNotIn("opening_minutes", public_snapshot["business_hours"])
+        bot_snapshot = self.client.post(
+            "/api/queue-bot/players", json={}, headers=self.bot_headers
+        ).get_json()
+        self.assertEqual(snapshot["registration_open"], bot_snapshot["registration_open"])
+        self.assertEqual(snapshot["business_hours"], bot_snapshot["business_hours"])
 
         closing = copy.deepcopy(snapshot)
         closing["revision"] = 5
@@ -464,6 +559,10 @@ class QueueStatusApiTest(unittest.TestCase):
             "/api/queue-status", json=closing, headers=self.headers
         )
         self.assertEqual(204, accepted_closing.status_code)
+        closing_bot_snapshot = self.client.post(
+            "/api/queue-bot/players", json={}, headers=self.bot_headers
+        ).get_json()
+        self.assertEqual(closing["business_hours"], closing_bot_snapshot["business_hours"])
         self.assertEqual(
             closing["business_hours"],
             self.client.get("/api/queue-status").get_json()["business_hours"],
@@ -1113,6 +1212,123 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(event["cursor"], events_response["next_cursor"])
         self.assertEqual(event["cursor"], events_response["latest_cursor"])
 
+    def test_new_queue_reset_event_notifies_players_from_previous_batch(self):
+        first = self.snapshot(revision=4)
+        first["schema_version"] = 3
+        registration = first["machines"]["A"]["playing"][0]
+        first["private_player_profiles"] = [self.player_profile()]
+        first["private_player_contacts"] = [
+            {
+                "registration_id": registration["registration_id"],
+                "profile_id": self.profile_id,
+                "qq_number": "12345678",
+            }
+        ]
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=first, headers=self.headers
+            ).status_code,
+        )
+
+        reset_event_id = "00000000-0000-0000-0000-000000000195"
+        second = self.snapshot(
+            queue_id="00000000-0000-0000-0000-000000000002",
+            revision=5,
+        )
+        second["schema_version"] = 3
+        second["machines"]["A"] = self.machine(name="左侧 · 机台 A")
+        second["private_player_profiles"] = [self.player_profile()]
+        second["private_player_contacts"] = []
+        reset_event = self.event(reset_event_id, "QUEUE_RESET", 1_000_200)
+        reset_event.update(
+            {
+                "machine_id": None,
+                "title": "开始新的队列",
+                "detail": "未载入上次保存的 1 个登记，已从空队列开始。",
+                "registration_ids": [],
+            }
+        )
+        second["recent_events"] = [reset_event]
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=second, headers=self.headers
+            ).status_code,
+        )
+
+        events_response = self.client.post(
+            "/api/queue-bot/events",
+            json={"qq": "12345678", "after": 0},
+            headers=self.bot_headers,
+        ).get_json()
+        public_logs = self.client.get("/api/queue-logs").get_json()["logs"]
+
+        self.assertEqual(second["queue_id"], events_response["queue_id"])
+        self.assertEqual(
+            [reset_event_id],
+            [event["event_id"] for event in events_response["events"]],
+        )
+        self.assertEqual(
+            "12345678",
+            events_response["events"][0]["affected_players"][0]["qq_number"],
+        )
+        self.assertEqual(
+            [registration["registration_id"]],
+            public_logs[0]["registration_ids"],
+        )
+
+    def test_current_registration_cannot_inherit_a_stale_qq_binding(self):
+        first = self.snapshot(revision=4)
+        first["schema_version"] = 3
+        registration = first["machines"]["A"]["playing"][0]
+        first["private_player_profiles"] = [self.player_profile()]
+        first["private_player_contacts"] = [
+            {
+                "registration_id": registration["registration_id"],
+                "profile_id": self.profile_id,
+                "qq_number": "12345678",
+            }
+        ]
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=first, headers=self.headers
+            ).status_code,
+        )
+
+        second = copy.deepcopy(first)
+        second["revision"] = 5
+        second["private_player_contacts"] = []
+        current_event = self.event(
+            "00000000-0000-0000-0000-000000000198",
+            "REGISTRATION_UPDATED",
+            1_000_200,
+        )
+        second["recent_events"] = [current_event]
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=second, headers=self.headers
+            ).status_code,
+        )
+
+        events = self.client.post(
+            "/api/queue-bot/events",
+            json={"qq": "12345678", "after": 0},
+            headers=self.bot_headers,
+        ).get_json()["events"]
+        connection = sqlite3.connect(self.database_path)
+        try:
+            contact_count = connection.execute(
+                "SELECT COUNT(*) FROM queue_private_contact"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        self.assertEqual([], events)
+        self.assertEqual(0, contact_count)
+
     def test_profile_can_rejoin_same_queue_with_a_new_registration_id(self):
         first = self.snapshot(revision=4)
         first["schema_version"] = 3
@@ -1610,6 +1826,37 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertFalse(data["terminal"]["online"])
         self.assertGreaterEqual(data["terminal"]["last_seen_seconds"], 91)
+
+    def test_same_revision_heartbeat_refreshes_terminal_presence(self):
+        snapshot = self.snapshot(revision=8)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE queue_snapshot SET received_at = ? WHERE id = 1",
+                (int(time.time()) - 91,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertFalse(
+            self.client.get("/api/queue-status").get_json()["terminal"]["online"]
+        )
+
+        heartbeat = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        current = self.client.get("/api/queue-status").get_json()
+
+        self.assertEqual(204, heartbeat.status_code)
+        self.assertEqual(8, current["revision"])
+        self.assertTrue(current["terminal"]["online"])
+        self.assertLessEqual(current["terminal"]["last_seen_seconds"], 1)
 
     def test_rejects_duplicate_registration_ids_across_machines(self):
         snapshot = self.snapshot()

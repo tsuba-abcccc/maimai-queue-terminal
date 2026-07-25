@@ -47,6 +47,34 @@ class PlayerProfilePersistenceTest {
     }
 
     @Test
+    fun mutationUsesLatestProfileInsteadOfStaleScreenSnapshot() = runBlocking {
+        val repository = FakePlayerProfileRepository()
+        val coordinator = PlayerProfilePersistenceCoordinator(repository)
+        val staleProfile = profile("profile-1")
+        var currentProfile = staleProfile.copy(
+            nickname = "QQ 修改后的昵称",
+            gender = PlayerGender.FEMALE,
+            defaultPreference = ProfilePlayPreference.SOLO,
+            updatedAtMillis = 200L
+        )
+
+        val persisted = coordinator.mutateAndApply(
+            profileId = staleProfile.id,
+            currentProfiles = { listOf(currentProfile) },
+            mutation = { latest -> latest.recordUsage(atMillis = 300L) },
+            onPersisted = { currentProfile = it }
+        )
+
+        assertTrue(persisted)
+        assertEquals("QQ 修改后的昵称", currentProfile.nickname)
+        assertEquals(PlayerGender.FEMALE, currentProfile.gender)
+        assertEquals(ProfilePlayPreference.SOLO, currentProfile.defaultPreference)
+        assertEquals(1, currentProfile.usageCount)
+        assertEquals(300L, currentProfile.lastUsedAtMillis)
+        assertEquals(currentProfile, repository.writtenProfiles.single())
+    }
+
+    @Test
     fun cloudRestoreAppliesOnlyIndividuallyPersistedProfiles() = runBlocking {
         val repository = FakePlayerProfileRepository(failedIds = setOf("profile-2"))
         val coordinator = PlayerProfilePersistenceCoordinator(repository)
@@ -153,11 +181,13 @@ class PlayerProfilePersistenceTest {
         private val events: MutableList<String>? = null
     ) : PlayerProfileRepository {
         val writtenIds = mutableListOf<String>()
+        val writtenProfiles = mutableListOf<PlayerProfile>()
 
         override suspend fun getProfiles(): List<PlayerProfile> = emptyList()
 
         override suspend fun upsertProfile(profile: PlayerProfile): Boolean {
             writtenIds += profile.id
+            writtenProfiles += profile
             events?.add("persist:${profile.id}")
             if (profile.id in throwingIds) error("simulated write failure")
             return profile.id !in failedIds

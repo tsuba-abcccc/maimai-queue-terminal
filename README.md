@@ -1,6 +1,6 @@
 # maimai Q
 
-[![Version](https://img.shields.io/badge/version-0.3.1-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
+[![Version](https://img.shields.io/badge/version-0.3.7-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
 [![Android](https://img.shields.io/badge/Android-10%2B-34C759?logo=android&logoColor=white)](https://developer.android.com/about/versions/10)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-007AFF)](https://developer.android.com/compose)
@@ -16,7 +16,7 @@
 - [在线查看当前队列](https://abcccc.top/queue-status)
 - [玩家使用手册](docs/user-manual.md)
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
-- [0.1.0 至 0.3.1 更新日志](docs/update.md)
+- [0.1.0 至 0.3.7 更新日志](docs/update.md)
 - [云端同步协议](docs/cloud-queue-sync.md)
 - [后端部署说明](cloud-server/README.md)
 
@@ -91,13 +91,13 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将两�
 ### 网站同步
 
 - 现场变化先保存到本机，再异步上传公开快照。
-- 完整玩家资料库通过鉴权后的私有通道同步，QQ 不进入公开网站。
+- 完整玩家资料库通过鉴权后的私有通道同步；当前有效登记的 QQ 只显示在网站登记详情中。
 - Koishi Bot 可以查询本人状态、读取相关事件并请求修改玩家资料。
 - 服务器修改先成为待执行命令，终端校验并落盘后才正式生效。
 - 网络失败不会阻止现场操作，应用会在后台自动重试。
 - 首页显示已同步、同步中、待重试、已关闭或未配置等状态。
 - 现场终端版可单独关闭“QQ Bot 联动”；关闭后不接受 Bot 查询或资料修改，也不会补发关闭期间的通知。
-- 预计无法在闭店前轮到时，App 会在创建登记前提醒；闭店后，App、网站和 QQ Bot 会统一显示收尾状态。
+- 闭店前 30 分钟，App、网站和 QQ Bot 会统一显示提醒；预计无法在闭店前轮到时，App 还会在创建登记前说明风险。闭店后，三端统一显示收尾状态。
 - 网站提供两台队列、位置详情、时间估算、公开日志和“标记为自己”。
 - 标记后可查看自己的位置、预计时间、共同游玩对象和未到场等处理结果。
 - 网站目前只读，不能远程改变现场队列。
@@ -176,7 +176,7 @@ app/build/outputs/apk/local/debug/app-local-debug.apk
 .\gradlew.bat :app:packageLocalDebugApk
 ```
 
-文件会复制到 `output/apk/maimai-Q-0.3.1-local.apk`。
+文件会复制到 `output/apk/maimai-Q-0.3.7-local.apk`。
 
 macOS 或 Linux 使用：
 
@@ -249,7 +249,7 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 - 公开分发版与现场终端版应使用不同签名和不同配置。
 - 现场终端 APK 只在受控设备间传递；令牌泄漏后立即在服务端轮换。
 
-现场终端文件会复制到 `output/apk/maimai-Q-0.3.1-terminal.apk`，不得作为 GitHub 公开 Release 附件。
+现场终端文件会复制到 `output/apk/maimai-Q-0.3.7-terminal.apk`，不得作为 GitHub 公开 Release 附件。
 
 ## 部署队列 API
 
@@ -283,12 +283,12 @@ curl https://your-domain.example/queue-api-healthz
 | 昵称、机台、队列位置 | 是 | 是 | 是 |
 | 游玩偏好、暂缓、暂离、未到场 | 是 | 是 | 是 |
 | 公开队列事件 | 是 | 是 | 是 |
-| QQ 号 | 是 | 是 | 否 |
+| 当前登记的 QQ 号 | 是 | 是 | 是，仅登记详情 |
 | 性别、默认资料偏好 | 是 | 是 | 否 |
 | 玩家资料 UUID | 是 | 是 | 否 |
 | 本机资料编辑日志 | 是 | 否 | 否 |
 
-应用已关闭 Android 系统备份。开启网站同步后，玩家资料和 QQ 通过需要专用令牌的私有接口保存，用于 Koishi Bot 身份、日志通知和上机提醒；公开网站不会显示这些字段。服务器修改会先成为待执行命令，只有终端按本地规则接受后才生效。
+应用已关闭 Android 系统备份。开启网站同步后，玩家资料和 QQ 通过需要专用令牌的私有接口保存，用于 Koishi Bot 身份、日志通知和上机提醒。当前有效登记的 QQ 会显示在网站登记详情中；性别、默认偏好和资料 UUID 不公开。服务器修改会先成为待执行命令，只有终端按本地规则接受后才生效。
 
 ## 测试
 

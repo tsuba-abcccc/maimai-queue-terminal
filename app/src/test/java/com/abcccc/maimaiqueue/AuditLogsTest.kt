@@ -1,6 +1,7 @@
 package com.abcccc.maimaiqueue
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -20,13 +21,15 @@ class AuditLogsTest {
     private fun queueLog(
         before: MachineQueue,
         after: MachineQueue,
-        titleOverride: String? = null
+        titleOverride: String? = null,
+        publicEventTypeOverride: PublicQueueEventType? = null
     ) = createQueueAuditLog(
         category = AuditLogCategory.MACHINE_A,
         machineLabel = "机台 A",
         before = before,
         after = after,
         titleOverride = titleOverride,
+        publicEventTypeOverride = publicEventTypeOverride,
         timestampMillis = 1_000L
     )
 
@@ -71,6 +74,39 @@ class AuditLogsTest {
     }
 
     @Test
+    fun fixedPairLogUsesTheEffectivePreferenceInsteadOfItsInternalOpenState() {
+        val first = registration(1, "小雨").copy(preference = PlayPreference.SOLO)
+        val second = registration(2, "青空").copy(preference = PlayPreference.SOLO)
+        val before = MachineQueue(waiting = listOf(first, second))
+        val after = MachineQueue(
+            waiting = listOf(
+                first.copy(
+                    preference = PlayPreference.OPEN_TO_JOIN,
+                    fixedPartnerKey = second.key
+                ),
+                second.copy(
+                    preference = PlayPreference.OPEN_TO_JOIN,
+                    fixedPartnerKey = first.key
+                )
+            )
+        )
+
+        val log = requireNotNull(
+            createQueueAuditLog(
+                category = AuditLogCategory.MACHINE_A,
+                machineLabel = "左侧 · 机台 A",
+                before = before,
+                after = after
+            )
+        )
+
+        assertEquals("左侧 · 机台 A · 固定组合已修改", log.title)
+        assertTrue(log.detail.contains("“小雨”改为与朋友共同游玩"))
+        assertTrue(log.detail.contains("“青空”改为与朋友共同游玩"))
+        assertFalse(log.detail.contains("允许他人加入"))
+    }
+
+    @Test
     fun noShowOnlyChangeUsesNoShowTitle() {
         val original = registration(1, "玩家")
         val changed = original.copy(noShowCount = 1)
@@ -81,6 +117,62 @@ class AuditLogsTest {
 
         assertEquals("机台 A · 未到场状态已更新", log.title)
         assertTrue(log.detail.contains("“玩家”已记录第 1 次未到场"))
+    }
+
+    @Test
+    fun noShowActionTitlesDescribeTheChosenHandling() {
+        val original = registration(1, "未到场玩家")
+        val deferred = original.copy(
+            absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND,
+            noShowCount = 1,
+            lastNoShowActionWasDefer = true
+        )
+        val movedToTail = original.copy(
+            noShowCount = 1,
+            lastNoShowActionWasDefer = false
+        )
+
+        val deferredLog = queueLog(
+            before = MachineQueue(waiting = listOf(original)),
+            after = MachineQueue(waiting = listOf(deferred)),
+            publicEventTypeOverride = PublicQueueEventType.NO_SHOW_DEFERRED
+        )!!
+        val movedLog = queueLog(
+            before = MachineQueue(waiting = listOf(original, registration(2))),
+            after = MachineQueue(waiting = listOf(registration(2), movedToTail)),
+            publicEventTypeOverride = PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL
+        )!!
+        val removedLog = queueLog(
+            before = MachineQueue(waiting = listOf(original)),
+            after = MachineQueue(),
+            publicEventTypeOverride = PublicQueueEventType.NO_SHOW_REMOVED
+        )!!
+
+        assertEquals("机台 A · 未到场 · 已暂缓一轮", deferredLog.title)
+        assertEquals("机台 A · 未到场 · 已移至队尾", movedLog.title)
+        assertEquals("机台 A · 未到场 · 已移除登记", removedLog.title)
+        assertTrue(removedLog.detail.contains("“未到场玩家”本次未到场，登记已移除"))
+    }
+
+    @Test
+    fun completedRoundReportsClearedNoShowRecordWithoutReplacingPlayingEvent() {
+        val completed = registration(1, "曾未到场玩家").copy(
+            noShowCount = 2,
+            lastNoShowActionWasDefer = true
+        )
+        val next = registration(2, "下一位")
+        val before = MachineQueue(
+            playing = listOf(completed),
+            waiting = listOf(next),
+            playingStartedAtMillis = 500L
+        )
+
+        val log = queueLog(before, before.finishRound(atMillis = 900L))!!
+
+        assertEquals("机台 A · 游玩位置已更新", log.title)
+        assertEquals(PublicQueueEventType.PLAYING_CHANGED, log.publicEventType)
+        assertTrue(log.detail.contains("“曾未到场玩家”正常完成游玩，未到场记录已清除"))
+        assertTrue(1 in log.affectedRegistrationKeys)
     }
 
     @Test
@@ -115,6 +207,32 @@ class AuditLogsTest {
     }
 
     @Test
+    fun machineTransferCreatesOnePublicEventWithAllConsequences() {
+        val transferred = registration(1, "小雨").copy(
+            absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND,
+            fixedPartnerKey = 2
+        )
+        val releasedPartner = registration(2, "青空").copy(fixedPartnerKey = 1)
+
+        val log = requireNotNull(
+            createMachineTransferAuditLog(
+                category = AuditLogCategory.MACHINE_A,
+                sourceMachineLabel = "左侧 · 机台 A",
+                destinationMachineLabel = "右侧 · 机台 B",
+                registrations = listOf(transferred),
+                releasedPartnerRegistrations = listOf(releasedPartner)
+            )
+        )
+
+        assertEquals("登记已转至右侧 · 机台 B", log.title)
+        assertEquals(PublicQueueEventType.REGISTRATION_UPDATED, log.publicEventType)
+        assertEquals(listOf(1, 2), log.affectedRegistrationKeys)
+        assertTrue(log.detail.contains("从左侧 · 机台 A 转至右侧 · 机台 B"))
+        assertTrue(log.detail.contains("暂缓一轮状态已解除"))
+        assertTrue(log.detail.contains("原固定组合已解除"))
+    }
+
+    @Test
     fun temporaryAwaySkipAndAutomaticExitAreExplained() {
         val away = registration(1, "暂离玩家").copy(
             absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
@@ -133,6 +251,26 @@ class AuditLogsTest {
         assertTrue(removedLog.detail.contains("第四次轮到"))
         assertTrue(removedLog.detail.contains("自动退出排队"))
         assertEquals(PublicQueueEventType.TEMPORARY_AWAY_EXPIRED, removedLog.publicEventType)
+        assertEquals("机台 A · 暂时离开已达轮空上限", removedLog.title)
+    }
+
+    @Test
+    fun claimingARegistrationTakesPriorityOverTheAccompanyingNicknameChange() {
+        val temporary = registration(1, "临时昵称").copy(isTemporary = true)
+        val claimed = temporary.copy(
+            displayId = "资料昵称",
+            isTemporary = false,
+            playerProfileId = "profile-1"
+        )
+
+        val log = queueLog(
+            before = MachineQueue(waiting = listOf(temporary)),
+            after = MachineQueue(waiting = listOf(claimed))
+        )!!
+
+        assertEquals("机台 A · 登记已认领", log.title)
+        assertTrue(log.detail.contains("“临时昵称”更名为“资料昵称”"))
+        assertTrue(log.detail.contains("“资料昵称”已认领登记"))
     }
 
     @Test

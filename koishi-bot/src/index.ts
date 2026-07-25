@@ -39,6 +39,7 @@ interface QueueRegistration {
   deferred_once: boolean;
   temporarily_away: boolean;
   temporary_away_skipped_turns: number;
+  fixed_pair: boolean;
   no_show_count: number;
 }
 
@@ -53,6 +54,7 @@ interface QueueMachine {
   name: string;
   operational: boolean;
   stop_reason: string | null;
+  stop_reason_detail: string | null;
   playing_started_at: number | null;
   playing: QueueRegistration[];
   waiting_positions: WaitingPosition[];
@@ -81,9 +83,19 @@ interface BotPlayer {
   qq_number: string;
   display_id: string;
   machine_id: "A" | "B";
+  machine_name?: string;
+  machine_operational?: boolean;
+  machine_stop_reason?: string | null;
+  machine_stop_reason_detail?: string | null;
+  playing_started_at?: number | null;
   position: "PLAYING" | "WAITING";
   position_index: number | null;
   estimated_wait_minutes: number | null;
+  co_player_display_ids?: string[];
+  preference?: "SOLO" | "OPEN_TO_JOIN";
+  fixed_pair?: boolean;
+  registration_type?: "TEMPORARY" | "PLAYER_PROFILE";
+  last_played_at?: number | null;
   deferred_once: boolean;
   temporarily_away: boolean;
   temporary_away_skipped_turns: number;
@@ -93,6 +105,13 @@ interface BotPlayer {
 
 interface BotPlayersResponse {
   queue_id: string;
+  received_at?: number;
+  registration_open?: boolean;
+  business_hours?: QueueStatus["business_hours"];
+  terminal?: {
+    online: boolean;
+    last_seen_seconds?: number;
+  };
   players: BotPlayer[];
 }
 
@@ -341,7 +360,7 @@ export function apply(ctx: Context, config: Config) {
           const matchingQueue = queue?.queue_id === playerResponse.queue_id
             ? queue
             : undefined;
-          return formatOwnQueue(players, matchingQueue);
+          return formatOwnQueue(players, matchingQueue, playerResponse);
         }
         const profiles = (await api.getProfiles(qq)).profiles;
         return profiles.length
@@ -563,12 +582,7 @@ export async function pollNotifications(
   const stateKey = cursorStateKey(config);
   const saved = await readCursor(ctx, stateKey);
   const firstPage = await api.getEvents(saved?.cursor ?? 0);
-  if (!saved || saved.queueId !== firstPage.queue_id) {
-    if (saved) {
-      await ctx.database.remove("maimai_q_delivery", {
-        queueId: saved.queueId,
-      });
-    }
+  if (!saved) {
     await ctx.database.remove("maimai_q_delivery", {
       queueId: firstPage.queue_id,
     });
@@ -577,6 +591,18 @@ export async function pollNotifications(
       cursor: firstPage.latest_cursor,
     });
     return;
+  }
+  if (saved.queueId !== firstPage.queue_id) {
+    await ctx.database.remove("maimai_q_delivery", {
+      queueId: saved.queueId,
+    });
+    await ctx.database.remove("maimai_q_delivery", {
+      queueId: firstPage.queue_id,
+    });
+    await writeCursor(ctx, stateKey, {
+      queueId: firstPage.queue_id,
+      cursor: saved.cursor,
+    });
   }
 
   let page = firstPage;
@@ -702,7 +728,7 @@ async function processNotificationEvent(
       }
       const current = await api.getPlayers(delivery.qqNumber);
       const status = current.players.length
-        ? `\n\n${formatOwnQueue(current.players)}`
+        ? `\n\n${formatOwnQueue(current.players, undefined, current)}`
         : "";
       await bot.sendPrivateMessage(
         delivery.qqNumber,
@@ -952,6 +978,12 @@ export function formatQueue(queue: QueueStatus): string {
       "不再接收新登记。现有队列处理完毕后将关闭，最迟保留 20 分钟。",
       "",
     );
+  } else if (queue.business_hours?.enabled && queue.business_hours.closing_soon) {
+    lines.push(
+      "将在 30 分钟内闭店",
+      "请留意后续队列安排。",
+      "",
+    );
   }
   for (const machine of [queue.machines.A, queue.machines.B]) {
     lines.push(formatMachine(machine), "");
@@ -970,7 +1002,9 @@ function formatMachine(machine: QueueMachine): string {
   if (!machine.operational) {
     overview.push(
       `停止使用${
-        machine.stop_reason ? `·${stopReason(machine.stop_reason)}` : ""
+        machine.stop_reason
+          ? `·${stopReason(machine.stop_reason, machine.stop_reason_detail)}`
+          : ""
       }`,
     );
   }
@@ -1025,6 +1059,10 @@ function formatMachine(machine: QueueMachine): string {
 export function formatOwnQueue(
   players: BotPlayer[],
   queue?: QueueStatus,
+  personalSnapshot?: Pick<
+    BotPlayersResponse,
+    "terminal" | "registration_open" | "business_hours"
+  >,
 ): string {
   if (!players.length) return "当前没有正在排队的登记。";
   const status = players.map((player) => {
@@ -1038,25 +1076,51 @@ export function formatOwnQueue(
       ]
         .find((item) => item.registration_id === player.registration_id)
       : undefined;
-    const elapsed = player.position === "PLAYING" && machine?.operational &&
-        machine.playing_started_at
+    const machineOperational = machine?.operational ??
+      player.machine_operational;
+    const compactMachineName = (
+      machine?.name ?? player.machine_name ?? `机台 ${player.machine_id}`
+    ).replace(/\s*·\s*/g, "·");
+    const playingStartedAt = machine
+      ? machine.playing_started_at
+      : player.playing_started_at;
+    const elapsed = player.position === "PLAYING" &&
+        machineOperational !== false && playingStartedAt
       ? Math.max(
         0,
-        Math.floor((Date.now() - machine.playing_started_at) / 60_000),
+        Math.floor((Date.now() - playingStartedAt) / 60_000),
       )
       : null;
     const location = player.position === "PLAYING"
-      ? `正在游玩位置 ${player.machine_id}${
-        elapsed === null ? "" : `·已游玩 ${elapsed} 分钟`
-      }`
+      ? machineOperational === false
+        ? `位于游玩位置 ${player.machine_id}`
+        : `正在游玩位置 ${player.machine_id}${
+          elapsed === null ? "" : `·已游玩 ${elapsed} 分钟`
+        }`
       : `位于队列位置 ${player.machine_id}${player.position_index}`;
+    const estimatedWaitMinutes = typeof player.estimated_wait_minutes === "number" &&
+        Number.isFinite(player.estimated_wait_minutes)
+      ? Math.max(0, Math.trunc(player.estimated_wait_minutes))
+      : null;
     const estimate = player.position === "WAITING" &&
-        machine?.operational !== false &&
-        player.estimated_wait_minutes !== null
-      ? `，约 ${player.estimated_wait_minutes} 分钟后可以游玩`
+        machineOperational !== false &&
+        estimatedWaitMinutes !== null
+      ? estimatedWaitMinutes <= 0
+        ? "，预计现在可以游玩"
+        : `，约 ${estimatedWaitMinutes} 分钟后可以游玩`
       : "";
-    const machineState = machine?.operational === false
-      ? "\n机台状态：停止使用，登记顺序已保留。"
+    const machineStopReason = machine
+      ? machine.stop_reason
+      : player.machine_stop_reason;
+    const machineStopReasonDetail = machine
+      ? machine.stop_reason_detail
+      : player.machine_stop_reason_detail;
+    const machineState = machineOperational === false
+      ? `\n机台状态：停止使用${
+        machineStopReason
+          ? `·${stopReason(machineStopReason, machineStopReasonDetail)}`
+          : ""
+      }，登记顺序已保留。`
       : "";
     const states = [];
     if (player.deferred_once) states.push("暂缓一轮");
@@ -1075,17 +1139,60 @@ export function formatOwnQueue(
         : "上次处理：移至队尾";
       states.push(`未到场记录 ${player.no_show_count} 次·${lastAction}`);
     }
-    const preference = registration
-      ? `\n本次偏好：${queuePreferenceLabel(registration.preference)}`
+    const currentPreference = registration
+      ? queueRegistrationPreferenceLabel(registration)
+      : player.preference
+      ? queueRegistrationPreferenceLabel({
+        preference: player.preference,
+        fixed_pair: player.fixed_pair ?? false,
+      })
+      : null;
+    const preference = currentPreference
+      ? `\n本次偏好：${currentPreference}`
       : "";
-    return `${player.display_id}：${location}${estimate}${machineState}${preference}${
+    const positionRegistrations = machine
+      ? player.position === "PLAYING"
+        ? machine.playing
+        : machine.waiting_positions.find((position) =>
+          position.index === player.position_index
+        )?.registrations
+      : undefined;
+    const coPlayerDisplayIds = positionRegistrations
+      ? positionRegistrations
+        .filter((item) => item.registration_id !== player.registration_id)
+        .map((item) => item.display_id)
+      : player.co_player_display_ids ?? [];
+    const coPlayers = coPlayerDisplayIds.length
+      ? `\n共同游玩：${coPlayerDisplayIds.join("、")}`
+      : "";
+    return `${player.display_id}：${location}${estimate}\n所在机台：${compactMachineName}${machineState}${preference}${coPlayers}${
       states.length ? `\n当前状态：${states.join("、")}` : ""
     }`;
   }).join("\n\n");
-  if (queue && !queue.terminal.online) {
-    return `终端暂时离线，以下为最近一次同步状态。\n\n${status}`;
+  const terminalOnline = queue?.terminal.online ??
+    personalSnapshot?.terminal?.online;
+  const businessHours = queue?.business_hours ?? personalSnapshot?.business_hours;
+  const registrationOpen = queue?.registration_open ??
+    personalSnapshot?.registration_open;
+  const notices: string[] = [];
+  if (terminalOnline === false) {
+    notices.push("终端暂时离线，以下为最近一次同步状态。");
   }
-  return status;
+  if (businessHours?.enabled && businessHours.outside) {
+    notices.push(
+      businessHours.closing_grace
+        ? "今日营业时间已结束，现有队列正在收尾。"
+        : "当前不在营业时间。",
+    );
+  } else {
+    if (businessHours?.enabled && businessHours.closing_soon) {
+      notices.push("将在 30 分钟内闭店，请留意后续队列安排。");
+    }
+    if (registrationOpen === false) {
+      notices.push("当前采用现场自然排队。");
+    }
+  }
+  return notices.length ? `${notices.join("\n")}\n\n${status}` : status;
 }
 
 export function formatQueueNotification(
@@ -1123,7 +1230,7 @@ function formatQueueRegistrations(
 function formatQueueRegistration(registration: QueueRegistration): string[] {
   const lines = [
     ` - ${registration.display_id} (${
-      compactQueuePreferenceLabel(registration.preference)
+      compactQueuePreferenceLabel(registration)
     })`,
   ];
   if (registration.deferred_once) lines.push("    - 暂缓一轮");
@@ -1143,13 +1250,22 @@ function formatQueueRegistration(registration: QueueRegistration): string[] {
 }
 
 function compactQueuePreferenceLabel(
-  value: QueueRegistration["preference"],
+  registration: QueueRegistration,
 ): string {
-  return value === "SOLO" ? "单人" : "允许加入";
+  if (registration.fixed_pair) return "固定组合";
+  return registration.preference === "SOLO" ? "单人" : "允许加入";
 }
 
 function queuePreferenceLabel(value: QueueRegistration["preference"]): string {
   return value === "SOLO" ? "单人游玩" : "允许他人加入";
+}
+
+function queueRegistrationPreferenceLabel(
+  registration: Pick<QueueRegistration, "preference" | "fixed_pair">,
+): string {
+  return registration.fixed_pair
+    ? "与朋友共同游玩"
+    : queuePreferenceLabel(registration.preference);
 }
 
 export function nicknameValidationError(value?: string): string | null {
@@ -1204,11 +1320,14 @@ function preferenceLabel(value: ProfilePreference): string {
   }[value];
 }
 
-function stopReason(value: string): string {
+function stopReason(value: string, detail?: string | null): string {
+  if (value === "OTHER" && detail?.trim()) {
+    return `其他原因（${detail.trim()}）`;
+  }
   return {
     NOT_POWERED_ON: "机台未开机",
     NETWORK_DISCONNECTED: "机台断网",
-    MAINTENANCE: "维护保养",
+    MAINTENANCE: "机台维护",
     OTHER: "其他原因",
   }[value] || "原因未注明";
 }

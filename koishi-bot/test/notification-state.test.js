@@ -225,6 +225,47 @@ test('disabled recipients are skipped without blocking later queue events', asyn
   assert.equal(cursor.cursor, 2)
 })
 
+test('existing notification cursors continue through a new queue batch', async () => {
+  const database = new MemoryDatabase()
+  await database.upsert('maimai_q_state', [{
+    key: 'event-cursor:https://queue.example.test',
+    value: JSON.stringify({ queueId: 'queue-1', cursor: 2 }),
+  }])
+  const sends = []
+  const bot = {
+    platform: 'onebot',
+    selfId: '10000',
+    isActive: true,
+    async sendPrivateMessage(qq) { sends.push(qq) },
+  }
+  const api = {
+    async getEvents(after) {
+      assert.equal(after, 2)
+      return {
+        queue_id: 'queue-2',
+        events: [event(3, 'queue-reset', '11111')],
+        next_cursor: 3,
+        latest_cursor: 3,
+        has_more: false,
+      }
+    },
+    async getPlayers() { return { queue_id: 'queue-2', players: [] } },
+  }
+
+  await pollNotifications(
+    { database, bots: [bot] },
+    api,
+    config(),
+    logger(),
+  )
+
+  assert.deepEqual(sends, ['11111'])
+  const cursor = JSON.parse(database.states.get(
+    'event-cursor:https://queue.example.test',
+  ).value)
+  assert.deepEqual(cursor, { queueId: 'queue-2', cursor: 3 })
+})
+
 test('disabling notifications cancels an existing pending retry', async () => {
   const database = new MemoryDatabase()
   const currentConfig = config()

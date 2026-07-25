@@ -85,6 +85,10 @@ fun createQueueAuditLog(
     val afterByKey = after.allRegistrations.associateBy { it.key }
     val added = after.allRegistrations.filter { it.key !in beforeByKey }
     val removed = before.allRegistrations.filter { it.key !in afterByKey }
+    val temporaryAwayExpired = removed.filter {
+        it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
+            it.temporaryAwaySkippedTurns >= 3
+    }
     val affectedRegistrationKeys = mutableSetOf<Int>().apply {
         addAll(added.map { it.key })
         addAll(removed.map { it.key })
@@ -97,10 +101,10 @@ fun createQueueAuditLog(
     }
     if (removed.isNotEmpty()) {
         changeKinds += "removed"
-        details += "移除 ${quotedNames(removed)}"
-        val temporaryAwayExpired = removed.filter {
-            it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
-                it.temporaryAwaySkippedTurns >= 3
+        details += if (publicEventTypeOverride == PublicQueueEventType.NO_SHOW_REMOVED) {
+            "${quotedNames(removed)}本次未到场，登记已移除"
+        } else {
+            "移除 ${quotedNames(removed)}"
         }
         if (temporaryAwayExpired.isNotEmpty()) {
             details += "${quotedNames(temporaryAwayExpired)}在暂时离开期间第四次轮到，已自动退出排队"
@@ -123,7 +127,7 @@ fun createQueueAuditLog(
         if (old.preference != new.preference) {
             affectedRegistrationKeys += key
             changeKinds += "preference"
-            details += "“${new.displayId}”改为${queuePreferenceLabel(new.preference)}"
+            details += "“${new.displayId}”改为${queuePreferenceLabel(new)}"
         }
         if (old.fixedPartnerKey != new.fixedPartnerKey) {
             affectedRegistrationKeys += key
@@ -170,6 +174,11 @@ fun createQueueAuditLog(
             changeKinds += "no_show"
             details += "“${new.displayId}”已记录第 ${new.noShowCount} 次未到场"
         }
+        if (old.noShowCount > 0 && new.noShowCount == 0) {
+            affectedRegistrationKeys += key
+            changeKinds += "no_show_cleared"
+            details += "“${new.displayId}”正常完成游玩，未到场记录已清除"
+        }
     }
 
     if (before.playing.map { it.key } != after.playing.map { it.key }) {
@@ -193,26 +202,8 @@ fun createQueueAuditLog(
         details += "本轮计时已更新"
     }
 
-    val generatedTitle = when {
-        "added" in changeKinds && "removed" !in changeKinds -> "新增登记"
-        "removed" in changeKinds && "added" !in changeKinds -> "移除登记"
-        "renamed" in changeKinds -> "登记昵称已修改"
-        "claimed" in changeKinds -> "登记已认领"
-        "profile" in changeKinds -> "登记资料已更新"
-        "no_show" in changeKinds -> "未到场状态已更新"
-        "absence" in changeKinds -> "暂缓或暂离状态已修改"
-        "preference" in changeKinds -> "游玩偏好已修改"
-        "pair" in changeKinds -> "固定组合已修改"
-        "playing" in changeKinds -> "游玩位置已更新"
-        "order" in changeKinds -> "登记顺序已调整"
-        "timer" in changeKinds -> "本轮计时已重置"
-        else -> "队列已更新"
-    }
     val publicEventType = publicEventTypeOverride ?: when {
-        removed.any {
-            it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
-                it.temporaryAwaySkippedTurns >= 3
-        } -> PublicQueueEventType.TEMPORARY_AWAY_EXPIRED
+        temporaryAwayExpired.isNotEmpty() -> PublicQueueEventType.TEMPORARY_AWAY_EXPIRED
         "no_show" in changeKinds -> PublicQueueEventType.REGISTRATION_UPDATED
         "absence" in changeKinds -> PublicQueueEventType.ABSENCE_CHANGED
         "added" in changeKinds && "removed" !in changeKinds -> PublicQueueEventType.REGISTRATION_ADDED
@@ -221,6 +212,27 @@ fun createQueueAuditLog(
         "order" in changeKinds -> PublicQueueEventType.QUEUE_REORDERED
         changeKinds.isNotEmpty() -> PublicQueueEventType.REGISTRATION_UPDATED
         else -> PublicQueueEventType.OTHER
+    }
+    val generatedTitle = when (publicEventType) {
+        PublicQueueEventType.NO_SHOW_DEFERRED -> "未到场 · 已暂缓一轮"
+        PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场 · 已移至队尾"
+        PublicQueueEventType.NO_SHOW_REMOVED -> "未到场 · 已移除登记"
+        PublicQueueEventType.TEMPORARY_AWAY_EXPIRED -> "暂时离开已达轮空上限"
+        else -> when {
+            "added" in changeKinds && "removed" !in changeKinds -> "新增登记"
+            "removed" in changeKinds && "added" !in changeKinds -> "移除登记"
+            "claimed" in changeKinds -> "登记已认领"
+            "renamed" in changeKinds -> "登记昵称已修改"
+            "profile" in changeKinds -> "登记资料已更新"
+            "no_show" in changeKinds -> "未到场状态已更新"
+            "absence" in changeKinds -> "暂缓或暂离状态已修改"
+            "pair" in changeKinds -> "固定组合已修改"
+            "preference" in changeKinds -> "游玩偏好已修改"
+            "playing" in changeKinds -> "游玩位置已更新"
+            "order" in changeKinds -> "登记顺序已调整"
+            "timer" in changeKinds -> "本轮计时已重置"
+            else -> "队列已更新"
+        }
     }
     return createAuditLogEntry(
         category = category,
@@ -271,16 +283,57 @@ fun createPlayerProfileAuditLog(
     )
 }
 
+fun createMachineTransferAuditLog(
+    category: AuditLogCategory,
+    sourceMachineLabel: String,
+    destinationMachineLabel: String,
+    registrations: List<Registration>,
+    releasedPartnerRegistrations: List<Registration> = emptyList(),
+    source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
+    timestampMillis: Long = System.currentTimeMillis()
+): AuditLogEntry? {
+    if (registrations.isEmpty()) return null
+    val affectedRegistrationKeys = (registrations + releasedPartnerRegistrations)
+        .map { it.key }
+        .distinct()
+    val details = buildList {
+        add(
+            "已将${quotedNames(registrations)}从$sourceMachineLabel 转至$destinationMachineLabel，" +
+                "并加入目标机台的等待顺序末端"
+        )
+        if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
+            add("转入后，暂缓一轮状态已解除")
+        }
+        if (releasedPartnerRegistrations.isNotEmpty()) {
+            add("原固定组合已解除，双方均恢复为允许他人加入")
+        }
+    }
+    return createAuditLogEntry(
+        category = category,
+        title = "登记已转至$destinationMachineLabel",
+        detail = details.joinToString(separator = "；", postfix = "。"),
+        source = source,
+        timestampMillis = timestampMillis,
+        publicEventType = PublicQueueEventType.REGISTRATION_UPDATED,
+        affectedRegistrationKeys = affectedRegistrationKeys
+    )
+}
+
 private fun quotedNames(registrations: List<Registration>): String =
     registrations.joinToString("、") { "“${it.displayId}”" }.ifEmpty { "空" }
 
 private fun positionNames(registrations: List<Registration>): String =
     if (registrations.isEmpty()) "空" else quotedNames(registrations)
 
-private fun queuePreferenceLabel(preference: PlayPreference): String = when (preference) {
-    PlayPreference.SOLO -> "单人游玩"
-    PlayPreference.OPEN_TO_JOIN -> "允许他人加入"
-}
+private fun queuePreferenceLabel(registration: Registration): String =
+    if (registration.fixedPartnerKey != null) {
+        "与朋友共同游玩"
+    } else {
+        when (registration.preference) {
+            PlayPreference.SOLO -> "单人游玩"
+            PlayPreference.OPEN_TO_JOIN -> "允许他人加入"
+        }
+    }
 
 private fun profilePreferenceAuditLabel(preference: ProfilePlayPreference): String = when (preference) {
     ProfilePlayPreference.SOLO -> "单人游玩"

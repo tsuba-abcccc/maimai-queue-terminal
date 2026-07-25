@@ -2,7 +2,7 @@
 
 该插件把 Koishi OneBot 与 maimai Q 私有 API 连接起来。QQ 号来自 OneBot 会话身份，玩家不能在命令中指定其他人的 QQ。
 
-插件采用独立版本号，当前版本为 `0.1.6`，不会跟随 Android 应用版本同步递增。
+插件采用独立版本号，当前版本为 `0.1.8`，不会跟随 Android 应用版本同步递增。
 
 ## 当前功能
 
@@ -58,10 +58,10 @@ pnpm run build
 pnpm pack
 ```
 
-`pnpm pack` 会再次构建并生成 `koishi-plugin-maimai-q-0.1.6.tgz`。将该文件放到运行 Koishi 的机器，在 Koishi 项目根目录执行：
+`pnpm pack` 会再次构建并生成 `koishi-plugin-maimai-q-0.1.8.tgz`。将该文件放到运行 Koishi 的机器，在 Koishi 项目根目录执行：
 
 ```bash
-pnpm add -w /absolute/path/to/koishi-plugin-maimai-q-0.1.6.tgz
+pnpm add -w /absolute/path/to/koishi-plugin-maimai-q-0.1.8.tgz
 ```
 
 使用 pnpm 或 Yarn 管理 Koishi 项目时，应使用对应的本地包安装命令，不要在插件源码目录与 Koishi 项目之间直接复制 `node_modules`。
@@ -115,7 +115,7 @@ systemctl status maimai-q-koishi.service
 
 ## 隐私与失败处理
 
-- 公开队列接口始终不返回 QQ、性别或资料 UUID。
+- 公开队列接口只为当前有效的资料库登记返回 QQ，供网站登记详情联系玩家；性别、资料 UUID 和完整玩家资料仍不公开。
 - 私有接口必须携带 Bot 令牌。
 - Bot 令牌是服务级凭据，可以读取完整玩家资料库、当前登记绑定和通知事件中的全部 QQ 收件人；它不能提供给玩家或网页前端。
 - 按 QQ 查询玩家和资料时，QQ 只放在 POST JSON 内容中，不写入 URL 参数，避免被常规访问日志记录。

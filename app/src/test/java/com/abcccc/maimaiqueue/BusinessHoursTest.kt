@@ -24,17 +24,33 @@ class BusinessHoursTest {
     }
 
     @Test
-    fun ordinaryScheduleStaysOpenWithoutTheLegacyPreClosingWarning() {
+    fun closingWarningStartsExactlyThirtyMinutesBeforeClosing() {
         val settings = BusinessHoursSettings(
             enabled = true,
             defaultHours = DailyBusinessHours(10 * 60, 22 * 60)
         )
-        val status = evaluateBusinessHours(settings, timestamp(2026, 7, 25, 21, 45))
+        val beforeWarning = evaluateBusinessHours(
+            settings,
+            timestamp(2026, 7, 25, 21, 29),
+            zone
+        )
+        val atWarning = evaluateBusinessHours(
+            settings,
+            timestamp(2026, 7, 25, 21, 30),
+            zone
+        )
+        val beforeClosing = evaluateBusinessHours(
+            settings,
+            timestamp(2026, 7, 25, 21, 59),
+            zone
+        )
 
-        assertFalse(status.outsideBusinessHours)
-        assertFalse(status.closingSoon)
-        assertFalse(status.closingGracePeriod)
-        assertNotNull(status.activeClosingAtMillis)
+        assertFalse(beforeWarning.closingSoon)
+        assertTrue(atWarning.closingSoon)
+        assertTrue(beforeClosing.closingSoon)
+        assertFalse(atWarning.outsideBusinessHours)
+        assertFalse(atWarning.closingGracePeriod)
+        assertNotNull(atWarning.activeClosingAtMillis)
     }
 
     @Test
@@ -142,6 +158,24 @@ class BusinessHoursTest {
                 4,
                 status.mostRecentClosingOccurrenceId
             )
+        )
+    }
+
+    @Test
+    fun handledClosingOccurrenceDoesNotBlockAManuallyReopenedQueue() {
+        val settings = BusinessHoursSettings(
+            enabled = true,
+            defaultHours = DailyBusinessHours(10 * 60, 22 * 60)
+        )
+        val status = evaluateBusinessHours(settings, timestamp(2026, 7, 25, 22, 5), zone)
+
+        assertTrue(hasUnhandledClosingOccurrence(status, null))
+        assertTrue(isActiveClosingGracePeriod(status, null))
+        assertFalse(
+            hasUnhandledClosingOccurrence(status, status.mostRecentClosingOccurrenceId)
+        )
+        assertFalse(
+            isActiveClosingGracePeriod(status, status.mostRecentClosingOccurrenceId)
         )
     }
 

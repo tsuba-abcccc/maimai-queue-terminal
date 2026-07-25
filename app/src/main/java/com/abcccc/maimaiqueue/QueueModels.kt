@@ -51,11 +51,18 @@ fun normalizeMachineStopReasonDetail(
 ): String? = if (reason == MachineStopReason.OTHER) {
     detail?.filterNot { it.isISOControl() }
         ?.trim()
-        ?.take(MAX_MACHINE_STOP_REASON_DETAIL_CHARACTERS)
+        ?.takeCodePoints(MAX_MACHINE_STOP_REASON_DETAIL_CHARACTERS)
         ?.takeIf { it.isNotEmpty() }
 } else {
     null
 }
+
+private fun String.takeCodePoints(maximum: Int): String =
+    if (codePointCount(0, length) <= maximum) {
+        this
+    } else {
+        substring(0, offsetByCodePoints(0, maximum))
+    }
 
 data class Registration(
     val key: Int,
@@ -74,6 +81,7 @@ data class Registration(
 )
 
 data class FriendPairPlan(
+    val originalWaiting: List<Registration>,
     val waiting: List<Registration>,
     val firstRegistration: Registration,
     val secondRegistration: Registration,
@@ -580,6 +588,7 @@ data class MachineQueue(
                 }
             }
             return FriendPairPlan(
+                originalWaiting = waiting,
                 waiting = fixedWaiting,
                 firstRegistration = firstOriginal,
                 secondRegistration = secondOriginal,
@@ -654,6 +663,7 @@ data class MachineQueue(
             pairPositionIndex > (originalPositionByKey[registration.key] ?: pairPositionIndex)
         }
         return FriendPairPlan(
+            originalWaiting = waiting,
             waiting = newWaiting,
             firstRegistration = firstOriginal,
             secondRegistration = secondOriginal,
@@ -663,9 +673,24 @@ data class MachineQueue(
         )
     }
 
-    fun applyFriendPair(plan: FriendPairPlan): MachineQueue =
-        if (plan.delayedOtherRegistrations.isNotEmpty()) this
-        else copy(waiting = sanitizeFriendPairs(plan.waiting))
+    fun applyFriendPair(plan: FriendPairPlan): MachineQueue {
+        if (
+            plan.delayedOtherRegistrations.isNotEmpty() ||
+            !registrationsHaveSameQueueState(waiting, plan.originalWaiting)
+        ) return this
+
+        val currentByKey = waiting.associateBy(Registration::key)
+        val rebasedWaiting = plan.waiting.map { planned ->
+            val current = currentByKey[planned.key] ?: return this
+            current.copy(
+                preference = planned.preference,
+                absenceStatus = planned.absenceStatus,
+                temporaryAwaySkippedTurns = planned.temporaryAwaySkippedTurns,
+                fixedPartnerKey = planned.fixedPartnerKey
+            )
+        }
+        return copy(waiting = sanitizeFriendPairs(rebasedWaiting))
+    }
 
     fun createFriendPair(registrationKey: Int, friend: Registration): MachineQueue {
         val registration = waiting.firstOrNull { it.key == registrationKey } ?: return this
@@ -976,11 +1001,16 @@ data class MachineQueue(
         }
         if (proposedKeys == currentKeys) return this
 
+        // A reorder proposal carries identity and order only. Registration details may have
+        // changed while its confirmation was open, for example through a QQ profile update.
+        val currentRegistrationsByKey = allRegistrations.associateBy { it.key }
+        val reorderedCurrentRegistrations = proposedKeys.map(currentRegistrationsByKey::getValue)
+
         // Reordering waiting registrations must not move the physically active
         // players or restart their timer. An intentionally empty playing
         // position must remain empty as well.
         if (playing.isEmpty()) {
-            return copy(waiting = sanitizeFriendPairs(registrations))
+            return copy(waiting = sanitizeFriendPairs(reorderedCurrentRegistrations))
         }
         val currentPlayingOrder = playing.map { it.key }
         val proposedPlayingOrder = proposedKeys.take(playing.size)
@@ -988,7 +1018,7 @@ data class MachineQueue(
         val currentPlayingKeys = currentPlayingOrder.toSet()
         return copy(
             waiting = sanitizeFriendPairs(
-                registrations.filter { it.key !in currentPlayingKeys }
+                reorderedCurrentRegistrations.filter { it.key !in currentPlayingKeys }
             )
         )
     }
@@ -1132,6 +1162,26 @@ data class MachineQueue(
     }
 }
 
+internal fun MachineQueue.hasSameQueueOperationState(other: MachineQueue): Boolean =
+    playingStartedAtMillis == other.playingStartedAtMillis &&
+        registrationsHaveSameQueueState(playing, other.playing) &&
+        registrationsHaveSameQueueState(waiting, other.waiting)
+
+internal fun registrationsHaveSameQueueState(
+    first: List<Registration>,
+    second: List<Registration>
+): Boolean = first.size == second.size && first.zip(second).all { (left, right) ->
+    left.key == right.key &&
+        left.preference == right.preference &&
+        left.absenceStatus == right.absenceStatus &&
+        left.temporaryAwaySkippedTurns == right.temporaryAwaySkippedTurns &&
+        left.createdAtMillis == right.createdAtMillis &&
+        left.lastPlayedAtMillis == right.lastPlayedAtMillis &&
+        left.noShowCount == right.noShowCount &&
+        left.lastNoShowActionWasDefer == right.lastNoShowActionWasDefer &&
+        left.fixedPartnerKey == right.fixedPartnerKey
+}
+
 fun groupIntoPositions(registrations: List<Registration>): List<List<Registration>> {
     val positions = mutableListOf<MutableList<Registration>>()
     var pendingOpenPositionIndex: Int? = null
@@ -1207,7 +1257,7 @@ fun groupIntoPositions(registrations: List<Registration>): List<List<Registratio
     return positions.map { it.toList() }
 }
 
-private fun sanitizeFriendPairs(registrations: List<Registration>): List<Registration> {
+internal fun sanitizeFriendPairs(registrations: List<Registration>): List<Registration> {
     val indexByKey = registrations.mapIndexed { index, registration -> registration.key to index }.toMap()
     val registrationByKey = registrations.associateBy { it.key }
     return registrations.mapIndexed { index, registration ->

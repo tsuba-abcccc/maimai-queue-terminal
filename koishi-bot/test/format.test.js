@@ -64,6 +64,94 @@ test('shows move-to-end as the latest no-show handling result', () => {
   assert.match(text, /上次处理：移至队尾/)
 })
 
+test('describes a zero-minute personal estimate as ready now', () => {
+  const text = formatOwnQueue([{
+    registration_id: 'registration-ready',
+    profile_id: 'profile-ready',
+    qq_number: '87654321',
+    display_id: '即将上机',
+    machine_id: 'B',
+    position: 'WAITING',
+    position_index: 1,
+    estimated_wait_minutes: 0,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+  }])
+
+  assert.match(text, /预计现在可以游玩/)
+  assert.doesNotMatch(text, /约 0 分钟后/)
+})
+
+test('omits the estimate when an older personal response has no estimate field', () => {
+  const text = formatOwnQueue([{
+    registration_id: 'registration-without-estimate',
+    profile_id: 'profile-without-estimate',
+    qq_number: '87654321',
+    display_id: '旧数据玩家',
+    machine_id: 'A',
+    position: 'WAITING',
+    position_index: 1,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+  }])
+
+  assert.match(text, /旧数据玩家：位于队列位置 A1/)
+  assert.doesNotMatch(text, /undefined|约 .* 分钟后/)
+})
+
+test('shows business-hours state in personal queue output and notifications', () => {
+  const player = {
+    registration_id: 'registration-closing',
+    profile_id: 'profile-closing',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'A',
+    position: 'WAITING',
+    position_index: 1,
+    estimated_wait_minutes: 7,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+  }
+  const personalSnapshot = {
+    terminal: { online: true },
+    registration_open: true,
+    business_hours: {
+      enabled: true,
+      outside: true,
+      closing_soon: false,
+      closing_grace: true,
+      closes_at: null,
+      registration_closes_at: Date.now() + 10 * 60_000,
+    },
+  }
+
+  const text = formatOwnQueue([player], undefined, personalSnapshot)
+  const closingSoonText = formatOwnQueue([player], undefined, {
+    ...personalSnapshot,
+    business_hours: {
+      enabled: true,
+      outside: false,
+      closing_soon: true,
+      closing_grace: false,
+      closes_at: Date.now() + 30 * 60_000,
+      registration_closes_at: null,
+    },
+  })
+
+  assert.match(text, /^今日营业时间已结束，现有队列正在收尾。\n\n/)
+  assert.match(text, /小雨：位于队列位置 A1/)
+  assert.match(closingSoonText, /^将在 30 分钟内闭店，请留意后续队列安排。\n\n/)
+})
+
 test('formats both machines without exposing private profile fields', () => {
   const text = formatQueue({
     queue_id: 'queue-1',
@@ -157,6 +245,72 @@ test('keeps preserved registrations visible while a machine is stopped', () => {
   assert.doesNotMatch(text, /小雨（|允许他人加入/)
 })
 
+test('shows fixed pairs and the complete machine stop reason', () => {
+  const fixedRegistration = (id, name) => ({
+    registration_id: id,
+    display_id: name,
+    preference: 'OPEN_TO_JOIN',
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    fixed_pair: true,
+    no_show_count: 0,
+  })
+  const machine = (id, overrides = {}) => ({
+    id,
+    name: `${id === 'A' ? '入口侧' : '墙侧'} · 机台 ${id}`,
+    operational: true,
+    stop_reason: null,
+    stop_reason_detail: null,
+    playing_started_at: null,
+    playing: [],
+    waiting_positions: [],
+    ...overrides,
+  })
+  const fixedPairText = formatQueue({
+    queue_id: 'queue-1',
+    captured_at: Date.now(),
+    registration_open: true,
+    terminal: { online: true },
+    machines: {
+      A: machine('A', {
+        waiting_positions: [{
+          index: 1,
+          estimated_wait_minutes: 0,
+          registrations: [
+            fixedRegistration('registration-1', '小雨'),
+            fixedRegistration('registration-2', '青空'),
+          ],
+        }],
+      }),
+      B: machine('B', {
+        operational: false,
+        stop_reason: 'OTHER',
+        stop_reason_detail: '等待配件',
+      }),
+    },
+  })
+
+  assert.match(fixedPairText, /小雨 \(固定组合\)/)
+  assert.match(fixedPairText, /青空 \(固定组合\)/)
+  assert.match(fixedPairText, /停止使用·其他原因（等待配件）/)
+
+  const maintenanceText = formatQueue({
+    queue_id: 'queue-1',
+    captured_at: Date.now(),
+    registration_open: true,
+    terminal: { online: true },
+    machines: {
+      A: machine('A'),
+      B: machine('B', {
+        operational: false,
+        stop_reason: 'MAINTENANCE',
+      }),
+    },
+  })
+  assert.match(maintenanceText, /停止使用·机台维护/)
+})
+
 test('does not show a stale personal estimate while the machine is stopped', () => {
   const player = {
     registration_id: 'registration-1',
@@ -200,8 +354,101 @@ test('does not show a stale personal estimate while the machine is stopped', () 
     },
   })
 
-  assert.match(text, /机台状态：停止使用，登记顺序已保留/)
+  assert.match(text, /机台状态：停止使用·机台未开机，登记顺序已保留/)
   assert.doesNotMatch(text, /约 8 分钟后/)
+})
+
+test('keeps personal status complete without a public queue snapshot', () => {
+  const text = formatOwnQueue([{
+    registration_id: 'registration-1',
+    profile_id: 'profile-1',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'A',
+    machine_name: '入口侧 · 机台 A',
+    machine_operational: false,
+    machine_stop_reason: 'OTHER',
+    machine_stop_reason_detail: '等待配件',
+    playing_started_at: null,
+    position: 'WAITING',
+    position_index: 1,
+    estimated_wait_minutes: 8,
+    co_player_display_ids: ['青空'],
+    preference: 'OPEN_TO_JOIN',
+    fixed_pair: true,
+    registration_type: 'PLAYER_PROFILE',
+    last_played_at: null,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+  }], undefined, { terminal: { online: false } })
+
+  assert.match(text, /^终端暂时离线/)
+  assert.match(text, /所在机台：入口侧·机台 A/)
+  assert.match(text, /机台状态：停止使用·其他原因（等待配件），登记顺序已保留。/)
+  assert.match(text, /本次偏好：与朋友共同游玩/)
+  assert.match(text, /共同游玩：青空/)
+  assert.doesNotMatch(text, /约 8 分钟后/)
+  assert.doesNotMatch(text, /允许他人加入/)
+})
+
+test('uses the private playing timer when formatting a notification status', () => {
+  const text = formatOwnQueue([{
+    registration_id: 'registration-1',
+    profile_id: 'profile-1',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'A',
+    machine_operational: true,
+    playing_started_at: Date.now() - 5 * 60_000,
+    position: 'PLAYING',
+    position_index: null,
+    estimated_wait_minutes: null,
+    preference: 'SOLO',
+    fixed_pair: false,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+  }])
+
+  assert.match(text, /正在游玩位置 A·已游玩 [45] 分钟/)
+  assert.match(text, /本次偏好：单人游玩/)
+})
+
+test('describes a retained playing position as a location while its machine is stopped', () => {
+  const player = {
+    registration_id: 'registration-stopped-playing',
+    profile_id: 'profile-1',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'A',
+    machine_name: '入口侧 · 机台 A',
+    machine_operational: false,
+    machine_stop_reason: 'NETWORK_DISCONNECTED',
+    machine_stop_reason_detail: null,
+    playing_started_at: Date.now() - 8 * 60_000,
+    position: 'PLAYING',
+    position_index: null,
+    estimated_wait_minutes: null,
+    preference: 'SOLO',
+    fixed_pair: false,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+  }
+
+  const text = formatOwnQueue([player])
+
+  assert.match(text, /位于游玩位置 A/)
+  assert.match(text, /机台状态：停止使用·机台断网，登记顺序已保留。/)
+  assert.doesNotMatch(text, /正在游玩位置/)
+  assert.doesNotMatch(text, /已游玩 \d+ 分钟/)
 })
 
 test('adds current preference, elapsed time, and stale warning to own status', () => {
@@ -313,7 +560,7 @@ test('shows the computed business-hours state in the queue header', () => {
   assert.match(naturalQueue, /^当前队列·终端在线·自然排队$/m)
 })
 
-test('shows the closing grace period without restoring the old pre-closing warning', () => {
+test('shows both the thirty-minute closing warning and the closing grace period', () => {
   const emptyMachine = id => ({
     id,
     name: `${id === 'A' ? '入口侧' : '墙侧'} · 机台 ${id}`,
@@ -338,11 +585,27 @@ test('shows the closing grace period without restoring the old pre-closing warni
     terminal: { online: true },
     machines: { A: emptyMachine('A'), B: emptyMachine('B') },
   })
+  const closingSoonText = formatQueue({
+    queue_id: 'queue-1',
+    captured_at: Date.now(),
+    registration_open: true,
+    business_hours: {
+      enabled: true,
+      outside: false,
+      closing_soon: true,
+      closing_grace: false,
+      closes_at: Date.now() + 30 * 60_000,
+      registration_closes_at: null,
+    },
+    terminal: { online: true },
+    machines: { A: emptyMachine('A'), B: emptyMachine('B') },
+  })
 
   assert.match(text, /^当前队列·终端在线·不在营业时间$/m)
   assert.match(text, /今日营业时间已结束/)
   assert.match(text, /最迟保留 20 分钟/)
-  assert.doesNotMatch(text, /距离闭店不足 15 分钟/)
+  assert.match(closingSoonText, /将在 30 分钟内闭店/)
+  assert.match(closingSoonText, /请留意后续队列安排。/)
 })
 
 test('formats queue notifications with the canonical heading and compact middle dots', () => {

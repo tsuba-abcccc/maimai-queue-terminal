@@ -31,6 +31,20 @@ internal class PlayerProfilePersistenceCoordinator(
         persisted
     }
 
+    suspend fun mutateAndApply(
+        profileId: String,
+        currentProfiles: () -> List<PlayerProfile>,
+        mutation: (PlayerProfile) -> PlayerProfile,
+        onPersisted: (PlayerProfile) -> Unit = {}
+    ): Boolean = writeMutex.withLock {
+        val currentProfile = currentProfiles().firstOrNull { it.id == profileId }
+            ?: return@withLock false
+        val updatedProfile = mutation(currentProfile)
+        val persisted = persist(updatedProfile)
+        if (persisted) onPersisted(updatedProfile)
+        persisted
+    }
+
     suspend fun persistIndividually(
         profiles: List<PlayerProfile>,
         shouldPersist: (PlayerProfile) -> Boolean = { true },
