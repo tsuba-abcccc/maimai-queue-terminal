@@ -164,6 +164,8 @@ private val AbsenceStatusColor = Color(0xFFB85C00)
 private val AbsenceStatusBackground = Color(0xFFFFF1DC)
 private val NoShowStatusColor = Color(0xFFC9342C)
 private val NoShowStatusBackground = Color(0xFFFFEFEE)
+private val OnlineRegistrationStatusColor = Color(0xFF087F73)
+private val OnlineRegistrationStatusBackground = Color(0xFFE8F7F4)
 private val DisabledBackground = Color(0xFFE8E8ED)
 private val PositionBackground = Color(0xFFFAFAFC)
 private val ControlRadius = 11.dp
@@ -590,8 +592,11 @@ private fun RegistrationApp() {
             displaySettings = QueuePublicDisplaySettings(
                 machineARemark = queueRuleSettings.machineARemark,
                 machineBRemark = queueRuleSettings.machineBRemark,
+                websiteRemoteEnabled = queueRuleSettings.websiteSyncEnabled,
                 oneBotSyncEnabled = queueRuleSettings.websiteSyncEnabled &&
                     queueRuleSettings.oneBotSyncEnabled,
+                allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
+                allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
                 businessHours = QueuePublicBusinessHours(
                     enabled = businessHoursStatus.enabled,
                     outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
@@ -683,7 +688,10 @@ private fun RegistrationApp() {
                         displaySettings = QueuePublicDisplaySettings(
                             machineARemark = settings.machineARemark,
                             machineBRemark = settings.machineBRemark,
+                            websiteRemoteEnabled = false,
                             oneBotSyncEnabled = false,
+                            allowDeferOneRound = settings.allowDeferOneRound,
+                            allowTemporaryLeave = settings.allowTemporaryLeave,
                             businessHours = QueuePublicBusinessHours(
                                 enabled = closingStatus.enabled,
                                 outsideBusinessHours = closingStatus.outsideBusinessHours,
@@ -1636,6 +1644,26 @@ private fun RegistrationApp() {
         }
     }
 
+    fun currentRemoteQueueExecutionState() = RemoteQueueExecutionState(
+        queueId = queueId,
+        queues = linkedMapOf(
+            MachineId.A.name to machineA,
+            MachineId.B.name to machineB
+        ),
+        machineStatuses = mapOf(
+            MachineId.A.name to machineAStatus,
+            MachineId.B.name to machineBStatus
+        ),
+        playerProfiles = playerProfiles,
+        nextRegistrationKey = nextKey,
+        acceptingNewRegistrations = acceptingNewRegistrations,
+        websiteRemoteEnabled = queueRuleSettings.websiteSyncEnabled,
+        oneBotSyncEnabled = queueRuleSettings.websiteSyncEnabled &&
+            queueRuleSettings.oneBotSyncEnabled,
+        allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
+        allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave
+    )
+
     LaunchedEffect(
         queueCommandClient,
         queueRuleSettings.websiteSyncEnabled,
@@ -1663,57 +1691,160 @@ private fun RegistrationApp() {
                             CLOUD_PROFILE_REFRESH_INTERVAL_MILLIS
                     }
                 }
-                if (queueRuleSettings.oneBotSyncEnabled) {
-                    queueCommandClient.fetchPlayerProfileUpdates()?.forEach { command ->
-                        when (val result = playerProfilePersistence.processCommand(
-                            command = command,
-                            currentProfiles = { playerProfiles },
-                            nicknameConflictsWithQueue = ::playerProfileNicknameConflictsWithQueue,
-                            onPersisted = { profile ->
-                                applyPlayerProfileToState(
-                                    profile,
-                                    source = AuditLogSource.QQ_BOT
-                                )
-                            }
-                        )) {
-                            is PlayerProfileCommandPersistenceResult.Applied -> {
-                                localWriteFailureDetail = null
-                                queueCommandClient.complete(
-                                    command.commandId,
-                                    applied = true,
-                                    detail = "玩家资料已由终端更新。"
-                                )
+                queueCommandClient.fetchPendingCommands()?.let { commands ->
+                    for (command in commands) {
+                        when (command) {
+                            is PlayerProfileUpdateCommand -> {
+                                if (!queueRuleSettings.oneBotSyncEnabled) {
+                                    queueCommandClient.complete(
+                                        command.commandId,
+                                        applied = false,
+                                        detail = "现场终端已关闭 QQ Bot 联动。"
+                                    )
+                                    continue
+                                }
+                                when (val result = playerProfilePersistence.processCommand(
+                                    command = command,
+                                    currentProfiles = { playerProfiles },
+                                    nicknameConflictsWithQueue =
+                                        ::playerProfileNicknameConflictsWithQueue,
+                                    onPersisted = { profile ->
+                                        applyPlayerProfileToState(
+                                            profile,
+                                            source = AuditLogSource.QQ_BOT
+                                        )
+                                    }
+                                )) {
+                                    is PlayerProfileCommandPersistenceResult.Applied -> {
+                                        localWriteFailureDetail = null
+                                        queueCommandClient.complete(
+                                            command.commandId,
+                                            applied = true,
+                                            detail = "玩家资料已由终端更新。"
+                                        )
+                                    }
+
+                                    PlayerProfileCommandPersistenceResult.AlreadyApplied -> {
+                                        localWriteFailureDetail = null
+                                        queueCommandClient.complete(
+                                            command.commandId,
+                                            applied = true,
+                                            detail = "玩家资料已经是请求的内容。"
+                                        )
+                                    }
+
+                                    is PlayerProfileCommandPersistenceResult.Rejected -> {
+                                        queueCommandClient.complete(
+                                            command.commandId,
+                                            applied = false,
+                                            detail = result.detail
+                                        )
+                                    }
+
+                                    PlayerProfileCommandPersistenceResult.PersistenceFailed -> {
+                                        localWriteFailureDetail =
+                                            "玩家资料暂时无法写入本机，应用将继续重试。"
+                                    }
+                                }
                             }
 
-                            PlayerProfileCommandPersistenceResult.AlreadyApplied -> {
-                                localWriteFailureDetail = null
-                                queueCommandClient.complete(
-                                    command.commandId,
-                                    applied = true,
-                                    detail = "玩家资料已经是请求的内容。"
+                            is RemoteQueueOperationCommand -> {
+                                var decision = decideRemoteQueueOperation(
+                                    command,
+                                    currentRemoteQueueExecutionState()
                                 )
-                            }
+                                val profileToPersist =
+                                    (decision as? RemoteQueueOperationDecision.Apply)
+                                        ?.updatedProfile
+                                if (profileToPersist != null) {
+                                    val persisted = playerProfilePersistence.persistAndApply(
+                                        profileToPersist
+                                    ) { profile ->
+                                        applyPlayerProfileToState(
+                                            profile,
+                                            recordAudit = false,
+                                            source = command.source.auditLogSource
+                                        )
+                                    }
+                                    if (!persisted) {
+                                        localWriteFailureDetail =
+                                            "线上登记的玩家资料暂时无法写入本机，应用将继续重试。"
+                                        continue
+                                    }
+                                    decision = decideRemoteQueueOperation(
+                                        command,
+                                        currentRemoteQueueExecutionState()
+                                    )
+                                }
+                                when (val result = decision) {
+                                    is RemoteQueueOperationDecision.Apply -> {
+                                        val beforeQueues = mapOf(
+                                            MachineId.A.name to machineA,
+                                            MachineId.B.name to machineB
+                                        )
+                                        machineA = result.state.queues[MachineId.A.name]
+                                            ?: machineA
+                                        machineB = result.state.queues[MachineId.B.name]
+                                            ?: machineB
+                                        nextKey = maxOf(
+                                            nextKey,
+                                            result.state.nextRegistrationKey
+                                        )
+                                        queueUndoAction = null
+                                        result.changedMachineIds.forEach { machineName ->
+                                            val machineId = MachineId.entries.firstOrNull {
+                                                it.name == machineName
+                                            } ?: return@forEach
+                                            appendQueueAuditLog(
+                                                machineId = machineId,
+                                                beforeQueue = beforeQueues.getValue(machineName),
+                                                afterQueue = result.state.queues.getValue(machineName),
+                                                source = command.source.auditLogSource
+                                            )
+                                        }
+                                        if (result.changedMachineIds.isNotEmpty()) {
+                                            queueSoundPlayer.play(
+                                                if (command.operation ==
+                                                    RemoteQueueOperation.JOIN_QUEUE
+                                                ) {
+                                                    QueueSoundCue.CONFIRM
+                                                } else {
+                                                    QueueSoundCue.QUEUE_CHANGE
+                                                }
+                                            )
+                                        }
+                                        localWriteFailureDetail = null
+                                        queueCommandClient.complete(
+                                            command.commandId,
+                                            applied = true,
+                                            detail = result.detail
+                                        )
+                                    }
 
-                            is PlayerProfileCommandPersistenceResult.Rejected -> {
-                                queueCommandClient.complete(
-                                    command.commandId,
-                                    applied = false,
-                                    detail = result.detail
-                                )
-                            }
+                                    is RemoteQueueOperationDecision.AlreadyApplied -> {
+                                        localWriteFailureDetail = null
+                                        queueCommandClient.complete(
+                                            command.commandId,
+                                            applied = true,
+                                            detail = result.detail
+                                        )
+                                    }
 
-                            PlayerProfileCommandPersistenceResult.PersistenceFailed ->
-                                localWriteFailureDetail =
-                                    "玩家资料暂时无法写入本机，应用将继续重试。"
+                                    is RemoteQueueOperationDecision.Reject -> {
+                                        queueCommandClient.complete(
+                                            command.commandId,
+                                            applied = false,
+                                            detail = result.detail
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
-                } else {
-                    localWriteFailureDetail = null
                 }
                 privateSyncFailureDetail = localWriteFailureDetail
                     ?: queueCommandClient.profileSyncFailureDetail
                     ?: queueCommandClient.commandSyncFailureDetail
-                        ?.takeIf { queueRuleSettings.oneBotSyncEnabled }
             } else {
                 privateSyncFailureDetail = null
             }
@@ -1811,7 +1942,7 @@ private fun RegistrationApp() {
                             onEnterPlaying = { machineId ->
                                 if (reorderSession == null) {
                                     val preview = queueFor(machineId).nextPlayingPositionPreview()
-                                    if (preview?.changedByAbsence == true) {
+                                    if (preview?.changedByAvailability == true) {
                                         enterPlayingConfirmation = machineId
                                     } else {
                                         updateQueue(machineId, QueueSoundCue.QUEUE_CHANGE) {
@@ -2144,7 +2275,7 @@ private fun RegistrationApp() {
                             playingPositionLabel = playingPositionName(selection.machineId),
                             canMoveIntoPlaying = currentPlayer != null &&
                                 isInFirstWaitingPosition &&
-                                registration.absenceStatus == QueueAbsenceStatus.NONE,
+                                registration.canEnterPlayingPosition,
                             canReportNoShow = queue.canMarkNoShow(registration.key),
                             allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
                             allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
@@ -2260,6 +2391,17 @@ private fun RegistrationApp() {
                                     } else {
                                         noShowTarget = selection.copy(fromPlayingPosition = wasPlaying)
                                     }
+                                }
+                                selectedRegistration = null
+                            },
+                            onCheckIn = {
+                                updateQueue(
+                                    machineId = selection.machineId,
+                                    soundCue = QueueSoundCue.CONFIRM,
+                                    affectedRegistrationKeysOverride =
+                                        listOf(registration.key)
+                                ) {
+                                    it.checkIn(registration.key)
                                 }
                                 selectedRegistration = null
                             },
@@ -2504,7 +2646,7 @@ private fun RegistrationApp() {
                     val queue = queueFor(machineId)
                     val preview = queue.nextPlayingPositionPreview()
                     val notice = nextPlayingChangeMessage(preview)
-                    if (preview?.changedByAbsence == true && notice != null) {
+                    if (preview?.changedByAvailability == true && notice != null) {
                         EnterPlayingConfirmation(
                             playingPositionLabel = playingPositionName(machineId),
                             notice = notice,
@@ -2685,7 +2827,7 @@ private fun RegistrationApp() {
                         },
                         onEnterPlaying = {
                             val preview = queueFor(selection.machineId).nextPlayingPositionPreview()
-                            if (preview?.changedByAbsence == true) {
+                            if (preview?.changedByAvailability == true) {
                                 enterPlayingConfirmation = selection.machineId
                             } else {
                                 updateQueue(selection.machineId) { it.enterPlayingPosition() }
@@ -5131,13 +5273,19 @@ private fun RegistrationTile(
         includeSkippedTurns = false
     )
     val noShowStatus = registration.noShowCount.takeIf { it > 0 }?.let { "未到场 $it 次" }
-    val visibleStatus = absenceStatus ?: noShowStatus
-    val showNoShowStatus = absenceStatus == null && noShowStatus != null
+    val pendingCheckIn = registration.requiresOnSiteCheckIn
+    val visibleStatus = when {
+        pendingCheckIn -> "线上登记 · 待签到"
+        absenceStatus != null -> absenceStatus
+        else -> noShowStatus
+    }
+    val showNoShowStatus = !pendingCheckIn && absenceStatus == null && noShowStatus != null
     Column(
         modifier.height(QueueRegistrationTileHeight).clip(shape)
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .background(
                 when {
+                    pendingCheckIn -> OnlineRegistrationStatusBackground
                     isPlaying -> PlayingRegistrationBackground
                     showNoShowStatus -> NoShowStatusBackground
                     else -> CardBackground
@@ -5146,6 +5294,7 @@ private fun RegistrationTile(
             .border(
                 1.dp,
                 when {
+                    pendingCheckIn -> OnlineRegistrationStatusColor.copy(alpha = .20f)
                     isPlaying -> SystemBlue.copy(alpha = .08f)
                     showNoShowStatus -> NoShowStatusColor.copy(alpha = .16f)
                     else -> Color.Transparent
@@ -5180,6 +5329,7 @@ private fun RegistrationTile(
                 else -> "允许他人加入"
             },
             color = when {
+                pendingCheckIn -> OnlineRegistrationStatusColor
                 absenceStatus != null -> AbsenceStatusColor
                 showNoShowStatus -> NoShowStatusColor
                 else -> SecondaryText
@@ -6883,6 +7033,7 @@ private fun RegistrationActions(
     onEditPlayerProfile: () -> Unit,
     onTransfer: () -> Unit,
     onNoShow: () -> Unit,
+    onCheckIn: () -> Unit,
     onExit: () -> Unit
 ) {
     ModalSurface(onDismiss, width = 560.dp) {
@@ -6975,13 +7126,15 @@ private fun RegistrationActions(
                         modifier = Modifier.weight(1f)
                     )
                     Spacer(Modifier.width(8.dp))
-                    IconButton(onClick = onRename, modifier = Modifier.size(40.dp)) {
-                        Icon(
-                            imageVector = Icons.Default.Edit,
-                            contentDescription = "编辑登记昵称",
-                            tint = SystemBlue,
-                            modifier = Modifier.size(18.dp)
-                        )
+                    if (!registration.requiresOnSiteCheckIn) {
+                        IconButton(onClick = onRename, modifier = Modifier.size(40.dp)) {
+                            Icon(
+                                imageVector = Icons.Default.Edit,
+                                contentDescription = "编辑登记昵称",
+                                tint = SystemBlue,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
                 }
                 Spacer(Modifier.height(6.dp))
@@ -6989,6 +7142,13 @@ private fun RegistrationActions(
                     horizontalArrangement = Arrangement.spacedBy(7.dp),
                     verticalArrangement = Arrangement.spacedBy(7.dp)
                 ) {
+                    if (registration.requiresOnSiteCheckIn) {
+                        DetailPill(
+                            text = "线上登记 · 待签到",
+                            color = OnlineRegistrationStatusColor,
+                            backgroundColor = OnlineRegistrationStatusBackground
+                        )
+                    }
                     registrationAbsenceStatusLabel(registration, includeSkippedTurns = true)?.let { status ->
                         DetailPill(
                             text = status,
@@ -7035,6 +7195,32 @@ private fun RegistrationActions(
                     )
                 }
                 Spacer(Modifier.height(16.dp))
+                if (registration.requiresOnSiteCheckIn) {
+                    MenuSectionHeader("到场与退出")
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(9.dp)
+                    ) {
+                        MenuActionButton(
+                            MenuAction(
+                                "已到场",
+                                "完成签到后，这份登记会保持当前顺序，并开始参与后续游玩位置分配。",
+                                onCheckIn,
+                                accented = true
+                            ),
+                            Modifier.weight(1f)
+                        )
+                        MenuActionButton(
+                            MenuAction(
+                                "退出排队",
+                                "移除这份线上登记；继续游玩时需要重新加入排队。",
+                                onExit,
+                                destructive = true
+                            ),
+                            Modifier.weight(1f)
+                        )
+                    }
+                } else {
                 val queueActions = buildList {
                     if (canMoveIntoPlaying) {
                         add(
@@ -7169,6 +7355,7 @@ private fun RegistrationActions(
                         MenuAction("退出排队", "移除这份登记；继续游玩时需要重新排队。", onExit, destructive = true),
                         Modifier.weight(1f)
                     )
+                }
                 }
             }
         }
@@ -7611,7 +7798,9 @@ private fun PositionActions(
         }
     }
     val firstAvailablePositionIndex = queue.firstAvailableWaitingPositionIndex()
-    val showsRoundEndShortcut = selection.waitingPositionIndex == firstAvailablePositionIndex &&
+    val hasPendingCheckIn = registrations.any { it.requiresOnSiteCheckIn }
+    val showsRoundEndShortcut = !selection.isPlayingPosition &&
+        selection.waitingPositionIndex == firstAvailablePositionIndex &&
         queue.playing.isNotEmpty()
     val canReportNoShow = registrations.isNotEmpty() && registrations.all { queue.canMarkNoShow(it.key) }
     val playingOvertime = queue.playingStartedAtMillis?.let { startedAt ->
@@ -7622,7 +7811,7 @@ private fun PositionActions(
         (selection.waitingPositionIndex ?: 0) > 0 &&
         !showsRoundEndShortcut &&
         targetPosition?.map { it.key }?.toSet() == selection.registrationKeys.toSet() &&
-        targetPosition.all { it.absenceStatus == QueueAbsenceStatus.NONE }
+        targetPosition.all { it.canEnterPlayingPosition }
     val playActions = buildList {
         when {
             selection.isPlayingPosition && registrations.isNotEmpty() -> add(
@@ -7635,7 +7824,7 @@ private fun PositionActions(
             selection.isPlayingPosition -> add(
                 MenuAction(
                     "进入$playingPositionLabel",
-                    "将第一个可以上机的队列位置移入$playingPositionLabel。",
+                    "将第一个可以进入游玩位置的队列位置移入$playingPositionLabel。",
                     onEnterPlaying,
                     enabled = firstAvailablePositionIndex != null
                 )
@@ -7661,7 +7850,7 @@ private fun PositionActions(
         }
     }
     val queueArrangementActions = buildList {
-        if (registrations.isNotEmpty() && !selection.isPlayingPosition) {
+        if (registrations.isNotEmpty() && !selection.isPlayingPosition && !hasPendingCheckIn) {
             add(
                 MenuAction(
                     "转至 $transferMachineName",
@@ -7675,7 +7864,7 @@ private fun PositionActions(
                 )
             )
         }
-        if (isFixedPair && !selection.isPlayingPosition) {
+        if (isFixedPair && !selection.isPlayingPosition && !hasPendingCheckIn) {
             add(
                 MenuAction(
                     "释放组合",
@@ -7725,17 +7914,29 @@ private fun PositionActions(
                     )
                     val noShowStatus = registration.noShowCount.takeIf { it > 0 }
                         ?.let { "未到场 $it 次" }
-                    val visibleStatus = absenceStatus ?: noShowStatus ?: playPreferenceLabel(registration)
-                    val showNoShowStatus = absenceStatus == null && noShowStatus != null
+                    val pendingCheckIn = registration.requiresOnSiteCheckIn
+                    val visibleStatus = when {
+                        pendingCheckIn -> "线上登记 · 待签到"
+                        absenceStatus != null -> absenceStatus
+                        noShowStatus != null -> noShowStatus
+                        else -> playPreferenceLabel(registration)
+                    }
+                    val showNoShowStatus = !pendingCheckIn && absenceStatus == null && noShowStatus != null
                     Row(
                         Modifier.weight(1f).clip(RoundedCornerShape(12.dp))
-                            .background(if (showNoShowStatus) NoShowStatusBackground else PageBackground)
+                            .background(
+                                when {
+                                    pendingCheckIn -> OnlineRegistrationStatusBackground
+                                    showNoShowStatus -> NoShowStatusBackground
+                                    else -> PageBackground
+                                }
+                            )
                             .border(
                                 1.dp,
-                                if (showNoShowStatus) {
-                                    NoShowStatusColor.copy(alpha = .18f)
-                                } else {
-                                    Separator.copy(alpha = .8f)
+                                when {
+                                    pendingCheckIn -> OnlineRegistrationStatusColor.copy(alpha = .20f)
+                                    showNoShowStatus -> NoShowStatusColor.copy(alpha = .18f)
+                                    else -> Separator.copy(alpha = .8f)
                                 },
                                 RoundedCornerShape(12.dp)
                             )
@@ -7757,12 +7958,13 @@ private fun PositionActions(
                             Text(
                                 visibleStatus,
                                 color = when {
+                                    pendingCheckIn -> OnlineRegistrationStatusColor
                                     absenceStatus != null -> AbsenceStatusColor
                                     showNoShowStatus -> NoShowStatusColor
                                     else -> SecondaryText
                                 },
                                 fontSize = 10.sp,
-                                fontWeight = if (absenceStatus != null || showNoShowStatus) {
+                                fontWeight = if (pendingCheckIn || absenceStatus != null || showNoShowStatus) {
                                     FontWeight.Medium
                                 } else {
                                     FontWeight.Normal
@@ -7797,7 +7999,7 @@ private fun PositionActions(
             MenuSectionHeader("队列安排")
             CompactActionGrid(queueArrangementActions, accented = false)
         }
-        if (registrations.isNotEmpty()) {
+        if (registrations.isNotEmpty() && !hasPendingCheckIn) {
             Spacer(Modifier.height(16.dp))
             MenuSectionHeader("到场与登记")
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
@@ -8234,9 +8436,9 @@ private fun QueueAbsenceDialog(
                                 isPlayingPosition ->
                                     "$subject 会离开$playingPositionLabel 并回到等待顺序前端。这次游玩机会会被跳过，登记保持原有顺序，随后自动解除暂缓。"
                                 fixedPartnerDisplayId != null ->
-                                    "下一次轮到$subject 时，整组不会上机。两份登记保持当前顺序，并在跳过这次机会后自动解除暂缓。"
+                                "下一次轮到$subject 时，整组不会进入游玩位置。两份登记保持当前顺序，并在跳过这次机会后自动解除暂缓。"
                                 else ->
-                                    "下一次轮到$subject 时不会上机。这份登记保持当前顺序，并在跳过这次机会后自动解除暂缓。"
+                                "下一次轮到$subject 时不会进入游玩位置。这份登记保持当前顺序，并在跳过这次机会后自动解除暂缓。"
                             },
                             color = SecondaryText,
                             fontSize = 13.sp,
@@ -8275,7 +8477,7 @@ private fun QueueAbsenceDialog(
                             if (isPlayingPosition) {
                                 "$subject 会离开$playingPositionLabel，并按一次轮空移至当前等待顺序末端。之后每次轮到时仍会移至队尾，状态不会自动解除。"
                             } else {
-                                "下一次轮到$subject 时不会上机，而会按一次轮空移至当前等待顺序末端；之后每次轮到时仍会移至队尾。"
+                                "下一次轮到$subject 时不会进入游玩位置，而会按一次轮空移至当前等待顺序末端；之后每次轮到时仍会移至队尾。"
                             },
                             color = SecondaryText,
                             fontSize = 13.sp,
@@ -8616,6 +8818,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.4.0",
+            "线上登记与远程排队操作",
+            "网站和 QQ Bot 可以通过玩家资料创建线上登记；玩家到场后需在终端完成签到。QQ Bot 同时支持管理本人当前登记，终端继续负责最终校验和落地。"
+        ),
         Triple(
             "0.3.7",
             "跨批次通知与闭店提醒",
@@ -10252,7 +10459,7 @@ internal fun estimatedMinutesUntilPlaying(
 }
 
 private fun nextPlayingChangeMessage(preview: NextPlayingPositionPreview?): String? {
-    if (preview?.changedByAbsence != true) return null
+    if (preview?.changedByAvailability != true) return null
 
     fun names(registrations: List<Registration>): String =
         registrations.joinToString("和") { "“${it.displayId}”" }
@@ -10262,6 +10469,9 @@ private fun nextPlayingChangeMessage(preview: NextPlayingPositionPreview?): Stri
     }
     val deferred = preview.unavailableRegistrations.filter {
         it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
+    }
+    val pendingCheckIn = preview.unavailableRegistrations.filter {
+        it.requiresOnSiteCheckIn
     }
     val temporaryAwayWillExpire = temporarilyAway.any {
         it.temporaryAwaySkippedTurns >= 3
@@ -10273,11 +10483,14 @@ private fun nextPlayingChangeMessage(preview: NextPlayingPositionPreview?): Stri
         if (deferred.isNotEmpty()) {
             add("${names(deferred)}${if (deferred.size > 1) "均" else ""}已暂缓一轮")
         }
+        if (pendingCheckIn.isNotEmpty()) {
+            add("${names(pendingCheckIn)}${if (pendingCheckIn.size > 1) "均" else ""}尚未完成现场签到")
+        }
     }.joinToString("，且")
     val nextRound = when (preview.nextRegistrations.size) {
-        0 -> "目前没有仍可上机的登记，游玩位置将保持空缺。"
-        1 -> "本轮将改由${names(preview.nextRegistrations)}单人游玩。"
-        else -> "本轮将改由${names(preview.nextRegistrations)}共同游玩。"
+        0 -> "目前没有可以进入游玩位置的登记，游玩位置将保持空缺。"
+        1 -> "实际将由${names(preview.nextRegistrations)}单人游玩。"
+        else -> "实际将由${names(preview.nextRegistrations)}共同游玩。"
     }
     val statusResult = buildList {
         if (temporaryAwayWillExpire) {
@@ -10286,9 +10499,10 @@ private fun nextPlayingChangeMessage(preview: NextPlayingPositionPreview?): Stri
             add("暂时离开状态会继续保留")
         }
         if (deferred.isNotEmpty()) add("暂缓会在跳过本次后自动解除")
+        if (pendingCheckIn.isNotEmpty()) add("未签到的线上登记会保留原有顺序，签到后再恢复正常轮候")
     }.joinToString("；")
 
-    return "由于$reasons，系统会跳过相关登记，并按照其余在场登记的游玩偏好重新组合。$nextRound$statusResult。"
+    return "由于$reasons，相关登记本次不会进入游玩位置。系统会按照其余可用登记的游玩偏好重新组合。$nextRound$statusResult。"
 }
 
 internal fun estimatedWaitForNewOpenRegistration(queue: MachineQueue, nowMillis: Long): Long? {
@@ -10325,12 +10539,11 @@ private fun formatPositionWaitEstimate(minutes: Long?): String = when {
 private fun positionWaitEstimateLabel(
     registrations: List<Registration>,
     minutes: Long?
-): String = if (
-    registrations.any { it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY }
-) {
-    "暂时离开，无法估算"
-} else {
-    formatPositionWaitEstimate(minutes)
+): String = when {
+    registrations.any { it.requiresOnSiteCheckIn } -> "签到后可估算"
+    registrations.any { it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY } ->
+        "暂时离开，无法估算"
+    else -> formatPositionWaitEstimate(minutes)
 }
 
 private fun randomChinesePlayerId(): String {
@@ -10455,6 +10668,7 @@ private fun registrationAbsenceStatusLabel(
 }
 
 private fun unavailableNoShowExplanation(registrations: List<Registration>): String {
+    val hasPendingCheckIn = registrations.any { it.requiresOnSiteCheckIn }
     val hasTemporaryLeave = registrations.any {
         it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
     }
@@ -10463,10 +10677,12 @@ private fun unavailableNoShowExplanation(registrations: List<Registration>): Str
     }
     val subject = if (registrations.size > 1) "这组玩家" else "这名玩家"
     return when {
+        hasPendingCheckIn ->
+            "$subject 尚未完成现场签到，不会进入游玩位置，不能标记为未到场。"
         hasTemporaryLeave && hasOneRoundDeferral ->
-            "$subject 包含暂缓或暂时离开的登记，本次不会被安排上机，不能标记为未到场。"
+            "$subject 包含暂缓或暂时离开的登记，本次不会进入游玩位置，不能标记为未到场。"
         hasTemporaryLeave ->
-            "$subject 处于暂时离开状态，本次不会被安排上机，不能标记为未到场。"
+            "$subject 处于暂时离开状态，本次不会进入游玩位置，不能标记为未到场。"
         else ->
             "$subject 已暂缓一轮，本次机会会被跳过，不能标记为未到场。"
     }

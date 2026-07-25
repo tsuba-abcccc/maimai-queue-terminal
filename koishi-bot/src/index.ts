@@ -30,17 +30,33 @@ declare module "koishi" {
 }
 
 type PlayerGender = "MALE" | "FEMALE" | "UNDISCLOSED";
-type ProfilePreference = "SOLO" | "OPEN_TO_JOIN" | "ASK_EVERY_TIME";
+type PlayPreference = "SOLO" | "OPEN_TO_JOIN";
+type ProfilePreference = PlayPreference | "ASK_EVERY_TIME";
+type QueueOperation =
+  | "JOIN_QUEUE"
+  | "DEFER_ONE_ROUND"
+  | "CANCEL_DEFER_ONE_ROUND"
+  | "TEMPORARILY_LEAVE"
+  | "CANCEL_TEMPORARY_LEAVE"
+  | "TRANSFER_MACHINE"
+  | "CHANGE_PLAY_PREFERENCE"
+  | "LEAVE_QUEUE";
+
+interface QueueRules {
+  allow_defer_one_round: boolean;
+  allow_temporary_leave: boolean;
+}
 
 interface QueueRegistration {
   registration_id: string;
   display_id: string;
-  preference: "SOLO" | "OPEN_TO_JOIN";
+  preference: PlayPreference;
   deferred_once: boolean;
   temporarily_away: boolean;
   temporary_away_skipped_turns: number;
   fixed_pair: boolean;
   no_show_count: number;
+  online_registration_pending_check_in?: boolean;
 }
 
 interface WaitingPosition {
@@ -50,7 +66,7 @@ interface WaitingPosition {
 }
 
 interface QueueMachine {
-  id: "A" | "B";
+  id: string;
   name: string;
   operational: boolean;
   stop_reason: string | null;
@@ -58,6 +74,8 @@ interface QueueMachine {
   playing_started_at: number | null;
   playing: QueueRegistration[];
   waiting_positions: WaitingPosition[];
+  registration_count?: number;
+  new_registration_estimated_wait_minutes?: number | null;
 }
 
 interface QueueStatus {
@@ -65,6 +83,7 @@ interface QueueStatus {
   captured_at: number;
   registration_open: boolean;
   onebot_sync_enabled?: boolean;
+  queue_rules?: QueueRules;
   business_hours?: {
     enabled: boolean;
     outside: boolean;
@@ -74,7 +93,7 @@ interface QueueStatus {
     registration_closes_at?: number | null;
   };
   terminal: { online: boolean };
-  machines: { A: QueueMachine; B: QueueMachine };
+  machines: Record<string, QueueMachine>;
 }
 
 interface BotPlayer {
@@ -82,7 +101,7 @@ interface BotPlayer {
   profile_id: string;
   qq_number: string;
   display_id: string;
-  machine_id: "A" | "B";
+  machine_id: string;
   machine_name?: string;
   machine_operational?: boolean;
   machine_stop_reason?: string | null;
@@ -92,7 +111,7 @@ interface BotPlayer {
   position_index: number | null;
   estimated_wait_minutes: number | null;
   co_player_display_ids?: string[];
-  preference?: "SOLO" | "OPEN_TO_JOIN";
+  preference?: PlayPreference;
   fixed_pair?: boolean;
   registration_type?: "TEMPORARY" | "PLAYER_PROFILE";
   last_played_at?: number | null;
@@ -101,6 +120,7 @@ interface BotPlayer {
   temporary_away_skipped_turns: number;
   no_show_count: number;
   last_no_show_action_was_defer: boolean;
+  online_registration_pending_check_in?: boolean;
 }
 
 interface BotPlayersResponse {
@@ -108,6 +128,7 @@ interface BotPlayersResponse {
   received_at?: number;
   registration_open?: boolean;
   business_hours?: QueueStatus["business_hours"];
+  queue_rules?: QueueRules;
   terminal?: {
     online: boolean;
     last_seen_seconds?: number;
@@ -139,7 +160,7 @@ interface QueueEvent {
   cursor: number;
   event_id: string;
   occurred_at: number;
-  machine_id: "A" | "B" | null;
+  machine_id: string | null;
   type: string;
   title: string;
   detail: string;
@@ -161,6 +182,12 @@ interface RemoteCommand {
   result_detail: string | null;
 }
 
+interface QueueCommandFields {
+  machine_id?: string;
+  target_machine_id?: string;
+  preference?: PlayPreference;
+}
+
 interface EventCursor {
   queueId: string;
   cursor: number;
@@ -175,12 +202,13 @@ export const NOTIFICATION_RETRY_DELAYS_MS = [
 ] as const;
 export const NOTIFICATION_MAX_ATTEMPTS = NOTIFICATION_RETRY_DELAYS_MS.length +
   1;
-const PROFILE_INPUT_TIMEOUT_MS = 60_000;
+const COMMAND_INPUT_TIMEOUT_MS = 60_000;
 
 export const HELP_TEXT = [
   "你好！",
   "可用的命令如下：",
   "",
+  " - 加入排队",
   " - 我的排队",
   " - 查看队列",
   " - 我的资料",
@@ -283,6 +311,34 @@ export class QueueApi {
     return response.data as RemoteCommand;
   }
 
+  async createQueueCommand(
+    actorQq: string,
+    operation: QueueOperation,
+    fields: QueueCommandFields = {},
+  ): Promise<RemoteCommand> {
+    const data: Record<string, string> = {
+      request_id: randomUUID(),
+      actor_qq: actorQq,
+      operation,
+    };
+    for (const [key, value] of Object.entries(fields)) {
+      if (value !== undefined) data[key] = value;
+    }
+    const response = await this.ctx.http<RemoteCommand | { error?: string }>(
+      "POST",
+      this.url("/api/queue-bot/queue-commands"),
+      {
+        data,
+        headers: this.privateHeaders(),
+        validateStatus: () => true,
+      },
+    );
+    if (response.status >= 400) {
+      throw new Error(profileUpdateErrorMessage(response.data, response.status));
+    }
+    return response.data as RemoteCommand;
+  }
+
   getCommand(commandId: string): Promise<RemoteCommand> {
     return this.privateGet(
       `/api/queue-bot/commands/${encodeURIComponent(commandId)}`,
@@ -348,6 +404,12 @@ export function apply(ctx: Context, config: Config) {
     return next();
   }, true);
 
+  ctx.command("maimaiq.join", "通过 QQ 玩家资料加入排队")
+    .alias("加入排队")
+    .action(async ({ session }) =>
+      withCommandError(() => joinQueueFromBot(api, config, session))
+    );
+
   ctx.command("maimaiq.status", "查询自己的排队状态")
     .alias("我的排队")
     .action(async ({ session }) =>
@@ -367,6 +429,66 @@ export function apply(ctx: Context, config: Config) {
           ? "你已有玩家资料，但当前没有正在排队的登记。"
           : "当前 QQ 尚未绑定终端中的玩家资料。请先在机厅终端创建资料。";
       })
+    );
+
+  ctx.command("maimaiq.status.defer", "将当前登记暂缓一轮")
+    .alias("暂缓一轮")
+    .action(async ({ session }) =>
+      withCommandError(() =>
+        changeAbsenceState(
+          api,
+          config,
+          session,
+          "DEFER_ONE_ROUND",
+        )
+      )
+    );
+
+  ctx.command("maimaiq.status.defer.cancel", "取消当前登记的暂缓一轮")
+    .alias("取消暂缓一轮")
+    .action(async ({ session }) =>
+      withCommandError(() =>
+        changeAbsenceState(
+          api,
+          config,
+          session,
+          "CANCEL_DEFER_ONE_ROUND",
+        )
+      )
+    );
+
+  ctx.command("maimaiq.status.away", "将当前登记设为暂时离开")
+    .alias("暂时离开")
+    .action(async ({ session }) =>
+      withCommandError(() =>
+        changeAbsenceState(api, config, session, "TEMPORARILY_LEAVE")
+      )
+    );
+
+  ctx.command("maimaiq.status.away.cancel", "取消当前登记的暂时离开")
+    .alias("取消暂时离开")
+    .action(async ({ session }) =>
+      withCommandError(() =>
+        changeAbsenceState(api, config, session, "CANCEL_TEMPORARY_LEAVE")
+      )
+    );
+
+  ctx.command("maimaiq.status.transfer", "将当前登记切换至其他机台")
+    .alias("切换机台")
+    .action(async ({ session }) =>
+      withCommandError(() => transferQueueMachine(api, config, session))
+    );
+
+  ctx.command("maimaiq.status.preference", "修改当前登记的游玩偏好")
+    .alias("修改游玩偏好")
+    .action(async ({ session }) =>
+      withCommandError(() => changeCurrentPreference(api, config, session))
+    );
+
+  ctx.command("maimaiq.status.leave", "退出当前排队")
+    .alias("退出排队")
+    .action(async ({ session }) =>
+      withCommandError(() => leaveQueueFromBot(api, config, session))
     );
 
   ctx.command("maimaiq.queue", "查看完整队列")
@@ -524,6 +646,406 @@ export function apply(ctx: Context, config: Config) {
   }
 }
 
+interface CurrentQueueRegistration {
+  qq: string;
+  response: BotPlayersResponse;
+  player: BotPlayer;
+}
+
+async function joinQueueFromBot(
+  api: QueueApi,
+  config: Config,
+  session: Session | undefined,
+): Promise<string> {
+  const qq = requireQqSession(session);
+  const [profilesResponse, playersResponse, queue] = await Promise.all([
+    api.getProfiles(qq),
+    api.getPlayers(qq),
+    api.getQueue(),
+  ]);
+  const profile = requireSingleProfile(profilesResponse.profiles);
+  if (playersResponse.players.length) {
+    throw new Error("你已经有一份正在排队的登记，不能重复加入。请先发送“我的排队”查看。");
+  }
+  if (!queue.terminal.online) {
+    throw new Error("现场终端暂时离线，暂不能加入排队。");
+  }
+  if (queue.onebot_sync_enabled === false) {
+    throw new Error("现场终端已关闭 QQ Bot 联动。");
+  }
+  if (!queue.registration_open) {
+    throw new Error("现场当前没有使用登记排队，请在现场自然排队。");
+  }
+
+  const machines = sortedMachines(queue).filter(machineCanAcceptRegistration);
+  if (!machines.length) {
+    throw new Error("当前没有可以加入排队的机台。");
+  }
+  const machineInput = await resolveQueueCommandInput(
+    session,
+    [
+      `你好，${profile.nickname}。`,
+      "",
+      "请选择要加入排队的机台：",
+      "",
+      ...machines.map((machine) => ` - ${formatMachineChoice(machine)}`),
+    ].join("\n"),
+  );
+  const machine = parseMachineChoice(machineInput, machines);
+  if (!machine) {
+    throw new Error("没有找到这个机台。请发送机台字母，例如“A”或“B”。");
+  }
+
+  let preference: PlayPreference | undefined;
+  if (profile.default_preference === "ASK_EVERY_TIME") {
+    const preferenceInput = await resolveQueueCommandInput(
+      session,
+      [
+        "请选择本次游玩偏好：",
+        "",
+        " - 单人游玩",
+        " - 允许他人加入（推荐）",
+        "",
+        "接受分配的共同游玩，通常可以缩短等待时间。",
+      ].join("\n"),
+    );
+    preference = parsePlayPreference(preferenceInput) ?? undefined;
+    if (!preference) {
+      throw new Error("请输入“单人游玩”或“允许他人加入”。");
+    }
+  }
+
+  const command = await submitQueueCommand(
+    api,
+    config,
+    qq,
+    "JOIN_QUEUE",
+    {
+      machine_id: machine.id,
+      preference,
+    },
+  );
+  if (command.status === "REJECTED") {
+    return command.result_detail || "现场终端拒绝了这次线上登记。";
+  }
+  if (command.status === "PENDING") {
+    return [
+      "线上登记已经提交，正在等待现场终端确认。",
+      "",
+      "确认成功后，到达现场仍需在终端点击自己的登记，再点击“已到场”完成签到。签到前，这份登记不会进入游玩位置。",
+    ].join("\n");
+  }
+  return [
+    `已经加入${compactMachineName(machine.name)} 的等待顺序。`,
+    "",
+    "这是一份线上登记。到达现场后，请在终端点击自己的登记，再点击“已到场”完成签到。签到前，这份登记不会进入游玩位置。",
+  ].join("\n");
+}
+
+async function changeAbsenceState(
+  api: QueueApi,
+  config: Config,
+  session: Session | undefined,
+  operation:
+    | "DEFER_ONE_ROUND"
+    | "CANCEL_DEFER_ONE_ROUND"
+    | "TEMPORARILY_LEAVE"
+    | "CANCEL_TEMPORARY_LEAVE",
+): Promise<string> {
+  const current = await requireCurrentQueueRegistration(api, session);
+  const { player, response } = current;
+  requireSignedInWaitingRegistration(player);
+
+  if (operation === "DEFER_ONE_ROUND") {
+    if (response.queue_rules?.allow_defer_one_round === false) {
+      throw new Error("系统规则不允许暂缓一轮。");
+    }
+    if (player.deferred_once) {
+      throw new Error("这份登记已经暂缓一轮；如需恢复，请发送“取消暂缓一轮”。");
+    }
+    if (player.temporarily_away) {
+      throw new Error("请先发送“取消暂时离开”，再设置暂缓一轮。");
+    }
+  } else if (operation === "CANCEL_DEFER_ONE_ROUND") {
+    if (!player.deferred_once) {
+      throw new Error("这份登记当前没有暂缓一轮。");
+    }
+  } else if (operation === "TEMPORARILY_LEAVE") {
+    if (response.queue_rules?.allow_temporary_leave === false) {
+      throw new Error("系统规则不允许暂时离开。");
+    }
+    if (player.temporarily_away) {
+      throw new Error("这份登记已经暂时离开；返回后请发送“取消暂时离开”。");
+    }
+    if (player.deferred_once) {
+      throw new Error("请先发送“取消暂缓一轮”，再设置暂时离开。");
+    }
+  } else if (!player.temporarily_away) {
+    throw new Error("这份登记当前没有处于暂时离开状态。");
+  }
+
+  const messages: Record<typeof operation, string> = {
+    DEFER_ONE_ROUND:
+      "登记已暂缓一轮。下一次轮到时会跳过这份登记，之后自动恢复；等待顺序保持不变。",
+    CANCEL_DEFER_ONE_ROUND:
+      "登记已取消暂缓一轮，将按照当前等待顺序正常参与游玩位置分配。",
+    TEMPORARILY_LEAVE: [
+      "登记已设为暂时离开。",
+      "",
+      "返回后需要手动发送“取消暂时离开”。在此之前，排队分组会忽略这份登记；连续轮空三次后，第四次仍未返回将退出排队。",
+    ].join("\n"),
+    CANCEL_TEMPORARY_LEAVE:
+      "登记已取消暂时离开，轮空次数已经清零，并将按照当前等待顺序正常参与游玩位置分配。",
+  };
+  return formatQueueCommandResult(
+    await submitQueueCommand(api, config, current.qq, operation),
+    messages[operation],
+  );
+}
+
+async function transferQueueMachine(
+  api: QueueApi,
+  config: Config,
+  session: Session | undefined,
+): Promise<string> {
+  const current = await requireCurrentQueueRegistration(api, session);
+  requireSignedInWaitingRegistration(current.player);
+  const queue = await api.getQueue();
+  const candidates = sortedMachines(queue).filter((machine) =>
+    machine.id !== current.player.machine_id && machineCanAcceptRegistration(machine)
+  );
+  if (!candidates.length) {
+    throw new Error("当前没有其他可以转入的机台。");
+  }
+  let target = candidates[0];
+  if (candidates.length > 1) {
+    const input = await resolveQueueCommandInput(
+      session,
+      [
+        "请选择要转入的机台：",
+        "",
+        ...candidates.map((machine) => ` - ${formatMachineChoice(machine)}`),
+      ].join("\n"),
+    );
+    const selected = parseMachineChoice(input, candidates);
+    if (!selected) {
+      throw new Error("没有找到这个机台。请发送列表中的机台字母。");
+    }
+    target = selected;
+  }
+  await requireQueueConfirmation(
+    session,
+    [
+      `是否将“${current.player.display_id}”转至${compactMachineName(target.name)}？`,
+      "",
+      "确认后，这份登记会离开当前机台，并进入目标机台的等待顺序末端。",
+    ].join("\n"),
+    "确认切换机台",
+  );
+  return formatQueueCommandResult(
+    await submitQueueCommand(api, config, current.qq, "TRANSFER_MACHINE", {
+      target_machine_id: target.id,
+    }),
+    `登记已转至${compactMachineName(target.name)} 的等待顺序末端。`,
+  );
+}
+
+async function changeCurrentPreference(
+  api: QueueApi,
+  config: Config,
+  session: Session | undefined,
+): Promise<string> {
+  const current = await requireCurrentQueueRegistration(api, session);
+  requireSignedInRegistration(current.player);
+  const fixedPairNotice = current.player.fixed_pair
+    ? ["", "当前登记属于固定组合。修改本次游玩偏好会解除这个固定组合。"]
+    : [];
+  const input = await resolveQueueCommandInput(
+    session,
+    [
+      "请选择新的本次游玩偏好：",
+      "",
+      " - 单人游玩",
+      " - 允许他人加入",
+      ...fixedPairNotice,
+      "",
+      "这项操作只修改当前登记，不会改变玩家资料中的默认偏好。",
+    ].join("\n"),
+  );
+  const preference = parsePlayPreference(input);
+  if (!preference) {
+    throw new Error("请输入“单人游玩”或“允许他人加入”。");
+  }
+  if (!current.player.fixed_pair && current.player.preference === preference) {
+    return `这份登记已经是“${queuePreferenceLabel(preference)}”。`;
+  }
+  return formatQueueCommandResult(
+    await submitQueueCommand(
+      api,
+      config,
+      current.qq,
+      "CHANGE_PLAY_PREFERENCE",
+      { preference },
+    ),
+    `本次游玩偏好已改为“${queuePreferenceLabel(preference)}”。玩家资料中的默认偏好没有改变。`,
+  );
+}
+
+async function leaveQueueFromBot(
+  api: QueueApi,
+  config: Config,
+  session: Session | undefined,
+): Promise<string> {
+  const current = await requireCurrentQueueRegistration(api, session);
+  await requireQueueConfirmation(
+    session,
+    [
+      `是否让“${current.player.display_id}”退出排队？`,
+      "",
+      current.player.online_registration_pending_check_in
+        ? "确认后，这份尚未签到的线上登记会被移除。"
+        : "确认后，这份登记会从当前队列中移除；继续游玩时需要重新加入排队。",
+    ].join("\n"),
+    "确认退出排队",
+  );
+  return formatQueueCommandResult(
+    await submitQueueCommand(api, config, current.qq, "LEAVE_QUEUE"),
+    "登记已退出排队。",
+  );
+}
+
+async function requireCurrentQueueRegistration(
+  api: QueueApi,
+  session: Session | undefined,
+): Promise<CurrentQueueRegistration> {
+  const qq = requireQqSession(session);
+  const response = await api.getPlayers(qq);
+  if (!response.players.length) {
+    throw new Error("当前没有正在排队的登记。");
+  }
+  if (response.players.length > 1) {
+    throw new Error("当前 QQ 对应多份排队登记，请先联系现场工作人员处理。");
+  }
+  return { qq, response, player: response.players[0] };
+}
+
+function requireSignedInRegistration(player: BotPlayer): void {
+  if (player.online_registration_pending_check_in) {
+    throw new Error("这份线上登记尚未在现场签到，目前只能退出排队。");
+  }
+}
+
+function requireSignedInWaitingRegistration(player: BotPlayer): void {
+  requireSignedInRegistration(player);
+  if (player.position !== "WAITING") {
+    throw new Error("这份登记已经处于游玩位置，不能执行这项等待队列操作。");
+  }
+}
+
+async function submitQueueCommand(
+  api: QueueApi,
+  config: Config,
+  qq: string,
+  operation: QueueOperation,
+  fields: QueueCommandFields = {},
+): Promise<RemoteCommand> {
+  let command = await api.createQueueCommand(qq, operation, fields);
+  const deadline = Date.now() + config.commandWaitSeconds * 1_000;
+  while (command.status === "PENDING" && Date.now() < deadline) {
+    await sleep(1_000);
+    command = await api.getCommand(command.command_id);
+  }
+  return command;
+}
+
+function formatQueueCommandResult(
+  command: RemoteCommand,
+  appliedMessage: string,
+): string {
+  if (command.status === "APPLIED") return appliedMessage;
+  if (command.status === "REJECTED") {
+    return command.result_detail || "现场终端拒绝了这次排队操作。";
+  }
+  return "操作已经提交，正在等待现场终端确认。稍后可发送“我的排队”查看结果。";
+}
+
+export async function resolveQueueCommandInput(
+  session: Session | undefined,
+  instruction: string,
+): Promise<string> {
+  requireQqSession(session);
+  if (!session) throw new Error("当前会话不可用，请重新发送命令。");
+  await session.send(
+    `${instruction}\n\n请在 60 秒内回复；发送“取消”可以结束本次操作。`,
+  );
+  const reply = (await session.prompt(COMMAND_INPUT_TIMEOUT_MS)).trim();
+  if (!reply) {
+    throw new Error("等待输入已结束。这次操作没有提交，请重新发送命令。");
+  }
+  if (reply === "取消") throw new Error("已取消这次操作。");
+  return reply;
+}
+
+async function requireQueueConfirmation(
+  session: Session | undefined,
+  explanation: string,
+  confirmation: string,
+): Promise<void> {
+  const reply = await resolveQueueCommandInput(
+    session,
+    `${explanation}\n\n如需继续，请回复“${confirmation}”。`,
+  );
+  if (reply !== confirmation) {
+    throw new Error(`没有收到“${confirmation}”，这次操作没有执行。`);
+  }
+}
+
+export function parsePlayPreference(value?: string): PlayPreference | null {
+  const parsed = parsePreference(value);
+  return parsed === "SOLO" || parsed === "OPEN_TO_JOIN" ? parsed : null;
+}
+
+export function parseMachineChoice(
+  value: string | undefined,
+  machines: QueueMachine[],
+): QueueMachine | null {
+  const normalized = value?.trim().replace(/\s+/g, "").toUpperCase() ?? "";
+  return machines.find((machine) => {
+    const id = machine.id.toUpperCase();
+    const name = machine.name.replace(/\s+/g, "").toUpperCase();
+    return normalized === id || normalized === `机台${id}` || normalized === name;
+  }) ?? null;
+}
+
+function sortedMachines(queue: QueueStatus): QueueMachine[] {
+  return Object.values(queue.machines).sort((left, right) =>
+    left.id.localeCompare(right.id, "zh-CN")
+  );
+}
+
+export function machineCanAcceptRegistration(machine: QueueMachine): boolean {
+  const registrationCount = typeof machine.registration_count === "number"
+    ? machine.registration_count
+    : machine.playing.length + machine.waiting_positions.reduce(
+      (total, position) => total + position.registrations.length,
+      0,
+    );
+  return machine.operational && registrationCount < 20;
+}
+
+function formatMachineChoice(machine: QueueMachine): string {
+  const estimate = typeof machine.new_registration_estimated_wait_minutes === "number"
+    ? machine.new_registration_estimated_wait_minutes <= 0
+      ? "（预计很快可以游玩）"
+      : `（约 ${machine.new_registration_estimated_wait_minutes} 分钟后）`
+    : "";
+  return `${compactMachineName(machine.name)}${estimate}`;
+}
+
+function compactMachineName(value: string): string {
+  return value.replace(/\s*·\s*/g, "·");
+}
+
 export async function resolveProfileCommandInput(
   session: Session | undefined,
   suppliedValue: string | undefined,
@@ -537,7 +1059,7 @@ export async function resolveProfileCommandInput(
   await session.send(
     `${instruction}\n请在 60 秒内回复；发送“取消”可结束本次修改。`,
   );
-  const reply = (await session.prompt(PROFILE_INPUT_TIMEOUT_MS)).trim();
+  const reply = (await session.prompt(COMMAND_INPUT_TIMEOUT_MS)).trim();
   if (!reply) {
     throw new Error("等待输入已结束。这次修改没有提交，请重新发送命令。");
   }
@@ -985,7 +1507,7 @@ export function formatQueue(queue: QueueStatus): string {
       "",
     );
   }
-  for (const machine of [queue.machines.A, queue.machines.B]) {
+  for (const machine of sortedMachines(queue)) {
     lines.push(formatMachine(machine), "");
   }
   return lines.join("\n").trimEnd();
@@ -997,8 +1519,8 @@ function formatMachine(machine: QueueMachine): string {
     0,
   );
   const registrationCount = machine.playing.length + waitingCount;
-  const compactMachineName = machine.name.replace(/\s*·\s*/g, "·");
-  const overview = [`【${compactMachineName}】`];
+  const machineName = compactMachineName(machine.name);
+  const overview = [`【${machineName}】`];
   if (!machine.operational) {
     overview.push(
       `停止使用${
@@ -1061,7 +1583,7 @@ export function formatOwnQueue(
   queue?: QueueStatus,
   personalSnapshot?: Pick<
     BotPlayersResponse,
-    "terminal" | "registration_open" | "business_hours"
+    "terminal" | "registration_open" | "business_hours" | "queue_rules"
   >,
 ): string {
   if (!players.length) return "当前没有正在排队的登记。";
@@ -1078,9 +1600,9 @@ export function formatOwnQueue(
       : undefined;
     const machineOperational = machine?.operational ??
       player.machine_operational;
-    const compactMachineName = (
+    const machineName = compactMachineName(
       machine?.name ?? player.machine_name ?? `机台 ${player.machine_id}`
-    ).replace(/\s*·\s*/g, "·");
+    );
     const playingStartedAt = machine
       ? machine.playing_started_at
       : player.playing_started_at;
@@ -1095,7 +1617,7 @@ export function formatOwnQueue(
       ? machineOperational === false
         ? `位于游玩位置 ${player.machine_id}`
         : `正在游玩位置 ${player.machine_id}${
-          elapsed === null ? "" : `·已游玩 ${elapsed} 分钟`
+          elapsed === null ? "" : `，已游玩 ${elapsed} 分钟`
         }`
       : `位于队列位置 ${player.machine_id}${player.position_index}`;
     const estimatedWaitMinutes = typeof player.estimated_wait_minutes === "number" &&
@@ -1103,6 +1625,7 @@ export function formatOwnQueue(
       ? Math.max(0, Math.trunc(player.estimated_wait_minutes))
       : null;
     const estimate = player.position === "WAITING" &&
+        !player.online_registration_pending_check_in &&
         machineOperational !== false &&
         estimatedWaitMinutes !== null
       ? estimatedWaitMinutes <= 0
@@ -1116,13 +1639,16 @@ export function formatOwnQueue(
       ? machine.stop_reason_detail
       : player.machine_stop_reason_detail;
     const machineState = machineOperational === false
-      ? `\n机台状态：停止使用${
+      ? `${machineName} 已停止使用${
         machineStopReason
           ? `·${stopReason(machineStopReason, machineStopReasonDetail)}`
           : ""
       }，登记顺序已保留。`
-      : "";
-    const states = [];
+      : null;
+    const states: string[] = [];
+    if (player.online_registration_pending_check_in) {
+      states.push("线上登记·待签到");
+    }
     if (player.deferred_once) states.push("暂缓一轮");
     if (player.temporarily_away) {
       states.push(
@@ -1147,9 +1673,6 @@ export function formatOwnQueue(
         fixed_pair: player.fixed_pair ?? false,
       })
       : null;
-    const preference = currentPreference
-      ? `\n本次偏好：${currentPreference}`
-      : "";
     const positionRegistrations = machine
       ? player.position === "PLAYING"
         ? machine.playing
@@ -1162,18 +1685,29 @@ export function formatOwnQueue(
         .filter((item) => item.registration_id !== player.registration_id)
         .map((item) => item.display_id)
       : player.co_player_display_ids ?? [];
-    const coPlayers = coPlayerDisplayIds.length
-      ? `\n共同游玩：${coPlayerDisplayIds.join("、")}`
-      : "";
-    return `${player.display_id}：${location}${estimate}\n所在机台：${compactMachineName}${machineState}${preference}${coPlayers}${
-      states.length ? `\n当前状态：${states.join("、")}` : ""
-    }`;
+    const subject = players.length === 1 ? "你" : `${player.display_id}：`;
+    const positionSentence = player.online_registration_pending_check_in &&
+        player.position === "WAITING"
+      ? `${subject}${location}，签到后可以估算等待时间。`
+      : `${subject}${location}${estimate}。`;
+    const lines = [
+      `${positionSentence}${
+        currentPreference ? `游玩偏好：${currentPreference}。` : ""
+      }`,
+    ];
+    if (machineState) lines.push(`机台状态：${machineState}`);
+    if (coPlayerDisplayIds.length) {
+      lines.push(`共同游玩：${coPlayerDisplayIds.join("、")}。`);
+    }
+    if (states.length) lines.push(`当前状态：${states.join("；")}。`);
+    return lines.join("\n");
   }).join("\n\n");
   const terminalOnline = queue?.terminal.online ??
     personalSnapshot?.terminal?.online;
   const businessHours = queue?.business_hours ?? personalSnapshot?.business_hours;
   const registrationOpen = queue?.registration_open ??
     personalSnapshot?.registration_open;
+  const queueRules = queue?.queue_rules ?? personalSnapshot?.queue_rules;
   const notices: string[] = [];
   if (terminalOnline === false) {
     notices.push("终端暂时离线，以下为最近一次同步状态。");
@@ -1192,7 +1726,35 @@ export function formatOwnQueue(
       notices.push("当前采用现场自然排队。");
     }
   }
-  return notices.length ? `${notices.join("\n")}\n\n${status}` : status;
+  const blocks = [`你好，${players[0].display_id}。`];
+  if (notices.length) blocks.push(notices.join("\n"));
+  blocks.push(status);
+  if (players.length === 1) {
+    const actions = formatOwnQueueActions(players[0], queueRules);
+    if (actions.length) blocks.push(actions.map((action) => ` - ${action}`).join("\n"));
+  }
+  return blocks.join("\n\n");
+}
+
+export function formatOwnQueueActions(
+  player: BotPlayer,
+  queueRules?: QueueRules,
+): string[] {
+  if (player.online_registration_pending_check_in) return ["退出排队"];
+  const actions: string[] = [];
+  if (player.position === "WAITING") {
+    if (player.deferred_once) {
+      actions.push("取消暂缓一轮");
+    } else if (player.temporarily_away) {
+      actions.push("取消暂时离开");
+    } else {
+      if (queueRules?.allow_defer_one_round !== false) actions.push("暂缓一轮");
+      if (queueRules?.allow_temporary_leave !== false) actions.push("暂时离开");
+    }
+    actions.push("切换机台");
+  }
+  actions.push("修改游玩偏好", "退出排队");
+  return actions;
 }
 
 export function formatQueueNotification(
@@ -1233,6 +1795,9 @@ function formatQueueRegistration(registration: QueueRegistration): string[] {
       compactQueuePreferenceLabel(registration)
     })`,
   ];
+  if (registration.online_registration_pending_check_in) {
+    lines.push("    - 线上登记·待签到");
+  }
   if (registration.deferred_once) lines.push("    - 暂缓一轮");
   if (registration.temporarily_away) {
     lines.push(

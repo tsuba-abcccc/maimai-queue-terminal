@@ -25,7 +25,7 @@ class QueueModelsTest {
 
         assertEquals(listOf(1), preview?.nextRegistrations?.map { it.key })
         assertEquals(setOf(2, 3), preview?.unavailableRegistrations?.map { it.key }?.toSet())
-        assertTrue(preview?.changedByAbsence == true)
+        assertTrue(preview?.changedByAvailability == true)
     }
 
     @Test
@@ -581,7 +581,7 @@ class QueueModelsTest {
         assertEquals(listOf(1, 2), preview.nominalRegistrations.map { it.key })
         assertEquals(listOf(1, 3), preview.nextRegistrations.map { it.key })
         assertEquals(listOf(2), preview.unavailableRegistrations.map { it.key })
-        assertTrue(preview.changedByAbsence)
+        assertTrue(preview.changedByAvailability)
     }
 
     @Test
@@ -1748,5 +1748,105 @@ class QueueModelsTest {
         )
 
         assertEquals(0L, estimatedMinutesUntilPlaying(queue, setOf(2), nowMillis))
+    }
+
+    @Test
+    fun pendingOnlineRegistrationIsSkippedWithoutDelayingAvailablePlayers() {
+        val nowMillis = 6_000_000L
+        val pending = registration(2).copy(requiresOnSiteCheckIn = true)
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1),
+                pending,
+                registration(3),
+                registration(4, PlayPreference.SOLO)
+            ),
+            playingStartedAtMillis = nowMillis - 5 * 60_000L
+        )
+
+        assertEquals(listOf(1, 3), queue.waitingPositions().first().map { it.key })
+        assertEquals(7L, estimatedMinutesUntilPlaying(queue, setOf(3), nowMillis))
+        assertEquals(null, estimatedMinutesUntilPlaying(queue, setOf(2), nowMillis))
+
+        val advanced = queue.finishRound(nowMillis)
+
+        assertEquals(listOf(1, 3), advanced.playing.map { it.key })
+        assertEquals(2, advanced.waiting.first().key)
+        assertTrue(advanced.waiting.first().requiresOnSiteCheckIn)
+        assertEquals(0, advanced.waiting.first().temporaryAwaySkippedTurns)
+    }
+
+    @Test
+    fun pendingOnlineRegistrationRemainsInOrderAcrossSeveralRounds() {
+        val pending = registration(1, PlayPreference.SOLO).copy(requiresOnSiteCheckIn = true)
+        val initial = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                pending,
+                registration(2, PlayPreference.SOLO),
+                registration(3, PlayPreference.SOLO)
+            )
+        )
+
+        val afterFirstRound = initial.finishRound(1_000L)
+        val afterSecondRound = afterFirstRound.finishRound(2_000L)
+
+        assertEquals(listOf(2), afterFirstRound.playing.map { it.key })
+        assertEquals(listOf(1, 3, 9), afterFirstRound.waiting.map { it.key })
+        assertEquals(listOf(3), afterSecondRound.playing.map { it.key })
+        assertEquals(listOf(1, 9, 2), afterSecondRound.waiting.map { it.key })
+        assertTrue(afterSecondRound.waiting.first().requiresOnSiteCheckIn)
+    }
+
+    @Test
+    fun checkInOnlyUnlocksRegistrationAndDoesNotEnterPlayingPositionAutomatically() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(requiresOnSiteCheckIn = true)
+            )
+        )
+
+        val checkedIn = queue.checkIn(1)
+
+        assertTrue(checkedIn.playing.isEmpty())
+        assertEquals(listOf(1), checkedIn.waiting.map { it.key })
+        assertFalse(checkedIn.waiting.single().requiresOnSiteCheckIn)
+        assertTrue(checkedIn.waiting.single().canEnterPlayingPosition)
+    }
+
+    @Test
+    fun pendingOnlineRegistrationRejectsActionsReservedForOnSitePlayers() {
+        val pending = registration(1).copy(
+            requiresOnSiteCheckIn = true,
+            playerProfileId = "profile-1",
+            isTemporary = false
+        )
+        val queue = MachineQueue(waiting = listOf(pending, registration(2, PlayPreference.SOLO)))
+
+        assertFalse(queue.canMarkNoShow(1))
+        assertEquals(queue, queue.deferOneRound(1))
+        assertEquals(queue, queue.temporarilyLeave(1))
+        assertEquals(queue, queue.changePreference(1, PlayPreference.SOLO))
+        assertEquals(queue, queue.rename(1, "新昵称"))
+        assertEquals(null, queue.planFriendPair(1, 2))
+    }
+
+    @Test
+    fun nextRoundPreviewExplainsPendingOnlineRegistrationReplacement() {
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1),
+                registration(2).copy(requiresOnSiteCheckIn = true),
+                registration(3)
+            )
+        )
+
+        val preview = queue.nextPlayingPositionPreview()!!
+
+        assertEquals(listOf(1, 2), preview.nominalRegistrations.map { it.key })
+        assertEquals(listOf(1, 3), preview.nextRegistrations.map { it.key })
+        assertEquals(listOf(2), preview.unavailableRegistrations.map { it.key })
+        assertTrue(preview.changedByAvailability)
     }
 }

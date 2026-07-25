@@ -8,6 +8,7 @@ const {
   profileUpdateErrorMessage,
   requireQqSession,
   resolveProfileCommandInput,
+  resolveQueueCommandInput,
 } = require('../lib')
 
 test('opens the menu only for a standalone mention of the current bot', () => {
@@ -131,6 +132,67 @@ test('submits profile updates as JSON and exposes the server rejection reason', 
   assert.equal(requests[0][0], 'PATCH')
   assert.equal(requests[0][2].data.actor_qq, '12345678')
   assert.equal(requests[0][2].data.gender, 'FEMALE')
+})
+
+test('submits queue operations with a unique request id and no undefined fields', async () => {
+  const requests = []
+  const http = async (...args) => {
+    requests.push(args)
+    return {
+      status: 202,
+      data: {
+        command_id: '00000000-0000-0000-0000-000000000401',
+        status: 'PENDING',
+        result_detail: null,
+      },
+    }
+  }
+  const api = new QueueApi({ http }, {
+    apiBase: 'https://queue.example.test',
+    botToken: 'test-token',
+    notificationEnabled: false,
+    notificationIntervalSeconds: 5,
+    commandWaitSeconds: 15,
+  })
+
+  await api.createQueueCommand('12345678', 'JOIN_QUEUE', {
+    machine_id: 'A',
+    preference: undefined,
+  })
+
+  const [method, url, options] = requests[0]
+  assert.equal(method, 'POST')
+  assert.equal(url, 'https://queue.example.test/api/queue-bot/queue-commands')
+  assert.match(options.data.request_id, /^[0-9a-f-]{36}$/)
+  assert.equal(options.data.actor_qq, '12345678')
+  assert.equal(options.data.operation, 'JOIN_QUEUE')
+  assert.equal(options.data.machine_id, 'A')
+  assert.equal('preference' in options.data, false)
+  assert.equal(options.headers.Authorization, 'Bearer test-token')
+})
+
+test('queue input uses a separate paragraph and supports cancellation', async () => {
+  const sent = []
+  const session = reply => ({
+    platform: 'onebot',
+    userId: '12345678',
+    isDirect: true,
+    async send(message) { sent.push(message) },
+    async prompt(timeout) {
+      assert.equal(timeout, 60_000)
+      return reply
+    },
+  })
+
+  assert.equal(await resolveQueueCommandInput(
+    session('A'),
+    '请选择机台：\n\n - 机台 A',
+  ), 'A')
+  assert.match(sent[0], /机台 A\n\n请在 60 秒内回复/)
+  await assert.rejects(
+    resolveQueueCommandInput(session('取消'), '请选择机台。'),
+    /已取消这次操作/,
+  )
 })
 
 test('formats profile update errors without leaking an HTML response', () => {

@@ -4,10 +4,14 @@ const assert = require('node:assert/strict')
 const {
   HELP_TEXT,
   formatOwnQueue,
+  formatOwnQueueActions,
+  machineCanAcceptRegistration,
   formatQueue,
   formatQueueNotification,
   nicknameValidationError,
   parseGender,
+  parseMachineChoice,
+  parsePlayPreference,
   parsePreference,
   parseNotificationPreference,
 } = require('../lib')
@@ -15,6 +19,7 @@ const {
 test('help text uses a message-safe profile menu', () => {
   assert.doesNotMatch(HELP_TEXT, /[<>]/)
   assert.match(HELP_TEXT, /修改资料/)
+  assert.match(HELP_TEXT, /加入排队/)
   assert.match(HELP_TEXT, /排队通知/)
   assert.match(HELP_TEXT, /设置 QQ 后才能使用/)
 })
@@ -101,7 +106,7 @@ test('omits the estimate when an older personal response has no estimate field',
     last_no_show_action_was_defer: false,
   }])
 
-  assert.match(text, /旧数据玩家：位于队列位置 A1/)
+  assert.match(text, /^你好，旧数据玩家。\n\n你位于队列位置 A1。/)
   assert.doesNotMatch(text, /undefined|约 .* 分钟后/)
 })
 
@@ -147,9 +152,9 @@ test('shows business-hours state in personal queue output and notifications', ()
     },
   })
 
-  assert.match(text, /^今日营业时间已结束，现有队列正在收尾。\n\n/)
-  assert.match(text, /小雨：位于队列位置 A1/)
-  assert.match(closingSoonText, /^将在 30 分钟内闭店，请留意后续队列安排。\n\n/)
+  assert.match(text, /^你好，小雨。\n\n今日营业时间已结束，现有队列正在收尾。\n\n/)
+  assert.match(text, /你位于队列位置 A1/)
+  assert.match(closingSoonText, /^你好，小雨。\n\n将在 30 分钟内闭店，请留意后续队列安排。\n\n/)
 })
 
 test('formats both machines without exposing private profile fields', () => {
@@ -354,7 +359,7 @@ test('does not show a stale personal estimate while the machine is stopped', () 
     },
   })
 
-  assert.match(text, /机台状态：停止使用·机台未开机，登记顺序已保留/)
+  assert.match(text, /机台状态：入口侧·机台 A 已停止使用·机台未开机，登记顺序已保留/)
   assert.doesNotMatch(text, /约 8 分钟后/)
 })
 
@@ -385,10 +390,9 @@ test('keeps personal status complete without a public queue snapshot', () => {
     last_no_show_action_was_defer: false,
   }], undefined, { terminal: { online: false } })
 
-  assert.match(text, /^终端暂时离线/)
-  assert.match(text, /所在机台：入口侧·机台 A/)
-  assert.match(text, /机台状态：停止使用·其他原因（等待配件），登记顺序已保留。/)
-  assert.match(text, /本次偏好：与朋友共同游玩/)
+  assert.match(text, /^你好，小雨。\n\n终端暂时离线/)
+  assert.match(text, /机台状态：入口侧·机台 A 已停止使用·其他原因（等待配件），登记顺序已保留。/)
+  assert.match(text, /游玩偏好：与朋友共同游玩/)
   assert.match(text, /共同游玩：青空/)
   assert.doesNotMatch(text, /约 8 分钟后/)
   assert.doesNotMatch(text, /允许他人加入/)
@@ -415,8 +419,8 @@ test('uses the private playing timer when formatting a notification status', () 
     last_no_show_action_was_defer: false,
   }])
 
-  assert.match(text, /正在游玩位置 A·已游玩 [45] 分钟/)
-  assert.match(text, /本次偏好：单人游玩/)
+  assert.match(text, /正在游玩位置 A，已游玩 [45] 分钟/)
+  assert.match(text, /游玩偏好：单人游玩/)
 })
 
 test('describes a retained playing position as a location while its machine is stopped', () => {
@@ -446,7 +450,7 @@ test('describes a retained playing position as a location while its machine is s
   const text = formatOwnQueue([player])
 
   assert.match(text, /位于游玩位置 A/)
-  assert.match(text, /机台状态：停止使用·机台断网，登记顺序已保留。/)
+  assert.match(text, /机台状态：入口侧·机台 A 已停止使用·机台断网，登记顺序已保留。/)
   assert.doesNotMatch(text, /正在游玩位置/)
   assert.doesNotMatch(text, /已游玩 \d+ 分钟/)
 })
@@ -503,9 +507,9 @@ test('adds current preference, elapsed time, and stale warning to own status', (
     },
   })
 
-  assert.match(text, /^终端暂时离线/)
-  assert.match(text, /正在游玩位置 A·已游玩 [45] 分钟/)
-  assert.match(text, /本次偏好：单人游玩/)
+  assert.match(text, /^你好，小雨。\n\n终端暂时离线/)
+  assert.match(text, /正在游玩位置 A，已游玩 [45] 分钟/)
+  assert.match(text, /游玩偏好：单人游玩/)
 })
 
 test('shows the computed business-hours state in the queue header', () => {
@@ -622,6 +626,128 @@ test('formats queue notifications with the canonical heading and compact middle 
     '【排队通知】\n\n机台 A·游玩位置已更新\n小雨·已进入游玩位置。\n\n未到场记录 1 次·上次处理：移至队尾',
   )
   assert.doesNotMatch(message, /\s·|·\s/)
+})
+
+test('shows the pending check-in state and only allows leaving the queue', () => {
+  const player = {
+    registration_id: 'registration-online',
+    profile_id: 'profile-online',
+    qq_number: '12345678',
+    display_id: '糍粑',
+    machine_id: 'A',
+    position: 'WAITING',
+    position_index: 4,
+    estimated_wait_minutes: null,
+    preference: 'OPEN_TO_JOIN',
+    fixed_pair: false,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+    online_registration_pending_check_in: true,
+  }
+
+  const text = formatOwnQueue([player])
+
+  assert.match(text, /^你好，糍粑。/)
+  assert.match(text, /你位于队列位置 A4，签到后可以估算等待时间。/)
+  assert.match(text, /当前状态：线上登记·待签到。/)
+  assert.match(text, /\n\n - 退出排队$/)
+  assert.doesNotMatch(text, /暂缓一轮|暂时离开|切换机台|修改游玩偏好/)
+  assert.deepEqual(formatOwnQueueActions(player), ['退出排队'])
+})
+
+test('formats pending check-in registrations in the public queue', () => {
+  const registration = {
+    registration_id: 'registration-online',
+    display_id: '糍粑',
+    preference: 'OPEN_TO_JOIN',
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    fixed_pair: false,
+    no_show_count: 0,
+    online_registration_pending_check_in: true,
+  }
+  const machine = id => ({
+    id,
+    name: `机台 ${id}`,
+    operational: true,
+    stop_reason: null,
+    stop_reason_detail: null,
+    playing_started_at: null,
+    playing: [],
+    waiting_positions: id === 'A'
+      ? [{ index: 1, estimated_wait_minutes: null, registrations: [registration] }]
+      : [],
+  })
+  const text = formatQueue({
+    queue_id: 'queue-1',
+    captured_at: Date.now(),
+    registration_open: true,
+    terminal: { online: true },
+    machines: { A: machine('A'), B: machine('B') },
+  })
+
+  assert.match(text, /糍粑 \(允许加入\)\n    - 线上登记·待签到/)
+})
+
+test('changes the personal menu with absence state and queue rules', () => {
+  const player = {
+    position: 'WAITING',
+    deferred_once: false,
+    temporarily_away: false,
+    online_registration_pending_check_in: false,
+  }
+  assert.deepEqual(formatOwnQueueActions(player, {
+    allow_defer_one_round: true,
+    allow_temporary_leave: true,
+  }), [
+    '暂缓一轮',
+    '暂时离开',
+    '切换机台',
+    '修改游玩偏好',
+    '退出排队',
+  ])
+  assert.deepEqual(formatOwnQueueActions({ ...player, deferred_once: true }), [
+    '取消暂缓一轮',
+    '切换机台',
+    '修改游玩偏好',
+    '退出排队',
+  ])
+  assert.deepEqual(formatOwnQueueActions(player, {
+    allow_defer_one_round: false,
+    allow_temporary_leave: false,
+  }), ['切换机台', '修改游玩偏好', '退出排队'])
+})
+
+test('parses only explicit machine and current-preference choices', () => {
+  const machines = [
+    { id: 'A', name: '左侧 · 机台 A' },
+    { id: 'B', name: '右侧 · 机台 B' },
+  ]
+  assert.equal(parseMachineChoice('机台 A', machines), machines[0])
+  assert.equal(parseMachineChoice('右侧·机台B', machines), machines[1])
+  assert.equal(parseMachineChoice('左边', machines), null)
+  assert.equal(parsePlayPreference('单人游玩'), 'SOLO')
+  assert.equal(parsePlayPreference('允许他人加入'), 'OPEN_TO_JOIN')
+  assert.equal(parsePlayPreference('每次询问'), null)
+})
+
+test('does not offer stopped or full machines for a new registration', () => {
+  const machine = {
+    id: 'A',
+    name: '左侧 · 机台 A',
+    operational: true,
+    playing: [],
+    waiting_positions: [],
+    registration_count: 19,
+  }
+
+  assert.equal(machineCanAcceptRegistration(machine), true)
+  assert.equal(machineCanAcceptRegistration({ ...machine, registration_count: 20 }), false)
+  assert.equal(machineCanAcceptRegistration({ ...machine, operational: false }), false)
 })
 
 test('parses only supported profile values', () => {

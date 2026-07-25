@@ -1,13 +1,13 @@
 # maimai Q
 
-[![Version](https://img.shields.io/badge/version-0.3.7-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
+[![Version](https://img.shields.io/badge/version-0.4.0-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
 [![Android](https://img.shields.io/badge/Android-10%2B-34C759?logo=android&logoColor=white)](https://developer.android.com/about/versions/10)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-007AFF)](https://developer.android.com/compose)
 
 面向机厅现场的双机台电子排队终端。maimai Q 用电子队列模拟现场“挪东西排卡”的流程，在保留玩家游玩偏好和现场调整能力的同时，提供等待时间估算、本机持久化、操作日志和可选的网站同步。
 
-项目以 Android 横屏终端为现场最终操作端。网络不可用时，排队仍然完整运行在本机；开启同步后，公开队列供网站查看，玩家资料通过私有接口备份，并可接收经过本地校验的 QQ Bot 资料修改。
+项目以 Android 横屏终端为现场最终操作端。网络不可用时，排队仍然完整运行在本机；开启同步后，网站和 QQ Bot 可以查看队列，并通过玩家资料提交线上登记。所有远程操作仍由现场终端按本地规则校验并写入。
 
 > 当前版本仍处于 `0.x` 阶段。用于真实现场前，请先根据本机厅规则完成测试，并安排能够处理误操作和机台故障的现场人员。
 
@@ -16,7 +16,7 @@
 - [在线查看当前队列](https://abcccc.top/queue-status)
 - [玩家使用手册](docs/user-manual.md)
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
-- [0.1.0 至 0.3.7 更新日志](docs/update.md)
+- [0.1.0 至 0.4.0 更新日志](docs/update.md)
 - [云端同步协议](docs/cloud-queue-sync.md)
 - [后端部署说明](cloud-server/README.md)
 
@@ -66,6 +66,8 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将两�
 - 使用玩家资料认领临时登记，保留原机台和位置，并将昵称更新为资料昵称。
 - 修改本次游玩偏好时，不会意外覆盖玩家资料的默认偏好。
 - 性别和 QQ 只在需要的详情页面显示，不出现在公开排队表面。
+- 网站和 QQ Bot 可使用已绑定的 QQ 玩家资料加入排队；线上登记到场后需在终端完成签到。
+- 待签到登记保留原有等待顺序，但不参与游玩位置分配和等待时间估算；签到后恢复为普通登记。
 
 ### 队列编辑和纠错
 
@@ -92,21 +94,21 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将两�
 
 - 现场变化先保存到本机，再异步上传公开快照。
 - 完整玩家资料库通过鉴权后的私有通道同步；当前有效登记的 QQ 只显示在网站登记详情中。
-- Koishi Bot 可以查询本人状态、读取相关事件并请求修改玩家资料。
+- Koishi Bot 可以查询本人状态、读取相关事件、请求修改玩家资料和管理本人的当前登记。
 - 服务器修改先成为待执行命令，终端校验并落盘后才正式生效。
 - 网络失败不会阻止现场操作，应用会在后台自动重试。
 - 首页显示已同步、同步中、待重试、已关闭或未配置等状态。
-- 现场终端版可单独关闭“QQ Bot 联动”；关闭后不接受 Bot 查询或资料修改，也不会补发关闭期间的通知。
+- 现场终端版可分别关闭网站同步和“QQ Bot 联动”；关闭后对应的线上入口与远程操作不可用。
 - 闭店前 30 分钟，App、网站和 QQ Bot 会统一显示提醒；预计无法在闭店前轮到时，App 还会在创建登记前说明风险。闭店后，三端统一显示收尾状态。
-- 网站提供两台队列、位置详情、时间估算、公开日志和“标记为自己”。
+- 网站提供两台队列、位置详情、时间估算、公开日志、“标记为自己”和线上加入排队入口。
 - 标记后可查看自己的位置、预计时间、共同游玩对象和未到场等处理结果。
-- 网站目前只读，不能远程改变现场队列。
+- QQ Bot 支持加入排队，以及暂缓一轮、暂时离开、切换机台、修改本次游玩偏好和退出排队；待签到登记只允许退出。
 
 <p align="center">
-  <img src="docs/images/queue-status-mobile.png" width="360" alt="maimai Q 只读队列网站移动端界面">
+  <img src="docs/images/queue-status-mobile.png" width="360" alt="maimai Q 队列网站移动端界面">
 </p>
 
-<p align="center"><sub>只读队列网站的移动端界面；现场操作仍以 Android 终端为准。</sub></p>
+<p align="center"><sub>队列网站的移动端界面；现场队列仍以 Android 终端保存的状态为准。</sub></p>
 
 ## 系统架构
 
@@ -117,7 +119,7 @@ flowchart LR
     Terminal -->|HTTPS POST<br/>公开队列 + 私有资料| API[Flask 队列 API]
     API --> PublicDB[(公开快照与公开事件)]
     API --> PrivateDB[(私有玩家资料与命令)]
-    Web[只读队列网站] -->|HTTPS GET| API
+    Web[队列网站] <-->|公开查询 + 线上登记| API
     Viewer[玩家手机] --> Web
     Bot[Koishi OneBot] <-->|私有查询与待执行命令| API
     Terminal -->|拉取并回执命令| API
@@ -176,7 +178,7 @@ app/build/outputs/apk/local/debug/app-local-debug.apk
 .\gradlew.bat :app:packageLocalDebugApk
 ```
 
-文件会复制到 `output/apk/maimai-Q-0.3.7-local.apk`。
+文件会复制到 `output/apk/maimai-Q-0.4.0-local.apk`。
 
 macOS 或 Linux 使用：
 
@@ -249,7 +251,7 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 - 公开分发版与现场终端版应使用不同签名和不同配置。
 - 现场终端 APK 只在受控设备间传递；令牌泄漏后立即在服务端轮换。
 
-现场终端文件会复制到 `output/apk/maimai-Q-0.3.7-terminal.apk`，不得作为 GitHub 公开 Release 附件。
+现场终端文件会复制到 `output/apk/maimai-Q-0.4.0-terminal.apk`，不得作为 GitHub 公开 Release 附件。
 
 ## 部署队列 API
 
@@ -337,12 +339,13 @@ maimai-queue-terminal/
 
 - 二维码入口已经预留，但当前版本尚未启用。
 - 玩家资料以终端本机为准，并可私有同步到服务器；云端只补回本机缺失资料。
-- Koishi Bot 已具备玩家查询、相关事件通知和资料修改 API，队列远程操作仍待逐项开放。
-- 网站目前只读，远程排队和远程修改队列尚未开放。
+- 网站与 Koishi Bot 的线上登记仅接受现场终端玩家资料库中已绑定 QQ 的玩家；新资料仍需在现场建立。
+- 线上登记到场后必须在终端签到；网站暂不提供暂缓、暂离、切换机台、修改偏好或退出排队等队列管理操作。
+- QQ Bot 只允许玩家管理与发送者 QQ 对应的本人登记，不提供远程调整其他玩家或整条队列的能力。
 - 当前公开站点的前端源码不在本仓库中。
 - 仓库没有包含可公开使用的生产同步令牌或正式签名密钥。
 
-后续计划包括逐项开放 QQ Bot 排队命令、权限明确的动态网站交互、二维码身份入口，以及将公开安装版与现场终端版分离。
+后续计划包括支持一至四台机台、继续扩展权限明确的网站交互、二维码身份入口，以及完善公开安装版与现场终端版的发布流程。
 
 ## 参与开发
 
@@ -358,7 +361,7 @@ maimai-queue-terminal/
 
 ## 许可证
 
-当前仓库尚未附带开源许可证，默认保留全部权利。公开查看源码不等同于获得复制、修改、分发或商业使用授权。正式采用开源许可证后，本节会同步更新。
+本项目按 [GNU General Public License v3.0](LICENSE) 发布，SPDX 标识为 `GPL-3.0-only`。复制、修改和分发时应遵守许可证中的源代码公开与版权声明要求。
 
 ## 声明
 

@@ -423,7 +423,7 @@ class QueueStatusApiTest(unittest.TestCase):
         )
 
         self.assertEqual(204, published.status_code)
-        self.assertEqual(3, public_response.get_json()["schema_version"])
+        self.assertEqual(4, public_response.get_json()["schema_version"])
         public_registration = public_response.get_json()["machines"]["A"]["playing"][0]
         public_companion = public_response.get_json()["machines"]["A"]["playing"][1]
         self.assertEqual("12345678", public_registration["qq_number"])
@@ -2010,6 +2010,212 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(204, other_response.status_code)
         self.assertEqual("按钮失灵", other_current["machines"]["A"]["stop_reason_detail"])
         self.assertEqual(400, invalid_response.status_code)
+
+    def test_website_profile_lookup_and_join_are_terminal_confirmed_and_idempotent(self):
+        snapshot = self.remote_ready_snapshot()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+
+        profile = self.client.post(
+            "/api/queue-online/profile", json={"qq": "12345678"}
+        )
+        request_id = "00000000-0000-0000-0000-000000000401"
+        request_body = {
+            "request_id": request_id,
+            "qq": "12345678",
+            "machine_id": "A",
+        }
+        created = self.client.post("/api/queue-online/join", json=request_body)
+        repeated = self.client.post("/api/queue-online/join", json=request_body)
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+
+        self.assertEqual(200, profile.status_code)
+        self.assertEqual("公开昵称", profile.get_json()["profile"]["nickname"])
+        self.assertTrue(profile.get_json()["capabilities"]["online_registration"])
+        self.assertEqual(202, created.status_code)
+        self.assertEqual(200, repeated.status_code)
+        self.assertEqual(request_id, repeated.get_json()["command_id"])
+        self.assertEqual(1, len(commands))
+        self.assertEqual("QUEUE_OPERATION", commands[0]["type"])
+        self.assertEqual("JOIN_QUEUE", commands[0]["payload"]["operation"])
+        self.assertEqual("WEBSITE_REMOTE", commands[0]["payload"]["operation_source"])
+
+    def test_online_join_requires_a_current_preference_when_profile_asks_each_time(self):
+        snapshot = self.remote_ready_snapshot(default_preference="ASK_EVERY_TIME")
+        self.client.post("/api/queue-status", json=snapshot, headers=self.headers)
+
+        missing = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000402",
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+        selected = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000403",
+                "qq": "12345678",
+                "machine_id": "A",
+                "preference": "SOLO",
+            },
+        )
+
+        self.assertEqual(400, missing.status_code)
+        self.assertEqual("请选择本次游玩偏好", missing.get_json()["error"])
+        self.assertEqual(202, selected.status_code)
+
+    def test_pending_online_registration_only_allows_remote_leave(self):
+        snapshot = self.remote_ready_snapshot(with_registration=True, pending_check_in=True)
+        self.client.post("/api/queue-status", json=snapshot, headers=self.headers)
+
+        deferred = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000404",
+                "actor_qq": "12345678",
+                "operation": "DEFER_ONE_ROUND",
+            },
+            headers=self.bot_headers,
+        )
+        left = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000405",
+                "actor_qq": "12345678",
+                "operation": "LEAVE_QUEUE",
+            },
+            headers=self.bot_headers,
+        )
+
+        self.assertEqual(409, deferred.status_code)
+        self.assertIn("完成现场签到后", deferred.get_json()["error"])
+        self.assertEqual(202, left.status_code)
+
+    def test_disabling_onebot_does_not_reject_a_pending_website_join(self):
+        enabled = self.remote_ready_snapshot(revision=4)
+        self.client.post("/api/queue-status", json=enabled, headers=self.headers)
+        command_id = "00000000-0000-0000-0000-000000000406"
+        created = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": command_id,
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+
+        disabled = self.remote_ready_snapshot(revision=5)
+        disabled["onebot_sync_enabled"] = False
+        published = self.client.post(
+            "/api/queue-status", json=disabled, headers=self.headers
+        )
+        pending = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+
+        self.assertEqual(202, created.status_code)
+        self.assertEqual(204, published.status_code)
+        self.assertEqual([command_id], [item["command_id"] for item in pending])
+
+    def test_rejects_pending_online_registration_in_playing_position(self):
+        snapshot = self.remote_ready_snapshot(with_registration=True, pending_check_in=True)
+        registration = snapshot["machines"]["A"]["waiting_positions"][0][
+            "registrations"
+        ][0]
+        snapshot["machines"]["A"]["playing"] = [registration]
+        snapshot["machines"]["A"]["playing_started_at"] = 900_000
+        snapshot["machines"]["A"]["waiting_positions"] = []
+
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("待签到登记不能处于游玩位置", response.get_json()["error"])
+
+    def test_profile_and_queue_commands_for_the_same_player_cannot_overlap(self):
+        snapshot = self.remote_ready_snapshot()
+        self.client.post("/api/queue-status", json=snapshot, headers=self.headers)
+        queue_command = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000407",
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+        profile_command = self.client.patch(
+            f"/api/queue-bot/profiles/{self.profile_id}",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000408",
+                "actor_qq": "12345678",
+                "nickname": "不应并发更新",
+            },
+            headers=self.bot_headers,
+        )
+
+        self.assertEqual(202, queue_command.status_code)
+        self.assertEqual(409, profile_command.status_code)
+        self.assertEqual(
+            "你已有一项操作正在等待终端处理",
+            profile_command.get_json()["error"],
+        )
+
+    def remote_ready_snapshot(
+        self,
+        revision=4,
+        default_preference="OPEN_TO_JOIN",
+        with_registration=False,
+        pending_check_in=False,
+    ):
+        snapshot = self.snapshot(revision=revision)
+        snapshot.update(
+            schema_version=4,
+            website_remote_enabled=True,
+            onebot_sync_enabled=True,
+            queue_rules={
+                "allow_defer_one_round": True,
+                "allow_temporary_leave": True,
+            },
+        )
+        profile = self.player_profile()
+        profile["default_preference"] = default_preference
+        snapshot["private_player_profiles"] = [profile]
+        snapshot["private_player_contacts"] = []
+        snapshot["machines"]["A"] = self.machine(name="左侧 · 机台 A")
+        snapshot["machines"]["B"] = self.machine(name="右侧 · 机台 B")
+        snapshot["machines"]["A"]["new_registration_estimated_wait_minutes"] = 0
+        snapshot["machines"]["B"]["new_registration_estimated_wait_minutes"] = 0
+        if with_registration:
+            registration = self.registration("a" * 24, "公开昵称")
+            registration["online_registration_pending_check_in"] = pending_check_in
+            snapshot["machines"]["A"]["waiting_positions"] = [
+                {
+                    "index": 1,
+                    "position_id": "b" * 24,
+                    "fixed_pair": False,
+                    "estimated_wait_minutes": None if pending_check_in else 0,
+                    "registrations": [registration],
+                }
+            ]
+            snapshot["machines"]["A"]["registration_count"] = 1
+            snapshot["machines"]["A"]["waiting_position_count"] = 1
+            snapshot["private_player_contacts"] = [
+                {
+                    "registration_id": registration["registration_id"],
+                    "profile_id": self.profile_id,
+                    "qq_number": "12345678",
+                }
+            ]
+        return snapshot
 
     def snapshot(
         self,

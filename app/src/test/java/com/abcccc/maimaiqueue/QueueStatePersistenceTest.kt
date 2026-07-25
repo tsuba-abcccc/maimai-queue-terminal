@@ -190,4 +190,33 @@ class QueueStatePersistenceTest {
         assertEquals(null, restored.waiting[2].fixedPartnerKey)
         assertEquals(PlayPreference.OPEN_TO_JOIN, restored.waiting[2].preference)
     }
+
+    @Test
+    fun restoredQueueKeepsPendingCheckInOnlyInWaitingOrder() {
+        val pendingPlaying = Registration(
+            key = 1,
+            displayId = "游玩玩家",
+            preference = PlayPreference.SOLO,
+            requiresOnSiteCheckIn = true,
+            createdAtMillis = 100L
+        )
+        val pendingWaiting = Registration(
+            key = 2,
+            displayId = "线上玩家",
+            preference = PlayPreference.SOLO,
+            requiresOnSiteCheckIn = true,
+            createdAtMillis = 200L
+        )
+
+        val restored = normalizeRestoredMachineQueue(
+            MachineQueue(
+                playing = listOf(pendingPlaying),
+                waiting = listOf(pendingWaiting),
+                playingStartedAtMillis = 300L
+            )
+        )
+
+        assertFalse(restored.playing.single().requiresOnSiteCheckIn)
+        assertTrue(restored.waiting.single().requiresOnSiteCheckIn)
+    }
 }

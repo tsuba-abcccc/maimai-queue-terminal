@@ -179,6 +179,15 @@ fun createQueueAuditLog(
             changeKinds += "no_show_cleared"
             details += "“${new.displayId}”正常完成游玩，未到场记录已清除"
         }
+        if (old.requiresOnSiteCheckIn != new.requiresOnSiteCheckIn) {
+            affectedRegistrationKeys += key
+            changeKinds += "check_in"
+            details += if (new.requiresOnSiteCheckIn) {
+                "“${new.displayId}”已标记为线上登记，需在现场签到"
+            } else {
+                "“${new.displayId}”已在现场完成签到"
+            }
+        }
     }
 
     if (before.playing.map { it.key } != after.playing.map { it.key }) {
@@ -225,6 +234,7 @@ fun createQueueAuditLog(
             "renamed" in changeKinds -> "登记昵称已修改"
             "profile" in changeKinds -> "登记资料已更新"
             "no_show" in changeKinds -> "未到场状态已更新"
+            "check_in" in changeKinds -> "线上登记签到状态已更新"
             "absence" in changeKinds -> "暂缓或暂离状态已修改"
             "pair" in changeKinds -> "固定组合已修改"
             "preference" in changeKinds -> "游玩偏好已修改"

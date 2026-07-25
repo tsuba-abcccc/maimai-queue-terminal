@@ -6,6 +6,68 @@ import org.junit.Test
 
 class QueueCloudCommandTest {
     @Test
+    fun terminalCommandResponseParsesProfileAndQueueOperations() {
+        val parsed = parseRemoteTerminalCommands(
+            """
+            {
+              "commands": [
+                {
+                  "command_id": "00000000-0000-0000-0000-000000000777",
+                  "type": "UPDATE_PLAYER_PROFILE",
+                  "payload": {
+                    "profile_id": "00000000-0000-0000-0000-000000000901",
+                    "qq_number": "12345678",
+                    "expected_updated_at": 1000,
+                    "nickname": "新昵称",
+                    "gender": "FEMALE",
+                    "default_preference": "SOLO"
+                  }
+                },
+                {
+                  "command_id": "00000000-0000-0000-0000-000000000401",
+                  "type": "QUEUE_OPERATION",
+                  "created_at": 2000,
+                  "payload": {
+                    "queue_id": "00000000-0000-0000-0000-000000000001",
+                    "profile_id": "00000000-0000-0000-0000-000000000901",
+                    "actor_qq": "12345678",
+                    "operation": "JOIN_QUEUE",
+                    "operation_source": "WEBSITE_REMOTE",
+                    "machine_id": "A",
+                    "preference": "OPEN_TO_JOIN"
+                  }
+                }
+              ]
+            }
+            """.trimIndent()
+        )
+
+        assertEquals(2, parsed.size)
+        assertTrue(parsed[0] is PlayerProfileUpdateCommand)
+        val join = parsed[1] as RemoteQueueOperationCommand
+        assertEquals(RemoteQueueOperation.JOIN_QUEUE, join.operation)
+        assertEquals(RemoteQueueOperationSource.WEBSITE_REMOTE, join.source)
+        assertEquals("A", join.machineId)
+        assertEquals(PlayPreference.OPEN_TO_JOIN, join.preference)
+    }
+
+    @Test
+    fun terminalCommandResponseSkipsMalformedOrUnknownCommands() {
+        val parsed = parseRemoteTerminalCommands(
+            """
+            {
+              "commands": [
+                {"command_id": "not-a-uuid", "type": "QUEUE_OPERATION", "payload": {}},
+                {"command_id": "00000000-0000-0000-0000-000000000402", "type": "UNKNOWN", "payload": {}}
+              ]
+            }
+            """.trimIndent()
+        )
+
+        assertTrue(parsed.isEmpty())
+    }
+
+    @Test
     fun matchingCommandProducesUpdatedProfile() {
         val original = profile()
         val decision = decidePlayerProfileUpdate(

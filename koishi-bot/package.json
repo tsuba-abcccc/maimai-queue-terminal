@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-maimai-q",
-  "version": "0.1.8",
-  "description": "Queue queries, player profile management, and private notifications for Koishi OneBot",
+  "version": "0.2.0",
+  "description": "Queue registration, status, player profile management, and private notifications for Koishi OneBot",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "files": [
@@ -20,7 +20,7 @@
     "maimai",
     "queue"
   ],
-  "license": "UNLICENSED",
+  "license": "GPL-3.0-only",
   "peerDependencies": {
     "koishi": "^4.18.0"
   },

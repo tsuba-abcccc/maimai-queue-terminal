@@ -10,21 +10,24 @@
 
 ## 协议版本
 
-新版终端发布 `schema_version: 3`，服务端继续接受版本 `1` 和 `2` 的公开队列快照。
+新版终端发布 `schema_version: 4`，服务端继续接受版本 `1`、`2` 和 `3` 的公开队列快照。
 
 完整请求体限制为 `1 MiB`，单次最多包含 `500` 份玩家资料和 `200` 条公开事件。
 
 ```text
 Authorization: Bearer <QUEUE_SYNC_TOKEN>
 X-Device-ID: <终端 UUID>
-X-Queue-Schema-Version: 3
+X-Queue-Schema-Version: 4
 Content-Type: application/json; charset=utf-8
 ```
 
-版本 3 在原有公开字段之外增加以下顶层字段：
+版本 3 增加私有玩家资料、当前登记联系信息、QQ Bot 联动状态和营业时间计算结果。版本 4 继续增加：
 
-- `onebot_sync_enabled`：现场终端当前是否允许 QQ Bot 联动。
-- `business_hours`：只包含 `enabled`、`outside`、`closing_soon`、`closing_grace`、`closes_at` 和 `registration_closes_at` 六个计算结果，不上传完整营业时间表。`closing_soon` 在营业时段进入闭店前 30 分钟后为 `true`，`closes_at` 是本次闭店时间；`closing_grace` 表示已到闭店时间但现有队列仍在收尾，`registration_closes_at` 是最迟收尾时间。
+- `website_remote_enabled`：现场终端是否允许网站创建线上登记。
+- `queue_rules`：当前是否允许暂缓一轮和暂时离开，供 Bot 在展示操作前判断。
+- 登记字段 `online_registration_pending_check_in`：该登记是否由网站或 Bot 建立且仍未在现场签到。
+
+`business_hours` 只包含 `enabled`、`outside`、`closing_soon`、`closing_grace`、`closes_at` 和 `registration_closes_at` 六个计算结果，不上传完整营业时间表。`closing_soon` 在营业时段进入闭店前 30 分钟后为 `true`，`closes_at` 是本次闭店时间；`closing_grace` 表示已到闭店时间但现有队列仍在收尾，`registration_closes_at` 是最迟收尾时间。
 
 - `private_player_profiles`：完整玩家资料库。
 - `private_player_contacts`：当前登记与玩家资料、QQ 的关联。
@@ -74,6 +77,14 @@ Content-Type: application/json; charset=utf-8
 `GET /api/queue-logs?queue_id=<UUID>&limit=50&before=<游标>`
 
 只返回白名单内的队列事件，不包含 QQ、性别、资料 UUID 或私有资料编辑日志。每条事件包含 `operation_source`，取值为 `ON_SITE_TERMINAL`、`QQ_BOT`、`SYSTEM_AUTOMATIC` 或预留的 `WEBSITE_REMOTE`。
+
+### 网站线上登记
+
+- `POST /api/queue-online/profile`：按 QQ 查询一份可用于线上登记的玩家资料，并返回当前可选机台和是否已有登记。
+- `POST /api/queue-online/join`：提交 `request_id`、QQ、机台编号和按需提供的本次游玩偏好。
+- `GET /api/queue-online/commands/<command_id>`：查询终端是否已应用或拒绝该登记。
+
+这组接口不返回完整玩家资料库，也不能修改已有队列。仅在终端在线、网站同步开启且登记排队开放时接受新登记。线上登记进入等待末端后带有待签到状态；完成现场签到前保留顺序，但不进入游玩位置，也不提供确定的等待时间估算。
 
 ## 私有 Bot 接口
 
@@ -135,6 +146,14 @@ Authorization: Bearer <QUEUE_BOT_TOKEN>
 
 状态包括 `PENDING`、`APPLIED` 和 `REJECTED`。拒绝原因位于 `result_detail`。
 
+### 请求排队操作
+
+`POST /api/queue-bot/queue-commands`
+
+基础请求包含 `request_id`、`actor_qq` 和 `operation`。加入或切换机台时附带 `machine_id` / `target_machine_id`，修改本次偏好时附带 `preference`。支持线上加入、退出、暂缓一轮、暂时离开、取消对应状态、切换机台和修改本次游玩偏好。
+
+服务器只接受与 `actor_qq` 当前绑定相符的本人登记。待签到的线上登记仅允许退出；暂缓、暂离、机台状态、队列容量和固定组合等规则会在服务器和终端分别校验。相同 `request_id` 保证幂等。
+
 ## 终端回流接口
 
 ### 恢复缺失资料
@@ -156,6 +175,8 @@ Authorization: Bearer <QUEUE_BOT_TOKEN>
 
 本地资料已经等于命令目标时，终端视为幂等成功并补发回执。
 
+`QUEUE_OPERATION` 命令还会重新校验队列批次、QQ 与资料绑定、登记编号、机台状态、登记上限、现场功能开关及当前登记状态。只有本机持久化成功后才返回 `APPLIED`。线上加入命令会写入原命令编号，回执丢失后重复拉取仍能识别为已经执行，不会创建第二份登记。
+
 ### 命令回执
 
 `POST /api/queue-terminal/commands/<command_id>/result`
@@ -166,9 +187,9 @@ Authorization: Bearer <QUEUE_BOT_TOKEN>
 
 终端写入本机后再返回 `APPLIED`，随后正常上传新的资料快照。服务器不能自行把待执行命令直接改成正式资料。
 
-## 尚未开放的能力
+## 远程操作边界
 
-QQ Bot 修改排队顺序、加入、退出、暂缓或暂离尚未开放。它们将复用同一命令通道，但必须逐项定义身份校验、机台规则、确认语义和冲突处理；当前私有接口明确返回 `remote_actions: false`。
+网站当前只开放线上加入排队；已有登记的暂缓、暂离、切换机台、修改偏好和退出排队由 QQ Bot 提供。两端均不能远程标记未到场、结束本轮、调整其他玩家、拖动顺序、报告机台停止使用或修改终端设置。现场终端仍是队列的最终数据源。
 
 ## 构建与安全
 

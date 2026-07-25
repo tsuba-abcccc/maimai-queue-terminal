@@ -1,12 +1,12 @@
 # maimai Q Cloud API
 
-为 maimai Q 现场终端提供队列公开展示、玩家资料私有备份、QQ Bot 查询与终端命令回流。
+为 maimai Q 现场终端提供队列公开展示、玩家资料私有备份、网站线上登记、QQ Bot 查询与终端命令回流。
 
 ## 数据权威关系
 
 - 机厅终端始终是队列和玩家资料的最终数据源。
 - 终端操作先写入本机，再上传服务器；服务器不可用时不影响现场排队。
-- QQ Bot 的修改先保存为待执行命令，终端拉取并按本地规则校验，通过后才成为正式数据。
+- 网站和 QQ Bot 的修改先保存为待执行命令，终端拉取并按本地规则校验，通过后才成为正式数据。
 - 终端可以独立关闭“QQ Bot 联动”；关闭时 Bot 接口停止服务，待执行命令失效，关闭期间不积压通知。
 - `GET /api/queue-status` 与 `GET /api/queue-logs` 是公开接口。队列状态只为当前有效的资料库登记返回 QQ，便于网站详情联系玩家；性别、资料 UUID、完整资料库和私有命令不会公开。
 - Bot 和终端私有接口分别使用独立令牌，不能在网页前端暴露。
@@ -31,7 +31,7 @@ QUEUE_CORS_ORIGIN=https://abcccc.top
 
 每份鉴权令牌在启用对应私有接口时都必须达到 32 个 UTF-8 字节；两份令牌都配置时不能相同。某份配置缺失或过短时，对应私有接口统一返回 `503`；两份配置相同时，终端与 Bot 私有接口都会返回 `503`。健康检查仍会响应，服务不会降级为未鉴权访问。可使用 `openssl rand -hex 32` 分别生成两份独立令牌。
 
-`QUEUE_COMMAND_TIMEOUT_SECONDS` 是资料修改等待终端处理的最长时间，默认 10 分钟。超时命令会被拒绝，玩家可以重新提交；当前权威终端发生接管时，仍在有效期内的命令会自动转交给新终端。
+`QUEUE_COMMAND_TIMEOUT_SECONDS` 是资料或队列命令等待终端处理的最长时间，默认 10 分钟。超时命令会被拒绝，玩家可以重新提交；当前权威终端发生接管时，仍在有效期内的命令会自动转交给新终端。
 
 `QUEUE_COMMAND_RETENTION_SECONDS` 控制已完成命令的保留时间，默认 30 天。到期后会删除包含 QQ 的命令载荷，避免私有信息无限期留存。
 
@@ -45,6 +45,14 @@ QUEUE_CORS_ORIGIN=https://abcccc.top
 GET  /api/queue-status
 GET  /api/queue-logs
 GET  /healthz
+```
+
+网站线上登记接口，不使用 Bot 令牌，仅在终端在线且开启网站同步时可用：
+
+```text
+POST /api/queue-online/profile                 {"qq":"<QQ号>"}
+POST /api/queue-online/join                    {"request_id":"<UUID>","qq":"<QQ号>","machine_id":"A"}
+GET  /api/queue-online/commands/<command_id>
 ```
 
 终端接口，使用 `QUEUE_SYNC_TOKEN` 和 `X-Device-ID`：
@@ -64,6 +72,7 @@ POST  /api/queue-bot/profiles     {"qq":"<QQ号>"}
 POST  /api/queue-bot/events       {"qq":"<QQ号>","after":0,"limit":50}
 GET   /api/queue-bot/events?after=<游标>&limit=50
 PATCH /api/queue-bot/profiles/<profile_id>
+POST  /api/queue-bot/queue-commands
 GET   /api/queue-bot/commands/<command_id>
 ```
 
@@ -73,7 +82,22 @@ GET   /api/queue-bot/commands/<command_id>
 
 `QUEUE_BOT_TOKEN` 是服务级凭据，不是单个玩家的登录凭据。持有该令牌的服务可以读取完整玩家资料库中的昵称、性别、默认偏好、资料 UUID 和 QQ，也可以读取当前登记绑定及通知事件中的全部 QQ 收件人；还可以请求修改任一与 `actor_qq` 相符的玩家资料。玩家命令只能操作发送者本人，是 Koishi 插件结合 OneBot 会话身份施加的限制。Bot 令牌必须只保存在受控服务端，泄漏后应立即轮换。
 
-当前允许 QQ 用户修改自己的昵称、性别和默认游玩偏好。QQ 是身份键，不能通过普通资料修改命令更换。队列远程操作尚未开放，响应中的 `remote_actions` 为 `false`。
+当前允许 QQ 用户修改自己的昵称、性别和默认游玩偏好，并管理与发送者 QQ 对应的本人登记。QQ 是身份键，不能通过普通资料修改命令更换。线上登记尚未在现场签到时只允许退出排队。
+
+网站只能查询与指定 QQ 对应的单份资料并创建线上登记，不能取得完整玩家资料库，也不能修改已有登记。网站提交成功后只会获得不含命令载荷的状态回执；现场终端仍会重新检查队列批次、资料、机台状态、登记上限和本次偏好。
+
+### 排队命令
+
+Koishi 使用 `POST /api/queue-bot/queue-commands` 提交本人操作。请求包含 `request_id`、`actor_qq` 和 `operation`，并按操作附带机台或本次游玩偏好。当前操作包括：
+
+- `JOIN_QUEUE`
+- `DEFER_ONE_ROUND` / `CANCEL_DEFER_ONE_ROUND`
+- `TEMPORARILY_LEAVE` / `CANCEL_TEMPORARY_LEAVE`
+- `TRANSFER_MACHINE`
+- `CHANGE_PLAY_PREFERENCE`
+- `LEAVE_QUEUE`
+
+服务器按最新公开快照先行检查，终端再以本机状态复核。相同 `request_id` 和相同请求内容会返回原命令，不会重复建立登记或执行操作；同一玩家已有待处理命令时，新请求返回 `409`。
 
 ## Koishi 资料修改示例
 
@@ -190,7 +214,7 @@ docker compose logs --tail=100 maimai-queue-status
 
 ### 2. 更新 Nginx 路由
 
-把当前 [nginx-location.conf.example](./nginx-location.conf.example) 中的 `/api/queue-bot/` 和 `/api/queue-terminal/` location 合并到现有 HTTPS 站点。不要用示例文件覆盖站点中的证书、静态网站或其他 location。随后执行：
+把当前 [nginx-location.conf.example](./nginx-location.conf.example) 中的 `/api/queue-online/`、`/api/queue-bot/` 和 `/api/queue-terminal/` location 合并到现有 HTTPS 站点。不要用示例文件覆盖站点中的证书、静态网站或其他 location。随后执行：
 
 ```bash
 sudo nginx -t
@@ -203,10 +227,12 @@ sudo systemctl reload nginx
 
 ```bash
 curl -i https://abcccc.top/queue-api-healthz
+curl -i -X POST -H 'Content-Type: application/json' \
+  -d '{"qq":"00000"}' https://abcccc.top/api/queue-online/profile
 curl -i 'https://abcccc.top/api/queue-bot/events?after=0&limit=1'
 ```
 
-第一条应返回 `200`。第二条故意不带令牌，应返回 `401` 和“Bot 认证失败”，这说明 Bot 路由已经到达新版后端。其他结果的含义如下：
+第一条应返回 `200`。第二条应返回后端 JSON；测试 QQ 不存在时通常为 `404 PROFILE_NOT_FOUND`，这证明网站线上登记路由已经生效。第三条故意不带令牌，应返回 `401` 和“Bot 认证失败”，这说明 Bot 路由已经到达新版后端。其他结果的含义如下：
 
 - `404 接口不存在`：新版 `app.py` 或 Nginx 的 `/api/queue-bot/` 路由尚未部署。
 - `503 服务器鉴权配置无效`：Bot 令牌缺失、少于 32 字节，或与终端令牌相同。
@@ -236,6 +262,7 @@ unset QUEUE_BOT_TOKEN
 查看队列
 我的资料
 我的排队
+加入排队
 ```
 
-`查看队列` 验证公开队列读取；后两项验证 OneBot 会话 QQ、私有鉴权和终端资料同步。首版只允许查询队列、查询本人状态、修改本人玩家资料和接收本人相关私信通知；远程加入、退出、暂缓、暂离和调整队列仍保持关闭。
+`查看队列` 验证公开队列读取；“我的资料”和“我的排队”验证 OneBot 会话 QQ、私有鉴权和终端资料同步。“加入排队”会真实建立登记，只应使用准备好的测试玩家资料执行。登记建立后，还应在现场终端确认“线上登记 · 待签到”、完成签到，并分别验证 Bot 的暂缓、暂离、切换机台、修改本次偏好和退出排队。

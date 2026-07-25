@@ -113,6 +113,11 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                     put("fixedPartnerKey", registration.fixedPartnerKey ?: JSONObject.NULL)
                     put("gender", registration.gender?.name ?: JSONObject.NULL)
                     put("playerProfileId", registration.playerProfileId ?: JSONObject.NULL)
+                    put("requiresOnSiteCheckIn", registration.requiresOnSiteCheckIn)
+                    put(
+                        "onlineRegistrationCommandId",
+                        registration.onlineRegistrationCommandId ?: JSONObject.NULL
+                    )
                 }
             )
         }
@@ -217,7 +222,11 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                 gender = item.optNullableString("gender")?.let { name ->
                     enumValues<PlayerGender>().firstOrNull { it.name == name }
                 },
-                playerProfileId = item.optNullableString("playerProfileId")
+                playerProfileId = item.optNullableString("playerProfileId"),
+                requiresOnSiteCheckIn = item.optBoolean("requiresOnSiteCheckIn", false),
+                onlineRegistrationCommandId = item
+                    .optNullableString("onlineRegistrationCommandId")
+                    ?.takeIf { value -> runCatching { java.util.UUID.fromString(value) }.isSuccess }
             )
         }
         return registrations
@@ -250,7 +259,7 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
     private companion object {
         const val KEY_STATE = "latest"
         const val MIN_SUPPORTED_SCHEMA_VERSION = 1
-        const val SCHEMA_VERSION = 3
+        const val SCHEMA_VERSION = 4
         const val MAX_REGISTRATIONS_PER_MACHINE = 20
     }
 }
@@ -269,7 +278,9 @@ internal fun normalizeRestoredMachineStatus(status: MachineStatus): MachineStatu
     }
 
 internal fun normalizeRestoredMachineQueue(queue: MachineQueue): MachineQueue {
-    val playing = normalizeRestoredRegistrations(queue.playing)
+    val playing = normalizeRestoredRegistrations(queue.playing).map {
+        it.copy(requiresOnSiteCheckIn = false)
+    }
     val waiting = normalizeRestoredRegistrations(queue.waiting)
     return queue.copy(
         playing = playing,

@@ -77,8 +77,13 @@ data class Registration(
     val lastNoShowActionWasDefer: Boolean = false,
     val fixedPartnerKey: Int? = null,
     val gender: PlayerGender? = null,
-    val playerProfileId: String? = null
-)
+    val playerProfileId: String? = null,
+    val requiresOnSiteCheckIn: Boolean = false,
+    val onlineRegistrationCommandId: String? = null
+) {
+    val canEnterPlayingPosition: Boolean
+        get() = absenceStatus == QueueAbsenceStatus.NONE && !requiresOnSiteCheckIn
+}
 
 data class FriendPairPlan(
     val originalWaiting: List<Registration>,
@@ -95,7 +100,7 @@ data class NextPlayingPositionPreview(
     val nextRegistrations: List<Registration>,
     val unavailableRegistrations: List<Registration>
 ) {
-    val changedByAbsence: Boolean
+    val changedByAvailability: Boolean
         get() = unavailableRegistrations.isNotEmpty() &&
             nominalRegistrations.map { it.key }.toSet() != nextRegistrations.map { it.key }.toSet()
 }
@@ -122,7 +127,7 @@ data class MachineQueue(
     fun waitingPositions(): List<List<Registration>> = groupIntoPositions(waiting)
 
     fun firstAvailableWaitingPositionIndex(): Int? = waitingPositions().indexOfFirst { position ->
-        position.all { it.absenceStatus == QueueAbsenceStatus.NONE }
+        position.all { it.canEnterPlayingPosition }
     }.takeIf { it >= 0 }
 
     fun nextPlayingPositionPreview(): NextPlayingPositionPreview? {
@@ -132,7 +137,8 @@ data class MachineQueue(
             waiting.map { registration ->
                 registration.copy(
                     absenceStatus = QueueAbsenceStatus.NONE,
-                    temporaryAwaySkippedTurns = 0
+                    temporaryAwaySkippedTurns = 0,
+                    requiresOnSiteCheckIn = false
                 )
             }
         ).firstOrNull().orEmpty()
@@ -144,7 +150,7 @@ data class MachineQueue(
             ?: waiting.lastIndex
         val unavailableRegistrations = waiting
             .take(lastNextRegistrationIndex + 1)
-            .filter { it.absenceStatus != QueueAbsenceStatus.NONE }
+            .filterNot { it.canEnterPlayingPosition }
 
         return NextPlayingPositionPreview(
             nominalRegistrations = nominalRegistrations,
@@ -172,7 +178,7 @@ data class MachineQueue(
     fun canMarkNoShow(registrationKey: Int): Boolean {
         val registration = allRegistrations.firstOrNull { it.key == registrationKey }
             ?: return false
-        if (registration.absenceStatus != QueueAbsenceStatus.NONE) return false
+        if (!registration.canEnterPlayingPosition) return false
         return playing.any { it.key == registrationKey } ||
             waitingPositions().getOrNull(firstAvailableWaitingPositionIndex() ?: -1)
                 ?.any { it.key == registrationKey } == true
@@ -275,7 +281,7 @@ data class MachineQueue(
             .getOrNull(firstAvailableWaitingPositionIndex() ?: -1)
             ?: return this
         val joiningPlayer = firstWaitingPosition.firstOrNull { it.key == registrationKey } ?: return this
-        if (joiningPlayer.absenceStatus != QueueAbsenceStatus.NONE) return this
+        if (!joiningPlayer.canEnterPlayingPosition) return this
         val remainingWaiting = sanitizeFriendPairs(waiting.filterNot { it.key == registrationKey })
         return copy(
             playing = listOf(
@@ -310,7 +316,7 @@ data class MachineQueue(
             position.size == registrationKeys.size && position.all { it.key in registrationKeys }
         }
         if (targetIndex <= 0) return this
-        if (positions[targetIndex].any { it.absenceStatus != QueueAbsenceStatus.NONE }) return this
+        if (positions[targetIndex].any { !it.canEnterPlayingPosition }) return this
 
         val targetPosition = positions[targetIndex].map {
             it.copy(
@@ -327,7 +333,7 @@ data class MachineQueue(
                 lastPlayedAtMillis = atMillis
             )
         }.toMutableList()
-        val retainedDeferredRegistrations = mutableListOf<Registration>()
+        val retainedUnavailableRegistrations = mutableListOf<Registration>()
         val temporarilyAwayRegistrations = mutableListOf<Registration>()
 
         positions.take(targetIndex).forEach { position ->
@@ -338,6 +344,9 @@ data class MachineQueue(
                 it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
             }
             when {
+                position.any { it.requiresOnSiteCheckIn } -> {
+                    retainedUnavailableRegistrations += position
+                }
                 hasTemporarilyAway -> {
                     val isFixedPair = position.size == 2 &&
                         position[0].fixedPartnerKey == position[1].key &&
@@ -375,7 +384,7 @@ data class MachineQueue(
                     }
                 }
                 hasOneRoundDeferral -> {
-                    retainedDeferredRegistrations += position.map { registration ->
+                    retainedUnavailableRegistrations += position.map { registration ->
                         if (registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND) {
                             registration.copy(absenceStatus = QueueAbsenceStatus.NONE)
                         } else {
@@ -399,7 +408,7 @@ data class MachineQueue(
         return copy(
             playing = targetPosition,
             waiting = sanitizeFriendPairs(
-                retainedDeferredRegistrations +
+                retainedUnavailableRegistrations +
                     positionsStillWaiting +
                     completedRegistrations +
                     temporarilyAwayRegistrations
@@ -411,7 +420,10 @@ data class MachineQueue(
     /** Skips exactly one opportunity while preserving the registration's physical order. */
     fun deferOneRound(registrationKey: Int): MachineQueue {
         val affectedKeys = fixedGroupKeys(registrationKey)
-        if (affectedKeys.isEmpty()) return this
+        if (
+            affectedKeys.isEmpty() ||
+            allRegistrations.any { it.key in affectedKeys && it.requiresOnSiteCheckIn }
+        ) return this
         val movedFromPlaying = playing.filter { it.key in affectedKeys }
         if (movedFromPlaying.isNotEmpty()) {
             val remainingPlayers = sanitizeFriendPairs(playing.filterNot { it.key in affectedKeys })
@@ -461,7 +473,10 @@ data class MachineQueue(
     /** Keeps skipping turns until manually cancelled, rotating to the tail after each skipped turn. */
     fun temporarilyLeave(registrationKey: Int): MachineQueue {
         val affectedKeys = fixedGroupKeys(registrationKey)
-        if (affectedKeys.isEmpty()) return this
+        if (
+            affectedKeys.isEmpty() ||
+            allRegistrations.any { it.key in affectedKeys && it.requiresOnSiteCheckIn }
+        ) return this
         val movedFromPlaying = playing.filter { it.key in affectedKeys }
         if (movedFromPlaying.isNotEmpty()) {
             val remainingPlayers = sanitizeFriendPairs(playing.filterNot { it.key in affectedKeys })
@@ -512,6 +527,9 @@ data class MachineQueue(
     }
 
     fun changePreference(registrationKey: Int, preference: PlayPreference): MachineQueue {
+        if (allRegistrations.any { it.key == registrationKey && it.requiresOnSiteCheckIn }) {
+            return this
+        }
         val partnerKey = allRegistrations.firstOrNull { it.key == registrationKey }?.fixedPartnerKey
         val transform: (Registration) -> Registration = {
             when (it.key) {
@@ -533,6 +551,7 @@ data class MachineQueue(
         }
         val firstOriginal = waiting.firstOrNull { it.key == firstKey } ?: return null
         val secondOriginal = waiting.firstOrNull { it.key == secondKey } ?: return null
+        if (firstOriginal.requiresOnSiteCheckIn || secondOriginal.requiresOnSiteCheckIn) return null
         val firstPosition = originalPositionByKey[firstKey] ?: return null
         val secondPosition = originalPositionByKey[secondKey] ?: return null
         val pairKeys = setOf(firstKey, secondKey)
@@ -622,7 +641,7 @@ data class MachineQueue(
                         listOf(registration),
                         positionIndex,
                         order++,
-                        canShare = registration.absenceStatus == QueueAbsenceStatus.NONE &&
+                        canShare = registration.canEnterPlayingPosition &&
                             registration.preference == PlayPreference.OPEN_TO_JOIN &&
                             registration.fixedPartnerKey == null
                     )
@@ -694,6 +713,7 @@ data class MachineQueue(
 
     fun createFriendPair(registrationKey: Int, friend: Registration): MachineQueue {
         val registration = waiting.firstOrNull { it.key == registrationKey } ?: return this
+        if (registration.requiresOnSiteCheckIn) return this
         val normalizedFriendId = friend.displayId.trim()
         if (normalizedFriendId.isBlank() || containsId(normalizedFriendId)) return this
         val previousPartnerKey = registration.fixedPartnerKey
@@ -722,7 +742,11 @@ data class MachineQueue(
 
     fun rename(registrationKey: Int, newDisplayId: String): MachineQueue {
         val normalizedId = newDisplayId.trim()
-        if (normalizedId.isBlank() || containsId(normalizedId, exceptKey = registrationKey)) return this
+        if (
+            normalizedId.isBlank() ||
+            containsId(normalizedId, exceptKey = registrationKey) ||
+            allRegistrations.any { it.key == registrationKey && it.requiresOnSiteCheckIn }
+        ) return this
         return copy(
             playing = playing.map {
                 if (it.key == registrationKey) it.copy(displayId = normalizedId) else it
@@ -790,7 +814,9 @@ data class MachineQueue(
     }
 
     fun claim(registrationKey: Int): MachineQueue =
-        copy(
+        if (allRegistrations.any { it.key == registrationKey && it.requiresOnSiteCheckIn }) {
+            this
+        } else copy(
             playing = playing.map {
                 if (it.key == registrationKey) it.copy(isTemporary = false) else it
             },
@@ -811,6 +837,7 @@ data class MachineQueue(
         val normalizedNickname = playerNickname.trim()
         if (
             !registration.isTemporary ||
+            registration.requiresOnSiteCheckIn ||
             playerProfileId.isBlank() ||
             normalizedNickname.isBlank() ||
             containsId(normalizedNickname, exceptKey = registrationKey)
@@ -961,6 +988,10 @@ data class MachineQueue(
     fun remove(registrationKey: Int): MachineQueue =
         removeAll(setOf(registrationKey))
 
+    fun checkIn(registrationKey: Int): MachineQueue = transformRegistrations(setOf(registrationKey)) {
+        if (it.requiresOnSiteCheckIn) it.copy(requiresOnSiteCheckIn = false) else it
+    }
+
     fun removeAll(registrationKeys: Set<Int>): MachineQueue {
         val remainingPlaying = playing.filterNot { it.key in registrationKeys }
         return copy(
@@ -1031,7 +1062,7 @@ data class MachineQueue(
 
         val positions = waitingPositions()
         val nextPlayers = positions.firstOrNull { position ->
-            position.all { it.absenceStatus == QueueAbsenceStatus.NONE }
+            position.all { it.canEnterPlayingPosition }
         }.orEmpty()
         val nextPlayerKeys = nextPlayers.mapTo(mutableSetOf()) { it.key }
         val opportunityEndIndex = if (nextPlayers.isEmpty()) {
@@ -1042,7 +1073,7 @@ data class MachineQueue(
         val crossedUnavailableKeys = waiting
             .take(opportunityEndIndex + 1)
             .filter {
-                it.absenceStatus != QueueAbsenceStatus.NONE &&
+                !it.canEnterPlayingPosition &&
                     it.key !in skippedThisOpportunity
             }
             .mapTo(mutableSetOf()) { it.key }
@@ -1087,6 +1118,7 @@ data class MachineQueue(
             remainingGroup.forEach { registration ->
                 when {
                     registration.key !in crossedUnavailableKeys -> retained += registration
+                    registration.requiresOnSiteCheckIn -> retained += registration
                     registration.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY -> {
                         if (registration.temporaryAwaySkippedTurns < 3) {
                             movedToTail += registration.copy(
@@ -1179,7 +1211,8 @@ internal fun registrationsHaveSameQueueState(
         left.lastPlayedAtMillis == right.lastPlayedAtMillis &&
         left.noShowCount == right.noShowCount &&
         left.lastNoShowActionWasDefer == right.lastNoShowActionWasDefer &&
-        left.fixedPartnerKey == right.fixedPartnerKey
+        left.fixedPartnerKey == right.fixedPartnerKey &&
+        left.requiresOnSiteCheckIn == right.requiresOnSiteCheckIn
 }
 
 fun groupIntoPositions(registrations: List<Registration>): List<List<Registration>> {
@@ -1205,7 +1238,7 @@ fun groupIntoPositions(registrations: List<Registration>): List<List<Registratio
         } else {
             listOf(first)
         }
-        val isUnavailable = group.any { it.absenceStatus != QueueAbsenceStatus.NONE }
+        val isUnavailable = group.any { !it.canEnterPlayingPosition }
 
         if (isUnavailable) {
             // Temporarily unavailable registrations remain visible, but never
@@ -1217,6 +1250,7 @@ fun groupIntoPositions(registrations: List<Registration>): List<List<Registratio
                         previous.first().fixedPartnerKey == null &&
                         previous.first().preference == PlayPreference.OPEN_TO_JOIN &&
                         previous.first().absenceStatus == first.absenceStatus &&
+                        previous.first().requiresOnSiteCheckIn == first.requiresOnSiteCheckIn &&
                         (first.absenceStatus != QueueAbsenceStatus.TEMPORARILY_AWAY ||
                             previous.first().temporaryAwaySkippedTurns == first.temporaryAwaySkippedTurns)
                 } == true
@@ -1266,6 +1300,7 @@ internal fun sanitizeFriendPairs(registrations: List<Registration>): List<Regist
         val partnerIndex = partnerKey?.let { indexByKey[it] }
         val validPair = partner != null &&
             partner.fixedPartnerKey == registration.key &&
+            partner.requiresOnSiteCheckIn == registration.requiresOnSiteCheckIn &&
             partnerIndex != null &&
             kotlin.math.abs(partnerIndex - index) == 1
         if (partnerKey != null && !validPair) {
