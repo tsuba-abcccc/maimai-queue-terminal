@@ -24,7 +24,7 @@ Content-Type: application/json; charset=utf-8
 版本 3 在原有公开字段之外增加以下顶层字段：
 
 - `onebot_sync_enabled`：现场终端当前是否允许 QQ Bot 联动。
-- `business_hours`：只包含 `enabled`、`outside`、`closing_soon` 和 `closes_at` 四个计算结果，不上传完整营业时间表。
+- `business_hours`：只包含 `enabled`、`outside`、`closing_soon`、`closing_grace`、`closes_at` 和 `registration_closes_at` 六个计算结果，不上传完整营业时间表。`closing_soon` 为旧客户端兼容字段，在 `0.3.1` 中固定为 `false`；`closing_grace` 表示已到闭店时间但现有队列仍在收尾，`registration_closes_at` 是最迟收尾时间。
 
 - `private_player_profiles`：完整玩家资料库。
 - `private_player_contacts`：当前登记与玩家资料、QQ 的关联。

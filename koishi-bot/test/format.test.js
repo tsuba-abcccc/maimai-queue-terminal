@@ -9,11 +9,13 @@ const {
   nicknameValidationError,
   parseGender,
   parsePreference,
+  parseNotificationPreference,
 } = require('../lib')
 
 test('help text uses a message-safe profile menu', () => {
   assert.doesNotMatch(HELP_TEXT, /[<>]/)
   assert.match(HELP_TEXT, /修改资料/)
+  assert.match(HELP_TEXT, /排队通知/)
   assert.match(HELP_TEXT, /设置 QQ 后才能使用/)
 })
 
@@ -311,6 +313,38 @@ test('shows the computed business-hours state in the queue header', () => {
   assert.match(naturalQueue, /^当前队列·终端在线·自然排队$/m)
 })
 
+test('shows the closing grace period without restoring the old pre-closing warning', () => {
+  const emptyMachine = id => ({
+    id,
+    name: `${id === 'A' ? '入口侧' : '墙侧'} · 机台 ${id}`,
+    operational: true,
+    stop_reason: null,
+    playing_started_at: null,
+    playing: [],
+    waiting_positions: [],
+  })
+  const text = formatQueue({
+    queue_id: 'queue-1',
+    captured_at: Date.now(),
+    registration_open: true,
+    business_hours: {
+      enabled: true,
+      outside: true,
+      closing_soon: false,
+      closing_grace: true,
+      closes_at: null,
+      registration_closes_at: Date.now() + 20 * 60_000,
+    },
+    terminal: { online: true },
+    machines: { A: emptyMachine('A'), B: emptyMachine('B') },
+  })
+
+  assert.match(text, /^当前队列·终端在线·不在营业时间$/m)
+  assert.match(text, /今日营业时间已结束/)
+  assert.match(text, /最迟保留 20 分钟/)
+  assert.doesNotMatch(text, /距离闭店不足 15 分钟/)
+})
+
 test('formats queue notifications with the canonical heading and compact middle dots', () => {
   const message = formatQueueNotification(
     {
@@ -332,6 +366,9 @@ test('parses only supported profile values', () => {
   assert.equal(parseGender('未知'), null)
   assert.equal(parsePreference('允许他人加入'), 'OPEN_TO_JOIN')
   assert.equal(parsePreference('固定组合'), null)
+  assert.equal(parseNotificationPreference('开启'), true)
+  assert.equal(parseNotificationPreference('关闭'), false)
+  assert.equal(parseNotificationPreference('稍后'), null)
 })
 
 test('rejects unsafe or oversized profile nicknames', () => {

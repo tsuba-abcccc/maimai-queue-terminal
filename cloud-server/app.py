@@ -1703,33 +1703,58 @@ def normalize_public_business_hours(source: Any) -> dict[str, Any]:
             "enabled": False,
             "outside": False,
             "closing_soon": False,
+            "closing_grace": False,
             "closes_at": None,
+            "registration_closes_at": None,
         }
     if not isinstance(source, dict):
         raise ValidationError("business_hours 必须是对象")
-    allowed_fields = {"enabled", "outside", "closing_soon", "closes_at"}
+    allowed_fields = {
+        "enabled",
+        "outside",
+        "closing_soon",
+        "closing_grace",
+        "closes_at",
+        "registration_closes_at",
+    }
     if set(source) - allowed_fields:
         raise ValidationError("business_hours 包含不支持的字段")
     values = {
         "enabled": source.get("enabled", False),
         "outside": source.get("outside", False),
         "closing_soon": source.get("closing_soon", False),
+        "closing_grace": source.get("closing_grace", False),
     }
     if any(type(value) is not bool for value in values.values()):
         raise ValidationError("business_hours 状态必须是布尔值")
     closes_at = source.get("closes_at")
     if closes_at is not None and (type(closes_at) is not int or closes_at < 1):
         raise ValidationError("business_hours.closes_at 数值无效")
+    registration_closes_at = source.get("registration_closes_at")
+    if registration_closes_at is not None and (
+        type(registration_closes_at) is not int or registration_closes_at < 1
+    ):
+        raise ValidationError("business_hours.registration_closes_at 数值无效")
     if not values["enabled"]:
         return {
             "enabled": False,
             "outside": False,
             "closing_soon": False,
+            "closing_grace": False,
             "closes_at": None,
+            "registration_closes_at": None,
         }
     if values["outside"] and values["closing_soon"]:
         raise ValidationError("非营业时间不能同时处于闭店提醒状态")
-    return {**values, "closes_at": closes_at}
+    if values["closing_grace"] and not values["outside"]:
+        raise ValidationError("营业时间内不能处于闭店收尾状态")
+    if values["closing_grace"] != (registration_closes_at is not None):
+        raise ValidationError("闭店收尾状态与登记关闭时间不一致")
+    return {
+        **values,
+        "closes_at": closes_at,
+        "registration_closes_at": registration_closes_at,
+    }
 
 
 def normalize_public_event(source: Any) -> dict[str, Any]:

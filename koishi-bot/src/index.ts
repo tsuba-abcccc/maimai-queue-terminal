@@ -67,7 +67,9 @@ interface QueueStatus {
     enabled: boolean;
     outside: boolean;
     closing_soon: boolean;
+    closing_grace?: boolean;
     closes_at: number | null;
+    registration_closes_at?: number | null;
   };
   terminal: { online: boolean };
   machines: { A: QueueMachine; B: QueueMachine };
@@ -157,13 +159,14 @@ export const NOTIFICATION_MAX_ATTEMPTS = NOTIFICATION_RETRY_DELAYS_MS.length +
 const PROFILE_INPUT_TIMEOUT_MS = 60_000;
 
 export const HELP_TEXT = [
-  "你好！欢迎",
+  "你好！",
   "可用的命令如下：",
   "",
   " - 我的排队",
   " - 查看队列",
   " - 我的资料",
   " - 修改资料",
+  " - 排队通知",
   "",
   "有关玩家资料的命令，需要在机厅终端创建资料并设置 QQ 后才能使用。",
 ].join("\n");
@@ -321,6 +324,11 @@ export function apply(ctx: Context, config: Config) {
     .alias("排队")
     .action(() => HELP_TEXT);
 
+  ctx.middleware((session, next) => {
+    if (isOnlyBotMention(session)) return HELP_TEXT;
+    return next();
+  }, true);
+
   ctx.command("maimaiq.status", "查询自己的排队状态")
     .alias("我的排队")
     .action(async ({ session }) =>
@@ -431,6 +439,54 @@ export function apply(ctx: Context, config: Config) {
       })
     );
 
+  ctx.command("maimaiq.notifications [state:string]", "查看或调整排队通知")
+    .alias("排队通知")
+    .action(async ({ session }, state) =>
+      withCommandError(async () => {
+        const qq = requireQqSession(session);
+        const profiles = (await api.getProfiles(qq)).profiles;
+        if (!profiles.length) {
+          return "当前 QQ 尚未绑定玩家资料，不能调整排队通知。请先在机厅终端创建玩家资料。";
+        }
+        const requested = parseNotificationPreference(state);
+        if (state?.trim() && requested === null) {
+          return "请输入“开启”或“关闭”，也可以发送“开启排队通知”或“关闭排队通知”。";
+        }
+        if (requested !== null) {
+          await writeNotificationPreference(ctx, config, qq, requested);
+          return formatNotificationPreferenceChanged(
+            requested,
+            config.notificationEnabled,
+          );
+        }
+        const enabled = await readNotificationPreference(ctx, config, qq);
+        return formatNotificationPreferenceMenu(
+          enabled,
+          config.notificationEnabled,
+        );
+      })
+    );
+
+  ctx.command("maimaiq.notifications.enable", "开启排队通知")
+    .alias("开启排队通知")
+    .action(async ({ session }) =>
+      withCommandError(async () => {
+        const qq = await requireNotificationProfile(api, session);
+        await writeNotificationPreference(ctx, config, qq, true);
+        return formatNotificationPreferenceChanged(true, config.notificationEnabled);
+      })
+    );
+
+  ctx.command("maimaiq.notifications.disable", "关闭排队通知")
+    .alias("关闭排队通知")
+    .action(async ({ session }) =>
+      withCommandError(async () => {
+        const qq = await requireNotificationProfile(api, session);
+        await writeNotificationPreference(ctx, config, qq, false);
+        return formatNotificationPreferenceChanged(false, config.notificationEnabled);
+      })
+    );
+
   if (config.notificationEnabled) {
     let polling = false;
     const poll = async () => {
@@ -537,6 +593,7 @@ export async function pollNotifications(
         event,
         selectedBot,
         logState,
+        config,
       );
       if (!complete) {
         cursorBlocked = true;
@@ -573,6 +630,7 @@ async function processNotificationEvent(
   event: QueueEvent,
   bot: Bot | undefined,
   logState: { unavailableBotLogged: boolean },
+  config: Config,
 ): Promise<boolean> {
   const currentRecipients = [
     ...new Set(
@@ -586,10 +644,20 @@ async function processNotificationEvent(
     eventId: event.event_id,
   });
   if (!deliveries.length) {
+    const recipientPreferences = await Promise.all(
+      currentRecipients.map(async (qqNumber) => ({
+        qqNumber,
+        enabled: await readNotificationPreference(ctx, config, qqNumber),
+      })),
+    );
+    const enabledRecipients = recipientPreferences
+      .filter((preference) => preference.enabled)
+      .map((preference) => preference.qqNumber);
+    if (!enabledRecipients.length) return true;
     const now = Date.now();
     await ctx.database.upsert(
       "maimai_q_delivery",
-      currentRecipients.map((qqNumber) => ({
+      enabledRecipients.map((qqNumber) => ({
         queueId,
         eventId: event.event_id,
         qqNumber,
@@ -608,6 +676,16 @@ async function processNotificationEvent(
 
   for (const delivery of deliveries) {
     if (isNotificationDeliveryTerminal(delivery)) continue;
+    if (!await readNotificationPreference(ctx, config, delivery.qqNumber)) {
+      await writeNotificationDelivery(ctx, {
+        ...delivery,
+        status: "DELIVERED",
+        nextRetryAt: 0,
+        lastError: "",
+        updatedAt: Date.now(),
+      });
+      continue;
+    }
     const now = Date.now();
     if (!isNotificationDeliveryDue(delivery, now)) continue;
 
@@ -757,18 +835,123 @@ async function writeCursor(ctx: Context, key: string, cursor: EventCursor) {
   }]);
 }
 
+function notificationPreferenceStateKey(config: Config, qqNumber: string): string {
+  return `notification-preference:${new URL(config.apiBase).origin}:${qqNumber}`;
+}
+
+export async function readNotificationPreference(
+  ctx: Context,
+  config: Config,
+  qqNumber: string,
+): Promise<boolean> {
+  const rows = await ctx.database.get("maimai_q_state", {
+    key: notificationPreferenceStateKey(config, qqNumber),
+  });
+  return rows[0]?.value !== "disabled";
+}
+
+export async function writeNotificationPreference(
+  ctx: Context,
+  config: Config,
+  qqNumber: string,
+  enabled: boolean,
+) {
+  await ctx.database.upsert("maimai_q_state", [{
+    key: notificationPreferenceStateKey(config, qqNumber),
+    value: enabled ? "enabled" : "disabled",
+  }]);
+}
+
+export function parseNotificationPreference(value?: string): boolean | null {
+  switch (value?.trim()) {
+    case "开启":
+    case "打开":
+    case "启用":
+      return true;
+    case "关闭":
+    case "停用":
+      return false;
+    default:
+      return null;
+  }
+}
+
+function formatNotificationPreferenceMenu(
+  enabled: boolean,
+  systemEnabled: boolean,
+): string {
+  return [
+    "排队通知",
+    "",
+    `个人设置：${enabled ? "已开启" : "已关闭"}`,
+    `系统通知：${systemEnabled ? "正在运行" : "暂未启用"}`,
+    "",
+    "开启后，与你有关的排队变动会通过 QQ 私聊发送。",
+    "",
+    " - 开启排队通知",
+    " - 关闭排队通知",
+  ].join("\n");
+}
+
+function formatNotificationPreferenceChanged(
+  enabled: boolean,
+  systemEnabled: boolean,
+): string {
+  if (!enabled) {
+    return "排队通知已关闭。\n\n之后发生的个人排队变动不会再通过私聊发送；你仍可随时重新开启。";
+  }
+  return systemEnabled
+    ? "排队通知已开启。\n\n之后发生的个人排队变动会通过私聊发送。"
+    : "排队通知的个人设置已开启。\n\n系统通知目前暂未启用；系统恢复后，将按照这项设置发送。";
+}
+
+async function requireNotificationProfile(
+  api: QueueApi,
+  session: Session | undefined,
+): Promise<string> {
+  const qq = requireQqSession(session);
+  if (!(await api.getProfiles(qq)).profiles.length) {
+    throw new Error(
+      "当前 QQ 尚未绑定玩家资料，不能调整排队通知。请先在机厅终端创建玩家资料。",
+    );
+  }
+  return qq;
+}
+
+export function isOnlyBotMention(
+  session: Pick<Session, "platform" | "selfId" | "elements">,
+): boolean {
+  if (session.platform !== "onebot" || !session.selfId) return false;
+  const meaningfulElements = (session.elements ?? []).filter((element) => {
+    if (element.type !== "text") return true;
+    return String(element.attrs.content ?? "").trim().length > 0;
+  });
+  if (meaningfulElements.length !== 1) return false;
+  const mention = meaningfulElements[0];
+  return mention.type === "at" && String(mention.attrs.id ?? "") === session.selfId;
+}
+
 export function formatQueue(queue: QueueStatus): string {
   const terminalStatus = queue.terminal.online ? "终端在线" : "终端离线";
   const outsideBusinessHours = queue.business_hours?.enabled &&
     queue.business_hours.outside;
   const queueMode = outsideBusinessHours
     ? "·不在营业时间"
-    : queue.registration_open ? "" : "·自然排队";
+    : queue.registration_open
+    ? ""
+    : "·自然排队";
   const lines = [`当前队列·${terminalStatus}${queueMode}`];
   if (queue.terminal.online) {
     lines.push("");
   } else {
     lines.push("以下为最近一次同步状态。", "");
+  }
+  if (queue.business_hours?.closing_grace) {
+    lines.push(
+      "今日营业时间已结束",
+      "不再接收新登记。现有队列处理完毕后将关闭，最迟保留 20 分钟。",
+      "",
+    );
   }
   for (const machine of [queue.machines.A, queue.machines.B]) {
     lines.push(formatMachine(machine), "");
@@ -808,7 +991,7 @@ function formatMachine(machine: QueueMachine): string {
       ? Math.max(
         0,
         Math.floor((Date.now() - machine.playing_started_at) / 60_000),
-        )
+      )
       : null;
     const playingState = machine.operational
       ? elapsed === null ? "" : `·${elapsed} 分钟`
@@ -939,7 +1122,9 @@ function formatQueueRegistrations(
 
 function formatQueueRegistration(registration: QueueRegistration): string[] {
   const lines = [
-    ` - ${registration.display_id} (${compactQueuePreferenceLabel(registration.preference)})`,
+    ` - ${registration.display_id} (${
+      compactQueuePreferenceLabel(registration.preference)
+    })`,
   ];
   if (registration.deferred_once) lines.push("    - 暂缓一轮");
   if (registration.temporarily_away) {

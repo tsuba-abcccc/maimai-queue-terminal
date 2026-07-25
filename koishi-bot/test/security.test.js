@@ -4,10 +4,33 @@ const assert = require('node:assert/strict')
 const {
   QueueApi,
   apiBaseValidationError,
+  isOnlyBotMention,
   profileUpdateErrorMessage,
   requireQqSession,
   resolveProfileCommandInput,
 } = require('../lib')
+
+test('opens the menu only for a standalone mention of the current bot', () => {
+  const mention = { type: 'at', attrs: { id: '10000' } }
+  const whitespace = { type: 'text', attrs: { content: '  ' } }
+  const command = { type: 'text', attrs: { content: ' 查看队列' } }
+
+  assert.equal(isOnlyBotMention({
+    platform: 'onebot',
+    selfId: '10000',
+    elements: [mention, whitespace],
+  }), true)
+  assert.equal(isOnlyBotMention({
+    platform: 'onebot',
+    selfId: '10000',
+    elements: [mention, command],
+  }), false)
+  assert.equal(isOnlyBotMention({
+    platform: 'onebot',
+    selfId: '20000',
+    elements: [mention],
+  }), false)
+})
 
 test('requires personal commands to run in a direct OneBot session', () => {
   assert.equal(requireQqSession({

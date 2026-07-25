@@ -24,7 +24,7 @@ class BusinessHoursTest {
     }
 
     @Test
-    fun ordinaryScheduleIsOpenAndWarnsDuringLastFifteenMinutes() {
+    fun ordinaryScheduleStaysOpenWithoutTheLegacyPreClosingWarning() {
         val settings = BusinessHoursSettings(
             enabled = true,
             defaultHours = DailyBusinessHours(10 * 60, 22 * 60)
@@ -32,7 +32,8 @@ class BusinessHoursTest {
         val status = evaluateBusinessHours(settings, timestamp(2026, 7, 25, 21, 45))
 
         assertFalse(status.outsideBusinessHours)
-        assertTrue(status.closingSoon)
+        assertFalse(status.closingSoon)
+        assertFalse(status.closingGracePeriod)
         assertNotNull(status.activeClosingAtMillis)
     }
 
@@ -48,8 +49,100 @@ class BusinessHoursTest {
 
         assertTrue(first.outsideBusinessHours)
         assertFalse(first.closingSoon)
+        assertTrue(first.closingGracePeriod)
+        assertEquals(atClose + CLOSING_GRACE_MILLIS, first.registrationClosesAtMillis)
         assertEquals(first.mostRecentClosingOccurrenceId, second.mostRecentClosingOccurrenceId)
         assertEquals(atClose, first.mostRecentClosingAtMillis)
+    }
+
+    @Test
+    fun closingGraceEndsExactlyTwentyMinutesAfterClosing() {
+        val settings = BusinessHoursSettings(
+            enabled = true,
+            defaultHours = DailyBusinessHours(10 * 60, 22 * 60)
+        )
+        val atClose = timestamp(2026, 7, 25, 22, 0)
+
+        val duringGrace = evaluateBusinessHours(
+            settings,
+            atClose + CLOSING_GRACE_MILLIS - 1L,
+            zone
+        )
+        val afterGrace = evaluateBusinessHours(
+            settings,
+            atClose + CLOSING_GRACE_MILLIS,
+            zone
+        )
+
+        assertTrue(duringGrace.closingGracePeriod)
+        assertFalse(afterGrace.closingGracePeriod)
+        assertNull(afterGrace.registrationClosesAtMillis)
+    }
+
+    @Test
+    fun estimatedWaitWarnsOnlyWhenItExtendsPastClosing() {
+        val settings = BusinessHoursSettings(
+            enabled = true,
+            defaultHours = DailyBusinessHours(10 * 60, 22 * 60)
+        )
+        val now = timestamp(2026, 7, 25, 21, 40)
+        val status = evaluateBusinessHours(settings, now, zone)
+
+        assertFalse(estimatedWaitExtendsPastClosing(status, now, 20L))
+        assertTrue(estimatedWaitExtendsPastClosing(status, now, 21L))
+        assertFalse(estimatedWaitExtendsPastClosing(status, now, null))
+    }
+
+    @Test
+    fun closingGraceWaitsForAQueueButClosesAsSoonAsItBecomesEmpty() {
+        val settings = BusinessHoursSettings(
+            enabled = true,
+            defaultHours = DailyBusinessHours(10 * 60, 22 * 60)
+        )
+        val atClose = timestamp(2026, 7, 25, 22, 0)
+        val duringGrace = evaluateBusinessHours(settings, atClose + 5 * 60_000L, zone)
+
+        assertNull(
+            businessHoursCloseTrigger(
+                status = duringGrace,
+                nowMillis = atClose + 5 * 60_000L,
+                registrationCount = 1,
+                lastHandledOccurrenceId = null
+            )
+        )
+        assertEquals(
+            BusinessHoursCloseTrigger.QUEUE_EMPTY_DURING_GRACE,
+            businessHoursCloseTrigger(
+                status = duringGrace,
+                nowMillis = atClose + 5 * 60_000L,
+                registrationCount = 0,
+                lastHandledOccurrenceId = null
+            )
+        )
+    }
+
+    @Test
+    fun closingGraceExpiresOnceForEachClosingOccurrence() {
+        val settings = BusinessHoursSettings(
+            enabled = true,
+            defaultHours = DailyBusinessHours(10 * 60, 22 * 60)
+        )
+        val atClose = timestamp(2026, 7, 25, 22, 0)
+        val afterGrace = atClose + CLOSING_GRACE_MILLIS
+        val status = evaluateBusinessHours(settings, afterGrace, zone)
+
+        assertEquals(
+            BusinessHoursCloseTrigger.GRACE_PERIOD_EXPIRED,
+            businessHoursCloseTrigger(status, afterGrace, 4, null)
+        )
+        assertNull(
+            businessHoursCloseTrigger(
+                status,
+                afterGrace,
+                4,
+                status.mostRecentClosingOccurrenceId
+            )
+        )
     }
 
     @Test

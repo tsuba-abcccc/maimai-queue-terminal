@@ -9,7 +9,9 @@ const {
   isNotificationDeliveryTerminal,
   nextNotificationFailure,
   pollNotifications,
+  readNotificationPreference,
   redactQqNumber,
+  writeNotificationPreference,
 } = require('../lib')
 
 class MemoryDatabase {
@@ -162,6 +164,106 @@ test('redacts every occurrence of the current QQ from adapter errors', () => {
 
   assert.equal(redacted, '向 12****78 发送失败：OneBot 用户 12****78 不可用')
   assert.doesNotMatch(redacted, /12345678/)
+})
+
+test('queue notifications default to enabled and persist per QQ', async () => {
+  const database = new MemoryDatabase()
+  const ctx = { database }
+  const currentConfig = config()
+
+  assert.equal(
+    await readNotificationPreference(ctx, currentConfig, '12345678'),
+    true,
+  )
+  await writeNotificationPreference(ctx, currentConfig, '12345678', false)
+  assert.equal(
+    await readNotificationPreference(ctx, currentConfig, '12345678'),
+    false,
+  )
+  assert.equal(
+    await readNotificationPreference(ctx, currentConfig, '87654321'),
+    true,
+  )
+})
+
+test('disabled recipients are skipped without blocking later queue events', async () => {
+  const database = new MemoryDatabase()
+  const currentConfig = config()
+  await database.upsert('maimai_q_state', [{
+    key: 'event-cursor:https://queue.example.test',
+    value: JSON.stringify({ queueId: 'queue-1', cursor: 0 }),
+  }])
+  await writeNotificationPreference(
+    { database },
+    currentConfig,
+    '11111',
+    false,
+  )
+  const sends = []
+  const bot = {
+    platform: 'onebot',
+    selfId: '10000',
+    isActive: true,
+    async sendPrivateMessage(qq) { sends.push(qq) },
+  }
+  const api = {
+    async getEvents(after) { return eventPage(after) },
+    async getPlayers() { return { queue_id: 'queue-1', players: [] } },
+  }
+
+  await pollNotifications(
+    { database, bots: [bot] },
+    api,
+    currentConfig,
+    logger(),
+  )
+
+  assert.deepEqual(sends, ['22222'])
+  const cursor = JSON.parse(database.states.get(
+    'event-cursor:https://queue.example.test',
+  ).value)
+  assert.equal(cursor.cursor, 2)
+})
+
+test('disabling notifications cancels an existing pending retry', async () => {
+  const database = new MemoryDatabase()
+  const currentConfig = config()
+  await database.upsert('maimai_q_state', [{
+    key: 'event-cursor:https://queue.example.test',
+    value: JSON.stringify({ queueId: 'queue-1', cursor: 0 }),
+  }])
+  const sends = []
+  const bot = {
+    platform: 'onebot',
+    selfId: '10000',
+    isActive: true,
+    async sendPrivateMessage(qq) {
+      sends.push(qq)
+      if (qq === '11111') throw new Error('发送失败')
+    },
+  }
+  const api = {
+    async getEvents(after) { return eventPage(after) },
+    async getPlayers() { return { queue_id: 'queue-1', players: [] } },
+  }
+  const ctx = { database, bots: [bot] }
+
+  await pollNotifications(ctx, api, currentConfig, logger())
+  assert.deepEqual(sends, ['11111', '22222'])
+  assert.equal(
+    database.deliveries.get('queue-1:event-1:11111').status,
+    'PENDING',
+  )
+
+  await writeNotificationPreference(ctx, currentConfig, '11111', false)
+  await pollNotifications(ctx, api, currentConfig, logger())
+
+  assert.deepEqual(sends, ['11111', '22222'])
+  const cursor = JSON.parse(database.states.get(
+    'event-cursor:https://queue.example.test',
+  ).value)
+  assert.equal(cursor.cursor, 2)
+  assert.equal(database.deliveries.size, 0)
 })
 
 test('uses an active OneBot when an earlier matching instance is offline', async () => {

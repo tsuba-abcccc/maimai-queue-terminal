@@ -27,6 +27,26 @@ class QueueModelsTest {
         assertTrue(preview?.changedByAbsence == true)
     }
 
+    @Test
+    fun removalPreviewDoesNotReuseCurrentPlayersWhenWaitingRegistrationsAreUnavailable() {
+        val queue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(2, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                ),
+                registration(3, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY
+                )
+            )
+        )
+
+        val preview = queue.nextPlayingPositionPreviewAfterCurrentRoundRemoved()
+
+        assertTrue(preview?.nextRegistrations?.isEmpty() == true)
+        assertEquals(setOf(2, 3), preview?.unavailableRegistrations?.map { it.key }?.toSet())
+    }
+
     private fun registration(
         key: Int,
         preference: PlayPreference = PlayPreference.OPEN_TO_JOIN
@@ -87,17 +107,44 @@ class QueueModelsTest {
     }
 
     @Test
-    fun removingCurrentRoundRegistrationsLeavesTheNextRoundWaiting() {
+    fun removingCurrentRoundRegistrationsStartsTheNextRound() {
         val queue = MachineQueue(
             playing = listOf(registration(1), registration(2)),
             waiting = listOf(registration(3, PlayPreference.SOLO))
         )
 
-        val removed = queue.removeAll(queue.playing.mapTo(mutableSetOf()) { it.key })
+        val advanced = queue.removeCurrentRoundAndStartNext(4_000L)
 
-        assertTrue(removed.playing.isEmpty())
-        assertEquals(listOf(3), removed.waiting.map { it.key })
-        assertEquals(null, removed.playingStartedAtMillis)
+        assertEquals(listOf(3), advanced.playing.map { it.key })
+        assertTrue(advanced.waiting.isEmpty())
+        assertEquals(4_000L, advanced.playingStartedAtMillis)
+        assertTrue(advanced.allRegistrations.none { it.key == 1 || it.key == 2 })
+    }
+
+    @Test
+    fun removingCurrentRoundAndStartingNextKeepsAbsenceRules() {
+        val queue = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                registration(1, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+                ),
+                registration(2, PlayPreference.SOLO).copy(
+                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY
+                ),
+                registration(3, PlayPreference.SOLO)
+            )
+        )
+
+        val advanced = queue.removeCurrentRoundAndStartNext(5_000L)
+
+        assertEquals(listOf(3), advanced.playing.map { it.key })
+        assertEquals(5_000L, advanced.playingStartedAtMillis)
+        assertEquals(listOf(1, 2), advanced.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.NONE, advanced.waiting[0].absenceStatus)
+        assertEquals(QueueAbsenceStatus.TEMPORARILY_AWAY, advanced.waiting[1].absenceStatus)
+        assertEquals(1, advanced.waiting[1].temporaryAwaySkippedTurns)
+        assertTrue(advanced.allRegistrations.none { it.key == 9 })
     }
 
     @Test

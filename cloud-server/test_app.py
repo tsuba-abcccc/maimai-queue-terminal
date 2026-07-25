@@ -434,7 +434,9 @@ class QueueStatusApiTest(unittest.TestCase):
             "enabled": True,
             "outside": False,
             "closing_soon": True,
+            "closing_grace": False,
             "closes_at": 1_060_000,
+            "registration_closes_at": None,
         }
 
         published = self.client.post(
@@ -448,8 +450,27 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertNotIn("weekly_hours", public_snapshot["business_hours"])
         self.assertNotIn("opening_minutes", public_snapshot["business_hours"])
 
+        closing = copy.deepcopy(snapshot)
+        closing["revision"] = 5
+        closing["business_hours"] = {
+            "enabled": True,
+            "outside": True,
+            "closing_soon": False,
+            "closing_grace": True,
+            "closes_at": None,
+            "registration_closes_at": 2_200_000,
+        }
+        accepted_closing = self.client.post(
+            "/api/queue-status", json=closing, headers=self.headers
+        )
+        self.assertEqual(204, accepted_closing.status_code)
+        self.assertEqual(
+            closing["business_hours"],
+            self.client.get("/api/queue-status").get_json()["business_hours"],
+        )
+
         invalid = copy.deepcopy(snapshot)
-        invalid["revision"] = 5
+        invalid["revision"] = 6
         invalid["business_hours"]["weekly_hours"] = {}
         rejected = self.client.post(
             "/api/queue-status", json=invalid, headers=self.headers

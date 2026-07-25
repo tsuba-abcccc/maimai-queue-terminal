@@ -58,7 +58,8 @@ class QueueCloudSnapshotTest {
                     enabled = true,
                     outsideBusinessHours = true,
                     closingSoon = false,
-                    closesAtMillis = 2_000L
+                    closingGracePeriod = true,
+                    registrationClosesAtMillis = 2_000L
                 )
             )
         )
@@ -71,7 +72,9 @@ class QueueCloudSnapshotTest {
         assertTrue(businessHours.getBoolean("enabled"))
         assertTrue(businessHours.getBoolean("outside"))
         assertFalse(businessHours.getBoolean("closing_soon"))
-        assertEquals(2_000L, businessHours.getLong("closes_at"))
+        assertTrue(businessHours.getBoolean("closing_grace"))
+        assertTrue(businessHours.isNull("closes_at"))
+        assertEquals(2_000L, businessHours.getLong("registration_closes_at"))
     }
 
     @Test

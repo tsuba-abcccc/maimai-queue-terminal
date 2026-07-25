@@ -6,12 +6,12 @@ import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneId
 import java.time.ZonedDateTime
-import java.time.temporal.ChronoUnit
 
 internal const val MINUTES_PER_DAY = 24 * 60
 internal const val DEFAULT_OPENING_MINUTES = 10 * 60
 internal const val DEFAULT_CLOSING_MINUTES = 22 * 60
-internal const val CLOSING_SOON_MINUTES = 15L
+internal const val CLOSING_GRACE_MINUTES = 20L
+internal const val CLOSING_GRACE_MILLIS = CLOSING_GRACE_MINUTES * 60_000L
 
 data class DailyBusinessHours(
     val openingMinutes: Int = DEFAULT_OPENING_MINUTES,
@@ -44,7 +44,9 @@ data class BusinessHoursStatus(
     val enabled: Boolean,
     val outsideBusinessHours: Boolean,
     val closingSoon: Boolean,
+    val closingGracePeriod: Boolean,
     val activeClosingAtMillis: Long?,
+    val registrationClosesAtMillis: Long?,
     val mostRecentClosingAtMillis: Long?,
     val mostRecentClosingOccurrenceId: String?
 ) {
@@ -53,11 +55,18 @@ data class BusinessHoursStatus(
             enabled = false,
             outsideBusinessHours = false,
             closingSoon = false,
+            closingGracePeriod = false,
             activeClosingAtMillis = null,
+            registrationClosesAtMillis = null,
             mostRecentClosingAtMillis = null,
             mostRecentClosingOccurrenceId = null
         )
     }
+}
+
+internal enum class BusinessHoursCloseTrigger {
+    QUEUE_EMPTY_DURING_GRACE,
+    GRACE_PERIOD_EXPIRED
 }
 
 internal fun defaultWeeklyBusinessHours(): Map<DayOfWeek, DailyBusinessHours> =
@@ -85,22 +94,58 @@ internal fun evaluateBusinessHours(
         .map(BusinessInterval::closing)
         .filter { closing -> !closing.isAfter(now) }
         .maxOrNull()
-    val minutesUntilClosing = activeInterval?.let { interval ->
-        ChronoUnit.MINUTES.between(now, interval.closing)
-    }
+    val closingGraceEndsAt = mostRecentClosing
+        ?.plusMinutes(CLOSING_GRACE_MINUTES)
+        ?.takeIf { graceEnd ->
+            activeInterval == null && now.isBefore(graceEnd)
+        }
+    val closingGracePeriod = closingGraceEndsAt != null
     val fingerprint = businessHoursFingerprint(normalized, zoneId)
 
     return BusinessHoursStatus(
         enabled = true,
         outsideBusinessHours = activeInterval == null,
-        closingSoon = minutesUntilClosing != null &&
-            minutesUntilClosing in 0..CLOSING_SOON_MINUTES,
+        // Kept in the public payload for compatibility with older clients.
+        // 0.3.1 replaces the pre-closing warning with the post-closing grace state.
+        closingSoon = false,
+        closingGracePeriod = closingGracePeriod,
         activeClosingAtMillis = activeInterval?.closing?.toInstant()?.toEpochMilli(),
+        registrationClosesAtMillis = closingGraceEndsAt?.toInstant()?.toEpochMilli(),
         mostRecentClosingAtMillis = mostRecentClosing?.toInstant()?.toEpochMilli(),
         mostRecentClosingOccurrenceId = mostRecentClosing?.let { closing ->
             "$fingerprint:${closing.toInstant().toEpochMilli()}"
         }
     )
+}
+
+internal fun estimatedWaitExtendsPastClosing(
+    status: BusinessHoursStatus,
+    nowMillis: Long,
+    estimatedWaitMinutes: Long?
+): Boolean {
+    val closingAtMillis = status.activeClosingAtMillis ?: return false
+    val waitMinutes = estimatedWaitMinutes?.takeIf { it >= 0L } ?: return false
+    val estimatedPlayingAtMillis = nowMillis + waitMinutes * 60_000L
+    return estimatedPlayingAtMillis > closingAtMillis
+}
+
+internal fun businessHoursCloseTrigger(
+    status: BusinessHoursStatus,
+    nowMillis: Long,
+    registrationCount: Int,
+    lastHandledOccurrenceId: String?
+): BusinessHoursCloseTrigger? {
+    if (!status.enabled || !status.outsideBusinessHours) return null
+    val occurrenceId = status.mostRecentClosingOccurrenceId ?: return null
+    if (occurrenceId == lastHandledOccurrenceId) return null
+    val closingAtMillis = status.mostRecentClosingAtMillis ?: return null
+    val graceEndsAtMillis = closingAtMillis + CLOSING_GRACE_MILLIS
+    return when {
+        nowMillis >= graceEndsAtMillis -> BusinessHoursCloseTrigger.GRACE_PERIOD_EXPIRED
+        status.closingGracePeriod && registrationCount == 0 ->
+            BusinessHoursCloseTrigger.QUEUE_EMPTY_DURING_GRACE
+        else -> null
+    }
 }
 
 internal fun formatBusinessTime(minutes: Int): String {

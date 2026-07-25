@@ -231,6 +231,13 @@ private data class MachineTransferRequest(
     val registrationKeys: List<Int>
 )
 
+private data class JoinClosingWarningRequest(
+    val requestedMachineId: MachineId?,
+    val lateMachineIds: List<MachineId>,
+    val joinableMachineIds: List<MachineId>,
+    val continueFromMachineSelection: Boolean = false
+)
+
 private data class MenuAction(
     val title: String,
     val description: String,
@@ -411,6 +418,12 @@ private fun RegistrationApp() {
     var draftId by remember { mutableStateOf("") }
     var temporarySelected by remember { mutableStateOf(false) }
     var selectedPreference by remember { mutableStateOf<PlayPreference?>(PlayPreference.OPEN_TO_JOIN) }
+    var joinClosingWarningRequest by remember {
+        mutableStateOf<JoinClosingWarningRequest?>(null)
+    }
+    var closingWarningAcknowledgedMachineIds by remember {
+        mutableStateOf<Set<MachineId>>(emptySet())
+    }
     var nextKey by remember { mutableIntStateOf(1) }
     var queueId by remember { mutableStateOf(newQueueId()) }
     val queueRevision = remember { AtomicLong(0L) }
@@ -474,6 +487,8 @@ private fun RegistrationApp() {
     var queuePersistenceReady by remember { mutableStateOf(false) }
     val nowMillis = rememberCurrentTimeMillis()
     val businessHoursStatus = evaluateBusinessHours(queueRuleSettings.businessHours, nowMillis)
+    val acceptingNewRegistrations =
+        registrationOpen && !businessHoursStatus.closingGracePeriod
 
     LaunchedEffect(playerProfileRepository) {
         playerProfiles = playerProfileRepository.getProfiles()
@@ -536,7 +551,10 @@ private fun RegistrationApp() {
                     enabled = businessHoursStatus.enabled,
                     outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
                     closingSoon = businessHoursStatus.closingSoon,
-                    closesAtMillis = businessHoursStatus.activeClosingAtMillis
+                    closingGracePeriod = businessHoursStatus.closingGracePeriod,
+                    closesAtMillis = businessHoursStatus.activeClosingAtMillis,
+                    registrationClosesAtMillis =
+                        businessHoursStatus.registrationClosesAtMillis
                 )
             ),
             playerProfiles = playerProfiles
@@ -605,7 +623,10 @@ private fun RegistrationApp() {
                                 enabled = closingStatus.enabled,
                                 outsideBusinessHours = closingStatus.outsideBusinessHours,
                                 closingSoon = closingStatus.closingSoon,
-                                closesAtMillis = closingStatus.activeClosingAtMillis
+                                closingGracePeriod = closingStatus.closingGracePeriod,
+                                closesAtMillis = closingStatus.activeClosingAtMillis,
+                                registrationClosesAtMillis =
+                                    closingStatus.registrationClosesAtMillis
                             )
                         ),
                         playerProfiles = playerProfiles
@@ -971,8 +992,9 @@ private fun RegistrationApp() {
         )
     }
 
-    fun closeRegistration(automaticBusinessHours: Boolean = false) {
+    fun closeRegistration(businessHoursTrigger: BusinessHoursCloseTrigger? = null) {
         if (!registrationOpen) return
+        val automaticBusinessHours = businessHoursTrigger != null
         val removedCount = machineA.registrationCount + machineB.registrationCount
         val removedRegistrationKeys = (machineA.allRegistrations + machineB.allRegistrations)
             .map { it.key }
@@ -983,18 +1005,23 @@ private fun RegistrationApp() {
         appendAuditLog(
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
-                title = if (automaticBusinessHours) "到达闭店时间，关闭登记排队" else "关闭登记排队",
+                title = if (automaticBusinessHours) "营业结束，关闭登记排队" else "关闭登记排队",
                 detail = if (removedCount == 0) {
-                    if (automaticBusinessHours) {
-                        "现在已进入非营业时间，新的排队登记已停止接收。"
-                    } else {
-                        "新的排队登记已停止接收。"
+                    when (businessHoursTrigger) {
+                        BusinessHoursCloseTrigger.QUEUE_EMPTY_DURING_GRACE ->
+                            "今日营业时间已结束，现有队列已经处理完毕，登记排队现已关闭。"
+                        BusinessHoursCloseTrigger.GRACE_PERIOD_EXPIRED ->
+                            "今日营业时间结束已 20 分钟，登记排队现已关闭。"
+                        null -> "新的排队登记已停止接收。"
                     }
                 } else {
-                    if (automaticBusinessHours) {
-                        "现在已进入非营业时间，新的排队登记已停止接收，并清除了两台机台的 $removedCount 份登记。"
-                    } else {
-                        "新的排队登记已停止接收，并清除了两台机台的 $removedCount 份登记。"
+                    when (businessHoursTrigger) {
+                        BusinessHoursCloseTrigger.GRACE_PERIOD_EXPIRED ->
+                            "今日营业时间结束已 20 分钟，登记排队现已关闭，并清除了两台机台剩余的 $removedCount 份登记。"
+                        BusinessHoursCloseTrigger.QUEUE_EMPTY_DURING_GRACE ->
+                            "今日营业时间已结束，登记排队现已关闭，并清除了两台机台的 $removedCount 份登记。"
+                        null ->
+                            "新的排队登记已停止接收，并清除了两台机台的 $removedCount 份登记。"
                     }
                 },
                 source = if (automaticBusinessHours) {
@@ -1138,6 +1165,7 @@ private fun RegistrationApp() {
         } ?: return
         val preference = profile.defaultPreference.toPlayPreferenceOrNull() ?: profileJoinPreference ?: return
         if (
+            !acceptingNewRegistrations ||
             !profile.hasValidContact ||
             playerProfileAlreadyRegistered(profile) ||
             !statusFor(machineId).isOperational ||
@@ -1152,7 +1180,15 @@ private fun RegistrationApp() {
         persistPlayerProfileForUser(
             profile = usedProfile,
             failureDetail = "玩家资料的本次使用记录未能保存，因此尚未加入排队。请稍后重试。"
-        ) {
+        ) persisted@{
+            if (
+                !acceptingNewRegistrations ||
+                !statusFor(machineId).isOperational ||
+                queueFor(machineId).registrationCount >= 20
+            ) {
+                screen = Screen.HOME
+                return@persisted
+            }
             updateQueue(machineId, QueueSoundCue.CONFIRM) {
                 it.join(
                     Registration(
@@ -1206,12 +1242,23 @@ private fun RegistrationApp() {
         }
     }
 
-    fun beginRegistration(batch: Boolean) {
-        if (
-            reorderSession != null ||
-            !registrationOpen ||
-            listOf(MachineId.A, MachineId.B).none { statusFor(it).isOperational }
-        ) return
+    fun joinableMachineIds(): List<MachineId> = MachineId.entries.filter { machineId ->
+        statusFor(machineId).isOperational && queueFor(machineId).registrationCount < 20
+    }
+
+    fun registrationLikelyAfterClosing(machineId: MachineId): Boolean {
+        val nowMillis = System.currentTimeMillis()
+        return estimatedWaitExtendsPastClosing(
+            status = businessHoursStatus,
+            nowMillis = nowMillis,
+            estimatedWaitMinutes = estimatedWaitForNewOpenRegistration(
+                queueFor(machineId),
+                nowMillis
+            )
+        )
+    }
+
+    fun continueRegistrationStart(batch: Boolean) {
         isBatchFlow = batch
         selectedMachine = null
         draftId = ""
@@ -1221,19 +1268,86 @@ private fun RegistrationApp() {
         screen = Screen.MACHINE
     }
 
-    fun beginRegistrationForMachine(machineId: MachineId) {
-        if (
-            reorderSession != null ||
-            !registrationOpen ||
-            !statusFor(machineId).isOperational ||
-            queueFor(machineId).registrationCount >= 20
-        ) return
+    fun continueRegistrationForMachine(machineId: MachineId) {
         isBatchFlow = false
         selectedMachine = machineId
         draftId = ""
         temporarySelected = false
         selectedPreference = PlayPreference.OPEN_TO_JOIN
         screen = Screen.CREATE_REGISTRATION
+    }
+
+    fun continueSelectedRegistrationMachine(machineId: MachineId) {
+        selectedMachine = machineId
+        if (isBatchFlow) {
+            batchAmount = minOf(2, 20 - queueFor(machineId).registrationCount).toString()
+        }
+        screen = if (isBatchFlow) Screen.BATCH_AMOUNT else Screen.CREATE_REGISTRATION
+    }
+
+    fun beginRegistration(batch: Boolean) {
+        if (
+            reorderSession != null ||
+            !acceptingNewRegistrations
+        ) return
+        val joinableMachines = joinableMachineIds()
+        if (joinableMachines.isEmpty()) return
+        closingWarningAcknowledgedMachineIds = emptySet()
+        val lateMachines = if (batch) {
+            emptyList()
+        } else {
+            joinableMachines.filter(::registrationLikelyAfterClosing)
+        }
+        if (lateMachines.isNotEmpty() && lateMachines.size == joinableMachines.size) {
+            joinClosingWarningRequest = JoinClosingWarningRequest(
+                requestedMachineId = null,
+                lateMachineIds = lateMachines,
+                joinableMachineIds = joinableMachines
+            )
+            return
+        }
+        continueRegistrationStart(batch)
+    }
+
+    fun beginRegistrationForMachine(machineId: MachineId) {
+        if (
+            reorderSession != null ||
+            !acceptingNewRegistrations ||
+            !statusFor(machineId).isOperational ||
+            queueFor(machineId).registrationCount >= 20
+        ) return
+        closingWarningAcknowledgedMachineIds = emptySet()
+        if (registrationLikelyAfterClosing(machineId)) {
+            joinClosingWarningRequest = JoinClosingWarningRequest(
+                requestedMachineId = machineId,
+                lateMachineIds = listOf(machineId),
+                joinableMachineIds = joinableMachineIds()
+            )
+            return
+        }
+        continueRegistrationForMachine(machineId)
+    }
+
+    fun selectRegistrationMachine(machineId: MachineId) {
+        if (
+            !acceptingNewRegistrations ||
+            !statusFor(machineId).isOperational ||
+            queueFor(machineId).registrationCount >= 20
+        ) return
+        if (
+            !isBatchFlow &&
+            machineId !in closingWarningAcknowledgedMachineIds &&
+            registrationLikelyAfterClosing(machineId)
+        ) {
+            joinClosingWarningRequest = JoinClosingWarningRequest(
+                requestedMachineId = machineId,
+                lateMachineIds = listOf(machineId),
+                joinableMachineIds = joinableMachineIds(),
+                continueFromMachineSelection = true
+            )
+            return
+        }
+        continueSelectedRegistrationMachine(machineId)
     }
 
     fun randomUnusedId(): String {
@@ -1248,6 +1362,7 @@ private fun RegistrationApp() {
         val preference = selectedPreference ?: return
         val normalizedId = draftId.trim()
         if (
+            !acceptingNewRegistrations ||
             normalizedId.isBlank() ||
             idAlreadyExists(normalizedId) ||
             !statusFor(machineId).isOperational ||
@@ -1263,6 +1378,7 @@ private fun RegistrationApp() {
         val machineId = selectedMachine ?: return
         val normalizedId = draftId.trim()
         if (
+            !acceptingNewRegistrations ||
             normalizedId.isBlank() ||
             idAlreadyExists(normalizedId) ||
             !statusFor(machineId).isOperational ||
@@ -1282,7 +1398,7 @@ private fun RegistrationApp() {
 
     fun completeBatch() {
         val machineId = selectedMachine ?: return
-        if (!statusFor(machineId).isOperational) return
+        if (!acceptingNewRegistrations || !statusFor(machineId).isOperational) return
         val remainingCapacity = 20 - queueFor(machineId).registrationCount
         if (remainingCapacity <= 0) return
         val amount = batchAmount.toIntOrNull() ?: return
@@ -1324,6 +1440,8 @@ private fun RegistrationApp() {
     LaunchedEffect(
         queueRuleSettings.businessHours,
         registrationOpen,
+        machineA.registrationCount,
+        machineB.registrationCount,
         queuePersistenceReady,
         pendingQueueRestore
     ) {
@@ -1333,15 +1451,54 @@ private fun RegistrationApp() {
                 queueRuleSettings.businessHours,
                 System.currentTimeMillis()
             )
-            val occurrenceId = status.mostRecentClosingOccurrenceId
-                ?.takeIf { status.outsideBusinessHours }
-            if (occurrenceId != null &&
-                queueRuleSettingsRepository.getLastHandledClosingOccurrenceId() != occurrenceId
-            ) {
-                queueRuleSettingsRepository.markClosingOccurrenceHandled(occurrenceId)
-                if (registrationOpen) closeRegistration(automaticBusinessHours = true)
+            val trigger = businessHoursCloseTrigger(
+                status = status,
+                nowMillis = System.currentTimeMillis(),
+                registrationCount = machineA.registrationCount + machineB.registrationCount,
+                lastHandledOccurrenceId =
+                    queueRuleSettingsRepository.getLastHandledClosingOccurrenceId()
+            )
+            if (trigger != null) {
+                val occurrenceId = status.mostRecentClosingOccurrenceId
+                if (registrationOpen) closeRegistration(trigger)
+                if (occurrenceId != null) {
+                    queueRuleSettingsRepository.markClosingOccurrenceHandled(occurrenceId)
+                }
             }
-            delay(30_000L)
+            val now = System.currentTimeMillis()
+            val nextBoundary = listOfNotNull(
+                status.activeClosingAtMillis,
+                status.registrationClosesAtMillis
+            ).filter { it > now }.minOrNull()
+            delay(
+                nextBoundary
+                    ?.minus(now)
+                    ?.coerceIn(250L, 30_000L)
+                    ?: 30_000L
+            )
+        }
+    }
+
+    LaunchedEffect(businessHoursStatus.closingGracePeriod) {
+        if (!businessHoursStatus.closingGracePeriod) return@LaunchedEffect
+        joinClosingWarningRequest = null
+        val ordinaryJoinFlow = screen in setOf(
+            Screen.MACHINE,
+            Screen.CREATE_REGISTRATION,
+            Screen.PREFERENCE,
+            Screen.BATCH_AMOUNT
+        )
+        val profileJoinFlow = selectedMachine != null &&
+            playerProfileContext == PlayerProfileContext.JOIN_QUEUE &&
+            screen in setOf(
+                Screen.PLAYER_LIBRARY,
+                Screen.PLAYER_PROFILE_DETAIL,
+                Screen.PLAYER_PROFILE_EDITOR
+            )
+        if (ordinaryJoinFlow || profileJoinFlow) {
+            selectedMachine = null
+            selectedPlayerProfileId = null
+            screen = Screen.HOME
         }
     }
 
@@ -1480,6 +1637,7 @@ private fun RegistrationApp() {
                             machineARemark = queueRuleSettings.machineARemark,
                             machineBRemark = queueRuleSettings.machineBRemark,
                             registrationOpen = registrationOpen,
+                            acceptingNewRegistrations = acceptingNewRegistrations,
                             businessHoursStatus = businessHoursStatus,
                             cloudSyncStatus = displayedCloudSyncStatus.takeIf { cloudSyncAvailable },
                             queueUndoAction = queueUndoAction,
@@ -1562,13 +1720,7 @@ private fun RegistrationApp() {
                             machineBStatus = machineBStatus,
                             batch = isBatchFlow,
                             onBack = { screen = Screen.HOME },
-                            onSelect = {
-                                selectedMachine = it
-                                if (isBatchFlow) {
-                                    batchAmount = minOf(2, 20 - queueFor(it).registrationCount).toString()
-                                }
-                                screen = if (isBatchFlow) Screen.BATCH_AMOUNT else Screen.CREATE_REGISTRATION
-                            }
+                            onSelect = ::selectRegistrationMachine
                         )
 
                         Screen.CREATE_REGISTRATION -> CreateRegistrationScreen(
@@ -1705,7 +1857,8 @@ private fun RegistrationApp() {
                                     alreadyRegistered = profile?.let(::playerProfileAlreadyRegistered) == true,
                                     machineLabel = selectedMachine?.let(::machineName) ?: "所选机台",
                                     machineAvailable = selectedMachine?.let { machineId ->
-                                        statusFor(machineId).isOperational &&
+                                        acceptingNewRegistrations &&
+                                            statusFor(machineId).isOperational &&
                                             queueFor(machineId).registrationCount < 20
                                     } == true,
                                     onPreferenceChange = { profileJoinPreference = it },
@@ -2048,6 +2201,7 @@ private fun RegistrationApp() {
                             machineId = selection.machineId,
                             registration = registration,
                             queue = queue,
+                            allowCreateFriend = acceptingNewRegistrations,
                             idAlreadyExists = ::idAlreadyExists,
                             onGenerateFriendId = ::randomUnusedId,
                             onDismiss = {
@@ -2075,6 +2229,7 @@ private fun RegistrationApp() {
                             onCreateFriend = { displayId ->
                                 val normalizedId = displayId.trim()
                                 if (
+                                    acceptingNewRegistrations &&
                                     normalizedId.isNotBlank() &&
                                     !idAlreadyExists(normalizedId) &&
                                     queueFor(selection.machineId).registrationCount < 20
@@ -2113,6 +2268,8 @@ private fun RegistrationApp() {
                     val nextPlayingNotice = nextPlayingChangeMessage(
                         queueFor(machineId).nextPlayingPositionPreviewAfterRoundEnd()
                     )
+                    val removalPreview =
+                        queueFor(machineId).nextPlayingPositionPreviewAfterCurrentRoundRemoved()
                     RoundEndConfirmation(
                         machineName = machineName(machineId),
                         playingPositionLabel = playingPositionName(machineId),
@@ -2120,6 +2277,7 @@ private fun RegistrationApp() {
                             "“${it.displayId}”"
                         },
                         nextPlayingNotice = nextPlayingNotice,
+                        closingGracePeriod = businessHoursStatus.closingGracePeriod,
                         onDismiss = { finishConfirmation = null },
                         onConfirm = {
                             updateQueueWithUndo(
@@ -2135,12 +2293,48 @@ private fun RegistrationApp() {
                             ) { it.endRoundWithoutStartingNext() }
                             finishConfirmation = null
                         },
-                        onRemoveRegistrations = {
-                            val playingKeys = queueFor(machineId).playing.mapTo(mutableSetOf()) { it.key }
+                        removalNextPlayingNames = removalPreview
+                            ?.nextRegistrations
+                            .orEmpty()
+                            .joinToString("、") { "“${it.displayId}”" }
+                            .takeIf { it.isNotEmpty() },
+                        removalNextPlayingNotice = nextPlayingChangeMessage(removalPreview),
+                        onRemoveAndStartNext = {
                             updateQueue(machineId, QueueSoundCue.CAUTION) {
-                                it.removeAll(playingKeys)
+                                it.removeCurrentRoundAndStartNext()
                             }
                             finishConfirmation = null
+                        }
+                    )
+                }
+
+                joinClosingWarningRequest?.let { request ->
+                    val waitEstimateNowMillis = System.currentTimeMillis()
+                    JoinClosingWarningDialog(
+                        request = request,
+                        closingAtMillis = businessHoursStatus.activeClosingAtMillis,
+                        estimatedWaitMinutes = request.lateMachineIds.associateWith { machineId ->
+                            estimatedWaitForNewOpenRegistration(
+                                queueFor(machineId),
+                                waitEstimateNowMillis
+                            )
+                        },
+                        onDismiss = { joinClosingWarningRequest = null },
+                        onConfirm = {
+                            joinClosingWarningRequest = null
+                            if (acceptingNewRegistrations) {
+                                closingWarningAcknowledgedMachineIds =
+                                    closingWarningAcknowledgedMachineIds + request.lateMachineIds
+                                when {
+                                    request.requestedMachineId == null ->
+                                        continueRegistrationStart(batch = false)
+                                    request.continueFromMachineSelection ->
+                                        continueSelectedRegistrationMachine(request.requestedMachineId)
+                                    statusFor(request.requestedMachineId).isOperational &&
+                                        queueFor(request.requestedMachineId).registrationCount < 20 ->
+                                        continueRegistrationForMachine(request.requestedMachineId)
+                                }
+                            }
                         }
                     )
                 }
@@ -3376,6 +3570,7 @@ private fun HomeScreen(
     machineARemark: String,
     machineBRemark: String,
     registrationOpen: Boolean,
+    acceptingNewRegistrations: Boolean,
     businessHoursStatus: BusinessHoursStatus,
     cloudSyncStatus: QueueCloudSyncStatus?,
     queueUndoAction: QueueUndoAction?,
@@ -3424,6 +3619,8 @@ private fun HomeScreen(
             } else if (isEmpty && !hasStoppedMachine) {
                 EmptyHome(
                     outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
+                    closingGracePeriod = businessHoursStatus.closingGracePeriod,
+                    acceptingNewRegistrations = acceptingNewRegistrations,
                     onJoin = onJoin,
                     onBatch = onBatch
                 )
@@ -3436,7 +3633,8 @@ private fun HomeScreen(
                             queue = machineA,
                             status = machineAStatus,
                             registrationOpen = registrationOpen,
-                            businessHoursClosingSoon = businessHoursStatus.closingSoon,
+                            acceptingNewRegistrations = acceptingNewRegistrations,
+                            businessHoursClosingGrace = businessHoursStatus.closingGracePeriod,
                             nowMillis = nowMillis,
                             inlineReorderSession = inlineReorderSession?.takeIf { it.machineId == MachineId.A },
                             inlineReorderResetToken = inlineReorderResetToken,
@@ -3466,7 +3664,8 @@ private fun HomeScreen(
                             queue = machineB,
                             status = machineBStatus,
                             registrationOpen = registrationOpen,
-                            businessHoursClosingSoon = businessHoursStatus.closingSoon,
+                            acceptingNewRegistrations = acceptingNewRegistrations,
+                            businessHoursClosingGrace = businessHoursStatus.closingGracePeriod,
                             nowMillis = nowMillis,
                             inlineReorderSession = inlineReorderSession?.takeIf { it.machineId == MachineId.B },
                             inlineReorderResetToken = inlineReorderResetToken,
@@ -3495,6 +3694,8 @@ private fun HomeScreen(
                         machineBStatus = machineBStatus,
                         nowMillis = nowMillis,
                         registrationOpen = registrationOpen,
+                        acceptingNewRegistrations = acceptingNewRegistrations,
+                        closingGracePeriod = businessHoursStatus.closingGracePeriod,
                         onJoin = onJoin,
                         onBatch = onBatch,
                         modifier = Modifier.weight(.72f).fillMaxHeight()
@@ -3678,6 +3879,8 @@ private fun CloudSyncIndicator(status: QueueCloudSyncStatus, onClick: () -> Unit
 @Composable
 private fun EmptyHome(
     outsideBusinessHours: Boolean,
+    closingGracePeriod: Boolean,
+    acceptingNewRegistrations: Boolean,
     onJoin: () -> Unit,
     onBatch: () -> Unit
 ) {
@@ -3690,7 +3893,11 @@ private fun EmptyHome(
         Spacer(Modifier.height(10.dp))
         VisuallyCenteredSentence(
             if (outsideBusinessHours) {
-                "当前不在营业时间，手动开启登记排队后仍可使用。"
+                if (closingGracePeriod) {
+                    "今日营业时间已结束，登记排队正在完成最后的收尾。"
+                } else {
+                    "当前不在营业时间，登记排队已由现场手动开启。"
+                }
             } else {
                 "两台机台都没有正在等待的玩家。"
             },
@@ -3699,8 +3906,18 @@ private fun EmptyHome(
         )
         Spacer(Modifier.height(30.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            PrimaryButton("加入排队", onJoin, Modifier.width(260.dp))
-            SecondaryButton("批量创建登记", onBatch, Modifier.width(190.dp))
+            PrimaryButton(
+                "加入排队",
+                onJoin,
+                Modifier.width(260.dp),
+                enabled = acceptingNewRegistrations
+            )
+            SecondaryButton(
+                "批量创建登记",
+                onBatch,
+                Modifier.width(190.dp),
+                enabled = acceptingNewRegistrations
+            )
         }
         Spacer(Modifier.height(12.dp))
         VisuallyCenteredSentence("创建你的登记并加入排队。", SecondaryText, 13.sp)
@@ -3783,7 +4000,8 @@ private fun MachineLane(
     queue: MachineQueue,
     status: MachineStatus,
     registrationOpen: Boolean,
-    businessHoursClosingSoon: Boolean,
+    acceptingNewRegistrations: Boolean,
+    businessHoursClosingGrace: Boolean,
     nowMillis: Long,
     inlineReorderSession: ReorderSession?,
     inlineReorderResetToken: Int,
@@ -4042,12 +4260,12 @@ private fun MachineLane(
                             },
                             registrations = displayedQueue.playing,
                             isPlaying = true,
-                            overtimeWarning = playingOvertime,
-                            warningTitle = if (businessHoursClosingSoon && !playingOvertime) {
-                                "距离闭店不足 15 分钟"
+                            overtimeWarning = playingOvertime && !businessHoursClosingGrace,
+                            warningTitle = if (businessHoursClosingGrace) {
+                                "今日营业时间已结束"
                             } else null,
-                            warningDescription = if (businessHoursClosingSoon && !playingOvertime) {
-                                "请在闭店前确认当前游玩状态。"
+                            warningDescription = if (businessHoursClosingGrace) {
+                                "不再接收新登记。现有队列处理完毕后将关闭，最迟保留 20 分钟。"
                             } else null,
                             onRegistrationClick = onRegistrationClick,
                             onRegistrationLongPress = onRegistrationLongPress,
@@ -4168,6 +4386,8 @@ private fun MachineLane(
                         QueueJoinPosition(
                             machineId = machineId,
                             registrationOpen = registrationOpen,
+                            acceptingNewRegistrations = acceptingNewRegistrations,
+                            closingGracePeriod = businessHoursClosingGrace,
                             hasCapacity = displayedQueue.registrationCount < 20,
                             onClick = onJoinThisMachine
                         )
@@ -4758,10 +4978,12 @@ private fun RegistrationTile(
 private fun QueueJoinPosition(
     machineId: MachineId,
     registrationOpen: Boolean,
+    acceptingNewRegistrations: Boolean,
+    closingGracePeriod: Boolean,
     hasCapacity: Boolean,
     onClick: () -> Unit
 ) {
-    val enabled = registrationOpen && hasCapacity
+    val enabled = acceptingNewRegistrations && hasCapacity
     Column(
         Modifier.width(148.dp).height(QueueViewportHeight).clip(RoundedCornerShape(CardRadius))
             .background(if (enabled) SoftBlue.copy(alpha = .62f) else Color(0xFFF3F3F5))
@@ -4785,6 +5007,7 @@ private fun QueueJoinPosition(
         Text(
             when {
                 enabled -> "加入机台 ${machineId.name}"
+                closingGracePeriod -> "闭店收尾中"
                 !registrationOpen -> "未启用登记"
                 else -> "机台 ${machineId.name} 已满"
             },
@@ -4803,13 +5026,15 @@ private fun JoinPanel(
     machineBStatus: MachineStatus,
     nowMillis: Long,
     registrationOpen: Boolean,
+    acceptingNewRegistrations: Boolean,
+    closingGracePeriod: Boolean,
     onJoin: () -> Unit,
     onBatch: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val machineAJoinable = machineAStatus.isOperational && machineA.registrationCount < 20
     val machineBJoinable = machineBStatus.isOperational && machineB.registrationCount < 20
-    val joiningEnabled = registrationOpen && (machineAJoinable || machineBJoinable)
+    val joiningEnabled = acceptingNewRegistrations && (machineAJoinable || machineBJoinable)
     Column(
         modifier.clip(RoundedCornerShape(CardRadius)).background(CardBackground)
             .border(1.dp, Separator.copy(alpha = .68f), RoundedCornerShape(CardRadius))
@@ -4820,6 +5045,7 @@ private fun JoinPanel(
         Spacer(Modifier.height(8.dp))
         Text(
             when {
+                closingGracePeriod -> "今日营业时间已结束，收尾期间不再接收新的排队登记。"
                 !registrationOpen -> "当前未使用登记排队，请在现场自然排队。"
                 !machineAStatus.isOperational && !machineBStatus.isOperational -> "两台机台均已停止使用。"
                 !machineAJoinable && !machineBJoinable -> "两台机台目前都无法接受新登记。"
@@ -4829,7 +5055,7 @@ private fun JoinPanel(
             fontSize = 13.sp,
             lineHeight = 19.sp
         )
-        if (registrationOpen) {
+        if (acceptingNewRegistrations) {
             Spacer(Modifier.height(17.dp))
             Text("新登记预计等待", color = TertiaryText, fontSize = 10.sp, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(7.dp))
@@ -6104,6 +6330,7 @@ private fun FriendPairFlowDialog(
     machineId: MachineId,
     registration: Registration,
     queue: MachineQueue,
+    allowCreateFriend: Boolean,
     idAlreadyExists: (String) -> Boolean,
     onGenerateFriendId: () -> String,
     onDismiss: () -> Unit,
@@ -6168,6 +6395,7 @@ private fun FriendPairFlowDialog(
                         "为朋友创建登记",
                         when {
                             !isWaiting -> "${playingPositionName(machineId)} 中的登记暂时不能创建固定组合。"
+                            !allowCreateFriend -> "闭店收尾期间不再接收新的排队登记。"
                             queue.registrationCount >= 20 -> "当前机台已达到 20 人上限，无法继续创建登记。"
                             else -> "创建一份临时登记，并让你们在登记顺序末端组成固定组合。"
                         },
@@ -6175,7 +6403,7 @@ private fun FriendPairFlowDialog(
                             friendConsentConfirmed = false
                             step = FriendPairStep.CREATE_FRIEND
                         },
-                        enabled = isWaiting && queue.registrationCount < 20
+                        enabled = allowCreateFriend && isWaiting && queue.registrationCount < 20
                     ),
                     Modifier.widthIn(max = 340.dp).fillMaxWidth().align(Alignment.CenterHorizontally)
                 )
@@ -6344,6 +6572,7 @@ private fun FriendPairFlowDialog(
                     { onCreateFriend(friendIdDraft) },
                     Modifier.fillMaxWidth(),
                     friendIdDraft.isNotBlank() &&
+                        allowCreateFriend &&
                         !friendIdAlreadyExists &&
                         queue.registrationCount < 20 &&
                         friendConsentConfirmed
@@ -6812,28 +7041,60 @@ private fun RoundEndConfirmation(
     playingPositionLabel: String,
     playingRegistrationNames: String,
     nextPlayingNotice: String?,
+    closingGracePeriod: Boolean,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
     onEndOnly: () -> Unit,
-    onRemoveRegistrations: () -> Unit
+    removalNextPlayingNames: String?,
+    removalNextPlayingNotice: String?,
+    onRemoveAndStartNext: () -> Unit
 ) {
     var confirmEndOnly by remember { mutableStateOf(false) }
     var confirmRemoveRegistrations by remember { mutableStateOf(false) }
     ModalSurface(onDismiss, width = 480.dp) {
         if (confirmRemoveRegistrations) {
-                Text("移除本轮玩家的登记？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "移除本轮玩家的登记并开始下一轮？",
+                    color = PrimaryText,
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "$playingRegistrationNames 的登记会从$machineName 队列中移除，而不是回到队尾。$playingPositionLabel 将保持空缺，下一组不会自动开始；这些玩家之后仍要游玩时，需要重新加入排队。",
+                    buildString {
+                        append("$playingRegistrationNames 的登记会从$machineName 队列中移除，不会回到队尾。")
+                        if (removalNextPlayingNames != null) {
+                            append("随后，$removalNextPlayingNames 将进入$playingPositionLabel 并开始下一轮。")
+                        } else {
+                            append("当前没有可以进入下一轮的登记，$playingPositionLabel 将保持空缺。")
+                        }
+                        append("被移除的玩家之后仍要游玩时，需要重新加入排队。")
+                    },
                     color = SecondaryText,
                     fontSize = 13.sp,
                     lineHeight = 20.sp
                 )
+                if (removalNextPlayingNotice != null) {
+                    Spacer(Modifier.height(11.dp))
+                    Text(
+                        removalNextPlayingNotice,
+                        color = AbsenceStatusColor,
+                        fontSize = 12.sp,
+                        lineHeight = 19.sp,
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                            .background(AbsenceStatusBackground)
+                            .padding(horizontal = 13.dp, vertical = 11.dp)
+                    )
+                }
                 Spacer(Modifier.height(18.dp))
-                DestructiveButton("确认移除本轮登记", onRemoveRegistrations, Modifier.fillMaxWidth())
+                DestructiveButton(
+                    "确认移除并开始下一轮",
+                    onRemoveAndStartNext,
+                    Modifier.fillMaxWidth()
+                )
                 Spacer(Modifier.height(8.dp))
                 CancelAction { confirmRemoveRegistrations = false }
-        } else if (confirmEndOnly) {
+        } else if (confirmEndOnly && !closingGracePeriod) {
                 Text("仅结束本轮？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(8.dp))
                 Text(
@@ -6855,6 +7116,18 @@ private fun RoundEndConfirmation(
                     fontSize = 13.sp,
                     lineHeight = 20.sp
                 )
+                if (closingGracePeriod) {
+                    Spacer(Modifier.height(11.dp))
+                    Text(
+                        "闭店收尾期间，需要让现有队列逐步结束，因此只能移除本轮玩家的登记并开始下一轮。其他处理方式暂时不可用。",
+                        color = Color(0xFF9A5B00),
+                        fontSize = 12.sp,
+                        lineHeight = 19.sp,
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                            .background(Color(0xFFFFF4E5))
+                            .padding(horizontal = 13.dp, vertical = 11.dp)
+                    )
+                }
                 if (nextPlayingNotice != null) {
                     Spacer(Modifier.height(11.dp))
                     Text(
@@ -6868,22 +7141,72 @@ private fun RoundEndConfirmation(
                     )
                 }
                 Spacer(Modifier.height(18.dp))
-                PrimaryButton("确认结束本轮并开始下一轮", onConfirm, Modifier.fillMaxWidth())
+                PrimaryButton(
+                    "确认结束本轮并开始下一轮",
+                    onConfirm,
+                    Modifier.fillMaxWidth(),
+                    enabled = !closingGracePeriod
+                )
+                Spacer(Modifier.height(9.dp))
+                DestructiveButton(
+                    "移除本轮玩家的登记并开始下一轮",
+                    { confirmRemoveRegistrations = true },
+                    Modifier.fillMaxWidth()
+                )
                 Spacer(Modifier.height(9.dp))
                 SecondaryButton(
                     "仅结束本轮",
                     { confirmEndOnly = true },
-                    Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(9.dp))
-                DestructiveButton(
-                    "移除本轮玩家的登记",
-                    { confirmRemoveRegistrations = true },
-                    Modifier.fillMaxWidth()
+                    Modifier.fillMaxWidth(),
+                    enabled = !closingGracePeriod
                 )
                 Spacer(Modifier.height(12.dp))
                 CancelAction(onDismiss)
         }
+    }
+}
+
+@Composable
+private fun JoinClosingWarningDialog(
+    request: JoinClosingWarningRequest,
+    closingAtMillis: Long?,
+    estimatedWaitMinutes: Map<MachineId, Long?>,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    val closingTime = closingAtMillis?.let { timestamp ->
+        SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(timestamp))
+    } ?: "今日闭店时间"
+    val requestedMachine = request.requestedMachineId
+    val description = if (requestedMachine != null) {
+        val estimate = estimatedWaitMinutes[requestedMachine]
+        val estimateText = estimate?.let { "约 $it 分钟后" } ?: "按照当前队列估算"
+        val alternativeMachines = request.joinableMachineIds
+            .filterNot { it in request.lateMachineIds }
+            .joinToString("、") { machineName(it) }
+        val alternativeText = alternativeMachines.takeIf { it.isNotEmpty() }?.let {
+            "也可以取消并改选$it；按照当前队列估算，它更可能在闭店前轮到。"
+        }.orEmpty()
+        "加入${machineName(requestedMachine)}后，${estimateText}才能游玩，可能晚于 $closingTime。" +
+            alternativeText +
+            "现场进度仍可能变化，是否继续创建登记？"
+    } else {
+        val machineNames = request.lateMachineIds.joinToString("、") { machineName(it) }
+        "$machineNames 当前的预计等待时间都会超过 $closingTime。这份登记可能无法在闭店前游玩，是否仍要继续选择机台？"
+    }
+    ModalSurface(onDismiss, width = 480.dp) {
+        Text(
+            "可能无法在闭店前游玩",
+            color = PrimaryText,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(description, color = SecondaryText, fontSize = 13.sp, lineHeight = 20.sp)
+        Spacer(Modifier.height(18.dp))
+        PrimaryButton("仍然继续", onConfirm, Modifier.fillMaxWidth())
+        Spacer(Modifier.height(8.dp))
+        CancelAction(onDismiss)
     }
 }
 
@@ -8022,9 +8345,14 @@ private fun AppDetailsDialog(
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
         Triple(
+            "0.3.1",
+            "闭店收尾与个人通知",
+            "闭店后为现有队列保留最多 20 分钟的收尾时间，并统一终端、网站与 QQ Bot 的状态；玩家还可以单独开启或关闭自己的排队通知。"
+        ),
+        Triple(
             "0.3.0",
             "营业时间与远程联动",
-            "加入营业时间、QQ Bot 联动开关、操作来源和闭店提醒；本轮结束现在可以选择开始下一轮、仅结束本轮或移除本轮登记。"
+            "加入营业时间、QQ Bot 联动开关、操作来源和闭店提醒；本轮结束可以选择正常轮转、移除本轮登记后开始下一轮，或仅结束本轮。"
         ),
         Triple(
             "0.2.19",

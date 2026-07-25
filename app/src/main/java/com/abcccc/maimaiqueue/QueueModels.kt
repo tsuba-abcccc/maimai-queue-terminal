@@ -153,6 +153,14 @@ data class MachineQueue(
             endRoundWithoutStartingNext(atMillis = 0L).nextPlayingPositionPreview()
         }
 
+    /** Previews the next group after the current playing registrations are removed. */
+    fun nextPlayingPositionPreviewAfterCurrentRoundRemoved(): NextPlayingPositionPreview? =
+        if (playing.isEmpty()) {
+            nextPlayingPositionPreview()
+        } else {
+            removeAll(playing.mapTo(mutableSetOf()) { it.key }).nextPlayingPositionPreview()
+        }
+
     fun canMarkNoShow(registrationKey: Int): Boolean {
         val registration = allRegistrations.firstOrNull { it.key == registrationKey }
             ?: return false
@@ -223,6 +231,14 @@ data class MachineQueue(
             waiting = waiting + returned,
             playingStartedAtMillis = null
         )
+    }
+
+    fun removeCurrentRoundAndStartNext(
+        atMillis: Long = System.currentTimeMillis()
+    ): MachineQueue {
+        if (playing.isEmpty()) return this
+        val playingKeys = playing.mapTo(mutableSetOf()) { it.key }
+        return removeAll(playingKeys).advanceIfNeeded(atMillis)
     }
 
     fun restartPlayingTimer(atMillis: Long = System.currentTimeMillis()): MachineQueue =

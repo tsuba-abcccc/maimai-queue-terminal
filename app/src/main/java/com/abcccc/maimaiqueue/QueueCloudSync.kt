@@ -156,7 +156,9 @@ internal data class QueuePublicBusinessHours(
     val enabled: Boolean = false,
     val outsideBusinessHours: Boolean = false,
     val closingSoon: Boolean = false,
-    val closesAtMillis: Long? = null
+    val closingGracePeriod: Boolean = false,
+    val closesAtMillis: Long? = null,
+    val registrationClosesAtMillis: Long? = null
 )
 
 private data class QueuePublishPayload(
@@ -691,7 +693,12 @@ internal fun buildPublicQueueSnapshot(
             put("enabled", displaySettings.businessHours.enabled)
             put("outside", displaySettings.businessHours.outsideBusinessHours)
             put("closing_soon", displaySettings.businessHours.closingSoon)
+            put("closing_grace", displaySettings.businessHours.closingGracePeriod)
             put("closes_at", displaySettings.businessHours.closesAtMillis ?: JSONObject.NULL)
+            put(
+                "registration_closes_at",
+                displaySettings.businessHours.registrationClosesAtMillis ?: JSONObject.NULL
+            )
         }
     )
     put(

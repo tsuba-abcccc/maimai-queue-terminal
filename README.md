@@ -1,6 +1,6 @@
 # maimai Q
 
-[![Version](https://img.shields.io/badge/version-0.3.0-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
+[![Version](https://img.shields.io/badge/version-0.3.1-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
 [![Android](https://img.shields.io/badge/Android-10%2B-34C759?logo=android&logoColor=white)](https://developer.android.com/about/versions/10)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-007AFF)](https://developer.android.com/compose)
@@ -16,7 +16,7 @@
 - [在线查看当前队列](https://abcccc.top/queue-status)
 - [玩家使用手册](docs/user-manual.md)
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
-- [0.1.0 至 0.3.0 更新日志](docs/update.md)
+- [0.1.0 至 0.3.1 更新日志](docs/update.md)
 - [云端同步协议](docs/cloud-queue-sync.md)
 - [后端部署说明](cloud-server/README.md)
 
@@ -41,7 +41,7 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将两�
 - 机台 A、机台 B 两条完全独立的登记顺序。
 - 游玩位置、等待位置、登记人数和总人数统计。
 - 单人游玩、允许他人加入和与朋友固定组合。
-- 本轮结束可选择自动开始下一轮、仅结束当前轮次，或经二次确认移除本轮玩家的登记。
+- 本轮结束可选择正常开始下一轮、移除本轮玩家的登记后开始下一轮，或仅结束当前轮次。
 - 将误进入游玩位置的玩家撤回等待顺序前端。
 - 将实际已经共同上机的等待玩家补入当前游玩位置。
 - 游玩超过 20 分钟时提醒，并支持补记现场已完成但忘记操作的轮次。
@@ -83,7 +83,7 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将两�
 - 最多保留最近 1,000 条本机详细操作日志。
 - 机台停止使用时保留全部登记；恢复后本轮计时从头开始。
 - 可分别设置是否允许暂缓一轮、是否允许暂时离开。
-- 可统一设置营业时间，也可按星期分别设置；到闭店时间自动关闭登记并清空队列，开店时间不会自动开启。
+- 可统一设置营业时间，也可按星期分别设置；闭店后为现有队列保留最多 20 分钟的收尾时间，开店时间不会自动开启登记。
 - 操作日志区分现场终端、QQ Bot、系统自动和预留的网站远程来源，并可按来源筛选。
 - 支持自定义机台现场备注，固定名称“机台 A / B”保持不变。
 - 重要操作使用确认弹窗、状态动画和克制的操作音效。
@@ -97,7 +97,7 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将两�
 - 网络失败不会阻止现场操作，应用会在后台自动重试。
 - 首页显示已同步、同步中、待重试、已关闭或未配置等状态。
 - 现场终端版可单独关闭“QQ Bot 联动”；关闭后不接受 Bot 查询或资料修改，也不会补发关闭期间的通知。
-- App 与网站会在闭店前 15 分钟显示提醒，并在非营业时段保留“不在营业时间”状态。
+- 预计无法在闭店前轮到时，App 会在创建登记前提醒；闭店后，App、网站和 QQ Bot 会统一显示收尾状态。
 - 网站提供两台队列、位置详情、时间估算、公开日志和“标记为自己”。
 - 标记后可查看自己的位置、预计时间、共同游玩对象和未到场等处理结果。
 - 网站目前只读，不能远程改变现场队列。
@@ -176,7 +176,7 @@ app/build/outputs/apk/local/debug/app-local-debug.apk
 .\gradlew.bat :app:packageLocalDebugApk
 ```
 
-文件会复制到 `output/apk/maimai-Q-0.3.0-local.apk`。
+文件会复制到 `output/apk/maimai-Q-0.3.1-local.apk`。
 
 macOS 或 Linux 使用：
 
@@ -249,7 +249,7 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 - 公开分发版与现场终端版应使用不同签名和不同配置。
 - 现场终端 APK 只在受控设备间传递；令牌泄漏后立即在服务端轮换。
 
-现场终端文件会复制到 `output/apk/maimai-Q-0.3.0-terminal.apk`，不得作为 GitHub 公开 Release 附件。
+现场终端文件会复制到 `output/apk/maimai-Q-0.3.1-terminal.apk`，不得作为 GitHub 公开 Release 附件。
 
 ## 部署队列 API
 
