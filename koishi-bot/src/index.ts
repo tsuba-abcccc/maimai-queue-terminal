@@ -689,11 +689,13 @@ async function joinQueueFromBot(
       "请选择要加入排队的机台：",
       "",
       ...machines.map((machine) => ` - ${formatMachineChoice(machine)}`),
+      "",
+      formatMachineReplyHint(machines),
     ].join("\n"),
   );
   const machine = parseMachineChoice(machineInput, machines);
   if (!machine) {
-    throw new Error("没有找到这个机台。请发送机台字母，例如“A”或“B”。");
+    throw new Error("没有找到这个机台。请回复机台字母，或列表中的机台备注。");
   }
 
   let preference: PlayPreference | undefined;
@@ -825,11 +827,13 @@ async function transferQueueMachine(
         "请选择要转入的机台：",
         "",
         ...candidates.map((machine) => ` - ${formatMachineChoice(machine)}`),
+        "",
+        formatMachineReplyHint(candidates),
       ].join("\n"),
     );
     const selected = parseMachineChoice(input, candidates);
     if (!selected) {
-      throw new Error("没有找到这个机台。请发送列表中的机台字母。");
+      throw new Error("没有找到这个机台。请回复机台字母，或列表中的机台备注。");
     }
     target = selected;
   }
@@ -1009,12 +1013,24 @@ export function parseMachineChoice(
   value: string | undefined,
   machines: QueueMachine[],
 ): QueueMachine | null {
-  const normalized = value?.trim().replace(/\s+/g, "").toUpperCase() ?? "";
-  return machines.find((machine) => {
-    const id = machine.id.toUpperCase();
-    const name = machine.name.replace(/\s+/g, "").toUpperCase();
-    return normalized === id || normalized === `机台${id}` || normalized === name;
-  }) ?? null;
+  const normalized = normalizeMachineChoice(value);
+  if (!normalized) return null;
+
+  const directMatch = machines.find((machine) => {
+    const id = normalizeMachineChoice(machine.id);
+    return normalized === id || normalized === `机台${id}`;
+  });
+  if (directMatch) return directMatch;
+
+  const fullNameMatches = machines.filter((machine) =>
+    normalizeMachineChoice(machine.name) === normalized
+  );
+  if (fullNameMatches.length === 1) return fullNameMatches[0];
+
+  const remarkMatches = machines.filter((machine) =>
+    normalizeMachineChoice(machineRemark(machine)) === normalized
+  );
+  return remarkMatches.length === 1 ? remarkMatches[0] : null;
 }
 
 function sortedMachines(queue: QueueStatus): QueueMachine[] {
@@ -1033,13 +1049,38 @@ export function machineCanAcceptRegistration(machine: QueueMachine): boolean {
   return machine.operational && registrationCount < 20;
 }
 
-function formatMachineChoice(machine: QueueMachine): string {
-  const estimate = typeof machine.new_registration_estimated_wait_minutes === "number"
-    ? machine.new_registration_estimated_wait_minutes <= 0
-      ? "（预计很快可以游玩）"
-      : `（约 ${machine.new_registration_estimated_wait_minutes} 分钟后）`
-    : "";
-  return `${compactMachineName(machine.name)}${estimate}`;
+export function formatMachineChoice(machine: QueueMachine): string {
+  const details: string[] = [];
+  const remark = machineRemark(machine);
+  if (remark) details.push(remark);
+  if (typeof machine.new_registration_estimated_wait_minutes === "number") {
+    details.push(
+      machine.new_registration_estimated_wait_minutes <= 0
+        ? "预计很快可以游玩"
+        : `约 ${machine.new_registration_estimated_wait_minutes} 分钟后`,
+    );
+  }
+  return details.length
+    ? `${machine.id.toUpperCase()}（${details.join("，")}）`
+    : machine.id.toUpperCase();
+}
+
+export function formatMachineReplyHint(machines: QueueMachine[]): string {
+  const ids = machines.map((machine) => machine.id.toUpperCase()).join("、");
+  return machines.some((machine) => machineRemark(machine))
+    ? `回复 ${ids}，也可以回复括号中的机台备注。`
+    : `回复 ${ids}。`;
+}
+
+function machineRemark(machine: QueueMachine): string | null {
+  const name = compactMachineName(machine.name).trim();
+  const escapedId = machine.id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = name.match(new RegExp(`^(.*?)(?:·\\s*)?机台\\s*${escapedId}$`, "i"));
+  return match?.[1].trim() || null;
+}
+
+function normalizeMachineChoice(value: string | null | undefined): string {
+  return value?.trim().replace(/\s+/g, "").toUpperCase() ?? "";
 }
 
 function compactMachineName(value: string): string {

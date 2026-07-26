@@ -3,6 +3,8 @@ const assert = require('node:assert/strict')
 
 const {
   HELP_TEXT,
+  formatMachineChoice,
+  formatMachineReplyHint,
   formatOwnQueue,
   formatOwnQueueActions,
   machineCanAcceptRegistration,
@@ -722,17 +724,38 @@ test('changes the personal menu with absence state and queue rules', () => {
   }), ['切换机台', '修改游玩偏好', '退出排队'])
 })
 
-test('parses only explicit machine and current-preference choices', () => {
+test('accepts concise machine letters, full names, and unique remarks', () => {
   const machines = [
     { id: 'A', name: '左侧 · 机台 A' },
     { id: 'B', name: '右侧 · 机台 B' },
   ]
+  assert.equal(parseMachineChoice('A', machines), machines[0])
+  assert.equal(parseMachineChoice('b', machines), machines[1])
   assert.equal(parseMachineChoice('机台 A', machines), machines[0])
   assert.equal(parseMachineChoice('右侧·机台B', machines), machines[1])
+  assert.equal(parseMachineChoice('左侧', machines), machines[0])
+  assert.equal(parseMachineChoice('右侧', machines), machines[1])
   assert.equal(parseMachineChoice('左边', machines), null)
+  assert.equal(parseMachineChoice('入口', [
+    { id: 'A', name: '入口 · 机台 A' },
+    { id: 'B', name: '入口 · 机台 B' },
+  ]), null)
   assert.equal(parsePlayPreference('单人游玩'), 'SOLO')
   assert.equal(parsePlayPreference('允许他人加入'), 'OPEN_TO_JOIN')
   assert.equal(parsePlayPreference('每次询问'), null)
+})
+
+test('presents machine choices with the short letter first', () => {
+  const machines = [
+    { id: 'A', name: '左侧日框 · 机台 A', new_registration_estimated_wait_minutes: 12 },
+    { id: 'B', name: '机台 B', new_registration_estimated_wait_minutes: 0 },
+  ]
+  assert.equal(formatMachineChoice(machines[0]), 'A（左侧日框，约 12 分钟后）')
+  assert.equal(formatMachineChoice(machines[1]), 'B（预计很快可以游玩）')
+  assert.equal(
+    formatMachineReplyHint(machines),
+    '回复 A、B，也可以回复括号中的机台备注。',
+  )
 })
 
 test('does not offer stopped or full machines for a new registration', () => {
