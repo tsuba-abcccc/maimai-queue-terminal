@@ -79,7 +79,7 @@ data class Registration(
     val gender: PlayerGender? = null,
     val playerProfileId: String? = null,
     val requiresOnSiteCheckIn: Boolean = false,
-    val onlineRegistrationCommandId: String? = null
+    val originatingCommandId: String? = null
 ) {
     val canEnterPlayingPosition: Boolean
         get() = absenceStatus == QueueAbsenceStatus.NONE && !requiresOnSiteCheckIn

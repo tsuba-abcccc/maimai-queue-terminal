@@ -72,6 +72,32 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                             avatarReference = item.optNullableString("avatarReference"),
                             usageCount = item.optInt("usageCount", 0).coerceAtLeast(0),
                             lastUsedAtMillis = item.optLongOrNull("lastUsedAtMillis"),
+                            qqVisibility = enumValueOrDefault(
+                                item.optString("qqVisibility"),
+                                QqVisibility.TERMINAL_ONLY
+                            ),
+                            notificationPreferences = QueueNotificationPreferences(
+                                enabled = item.optBoolean("notificationEnabled", true),
+                                queueChanges = item.optBoolean(
+                                    "notifyQueueChanges",
+                                    true
+                                ),
+                                playingPosition = item.optBoolean(
+                                    "notifyPlayingPosition",
+                                    false
+                                ),
+                                onlineCheckIn = item.optBoolean(
+                                    "notifyOnlineCheckIn",
+                                    true
+                                ),
+                                absence = item.optBoolean("notifyAbsence", true),
+                                machineStatus = item.optBoolean(
+                                    "notifyMachineStatus",
+                                    false
+                                )
+                            ),
+                            setupVersion = item.optInt("setupVersion", 0).coerceAtLeast(0),
+                            revision = item.optLong("revision", 1L).coerceAtLeast(1L),
                             createdAtMillis = createdAtMillis,
                             updatedAtMillis = item.optLong("updatedAtMillis", 0L)
                                 .takeIf { it > 0L } ?: createdAtMillis
@@ -96,6 +122,15 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                     put("avatarReference", profile.avatarReference ?: JSONObject.NULL)
                     put("usageCount", profile.usageCount)
                     put("lastUsedAtMillis", profile.lastUsedAtMillis ?: JSONObject.NULL)
+                    put("qqVisibility", profile.qqVisibility.name)
+                    put("notificationEnabled", profile.notificationPreferences.enabled)
+                    put("notifyQueueChanges", profile.notificationPreferences.queueChanges)
+                    put("notifyPlayingPosition", profile.notificationPreferences.playingPosition)
+                    put("notifyOnlineCheckIn", profile.notificationPreferences.onlineCheckIn)
+                    put("notifyAbsence", profile.notificationPreferences.absence)
+                    put("notifyMachineStatus", profile.notificationPreferences.machineStatus)
+                    put("setupVersion", profile.setupVersion)
+                    put("revision", profile.revision)
                     put("createdAtMillis", profile.createdAtMillis)
                     put("updatedAtMillis", profile.updatedAtMillis)
                 }

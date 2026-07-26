@@ -6,6 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from uuid import UUID
 
 from app import create_app
 
@@ -390,9 +391,9 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertNotIn("13800138000", serialized)
         self.assertNotIn("12345678", serialized)
 
-    def test_v3_exposes_only_the_active_registration_qq_and_keeps_profiles_private(self):
+    def test_public_qq_visibility_exposes_only_the_allowed_active_contact(self):
         snapshot = self.snapshot()
-        snapshot["schema_version"] = 3
+        snapshot["schema_version"] = 5
         registration = snapshot["machines"]["A"]["playing"][0]
         companion = self.registration("b" * 24, "同行玩家")
         for fixed_registration in (registration, companion):
@@ -400,7 +401,9 @@ class QueueStatusApiTest(unittest.TestCase):
             fixed_registration["fixed_pair"] = True
             fixed_registration["fixed_pair_id"] = "f" * 24
         snapshot["machines"]["A"]["playing"].append(companion)
-        snapshot["private_player_profiles"] = [self.player_profile()]
+        public_profile = self.player_profile()
+        public_profile["qq_visibility"] = "PUBLIC_WEBSITE"
+        snapshot["private_player_profiles"] = [public_profile]
         snapshot["private_player_contacts"] = [
             {
                 "registration_id": registration["registration_id"],
@@ -423,7 +426,7 @@ class QueueStatusApiTest(unittest.TestCase):
         )
 
         self.assertEqual(204, published.status_code)
-        self.assertEqual(4, public_response.get_json()["schema_version"])
+        self.assertEqual(5, public_response.get_json()["schema_version"])
         public_registration = public_response.get_json()["machines"]["A"]["playing"][0]
         public_companion = public_response.get_json()["machines"]["A"]["playing"][1]
         self.assertEqual("12345678", public_registration["qq_number"])
@@ -1164,9 +1167,11 @@ class QueueStatusApiTest(unittest.TestCase):
 
     def test_private_qq_binding_routes_events_after_registration_leaves(self):
         first = self.snapshot(revision=4)
-        first["schema_version"] = 3
+        first["schema_version"] = 5
         registration = first["machines"]["A"]["playing"][0]
-        first["private_player_profiles"] = [self.player_profile()]
+        profile = self.player_profile()
+        profile["notify_playing_position"] = True
+        first["private_player_profiles"] = [profile]
         first["recent_events"] = [
             self.event(
                 "00000000-0000-0000-0000-000000000199",
@@ -1182,9 +1187,9 @@ class QueueStatusApiTest(unittest.TestCase):
             }
         ]
         second = self.snapshot(revision=5)
-        second["schema_version"] = 3
+        second["schema_version"] = 5
         second["machines"]["A"] = self.machine(name="左侧 · 机台 A")
-        second["private_player_profiles"] = [self.player_profile()]
+        second["private_player_profiles"] = [profile]
         second["private_player_contacts"] = []
 
         self.assertEqual(
@@ -1439,7 +1444,7 @@ class QueueStatusApiTest(unittest.TestCase):
         ]
         event = self.event(
             "00000000-0000-0000-0000-000000000194",
-            "PLAYING_CHANGED",
+            "REGISTRATION_UPDATED",
             1_000_100,
         )
         event["registration_ids"] = ["a" * 24, "b" * 24]
@@ -1480,7 +1485,7 @@ class QueueStatusApiTest(unittest.TestCase):
             "profile_id": self.profile_id,
             "qq_number": "12345678",
         }]
-        first["recent_events"] = [self.event(event_id, "PLAYING_CHANGED", 1_000_100)]
+        first["recent_events"] = [self.event(event_id, "REGISTRATION_UPDATED", 1_000_100)]
         self.assertEqual(
             204,
             self.client.post("/api/queue-status", json=first, headers=self.headers).status_code,
@@ -1497,7 +1502,7 @@ class QueueStatusApiTest(unittest.TestCase):
             "profile_id": self.profile_id,
             "qq_number": "87654321",
         }]
-        second["recent_events"] = [self.event(event_id, "PLAYING_CHANGED", 1_000_100)]
+        second["recent_events"] = [self.event(event_id, "REGISTRATION_UPDATED", 1_000_100)]
         self.assertEqual(
             204,
             self.client.post("/api/queue-status", json=second, headers=self.headers).status_code,
@@ -1545,7 +1550,7 @@ class QueueStatusApiTest(unittest.TestCase):
                 "qq_number": "87654321",
             },
         ]
-        first_event = self.event(event_id, "PLAYING_CHANGED", 1_000_100)
+        first_event = self.event(event_id, "REGISTRATION_UPDATED", 1_000_100)
         first_event["registration_ids"] = ["a" * 24]
         first["recent_events"] = [first_event]
         self.assertEqual(
@@ -2322,6 +2327,274 @@ class QueueStatusApiTest(unittest.TestCase):
             profile_command.get_json()["error"],
         )
 
+    def test_bot_identity_and_mobile_registration_session_are_private_and_one_time(self):
+        snapshot = self.remote_ready_snapshot(revision=20)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        identity = self.client.post(
+            "/api/queue-bot/identity",
+            json={"bot_qq": "87654321"},
+            headers=self.bot_headers,
+        )
+        self.assertEqual(200, identity.status_code)
+
+        session_id = "00000000-0000-0000-0000-000000000820"
+        created = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": session_id,
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(201, created.status_code)
+        token = created.get_json()["session_token"]
+        self.assertIn(
+            "/queue-status?mobile_registration=",
+            created.get_json()["registration_url"],
+        )
+
+        opened = self.client.get(f"/api/queue-mobile/sessions/{token}")
+        self.assertEqual(200, opened.status_code)
+        opened_payload = opened.get_json()
+        self.assertEqual("87654321", opened_payload["bot_qq"])
+        self.assertEqual(1, len(opened_payload["profiles"]))
+        self.assertIsNone(opened_payload["profiles"][0]["qq_number"])
+        self.assertTrue(opened_payload["profiles"][0]["qq_present"])
+        self.assertFalse(opened_payload["profiles"][0]["qq_public"])
+
+        command_id = "00000000-0000-0000-0000-000000000821"
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json={
+                "request_id": command_id,
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+            },
+        )
+        self.assertEqual(202, submitted.status_code)
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+        command = next(value for value in commands if value["command_id"] == command_id)
+        self.assertEqual("MOBILE_DEVICE_REGISTRATION", command["type"])
+        self.assertEqual("MOBILE_DEVICE", command["payload"]["operation_source"])
+        self.assertNotIn("online_registration_pending_check_in", command["payload"])
+
+        completed = self.client.post(
+            f"/api/queue-terminal/commands/{command_id}/result",
+            json={"status": "APPLIED", "detail": "已通过移动设备加入排队。"},
+            headers=self.headers,
+        )
+        self.assertEqual(200, completed.status_code)
+        result = self.client.get(
+            f"/api/queue-mobile/sessions/{token}/result"
+        ).get_json()
+        self.assertEqual("APPLIED", result["status"])
+        self.assertEqual(self.profile_id, result["profile_id"])
+
+        reused = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000822",
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+            },
+        )
+        self.assertEqual(409, reused.status_code)
+
+    def test_mobile_registration_requires_explicit_completion_for_legacy_profiles(self):
+        snapshot = self.remote_ready_snapshot(revision=21)
+        legacy_profile = snapshot["private_player_profiles"][0]
+        legacy_profile.update(
+            setup_version=0,
+            notification_enabled=True,
+            notify_queue_changes=False,
+            notify_playing_position=True,
+            notify_online_check_in=False,
+            notify_absence=True,
+            notify_machine_status=True,
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        created = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000830",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        ).get_json()
+        token = created["session_token"]
+        opened_profile = self.client.get(
+            f"/api/queue-mobile/sessions/{token}"
+        ).get_json()["profiles"][0]
+        self.assertFalse(opened_profile["notify_queue_changes"])
+        self.assertTrue(opened_profile["notify_playing_position"])
+        self.assertFalse(opened_profile["notify_online_check_in"])
+        self.assertTrue(opened_profile["notify_absence"])
+        self.assertTrue(opened_profile["notify_machine_status"])
+
+        missing_completion = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000831",
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+            },
+        )
+        self.assertEqual(400, missing_completion.status_code)
+
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000832",
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+                "profile_completion": {
+                    "qq_visibility": "TERMINAL_ONLY",
+                    "notification_enabled": True,
+                    "notify_queue_changes": False,
+                    "notify_playing_position": True,
+                    "notify_online_check_in": False,
+                    "notify_absence": True,
+                    "notify_machine_status": True,
+                },
+            },
+        )
+        self.assertEqual(202, submitted.status_code)
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+        completion = next(
+            value for value in commands
+            if value["command_id"] == "00000000-0000-0000-0000-000000000832"
+        )["payload"]["profile"]["completion"]
+        self.assertFalse(completion["notify_queue_changes"])
+        self.assertTrue(completion["notify_playing_position"])
+        self.assertFalse(completion["notify_online_check_in"])
+        self.assertTrue(completion["notify_machine_status"])
+
+    def test_mobile_registration_can_create_a_complete_player_profile(self):
+        snapshot = self.remote_ready_snapshot(revision=22)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        created = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000840",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "B",
+            },
+            headers=self.headers,
+        ).get_json()
+
+        command_id = "00000000-0000-0000-0000-000000000841"
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{created['session_token']}/submit",
+            json={
+                "request_id": command_id,
+                "preference": "SOLO",
+                "new_profile": {
+                    "nickname": "移动新玩家",
+                    "gender": "FEMALE",
+                    "default_preference": "ASK_EVERY_TIME",
+                    "qq_number": "87654321",
+                    "qq_visibility": "PUBLIC_WEBSITE",
+                    "notification_enabled": True,
+                    "notify_queue_changes": True,
+                    "notify_playing_position": False,
+                    "notify_online_check_in": True,
+                    "notify_absence": True,
+                    "notify_machine_status": False,
+                },
+            },
+        )
+        self.assertEqual(202, submitted.status_code)
+
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+        command = next(value for value in commands if value["command_id"] == command_id)
+        payload = command["payload"]
+        profile = payload["profile"]
+        self.assertEqual("MOBILE_DEVICE_REGISTRATION", command["type"])
+        self.assertEqual("MOBILE_DEVICE", payload["operation_source"])
+        self.assertEqual("B", payload["machine_id"])
+        self.assertEqual("87654321", payload["actor_qq"])
+        self.assertEqual("SOLO", payload["preference"])
+        self.assertEqual("NEW", profile["mode"])
+        self.assertEqual("移动新玩家", profile["profile"]["nickname"])
+        self.assertEqual("PUBLIC_WEBSITE", profile["profile"]["qq_visibility"])
+        self.assertEqual(1, profile["profile"]["setup_version"])
+        self.assertIsNone(profile.get("expected_profile_revision"))
+        self.assertIsNone(profile.get("completion"))
+        UUID(profile["profile_id"])
+
+    def test_mobile_registration_rechecks_machine_state_before_submission(self):
+        snapshot = self.remote_ready_snapshot(revision=23)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        created = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000850",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        ).get_json()
+
+        stopped = copy.deepcopy(snapshot)
+        stopped["revision"] += 1
+        stopped["machines"]["A"].update(
+            operational=False,
+            stop_reason="MAINTENANCE",
+            stopped_at=1_000_100,
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=stopped, headers=self.headers
+            ).status_code,
+        )
+
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{created['session_token']}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000851",
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+            },
+        )
+        self.assertEqual(409, submitted.status_code)
+        self.assertEqual("MACHINE_STOPPED", submitted.get_json()["code"])
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+        self.assertFalse(any(
+            command["command_id"] == "00000000-0000-0000-0000-000000000851"
+            for command in commands
+        ))
+
     def remote_ready_snapshot(
         self,
         revision=4,
@@ -2332,7 +2605,7 @@ class QueueStatusApiTest(unittest.TestCase):
     ):
         snapshot = self.snapshot(revision=revision)
         snapshot.update(
-            schema_version=4,
+            schema_version=5,
             website_remote_enabled=True,
             onebot_sync_enabled=True,
             queue_rules={
@@ -2454,6 +2727,15 @@ class QueueStatusApiTest(unittest.TestCase):
             "qq_number": "12345678",
             "usage_count": 3,
             "last_used_at": 900_000,
+            "qq_visibility": "TERMINAL_ONLY",
+            "notification_enabled": True,
+            "notify_queue_changes": True,
+            "notify_playing_position": False,
+            "notify_online_check_in": True,
+            "notify_absence": True,
+            "notify_machine_status": False,
+            "setup_version": 1,
+            "profile_revision": 3,
             "created_at": 800_000,
             "updated_at": 950_000,
         }

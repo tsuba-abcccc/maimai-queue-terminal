@@ -32,6 +32,19 @@ declare module "koishi" {
 type PlayerGender = "MALE" | "FEMALE" | "UNDISCLOSED";
 type PlayPreference = "SOLO" | "OPEN_TO_JOIN";
 type ProfilePreference = PlayPreference | "ASK_EVERY_TIME";
+type NotificationPreferenceField =
+  | "notification_enabled"
+  | "notify_queue_changes"
+  | "notify_playing_position"
+  | "notify_online_check_in"
+  | "notify_absence"
+  | "notify_machine_status";
+type PlayerProfileUpdateField =
+  | "nickname"
+  | "gender"
+  | "default_preference"
+  | "qq_visibility"
+  | NotificationPreferenceField;
 type QueueOperation =
   | "JOIN_QUEUE"
   | "DEFER_ONE_ROUND"
@@ -146,10 +159,20 @@ interface PlayerProfile {
   default_preference: ProfilePreference;
   qq_number: string | null;
   usage_count: number;
+  qq_visibility?: "TERMINAL_ONLY" | "PUBLIC_WEBSITE";
+  notification_enabled?: boolean;
+  notify_queue_changes?: boolean;
+  notify_playing_position?: boolean;
+  notify_online_check_in?: boolean;
+  notify_absence?: boolean;
+  notify_machine_status?: boolean;
+  setup_version?: number;
+  profile_revision?: number;
   updated_at: number;
 }
 
 interface ProfilesResponse {
+  bot_qq?: string | null;
   profiles: PlayerProfile[];
 }
 
@@ -206,6 +229,55 @@ export const NOTIFICATION_RETRY_DELAYS_MS = [
 export const NOTIFICATION_MAX_ATTEMPTS = NOTIFICATION_RETRY_DELAYS_MS.length +
   1;
 const COMMAND_INPUT_TIMEOUT_MS = 60_000;
+const BOT_IDENTITY_RETRY_INTERVAL_MS = 30_000;
+const BOT_IDENTITY_REFRESH_INTERVAL_MS = 60 * 60 * 1_000;
+
+const NOTIFICATION_OPTIONS: ReadonlyArray<{
+  field: Exclude<NotificationPreferenceField, "notification_enabled">;
+  title: string;
+  commandId: string;
+  commandLabel: string;
+}> = [
+  {
+    field: "notify_queue_changes",
+    title: "队列状态变化",
+    commandId: "queue",
+    commandLabel: "队列状态",
+  },
+  {
+    field: "notify_playing_position",
+    title: "游玩位置变化",
+    commandId: "playing",
+    commandLabel: "游玩位置",
+  },
+  {
+    field: "notify_online_check_in",
+    title: "线上登记与签到",
+    commandId: "check-in",
+    commandLabel: "签到状态",
+  },
+  {
+    field: "notify_absence",
+    title: "暂缓一轮、暂时离开和未到场",
+    commandId: "absence",
+    commandLabel: "暂缓暂离",
+  },
+  {
+    field: "notify_machine_status",
+    title: "机台及营业状态",
+    commandId: "machine",
+    commandLabel: "机台状态",
+  },
+];
+
+const DEFAULT_NOTIFICATION_SETTINGS: Record<NotificationPreferenceField, boolean> = {
+  notification_enabled: true,
+  notify_queue_changes: true,
+  notify_playing_position: false,
+  notify_online_check_in: true,
+  notify_absence: true,
+  notify_machine_status: false,
+};
 
 export const HELP_TEXT = [
   "你好！",
@@ -293,9 +365,7 @@ export class QueueApi {
   async updateProfile(
     profileId: string,
     actorQq: string,
-    update: Partial<
-      Pick<PlayerProfile, "nickname" | "gender" | "default_preference">
-    >,
+    update: Partial<Pick<PlayerProfile, PlayerProfileUpdateField>>,
   ): Promise<RemoteCommand> {
     const response = await this.ctx.http<RemoteCommand | { error?: string }>(
       "PATCH",
@@ -312,6 +382,21 @@ export class QueueApi {
       );
     }
     return response.data as RemoteCommand;
+  }
+
+  async updateIdentity(botQq: string): Promise<void> {
+    const response = await this.ctx.http<{ error?: string }>(
+      "POST",
+      this.url("/api/queue-bot/identity"),
+      {
+        data: { bot_qq: botQq },
+        headers: this.privateHeaders(),
+        validateStatus: () => true,
+      },
+    );
+    if (response.status >= 400) {
+      throw new Error(profileUpdateErrorMessage(response.data, response.status));
+    }
   }
 
   async createQueueCommand(
@@ -378,6 +463,7 @@ export function apply(ctx: Context, config: Config) {
   if (configError) throw new Error(configError);
   const logger = ctx.logger(name);
   const api = new QueueApi(ctx, config);
+  startBotIdentityReporting(ctx, api, config, logger);
 
   ctx.model.extend("maimai_q_state", {
     key: "string",
@@ -583,53 +669,7 @@ export function apply(ctx: Context, config: Config) {
       })
     );
 
-  ctx.command("maimaiq.notifications [state:string]", "查看或调整排队通知")
-    .alias("排队通知")
-    .action(async ({ session }, state) =>
-      withCommandError(async () => {
-        const qq = requireQqSession(session);
-        const profiles = (await api.getProfiles(qq)).profiles;
-        if (!profiles.length) {
-          return "当前 QQ 尚未绑定玩家资料，不能调整排队通知。请先在机厅终端创建玩家资料。";
-        }
-        const requested = parseNotificationPreference(state);
-        if (state?.trim() && requested === null) {
-          return "请输入“开启”或“关闭”，也可以发送“开启排队通知”或“关闭排队通知”。";
-        }
-        if (requested !== null) {
-          await writeNotificationPreference(ctx, config, qq, requested);
-          return formatNotificationPreferenceChanged(
-            requested,
-            config.notificationEnabled,
-          );
-        }
-        const enabled = await readNotificationPreference(ctx, config, qq);
-        return formatNotificationPreferenceMenu(
-          enabled,
-          config.notificationEnabled,
-        );
-      })
-    );
-
-  ctx.command("maimaiq.notifications.enable", "开启排队通知")
-    .alias("开启排队通知")
-    .action(async ({ session }) =>
-      withCommandError(async () => {
-        const qq = await requireNotificationProfile(api, session);
-        await writeNotificationPreference(ctx, config, qq, true);
-        return formatNotificationPreferenceChanged(true, config.notificationEnabled);
-      })
-    );
-
-  ctx.command("maimaiq.notifications.disable", "关闭排队通知")
-    .alias("关闭排队通知")
-    .action(async ({ session }) =>
-      withCommandError(async () => {
-        const qq = await requireNotificationProfile(api, session);
-        await writeNotificationPreference(ctx, config, qq, false);
-        return formatNotificationPreferenceChanged(false, config.notificationEnabled);
-      })
-    );
+  registerNotificationCommands(ctx, api, config);
 
   if (config.notificationEnabled) {
     let polling = false;
@@ -647,6 +687,134 @@ export function apply(ctx: Context, config: Config) {
     ctx.on("ready", poll);
     ctx.setInterval(poll, config.notificationIntervalSeconds * 1_000);
   }
+}
+
+function startBotIdentityReporting(
+  ctx: Context,
+  api: QueueApi,
+  config: Config,
+  logger: ReturnType<Context["logger"]>,
+) {
+  let running = false;
+  let lastReportedQq = "";
+  let nextRefreshAt = 0;
+  let lastFailure = "";
+  const report = async () => {
+    if (running) return;
+    const bot = selectOneBot(ctx, config.oneBotSelfId);
+    const botQq = bot?.selfId.trim() ?? "";
+    if (!/^[0-9]{5,12}$/.test(botQq)) return;
+    const now = Date.now();
+    if (botQq === lastReportedQq && now < nextRefreshAt) return;
+    running = true;
+    try {
+      await api.updateIdentity(botQq);
+      lastReportedQq = botQq;
+      nextRefreshAt = now + BOT_IDENTITY_REFRESH_INTERVAL_MS;
+      lastFailure = "";
+    } catch (error) {
+      const detail = apiErrorMessage(error);
+      if (detail !== lastFailure) {
+        logger.warn("上报 QQ Bot 账号失败：%s", detail);
+        lastFailure = detail;
+      }
+    } finally {
+      running = false;
+    }
+  };
+  ctx.on("ready", report);
+  ctx.setInterval(report, BOT_IDENTITY_RETRY_INTERVAL_MS);
+}
+
+function registerNotificationCommands(
+  ctx: Context,
+  api: QueueApi,
+  config: Config,
+) {
+  ctx.command("maimaiq.notifications [state:string]", "查看或调整排队通知")
+    .alias("排队通知")
+    .action(async ({ session }, state) =>
+      withCommandError(async () => {
+        const current = await requireNotificationProfile(api, session);
+        const requested = parseNotificationPreference(state);
+        if (state?.trim() && requested === null) {
+          return "请输入“开启”或“关闭”，也可以发送“开启排队通知”或“关闭排队通知”。";
+        }
+        if (requested !== null) {
+          return submitNotificationPreferenceUpdate(
+            api,
+            config,
+            current,
+            "notification_enabled",
+            "排队通知",
+            requested,
+          );
+        }
+        return formatNotificationPreferenceMenu(
+          current.profile,
+          config.notificationEnabled,
+          current.botQq,
+        );
+      })
+    );
+
+  for (const option of NOTIFICATION_OPTIONS) {
+    for (const enabled of [true, false]) {
+      const action = enabled ? "enable" : "disable";
+      const actionLabel = enabled ? "开启" : "关闭";
+      ctx.command(
+        `maimaiq.notifications.${option.commandId}.${action}`,
+        `${actionLabel}${option.title}通知`,
+      )
+        .alias(`${actionLabel}${option.commandLabel}通知`)
+        .action(async ({ session }) =>
+          withCommandError(async () => {
+            const current = await requireNotificationProfile(api, session);
+            if (!notificationSetting(current.profile, "notification_enabled")) {
+              return "排队通知总开关已关闭。请先发送“开启排队通知”，再调整分项设置。";
+            }
+            return submitNotificationPreferenceUpdate(
+              api,
+              config,
+              current,
+              option.field,
+              option.title,
+              enabled,
+            );
+          })
+        );
+    }
+  }
+
+  ctx.command("maimaiq.notifications.enable", "开启排队通知")
+    .alias("开启排队通知")
+    .action(async ({ session }) =>
+      withCommandError(async () =>
+        submitNotificationPreferenceUpdate(
+          api,
+          config,
+          await requireNotificationProfile(api, session),
+          "notification_enabled",
+          "排队通知",
+          true,
+        )
+      )
+    );
+
+  ctx.command("maimaiq.notifications.disable", "关闭排队通知")
+    .alias("关闭排队通知")
+    .action(async ({ session }) =>
+      withCommandError(async () =>
+        submitNotificationPreferenceUpdate(
+          api,
+          config,
+          await requireNotificationProfile(api, session),
+          "notification_enabled",
+          "排队通知",
+          false,
+        )
+      )
+    );
 }
 
 interface CurrentQueueRegistration {
@@ -1188,7 +1356,6 @@ export async function pollNotifications(
         event,
         selectedBot,
         logState,
-        config,
       );
       if (!complete) {
         cursorBlocked = true;
@@ -1225,7 +1392,6 @@ async function processNotificationEvent(
   event: QueueEvent,
   bot: Bot | undefined,
   logState: { unavailableBotLogged: boolean },
-  config: Config,
 ): Promise<boolean> {
   const currentRecipients = [
     ...new Set(
@@ -1233,6 +1399,15 @@ async function processNotificationEvent(
     ),
   ];
   if (!currentRecipients.length) return true;
+  const preferenceChecks = new Map<string, Promise<boolean>>();
+  const isEnabled = (qqNumber: string) => {
+    let check = preferenceChecks.get(qqNumber);
+    if (!check) {
+      check = notificationEnabledForEvent(api, qqNumber, event.type);
+      preferenceChecks.set(qqNumber, check);
+    }
+    return check;
+  };
 
   let deliveries = await ctx.database.get("maimai_q_delivery", {
     queueId,
@@ -1242,7 +1417,7 @@ async function processNotificationEvent(
     const recipientPreferences = await Promise.all(
       currentRecipients.map(async (qqNumber) => ({
         qqNumber,
-        enabled: await readNotificationPreference(ctx, config, qqNumber),
+        enabled: await isEnabled(qqNumber),
       })),
     );
     const enabledRecipients = recipientPreferences
@@ -1271,7 +1446,7 @@ async function processNotificationEvent(
 
   for (const delivery of deliveries) {
     if (isNotificationDeliveryTerminal(delivery)) continue;
-    if (!await readNotificationPreference(ctx, config, delivery.qqNumber)) {
+    if (!await isEnabled(delivery.qqNumber)) {
       await writeNotificationDelivery(ctx, {
         ...delivery,
         status: "DELIVERED",
@@ -1428,33 +1603,6 @@ async function writeCursor(ctx: Context, key: string, cursor: EventCursor) {
   }]);
 }
 
-function notificationPreferenceStateKey(config: Config, qqNumber: string): string {
-  return `notification-preference:${new URL(config.apiBase).origin}:${qqNumber}`;
-}
-
-export async function readNotificationPreference(
-  ctx: Context,
-  config: Config,
-  qqNumber: string,
-): Promise<boolean> {
-  const rows = await ctx.database.get("maimai_q_state", {
-    key: notificationPreferenceStateKey(config, qqNumber),
-  });
-  return rows[0]?.value !== "disabled";
-}
-
-export async function writeNotificationPreference(
-  ctx: Context,
-  config: Config,
-  qqNumber: string,
-  enabled: boolean,
-) {
-  await ctx.database.upsert("maimai_q_state", [{
-    key: notificationPreferenceStateKey(config, qqNumber),
-    value: enabled ? "enabled" : "disabled",
-  }]);
-}
-
 export function parseNotificationPreference(value?: string): boolean | null {
   switch (value?.trim()) {
     case "开启":
@@ -1469,46 +1617,173 @@ export function parseNotificationPreference(value?: string): boolean | null {
   }
 }
 
-function formatNotificationPreferenceMenu(
-  enabled: boolean,
+export function notificationSetting(
+  profile: PlayerProfile,
+  field: NotificationPreferenceField,
+): boolean {
+  return profile[field] ?? DEFAULT_NOTIFICATION_SETTINGS[field];
+}
+
+export function notificationFieldForEvent(
+  eventType: string,
+): Exclude<NotificationPreferenceField, "notification_enabled"> {
+  if (eventType === "PLAYING_CHANGED") return "notify_playing_position";
+  if (
+    [
+      "ONLINE_REGISTRATION_ADDED",
+      "ONLINE_CHECK_IN_COMPLETED",
+      "ONLINE_CHECK_IN_TIMED_OUT",
+      "ONLINE_CHECK_IN_MISSED",
+    ].includes(eventType)
+  ) {
+    return "notify_online_check_in";
+  }
+  if (
+    [
+      "NO_SHOW_DEFERRED",
+      "NO_SHOW_MOVED_TO_TAIL",
+      "NO_SHOW_REMOVED",
+      "TEMPORARY_AWAY_EXPIRED",
+      "ABSENCE_CHANGED",
+    ].includes(eventType)
+  ) {
+    return "notify_absence";
+  }
+  if (
+    [
+      "MACHINE_STOPPED",
+      "MACHINE_RESTORED",
+      "REGISTRATION_OPENED",
+      "REGISTRATION_CLOSED",
+    ].includes(eventType)
+  ) {
+    return "notify_machine_status";
+  }
+  return "notify_queue_changes";
+}
+
+export function profileAllowsEventNotification(
+  profile: PlayerProfile,
+  eventType: string,
+): boolean {
+  return notificationSetting(profile, "notification_enabled") &&
+    notificationSetting(profile, notificationFieldForEvent(eventType));
+}
+
+async function notificationEnabledForEvent(
+  api: QueueApi,
+  qqNumber: string,
+  eventType: string,
+): Promise<boolean> {
+  const response = await api.getProfiles(qqNumber);
+  const profile = response.profiles.find((item) => item.qq_number === qqNumber) ??
+    response.profiles[0];
+  return profile ? profileAllowsEventNotification(profile, eventType) : false;
+}
+
+export function formatNotificationPreferenceMenu(
+  profile: PlayerProfile,
   systemEnabled: boolean,
+  botQq?: string | null,
 ): string {
-  return [
+  const enabled = notificationSetting(profile, "notification_enabled");
+  const lines = [
     "排队通知",
     "",
-    `个人设置：${enabled ? "已开启" : "已关闭"}`,
+    `总开关：${enabled ? "已开启" : "已关闭"}`,
+    ...NOTIFICATION_OPTIONS.map((option) =>
+      `${option.title}：${notificationSetting(profile, option.field) ? "已开启" : "已关闭"}`
+    ),
     `系统通知：${systemEnabled ? "正在运行" : "暂未启用"}`,
     "",
-    "开启后，与你有关的排队变动会通过 QQ 私聊发送。",
+    botQq
+      ? `需要添加 QQ Bot（${botQq}）为好友，才能接收主动私信。`
+      : "需要添加 QQ Bot 为好友，才能接收主动私信。",
     "",
-    " - 开启排队通知",
-    " - 关闭排队通知",
-  ].join("\n");
+    ` - ${enabled ? "关闭" : "开启"}排队通知`,
+  ];
+  if (enabled) {
+    lines.push(
+      ...NOTIFICATION_OPTIONS.map((option) =>
+        ` - ${notificationSetting(profile, option.field) ? "关闭" : "开启"}${option.commandLabel}通知`
+      ),
+    );
+  }
+  return lines.join("\n");
 }
 
 function formatNotificationPreferenceChanged(
+  title: string,
   enabled: boolean,
   systemEnabled: boolean,
 ): string {
+  const label = title.endsWith("通知") ? title : `${title}通知`;
+  if (title !== "排队通知") {
+    const result = `${label}已${enabled ? "开启" : "关闭"}。`;
+    return systemEnabled
+      ? result
+      : `${result}\n\n系统通知目前暂未启用；系统恢复后，将按照这项设置发送。`;
+  }
   if (!enabled) {
     return "排队通知已关闭。\n\n之后发生的个人排队变动不会再通过私聊发送；你仍可随时重新开启。";
   }
   return systemEnabled
-    ? "排队通知已开启。\n\n之后发生的个人排队变动会通过私聊发送。"
+    ? "排队通知已开启。\n\n之后会按照各分项设置，通过私聊发送与你有关的排队变动。"
     : "排队通知的个人设置已开启。\n\n系统通知目前暂未启用；系统恢复后，将按照这项设置发送。";
+}
+
+interface NotificationProfileContext {
+  qq: string;
+  profile: PlayerProfile;
+  botQq: string | null;
 }
 
 async function requireNotificationProfile(
   api: QueueApi,
   session: Session | undefined,
-): Promise<string> {
+): Promise<NotificationProfileContext> {
   const qq = requireQqSession(session);
-  if (!(await api.getProfiles(qq)).profiles.length) {
+  const response = await api.getProfiles(qq);
+  if (!response.profiles.length) {
     throw new Error(
       "当前 QQ 尚未绑定玩家资料，不能调整排队通知。请先在机厅终端创建玩家资料。",
     );
   }
-  return qq;
+  const profile = requireSingleProfile(response.profiles);
+  return {
+    qq,
+    profile,
+    botQq: response.bot_qq?.trim() || null,
+  };
+}
+
+async function submitNotificationPreferenceUpdate(
+  api: QueueApi,
+  config: Config,
+  current: NotificationProfileContext,
+  field: NotificationPreferenceField,
+  title: string,
+  enabled: boolean,
+): Promise<string> {
+  const label = title.endsWith("通知") ? title : `${title}通知`;
+  if (notificationSetting(current.profile, field) === enabled) {
+    return `${label}已经${enabled ? "开启" : "关闭"}。`;
+  }
+  let command = await api.updateProfile(current.profile.profile_id, current.qq, {
+    [field]: enabled,
+  });
+  const deadline = Date.now() + config.commandWaitSeconds * 1_000;
+  while (command.status === "PENDING" && Date.now() < deadline) {
+    await sleep(1_000);
+    command = await api.getCommand(command.command_id);
+  }
+  if (command.status === "APPLIED") {
+    return formatNotificationPreferenceChanged(title, enabled, config.notificationEnabled);
+  }
+  if (command.status === "REJECTED") {
+    return command.result_detail || "机厅终端拒绝了这次通知设置修改。";
+  }
+  return "通知设置已经提交，正在等待机厅终端确认。稍后可使用“排队通知”查看结果。";
 }
 
 export function isOnlyBotMention(

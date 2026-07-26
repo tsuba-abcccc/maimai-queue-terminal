@@ -13,7 +13,8 @@ enum class AuditLogSource {
     ON_SITE_TERMINAL,
     QQ_BOT,
     SYSTEM_AUTOMATIC,
-    WEBSITE_REMOTE
+    WEBSITE_REMOTE,
+    MOBILE_DEVICE
 }
 
 enum class PublicQueueEventType {
@@ -26,6 +27,8 @@ enum class PublicQueueEventType {
     NO_SHOW_MOVED_TO_TAIL,
     NO_SHOW_REMOVED,
     TEMPORARY_AWAY_EXPIRED,
+    ONLINE_REGISTRATION_ADDED,
+    ONLINE_CHECK_IN_COMPLETED,
     ONLINE_CHECK_IN_TIMED_OUT,
     ONLINE_CHECK_IN_MISSED,
     ABSENCE_CHANGED,
@@ -243,6 +246,8 @@ fun createQueueAuditLog(
         PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场 · 已移至队尾"
         PublicQueueEventType.NO_SHOW_REMOVED -> "未到场 · 已移除登记"
         PublicQueueEventType.TEMPORARY_AWAY_EXPIRED -> "暂时离开已达轮空上限"
+        PublicQueueEventType.ONLINE_REGISTRATION_ADDED -> "线上登记已创建"
+        PublicQueueEventType.ONLINE_CHECK_IN_COMPLETED -> "线上登记签到状态已更新"
         PublicQueueEventType.ONLINE_CHECK_IN_TIMED_OUT -> "线上登记签到超时"
         PublicQueueEventType.ONLINE_CHECK_IN_MISSED -> "未签到登记已自动移除"
         else -> when {

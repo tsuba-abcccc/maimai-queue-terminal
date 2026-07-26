@@ -5,13 +5,14 @@ const {
   NOTIFICATION_MAX_ATTEMPTS,
   NOTIFICATION_RETRY_DELAYS_MS,
   QueueApi,
+  formatNotificationPreferenceMenu,
   isNotificationDeliveryDue,
   isNotificationDeliveryTerminal,
   nextNotificationFailure,
+  notificationFieldForEvent,
   pollNotifications,
-  readNotificationPreference,
+  profileAllowsEventNotification,
   redactQqNumber,
-  writeNotificationPreference,
 } = require('../lib')
 
 class MemoryDatabase {
@@ -94,6 +95,35 @@ function config() {
   }
 }
 
+function notificationProfile(qq, overrides = {}) {
+  return {
+    profile_id: `profile-${qq}`,
+    nickname: `玩家${qq}`,
+    gender: 'UNDISCLOSED',
+    default_preference: 'OPEN_TO_JOIN',
+    qq_number: qq,
+    usage_count: 1,
+    qq_visibility: 'TERMINAL_ONLY',
+    notification_enabled: true,
+    notify_queue_changes: true,
+    notify_playing_position: true,
+    notify_online_check_in: true,
+    notify_absence: true,
+    notify_machine_status: true,
+    setup_version: 1,
+    profile_revision: 1,
+    updated_at: 1_000,
+    ...overrides,
+  }
+}
+
+function profileResponse(qq, overrides = {}) {
+  return {
+    bot_qq: '10000',
+    profiles: [notificationProfile(qq, overrides)],
+  }
+}
+
 function logger() {
   return { debug() {}, info() {}, warn() {} }
 }
@@ -166,24 +196,120 @@ test('redacts every occurrence of the current QQ from adapter errors', () => {
   assert.doesNotMatch(redacted, /12345678/)
 })
 
-test('queue notifications default to enabled and persist per QQ', async () => {
-  const database = new MemoryDatabase()
-  const ctx = { database }
-  const currentConfig = config()
+test('reports the active Bot QQ to the private identity endpoint', async () => {
+  const requests = []
+  const http = async (...args) => {
+    requests.push(args)
+    return { status: 200, data: { ok: true } }
+  }
+  const api = new QueueApi({ http }, config())
 
+  await api.updateIdentity('123456789')
+
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0][0], 'POST')
   assert.equal(
-    await readNotificationPreference(ctx, currentConfig, '12345678'),
-    true,
+    requests[0][1],
+    'https://queue.example.test/api/queue-bot/identity',
   )
-  await writeNotificationPreference(ctx, currentConfig, '12345678', false)
+  assert.deepEqual(requests[0][2].data, { bot_qq: '123456789' })
   assert.equal(
-    await readNotificationPreference(ctx, currentConfig, '12345678'),
-    false,
+    requests[0][2].headers.Authorization,
+    'Bearer test-token',
   )
-  assert.equal(
-    await readNotificationPreference(ctx, currentConfig, '87654321'),
-    true,
-  )
+})
+
+test('submits every notification preference through player profile updates', async () => {
+  const requests = []
+  const http = async (...args) => {
+    requests.push(args)
+    return {
+      status: 202,
+      data: {
+        command_id: '00000000-0000-0000-0000-000000000401',
+        status: 'PENDING',
+        result_detail: null,
+      },
+    }
+  }
+  const api = new QueueApi({ http }, config())
+  const updates = [
+    ['notification_enabled', false],
+    ['notify_queue_changes', false],
+    ['notify_playing_position', true],
+    ['notify_online_check_in', false],
+    ['notify_absence', false],
+    ['notify_machine_status', true],
+  ]
+
+  for (const [field, enabled] of updates) {
+    await api.updateProfile(
+      '00000000-0000-0000-0000-000000000001',
+      '12345678',
+      { [field]: enabled },
+    )
+  }
+
+  assert.equal(requests.length, updates.length)
+  for (const [index, [field, enabled]] of updates.entries()) {
+    const [, url, options] = requests[index]
+    assert.equal(
+      url,
+      'https://queue.example.test/api/queue-bot/profiles/' +
+        '00000000-0000-0000-0000-000000000001',
+    )
+    assert.equal(options.data.actor_qq, '12345678')
+    assert.equal(options.data[field], enabled)
+    assert.equal(typeof options.data.request_id, 'string')
+  }
+})
+
+test('maps queue events to the same notification categories as the server', () => {
+  const expectations = {
+    PLAYING_CHANGED: 'notify_playing_position',
+    ONLINE_REGISTRATION_ADDED: 'notify_online_check_in',
+    ONLINE_CHECK_IN_COMPLETED: 'notify_online_check_in',
+    ONLINE_CHECK_IN_TIMED_OUT: 'notify_online_check_in',
+    ONLINE_CHECK_IN_MISSED: 'notify_online_check_in',
+    NO_SHOW_DEFERRED: 'notify_absence',
+    NO_SHOW_MOVED_TO_TAIL: 'notify_absence',
+    NO_SHOW_REMOVED: 'notify_absence',
+    TEMPORARY_AWAY_EXPIRED: 'notify_absence',
+    ABSENCE_CHANGED: 'notify_absence',
+    MACHINE_STOPPED: 'notify_machine_status',
+    MACHINE_RESTORED: 'notify_machine_status',
+    REGISTRATION_OPENED: 'notify_machine_status',
+    REGISTRATION_CLOSED: 'notify_machine_status',
+    REGISTRATION_UPDATED: 'notify_queue_changes',
+  }
+
+  for (const [eventType, field] of Object.entries(expectations)) {
+    assert.equal(notificationFieldForEvent(eventType), field)
+  }
+})
+
+test('uses documented defaults and formats the cloud notification menu', () => {
+  const profile = notificationProfile('12345678', {
+    notification_enabled: undefined,
+    notify_queue_changes: undefined,
+    notify_playing_position: undefined,
+    notify_online_check_in: undefined,
+    notify_absence: undefined,
+    notify_machine_status: undefined,
+  })
+
+  assert.equal(profileAllowsEventNotification(profile, 'REGISTRATION_UPDATED'), true)
+  assert.equal(profileAllowsEventNotification(profile, 'PLAYING_CHANGED'), false)
+  assert.equal(profileAllowsEventNotification(profile, 'ONLINE_CHECK_IN_COMPLETED'), true)
+  assert.equal(profileAllowsEventNotification(profile, 'ABSENCE_CHANGED'), true)
+  assert.equal(profileAllowsEventNotification(profile, 'MACHINE_STOPPED'), false)
+
+  const menu = formatNotificationPreferenceMenu(profile, true, '123456789')
+  assert.match(menu, /总开关：已开启/)
+  assert.match(menu, /游玩位置变化：已关闭/)
+  assert.match(menu, /QQ Bot（123456789）/)
+  assert.match(menu, /关闭排队通知/)
+  assert.match(menu, /开启游玩位置通知/)
 })
 
 test('disabled recipients are skipped without blocking later queue events', async () => {
@@ -193,12 +319,6 @@ test('disabled recipients are skipped without blocking later queue events', asyn
     key: 'event-cursor:https://queue.example.test',
     value: JSON.stringify({ queueId: 'queue-1', cursor: 0 }),
   }])
-  await writeNotificationPreference(
-    { database },
-    currentConfig,
-    '11111',
-    false,
-  )
   const sends = []
   const bot = {
     platform: 'onebot',
@@ -208,6 +328,11 @@ test('disabled recipients are skipped without blocking later queue events', asyn
   }
   const api = {
     async getEvents(after) { return eventPage(after) },
+    async getProfiles(qq) {
+      return profileResponse(qq, {
+        notification_enabled: qq !== '11111',
+      })
+    },
     async getPlayers() { return { queue_id: 'queue-1', players: [] } },
   }
 
@@ -223,6 +348,46 @@ test('disabled recipients are skipped without blocking later queue events', asyn
     'event-cursor:https://queue.example.test',
   ).value)
   assert.equal(cursor.cursor, 2)
+})
+
+test('a disabled event category is skipped without sending a private message', async () => {
+  const database = new MemoryDatabase()
+  await database.upsert('maimai_q_state', [{
+    key: 'event-cursor:https://queue.example.test',
+    value: JSON.stringify({ queueId: 'queue-1', cursor: 0 }),
+  }])
+  const sends = []
+  const bot = {
+    platform: 'onebot',
+    selfId: '10000',
+    isActive: true,
+    async sendPrivateMessage(qq) { sends.push(qq) },
+  }
+  const api = {
+    async getEvents(after) {
+      const page = eventPage(after)
+      return { ...page, events: page.events.slice(0, 1), latest_cursor: 1 }
+    },
+    async getProfiles(qq) {
+      return profileResponse(qq, { notify_playing_position: false })
+    },
+    async getPlayers() {
+      assert.fail('不应查询已关闭分项对应的排队状态')
+    },
+  }
+
+  await pollNotifications(
+    { database, bots: [bot] },
+    api,
+    config(),
+    logger(),
+  )
+
+  assert.deepEqual(sends, [])
+  const cursor = JSON.parse(database.states.get(
+    'event-cursor:https://queue.example.test',
+  ).value)
+  assert.equal(cursor.cursor, 1)
 })
 
 test('existing notification cursors continue through a new queue batch', async () => {
@@ -249,6 +414,7 @@ test('existing notification cursors continue through a new queue batch', async (
         has_more: false,
       }
     },
+    async getProfiles(qq) { return profileResponse(qq) },
     async getPlayers() { return { queue_id: 'queue-2', players: [] } },
   }
 
@@ -274,6 +440,7 @@ test('disabling notifications cancels an existing pending retry', async () => {
     value: JSON.stringify({ queueId: 'queue-1', cursor: 0 }),
   }])
   const sends = []
+  let firstRecipientEnabled = true
   const bot = {
     platform: 'onebot',
     selfId: '10000',
@@ -285,6 +452,11 @@ test('disabling notifications cancels an existing pending retry', async () => {
   }
   const api = {
     async getEvents(after) { return eventPage(after) },
+    async getProfiles(qq) {
+      return profileResponse(qq, {
+        notification_enabled: qq !== '11111' || firstRecipientEnabled,
+      })
+    },
     async getPlayers() { return { queue_id: 'queue-1', players: [] } },
   }
   const ctx = { database, bots: [bot] }
@@ -296,7 +468,7 @@ test('disabling notifications cancels an existing pending retry', async () => {
     'PENDING',
   )
 
-  await writeNotificationPreference(ctx, currentConfig, '11111', false)
+  firstRecipientEnabled = false
   await pollNotifications(ctx, api, currentConfig, logger())
 
   assert.deepEqual(sends, ['11111', '22222'])
@@ -335,6 +507,7 @@ test('uses an active OneBot when an earlier matching instance is offline', async
     async getEvents(after) {
       return eventPage(after)
     },
+    async getProfiles(qq) { return profileResponse(qq) },
     async getPlayers() {
       return { queue_id: 'queue-1', players: [] }
     },
@@ -373,6 +546,7 @@ test('a failing recipient does not block later delivery or cause duplicates', as
     async getEvents(after) {
       return eventPage(after)
     },
+    async getProfiles(qq) { return profileResponse(qq) },
     async getPlayers() {
       return { queue_id: 'queue-1', players: [] }
     },

@@ -1,6 +1,9 @@
 package com.abcccc.maimaiqueue
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class QueueRuleSettingsTest {
@@ -31,5 +34,77 @@ class QueueRuleSettingsTest {
             "A区入口侧",
             limitMachineRemarkLength("A区入口侧")
         )
+    }
+
+    @Test
+    fun queueSyncEndpointAcceptsSiteRootAndCanonicalEndpoint() {
+        assertEquals(
+            "https://example.com/api/queue-status",
+            normalizeQueueSyncEndpoint(" https://example.com/ ")
+        )
+        assertEquals(
+            "https://example.com/api/queue-status",
+            normalizeQueueSyncEndpoint("https://example.com/api/queue-status/")
+        )
+        assertEquals(
+            "https://example.com/custom/api/queue-status",
+            normalizeQueueSyncEndpoint("https://example.com/custom/api/queue-status")
+        )
+    }
+
+    @Test
+    fun queueSyncEndpointRejectsUnsafeOrIncompleteAddresses() {
+        assertNull(normalizeQueueSyncEndpoint("http://example.com"))
+        assertNull(normalizeQueueSyncEndpoint("https://example.com/api/queue-status?debug=1"))
+        assertNull(normalizeQueueSyncEndpoint("https:///api/queue-status"))
+        assertNull(normalizeQueueSyncEndpoint("example.com"))
+    }
+
+    @Test
+    fun queueSyncTokenUsesUtf8ByteMinimumAndCharacterMaximum() {
+        assertFalse(isValidQueueSyncToken("a".repeat(31)))
+        assertTrue(isValidQueueSyncToken("a".repeat(32)))
+        assertTrue(isValidQueueSyncToken("中".repeat(11)))
+        assertFalse(isValidQueueSyncToken("a".repeat(MAX_QUEUE_SYNC_TOKEN_CHARACTERS + 1)))
+    }
+
+    @Test
+    fun runtimeSettingsNormalizeConnectionAndDisableInvalidSync() {
+        val valid = normalizeQueueRuleSettingsForRuntime(
+            settings = QueueRuleSettings(
+                queueSyncEndpoint = "https://example.com/",
+                queueSyncToken = "a".repeat(32)
+            ),
+            cloudSyncAvailable = true
+        )
+        assertEquals("https://example.com/api/queue-status", valid.queueSyncEndpoint)
+        assertTrue(valid.websiteSyncEnabled)
+        assertTrue(valid.oneBotSyncEnabled)
+
+        val invalid = normalizeQueueRuleSettingsForRuntime(
+            settings = QueueRuleSettings(
+                queueSyncEndpoint = "https://example.com",
+                queueSyncToken = "short"
+            ),
+            cloudSyncAvailable = true
+        )
+        assertFalse(invalid.websiteSyncEnabled)
+        assertFalse(invalid.oneBotSyncEnabled)
+    }
+
+    @Test
+    fun localRuntimeAlwaysClearsCloudConnection() {
+        val settings = normalizeQueueRuleSettingsForRuntime(
+            settings = QueueRuleSettings(
+                queueSyncEndpoint = "https://example.com/api/queue-status",
+                queueSyncToken = "a".repeat(32)
+            ),
+            cloudSyncAvailable = false
+        )
+
+        assertFalse(settings.websiteSyncEnabled)
+        assertFalse(settings.oneBotSyncEnabled)
+        assertEquals("", settings.queueSyncEndpoint)
+        assertEquals("", settings.queueSyncToken)
     }
 }

@@ -9,7 +9,7 @@
 - 网站和 QQ Bot 的修改先保存为待执行命令，终端拉取并按本地规则校验，通过后才成为正式数据。
 - 终端可以独立关闭“QQ Bot 联动”；关闭时 Bot 接口停止服务，待执行命令失效，关闭期间不积压通知。
 - 终端可以独立关闭“允许线上登记”；关闭后只拒绝新建线上登记，队列查询、通知、资料同步和已有登记管理保持可用。
-- `GET /api/queue-status` 与 `GET /api/queue-logs` 是公开接口。队列状态只为当前有效的资料库登记返回 QQ，便于网站详情联系玩家；性别、资料 UUID、完整资料库和私有命令不会公开。
+- `GET /api/queue-status` 与 `GET /api/queue-logs` 是公开接口。只有玩家选择“允许网站显示”后，队列状态才为其当前有效登记返回 QQ；性别、资料 UUID、完整资料库和私有命令不会公开。
 - Bot 和终端私有接口分别使用独立令牌，不能在网页前端暴露。
 
 ## 环境变量
@@ -26,9 +26,12 @@ QUEUE_COMMAND_TIMEOUT_SECONDS=600
 QUEUE_COMMAND_RETENTION_SECONDS=2592000
 QUEUE_EVENT_RECIPIENT_RETENTION_SECONDS=2592000
 QUEUE_CORS_ORIGIN=https://abcccc.top
+QUEUE_PUBLIC_SITE_URL=https://abcccc.top/queue-status
+QUEUE_MOBILE_SESSION_TTL_SECONDS=600
+QUEUE_MOBILE_SESSION_RETENTION_SECONDS=86400
 ```
 
-`QUEUE_PROFILE_SCOPE_ID` 表示同一机厅共享的玩家资料库。主备终端使用相同值即可读取同一份云端资料，但同 UUID 的本机资料仍然优先。
+`QUEUE_PROFILE_SCOPE_ID` 表示同一机厅共享的玩家资料库。主备终端使用相同值即可读取同一份云端资料；同 UUID 通过递增的资料版本合并，终端仍负责拒绝昵称、QQ 和当前队列冲突。
 
 每份鉴权令牌在启用对应私有接口时都必须达到 32 个 UTF-8 字节；两份令牌都配置时不能相同。某份配置缺失或过短时，对应私有接口统一返回 `503`；两份配置相同时，终端与 Bot 私有接口都会返回 `503`。健康检查仍会响应，服务不会降级为未鉴权访问。可使用 `openssl rand -hex 32` 分别生成两份独立令牌。
 
@@ -37,6 +40,8 @@ QUEUE_CORS_ORIGIN=https://abcccc.top
 `QUEUE_COMMAND_RETENTION_SECONDS` 控制已完成命令的保留时间，默认 30 天。到期后会删除包含 QQ 的命令载荷，避免私有信息无限期留存。
 
 `QUEUE_EVENT_RECIPIENT_RETENTION_SECONDS` 控制日志通知与 QQ 收件人的私有关联保留时间，默认 30 天。到期后只删除 QQ 收件人关联，公开日志仍会保留。清理由终端同步或 Bot 读取通知时执行。
+
+`QUEUE_PUBLIC_SITE_URL` 是终端“使用移动设备登记”二维码打开的排队页面。`QUEUE_MOBILE_SESSION_TTL_SECONDS` 控制二维码有效时间，默认 10 分钟；`QUEUE_MOBILE_SESSION_RETENTION_SECONDS` 控制已结束会话和结果的保留时间，默认 24 小时。
 
 ## 接口边界
 
@@ -56,12 +61,21 @@ POST /api/queue-online/join                    {"request_id":"<UUID>","qq":"<QQ�
 GET  /api/queue-online/commands/<command_id>
 ```
 
+终端二维码对应的移动设备登记接口使用短时会话令牌，不使用 Bot 令牌：
+
+```text
+GET  /api/queue-mobile/sessions/<session_token>
+POST /api/queue-mobile/sessions/<session_token>/submit
+GET  /api/queue-mobile/sessions/<session_token>/result
+```
+
 终端接口，使用 `QUEUE_SYNC_TOKEN` 和 `X-Device-ID`：
 
 ```text
 POST /api/queue-status
 GET  /api/queue-terminal/profiles
 GET  /api/queue-terminal/commands
+POST /api/queue-terminal/mobile-registration-sessions
 POST /api/queue-terminal/commands/<command_id>/result
 ```
 
@@ -74,6 +88,7 @@ POST  /api/queue-bot/events       {"qq":"<QQ号>","after":0,"limit":50}
 GET   /api/queue-bot/events?after=<游标>&limit=50
 PATCH /api/queue-bot/profiles/<profile_id>
 POST  /api/queue-bot/queue-commands
+POST  /api/queue-bot/identity
 GET   /api/queue-bot/commands/<command_id>
 ```
 
@@ -139,7 +154,7 @@ Koishi 保存每个机厅的 `next_cursor`，周期读取：
 GET /api/queue-bot/events?after=<next_cursor>&limit=50
 ```
 
-每个事件包含 `affected_players`，可以按 `qq_number` 发送与本人有关的日志；`operation_source` 说明事件来自现场终端、QQ Bot、系统自动流程或预留的网站远程操作。事件首次入库时会一次性固定当时的 QQ 接收人；同一事件编号再次上传不会增加、替换收件人，之后修改资料 QQ 也不会把历史通知转给另一账号。`PLAYING_CHANGED` 可用于上机通知；未到场、暂缓、暂离和退出等事件也会保留对应 QQ 关联。开始新队列后，上一队列的当前登记关联会清除；历史通知关联在达到配置的保留期限后删除。
+每个事件包含 `affected_players`，可以按 `qq_number` 发送与本人有关的日志；`operation_source` 说明事件来自现场终端、移动设备登记、QQ Bot、系统自动流程或预留的网站远程操作。事件首次入库时会一次性固定当时的 QQ 接收人；同一事件编号再次上传不会增加、替换收件人，之后修改资料 QQ 也不会把历史通知转给另一账号。`PLAYING_CHANGED` 可用于游玩位置通知；未到场、暂缓、暂离和退出等事件也会保留对应 QQ 关联。开始新队列后，上一队列的当前登记关联会清除；历史通知关联在达到配置的保留期限后删除。
 
 使用 POST 按 QQ 筛选事件时，`affected_players` 只返回该 QQ 自己的关联，不会附带同一事件中其他玩家的 QQ。使用 GET 读取全量通知时仍会返回全部收件人，供受信任的 Koishi 服务统一投递。同一玩家在当前队列批次退出后重新登记时，当前 QQ 绑定会跟随新登记；退出期间已经固定的历史通知收件人不会改变。
 
@@ -215,7 +230,7 @@ docker compose logs --tail=100 maimai-queue-status
 
 ### 2. 更新 Nginx 路由
 
-把当前 [nginx-location.conf.example](./nginx-location.conf.example) 中的 `/api/queue-online/`、`/api/queue-bot/` 和 `/api/queue-terminal/` location 合并到现有 HTTPS 站点。不要用示例文件覆盖站点中的证书、静态网站或其他 location。随后执行：
+把当前 [nginx-location.conf.example](./nginx-location.conf.example) 中的 `/api/queue-online/`、`/api/queue-mobile/`、`/api/queue-bot/` 和 `/api/queue-terminal/` location 合并到现有 HTTPS 站点。不要用示例文件覆盖站点中的证书、静态网站或其他 location。随后执行：
 
 ```bash
 sudo nginx -t
@@ -230,10 +245,11 @@ sudo systemctl reload nginx
 curl -i https://abcccc.top/queue-api-healthz
 curl -i -X POST -H 'Content-Type: application/json' \
   -d '{"qq":"00000"}' https://abcccc.top/api/queue-online/profile
+curl -i https://abcccc.top/api/queue-mobile/sessions/invalid-token
 curl -i 'https://abcccc.top/api/queue-bot/events?after=0&limit=1'
 ```
 
-第一条应返回 `200`。第二条应返回后端 JSON；测试 QQ 不存在时通常为 `404 PROFILE_NOT_FOUND`，这证明网站线上登记路由已经生效。第三条故意不带令牌，应返回 `401` 和“Bot 认证失败”，这说明 Bot 路由已经到达新版后端。其他结果的含义如下：
+第一条应返回 `200`。第二条应返回后端 JSON；测试 QQ 不存在时通常为 `404 PROFILE_NOT_FOUND`，这证明网站线上登记路由已经生效。第三条应返回后端 JSON `404` 和“没有找到这次移动设备登记”，证明移动登记路由已经生效。第四条故意不带令牌，应返回 `401` 和“Bot 认证失败”，这说明 Bot 路由已经到达新版后端。其他结果的含义如下：
 
 - `404 接口不存在`：新版 `app.py` 或 Nginx 的 `/api/queue-bot/` 路由尚未部署。
 - `503 服务器鉴权配置无效`：Bot 令牌缺失、少于 32 字节，或与终端令牌相同。

@@ -231,7 +231,7 @@ class QueueCloudSnapshotTest {
         )
         val events = snapshot.getJSONArray("recent_events")
 
-        assertEquals(4, snapshot.getInt("schema_version"))
+        assertEquals(5, snapshot.getInt("schema_version"))
         assertEquals(1, events.length())
         assertEquals("NO_SHOW_MOVED_TO_TAIL", events.getJSONObject(0).getString("type"))
         assertEquals("QQ_BOT", events.getJSONObject(0).getString("operation_source"))
@@ -297,7 +297,7 @@ class QueueCloudSnapshotTest {
         val profiles = snapshot.getJSONArray("private_player_profiles")
         val contact = contacts.getJSONObject(0)
 
-        assertEquals(4, snapshot.getInt("schema_version"))
+        assertEquals(5, snapshot.getInt("schema_version"))
         assertEquals(1, contacts.length())
         assertEquals(3, profiles.length())
         assertEquals(publicRegistrationId(queueId, 10), contact.getString("registration_id"))

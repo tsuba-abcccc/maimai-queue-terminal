@@ -91,7 +91,7 @@ internal fun decideRemoteQueueOperation(
     if (command.operation == RemoteQueueOperation.JOIN_QUEUE) {
         val exactRegistration = state.queues.values.asSequence()
             .flatMap { it.allRegistrations.asSequence() }
-            .firstOrNull { it.onlineRegistrationCommandId == command.commandId }
+            .firstOrNull { it.originatingCommandId == command.commandId }
         if (exactRegistration != null) {
             return already(
                 "线上登记已经加入等待顺序。请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。"
@@ -141,7 +141,7 @@ internal fun decideRemoteQueueOperation(
             gender = profile.gender,
             playerProfileId = profile.id,
             requiresOnSiteCheckIn = true,
-            onlineRegistrationCommandId = command.commandId
+            originatingCommandId = command.commandId
         )
         // A remote join may arrive while the playing position was deliberately left empty.
         // It must only append the pending registration and never advance another group.

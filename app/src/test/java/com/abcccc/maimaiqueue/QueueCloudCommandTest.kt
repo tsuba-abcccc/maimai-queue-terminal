@@ -68,6 +68,42 @@ class QueueCloudCommandTest {
     }
 
     @Test
+    fun terminalCommandResponseParsesMobileDeviceRegistration() {
+        val parsed = parseRemoteTerminalCommands(
+            """
+            {
+              "commands": [{
+                "command_id": "00000000-0000-0000-0000-000000000821",
+                "type": "MOBILE_DEVICE_REGISTRATION",
+                "created_at": 2000,
+                "payload": {
+                  "queue_id": "00000000-0000-0000-0000-000000000001",
+                  "machine_id": "A",
+                  "actor_qq": "12345678",
+                  "preference": "OPEN_TO_JOIN",
+                  "operation_source": "MOBILE_DEVICE",
+                  "session_id": "00000000-0000-0000-0000-000000000820",
+                  "profile": {
+                    "mode": "EXISTING",
+                    "profile_id": "00000000-0000-0000-0000-000000000901",
+                    "expected_profile_revision": 3,
+                    "completion": null
+                  }
+                }
+              }]
+            }
+            """.trimIndent()
+        )
+
+        assertEquals(1, parsed.size)
+        val command = parsed.single() as MobileDeviceRegistrationCommand
+        assertEquals("A", command.machineId)
+        assertEquals(3L, command.expectedProfileRevision)
+        assertEquals(PlayPreference.OPEN_TO_JOIN, command.preference)
+        assertTrue(!command.createsProfile)
+    }
+
+    @Test
     fun matchingCommandProducesUpdatedProfile() {
         val original = profile()
         val decision = decidePlayerProfileUpdate(

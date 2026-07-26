@@ -28,6 +28,64 @@ class PlayerProfilesTest {
     )
 
     @Test
+    fun notificationDefaultsEnableOnlyTheRequestedCategories() {
+        val preferences = QueueNotificationPreferences()
+
+        assertTrue(preferences.enabled)
+        assertTrue(preferences.queueChanges)
+        assertFalse(preferences.playingPosition)
+        assertTrue(preferences.onlineCheckIn)
+        assertTrue(preferences.absence)
+        assertFalse(preferences.machineStatus)
+    }
+
+    @Test
+    fun notificationDefaultsDoNotMakeALegacyProfileComplete() {
+        val legacyProfile = profile("1", "旧资料")
+
+        assertEquals(QueueNotificationPreferences(), legacyProfile.notificationPreferences)
+        assertFalse(legacyProfile.hasCompleteRequiredDetails)
+        assertTrue(
+            legacyProfile.copy(setupVersion = CURRENT_PLAYER_PROFILE_SETUP_VERSION)
+                .hasCompleteRequiredDetails
+        )
+    }
+
+    @Test
+    fun cloudProfilesOnlyReplaceAnOlderMatchingLocalRevision() {
+        val local = profile("1", "小雨").copy(revision = 4L)
+        val newer = local.copy(nickname = "新小雨", revision = 5L)
+        val sameRevision = local.copy(nickname = "冲突内容", revision = 4L)
+
+        assertTrue(shouldApplyCloudPlayerProfile(newer, listOf(local)) { _, _ -> false })
+        assertFalse(
+            shouldApplyCloudPlayerProfile(sameRevision, listOf(local)) { _, _ -> false }
+        )
+    }
+
+    @Test
+    fun cloudProfilesDoNotIntroduceNicknameOrQqConflicts() {
+        val local = profile("1", "小雨", qqNumber = "12345678")
+        val duplicateNickname = profile("2", "小雨", qqNumber = "87654321")
+            .copy(revision = 2L)
+        val duplicateQq = profile("3", "青空", qqNumber = "12345678")
+            .copy(revision = 2L)
+
+        assertFalse(
+            shouldApplyCloudPlayerProfile(duplicateNickname, listOf(local)) { _, _ -> false }
+        )
+        assertFalse(
+            shouldApplyCloudPlayerProfile(duplicateQq, listOf(local)) { _, _ -> false }
+        )
+        assertFalse(
+            shouldApplyCloudPlayerProfile(
+                profile("4", "队列昵称").copy(revision = 2L),
+                listOf(local)
+            ) { _, _ -> true }
+        )
+    }
+
+    @Test
     fun recommendedSortUsesFrequencyThenMostRecentUsage() {
         val profiles = listOf(
             profile("1", "陈一", usageCount = 2, lastUsedAtMillis = 500L),

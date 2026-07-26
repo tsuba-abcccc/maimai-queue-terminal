@@ -1,6 +1,7 @@
 package com.abcccc.maimaiqueue
 
 import android.content.Context
+import java.net.URI
 import java.time.DayOfWeek
 
 enum class QueueSyncMode(val headerValue: String?) {
@@ -16,6 +17,8 @@ data class QueueRuleSettings(
     val websiteSyncEnabled: Boolean = true,
     val oneBotSyncEnabled: Boolean = true,
     val syncMode: QueueSyncMode = QueueSyncMode.UNSPECIFIED,
+    val queueSyncEndpoint: String = "",
+    val queueSyncToken: String = "",
     val machineARemark: String = DEFAULT_MACHINE_A_REMARK,
     val machineBRemark: String = DEFAULT_MACHINE_B_REMARK,
     val businessHours: BusinessHoursSettings = BusinessHoursSettings()
@@ -24,7 +27,11 @@ data class QueueRuleSettings(
         get() = allowDeferOneRound || allowTemporaryLeave
 }
 
-class LocalQueueRuleSettingsRepository(context: Context) {
+class LocalQueueRuleSettingsRepository(
+    context: Context,
+    private val defaultQueueSyncEndpoint: String = "",
+    private val defaultQueueSyncToken: String = ""
+) {
     private val preferences = context.applicationContext.getSharedPreferences(
         PREFERENCES_NAME,
         Context.MODE_PRIVATE
@@ -50,6 +57,14 @@ class LocalQueueRuleSettingsRepository(context: Context) {
                     ).orEmpty()
                 )
             }.getOrDefault(QueueSyncMode.UNSPECIFIED),
+            queueSyncEndpoint = readConnectionValue(
+                KEY_QUEUE_SYNC_ENDPOINT,
+                defaultQueueSyncEndpoint
+            ),
+            queueSyncToken = readConnectionValue(
+                KEY_QUEUE_SYNC_TOKEN,
+                defaultQueueSyncToken
+            ),
             machineARemark = normalizeMachineRemark(
                 preferences.getString(KEY_MACHINE_A_REMARK, DEFAULT_MACHINE_A_REMARK),
                 DEFAULT_MACHINE_A_REMARK
@@ -81,6 +96,8 @@ class LocalQueueRuleSettingsRepository(context: Context) {
             .putBoolean(KEY_WEBSITE_SYNC_ENABLED, settings.websiteSyncEnabled)
             .putBoolean(KEY_ONEBOT_SYNC_ENABLED, oneBotSyncEnabled)
             .putString(KEY_SYNC_MODE, settings.syncMode.name)
+            .putString(KEY_QUEUE_SYNC_ENDPOINT, settings.queueSyncEndpoint.trim())
+            .putString(KEY_QUEUE_SYNC_TOKEN, settings.queueSyncToken.trim())
             .putBoolean(KEY_BUSINESS_HOURS_ENABLED, settings.businessHours.enabled)
             .putBoolean(KEY_WEEKLY_BUSINESS_HOURS_ENABLED, settings.businessHours.useWeeklySchedule)
             .putInt(KEY_DEFAULT_OPENING_MINUTES, settings.businessHours.defaultHours.openingMinutes)
@@ -121,6 +138,13 @@ class LocalQueueRuleSettingsRepository(context: Context) {
     private fun weekdayKey(day: DayOfWeek, suffix: String): String =
         "business_hours_${day.name.lowercase()}_$suffix"
 
+    private fun readConnectionValue(key: String, defaultValue: String): String =
+        if (preferences.contains(key)) {
+            preferences.getString(key, "").orEmpty().trim()
+        } else {
+            defaultValue.trim()
+        }
+
     private companion object {
         const val PREFERENCES_NAME = "queue_rule_settings"
         const val KEY_ALLOW_DEFER_ONE_ROUND = "allow_defer_one_round"
@@ -129,6 +153,8 @@ class LocalQueueRuleSettingsRepository(context: Context) {
         const val KEY_WEBSITE_SYNC_ENABLED = "website_sync_enabled"
         const val KEY_ONEBOT_SYNC_ENABLED = "onebot_sync_enabled"
         const val KEY_SYNC_MODE = "sync_mode"
+        const val KEY_QUEUE_SYNC_ENDPOINT = "queue_sync_endpoint"
+        const val KEY_QUEUE_SYNC_TOKEN = "queue_sync_token"
         const val KEY_MACHINE_A_REMARK = "machine_a_remark"
         const val KEY_MACHINE_B_REMARK = "machine_b_remark"
         const val KEY_BUSINESS_HOURS_ENABLED = "business_hours_enabled"
@@ -142,6 +168,59 @@ class LocalQueueRuleSettingsRepository(context: Context) {
 internal const val DEFAULT_MACHINE_A_REMARK = "左侧"
 internal const val DEFAULT_MACHINE_B_REMARK = "右侧"
 internal const val MAX_MACHINE_REMARK_CHARACTERS = 8
+internal const val MIN_QUEUE_SYNC_TOKEN_BYTES = 32
+internal const val MAX_QUEUE_SYNC_TOKEN_CHARACTERS = 256
+internal const val MAX_QUEUE_SYNC_ENDPOINT_CHARACTERS = 500
+
+internal fun normalizeQueueSyncEndpoint(value: String): String? {
+    val raw = value.trim()
+    if (raw.isEmpty() || raw.length > MAX_QUEUE_SYNC_ENDPOINT_CHARACTERS) return null
+    return runCatching {
+        val parsed = URI(raw)
+        require(parsed.scheme.equals("https", ignoreCase = true))
+        require(!parsed.host.isNullOrBlank())
+        require(parsed.userInfo == null && parsed.query == null && parsed.fragment == null)
+        val normalizedBase = raw.trimEnd('/')
+        val normalizedPath = parsed.path.orEmpty().trimEnd('/')
+        if (normalizedPath == "/api/queue-status" || normalizedPath.endsWith("/api/queue-status")) {
+            normalizedBase
+        } else {
+            "$normalizedBase/api/queue-status"
+        }
+    }.getOrNull()
+}
+
+internal fun isValidQueueSyncToken(value: String): Boolean {
+    val normalized = value.trim()
+    return normalized.length <= MAX_QUEUE_SYNC_TOKEN_CHARACTERS &&
+        normalized.toByteArray(Charsets.UTF_8).size >= MIN_QUEUE_SYNC_TOKEN_BYTES
+}
+
+internal fun normalizeQueueRuleSettingsForRuntime(
+    settings: QueueRuleSettings,
+    cloudSyncAvailable: Boolean
+): QueueRuleSettings {
+    if (!cloudSyncAvailable) {
+        return settings.copy(
+            websiteSyncEnabled = false,
+            oneBotSyncEnabled = false,
+            queueSyncEndpoint = "",
+            queueSyncToken = ""
+        )
+    }
+    val endpoint = normalizeQueueSyncEndpoint(settings.queueSyncEndpoint)
+        ?: settings.queueSyncEndpoint.trim()
+    val token = settings.queueSyncToken.trim()
+    val connectionConfigured = normalizeQueueSyncEndpoint(endpoint) == endpoint &&
+        isValidQueueSyncToken(token)
+    val websiteSyncEnabled = settings.websiteSyncEnabled && connectionConfigured
+    return settings.copy(
+        websiteSyncEnabled = websiteSyncEnabled,
+        oneBotSyncEnabled = websiteSyncEnabled && settings.oneBotSyncEnabled,
+        queueSyncEndpoint = endpoint,
+        queueSyncToken = token
+    )
+}
 
 internal fun limitMachineRemarkLength(value: String): String {
     val characterCount = value.codePointCount(0, value.length)

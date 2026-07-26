@@ -1,6 +1,7 @@
 package com.abcccc.maimaiqueue
 
 import android.app.TimePickerDialog
+import android.graphics.Bitmap
 import android.content.pm.ActivityInfo
 import android.os.BatteryManager
 import android.os.Bundle
@@ -60,6 +61,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -109,6 +111,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -121,6 +124,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -136,6 +140,8 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.abcccc.maimaiqueue.ui.theme.MaimaiQueueTheme
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.qrcode.QRCodeWriter
 import java.text.SimpleDateFormat
 import java.time.DayOfWeek
 import java.util.Date
@@ -377,9 +383,18 @@ private fun RegistrationApp() {
     }
     val auditLogRepository = remember(context) { LocalAuditLogRepository(context) }
     val queueStateRepository = remember(context) { LocalQueueStateRepository(context) }
-    val queueRuleSettingsRepository = remember(context) { LocalQueueRuleSettingsRepository(context) }
+    val queueRuleSettingsRepository = remember(context) {
+        LocalQueueRuleSettingsRepository(
+            context = context,
+            defaultQueueSyncEndpoint = BuildConfig.QUEUE_SYNC_URL,
+            defaultQueueSyncToken = BuildConfig.QUEUE_SYNC_TOKEN
+        )
+    }
     val initialQueueRuleSettings = remember(queueRuleSettingsRepository) {
-        queueRuleSettingsRepository.getSettings()
+        normalizeQueueRuleSettingsForRuntime(
+            settings = queueRuleSettingsRepository.getSettings(),
+            cloudSyncAvailable = cloudSyncAvailable
+        )
     }
     val initialHandledClosingOccurrenceId = remember(queueRuleSettingsRepository) {
         queueRuleSettingsRepository.getLastHandledClosingOccurrenceId()
@@ -387,15 +402,15 @@ private fun RegistrationApp() {
     val queueStatePublisher = remember(context) {
         HttpQueueStatePublisher(
             context = context,
-            endpoint = BuildConfig.QUEUE_SYNC_URL,
-            token = BuildConfig.QUEUE_SYNC_TOKEN
+            endpoint = initialQueueRuleSettings.queueSyncEndpoint,
+            token = initialQueueRuleSettings.queueSyncToken
         )
     }
     val queueCommandClient = remember(context) {
         HttpQueueCommandClient(
             context = context,
-            queueStatusEndpoint = BuildConfig.QUEUE_SYNC_URL,
-            token = BuildConfig.QUEUE_SYNC_TOKEN
+            queueStatusEndpoint = initialQueueRuleSettings.queueSyncEndpoint,
+            token = initialQueueRuleSettings.queueSyncToken
         )
     }
     var cloudSyncStatus by remember(
@@ -466,6 +481,19 @@ private fun RegistrationApp() {
     var profileGenderDraft by remember { mutableStateOf(PlayerGender.UNDISCLOSED) }
     var profilePreferenceDraft by remember { mutableStateOf(ProfilePlayPreference.ASK_EVERY_TIME) }
     var profileQqDraft by remember { mutableStateOf("") }
+    var profileQqVisibilityDraft by remember {
+        mutableStateOf(QqVisibility.TERMINAL_ONLY)
+    }
+    var profileNotificationDraft by remember {
+        mutableStateOf(QueueNotificationPreferences())
+    }
+    var botQqNumber by remember { mutableStateOf<String?>(null) }
+    var botFriendPromptQq by remember { mutableStateOf<String?>(null) }
+    var mobileRegistrationSession by remember {
+        mutableStateOf<MobileRegistrationSession?>(null)
+    }
+    var mobileRegistrationLoading by remember { mutableStateOf(false) }
+    var mobileRegistrationFailureDetail by remember { mutableStateOf<String?>(null) }
     var profileJoinPreference by remember { mutableStateOf<PlayPreference?>(null) }
     var rememberProfileJoinPreference by remember { mutableStateOf(false) }
     var playerProfileContext by remember { mutableStateOf(PlayerProfileContext.JOIN_QUEUE) }
@@ -476,6 +504,7 @@ private fun RegistrationApp() {
     var cloudProfileRestoreFailureDetail by remember { mutableStateOf<String?>(null) }
 
     var selectedRegistration by remember { mutableStateOf<SelectedRegistration?>(null) }
+    var incompleteCheckInProfileId by remember { mutableStateOf<String?>(null) }
     var moveIntoPlayingTarget by remember { mutableStateOf<SelectedRegistration?>(null) }
     var registrationActionMode by remember { mutableStateOf(RegistrationActionMode.ACTIONS) }
     var renameDraft by remember { mutableStateOf("") }
@@ -641,12 +670,42 @@ private fun RegistrationApp() {
     }
 
     fun updateQueueRuleSettings(requestedSettings: QueueRuleSettings) {
-        val settings = requestedSettings.copy(
-            oneBotSyncEnabled = requestedSettings.websiteSyncEnabled &&
-                requestedSettings.oneBotSyncEnabled
+        val previousSettings = queueRuleSettings
+        val requestedConnectionChanged =
+            requestedSettings.queueSyncEndpoint != previousSettings.queueSyncEndpoint ||
+                requestedSettings.queueSyncToken != previousSettings.queueSyncToken
+        val guardedSettings = if (
+            cloudSyncAvailable && previousSettings.websiteSyncEnabled && requestedConnectionChanged
+        ) {
+            requestedSettings.copy(
+                queueSyncEndpoint = previousSettings.queueSyncEndpoint,
+                queueSyncToken = previousSettings.queueSyncToken
+            )
+        } else {
+            requestedSettings
+        }
+        val settings = normalizeQueueRuleSettingsForRuntime(
+            settings = guardedSettings,
+            cloudSyncAvailable = cloudSyncAvailable
         )
         if (settings == queueRuleSettings) return
-        val previousSettings = queueRuleSettings
+        val connectionChanged = settings.queueSyncEndpoint != previousSettings.queueSyncEndpoint ||
+            settings.queueSyncToken != previousSettings.queueSyncToken
+        if (connectionChanged) {
+            queueStatePublisher.updateConfiguration(
+                endpoint = settings.queueSyncEndpoint,
+                token = settings.queueSyncToken
+            )
+            queueCommandClient.updateConfiguration(
+                queueStatusEndpoint = settings.queueSyncEndpoint,
+                token = settings.queueSyncToken
+            )
+            privateSyncFailureDetail = null
+            cloudProfileRestoreFailureDetail = null
+            botQqNumber = null
+            mobileRegistrationSession = null
+            mobileRegistrationFailureDetail = null
+        }
         if (previousSettings.businessHours != settings.businessHours) {
             val changedScheduleStatus = evaluateBusinessHours(
                 settings.businessHours,
@@ -743,6 +802,9 @@ private fun RegistrationApp() {
             }
             if (cloudSyncAvailable && previousSettings.syncMode != settings.syncMode) {
                 add("同步方式：${queueSyncModeLabel(settings.syncMode)}")
+            }
+            if (cloudSyncAvailable && connectionChanged) {
+                add("网站连接配置已更新")
             }
             if (previousSettings.businessHours != settings.businessHours) {
                 add(
@@ -1080,7 +1142,10 @@ private fun RegistrationApp() {
             existingProfile.nickname != profile.nickname ||
             existingProfile.gender != profile.gender ||
             existingProfile.defaultPreference != profile.defaultPreference ||
-            existingProfile.qqNumber != profile.qqNumber
+            existingProfile.qqNumber != profile.qqNumber ||
+            existingProfile.qqVisibility != profile.qqVisibility ||
+            existingProfile.notificationPreferences != profile.notificationPreferences ||
+            existingProfile.setupVersion != profile.setupVersion
         )) {
             appendAuditLog(createPlayerProfileAuditLog(existingProfile, profile, source = source))
         }
@@ -1123,7 +1188,7 @@ private fun RegistrationApp() {
         }
     }
 
-    suspend fun mergeMissingCloudPlayerProfiles(cloudProfiles: List<PlayerProfile>) {
+    suspend fun mergeCloudPlayerProfiles(cloudProfiles: List<PlayerProfile>) {
         if (cloudProfiles.isEmpty()) {
             cloudProfileRestoreFailureDetail = null
             return
@@ -1131,12 +1196,11 @@ private fun RegistrationApp() {
         val result = playerProfilePersistence.persistIndividually(
             profiles = cloudProfiles,
             shouldPersist = { profile ->
-                val qqNumber = profile.normalizedQqNumber()
-                playerProfiles.none { current ->
-                    current.id == profile.id ||
-                        current.nickname.equals(profile.nickname.trim(), ignoreCase = true) ||
-                        (qqNumber != null && current.normalizedQqNumber() == qqNumber)
-                } && !playerProfileNicknameConflictsWithQueue(profile.nickname, profile.id)
+                shouldApplyCloudPlayerProfile(
+                    cloudProfile = profile,
+                    localProfiles = playerProfiles,
+                    nicknameConflictsWithQueue = ::playerProfileNicknameConflictsWithQueue
+                )
             },
             onPersisted = { profile ->
                 applyPlayerProfileToState(
@@ -1155,8 +1219,8 @@ private fun RegistrationApp() {
             appendAuditLog(
                 createAuditLogEntry(
                     category = AuditLogCategory.PLAYER_PROFILE,
-                    title = "恢复云端玩家资料",
-                    detail = "已从服务器补回 ${result.persistedProfiles.size} 份本机缺失的玩家资料。",
+                    title = "同步云端玩家资料",
+                    detail = "已从服务器写入 ${result.persistedProfiles.size} 份新增或较新的玩家资料。",
                     source = AuditLogSource.SYSTEM_AUTOMATIC
                 )
             )
@@ -1289,6 +1353,8 @@ private fun RegistrationApp() {
         profileGenderDraft = PlayerGender.UNDISCLOSED
         profilePreferenceDraft = ProfilePlayPreference.ASK_EVERY_TIME
         profileQqDraft = ""
+        profileQqVisibilityDraft = QqVisibility.TERMINAL_ONLY
+        profileNotificationDraft = QueueNotificationPreferences()
         screen = Screen.PLAYER_PROFILE_EDITOR
     }
 
@@ -1302,6 +1368,8 @@ private fun RegistrationApp() {
         profileGenderDraft = profile.gender
         profilePreferenceDraft = profile.defaultPreference
         profileQqDraft = profile.qqNumber.orEmpty()
+        profileQqVisibilityDraft = profile.qqVisibility
+        profileNotificationDraft = profile.notificationPreferences
         screen = Screen.PLAYER_PROFILE_EDITOR
     }
 
@@ -1327,17 +1395,25 @@ private fun RegistrationApp() {
         val existingProfile = editingPlayerProfileId?.let { profileId ->
             playerProfiles.firstOrNull { it.id == profileId }
         }
+        val completedNewSettings = existingProfile?.hasCompleteRequiredDetails != true
         val savedProfile = existingProfile?.copy(
             nickname = normalizedNickname,
             gender = profileGenderDraft,
             defaultPreference = profilePreferenceDraft,
             qqNumber = normalizedQqNumber,
+            qqVisibility = profileQqVisibilityDraft,
+            notificationPreferences = profileNotificationDraft,
+            setupVersion = CURRENT_PLAYER_PROFILE_SETUP_VERSION,
+            revision = existingProfile.revision + 1L,
             updatedAtMillis = nowMillis
         ) ?: createPlayerProfile(
             nickname = normalizedNickname,
             gender = profileGenderDraft,
             defaultPreference = profilePreferenceDraft,
             qqNumber = normalizedQqNumber,
+            qqVisibility = profileQqVisibilityDraft,
+            notificationPreferences = profileNotificationDraft,
+            setupVersion = CURRENT_PLAYER_PROFILE_SETUP_VERSION,
             createdAtMillis = nowMillis
         )
         persistPlayerProfileForUser(
@@ -1349,6 +1425,10 @@ private fun RegistrationApp() {
                         gender = profileGenderDraft,
                         defaultPreference = profilePreferenceDraft,
                         qqNumber = normalizedQqNumber,
+                        qqVisibility = profileQqVisibilityDraft,
+                        notificationPreferences = profileNotificationDraft,
+                        setupVersion = CURRENT_PLAYER_PROFILE_SETUP_VERSION,
+                        revision = latestProfile.revision + 1L,
                         updatedAtMillis = maxOf(
                             nowMillis,
                             latestProfile.updatedAtMillis + 1
@@ -1360,6 +1440,9 @@ private fun RegistrationApp() {
         ) { persistedProfile ->
             if (existingProfile == null) openPlayerProfile(persistedProfile)
             else screen = playerProfileEditorReturnScreen
+            if (completedNewSettings) {
+                botQqNumber?.let { botFriendPromptQq = it }
+            }
         }
     }
 
@@ -1372,6 +1455,7 @@ private fun RegistrationApp() {
         if (
             !acceptingNewRegistrations ||
             !profile.hasValidContact ||
+            !profile.hasCompleteRequiredDetails ||
             playerProfileAlreadyRegistered(profile) ||
             !statusFor(machineId).isOperational ||
             queueFor(machineId).registrationCount >= 20
@@ -1435,6 +1519,7 @@ private fun RegistrationApp() {
             .firstOrNull { it.key == selection.registrationKey } ?: return
         if (
             !profile.hasValidContact ||
+            !profile.hasCompleteRequiredDetails ||
             !registration.isTemporary ||
             !statusFor(selection.machineId).isOperational ||
             playerProfileAlreadyRegistered(profile, exceptKey = registration.key)
@@ -1499,10 +1584,45 @@ private fun RegistrationApp() {
     fun continueRegistrationForMachine(machineId: MachineId) {
         isBatchFlow = false
         selectedMachine = machineId
+        mobileRegistrationSession = null
+        mobileRegistrationFailureDetail = null
         draftId = ""
         temporarySelected = false
         selectedPreference = PlayPreference.OPEN_TO_JOIN
         screen = Screen.CREATE_REGISTRATION
+    }
+
+    fun requestMobileRegistrationSession() {
+        val machineId = selectedMachine ?: return
+        if (
+            mobileRegistrationLoading ||
+            !cloudSyncAvailable ||
+            !queueRuleSettings.websiteSyncEnabled ||
+            !queueCommandClient.isConfigured
+        ) return
+        mobileRegistrationLoading = true
+        mobileRegistrationFailureDetail = null
+        val requestedQueueId = queueId
+        val requestId = java.util.UUID.randomUUID().toString()
+        coroutineScope.launch {
+            try {
+                val session = queueCommandClient.createMobileRegistrationSession(
+                    requestId = requestId,
+                    queueId = requestedQueueId,
+                    machineId = machineId.name
+                )
+                if (queueId != requestedQueueId || selectedMachine != machineId) return@launch
+                if (session == null) {
+                    mobileRegistrationFailureDetail =
+                        queueCommandClient.commandSyncFailureDetail
+                            ?: "暂时无法创建移动设备登记，请稍后重试。"
+                } else {
+                    mobileRegistrationSession = session
+                }
+            } finally {
+                mobileRegistrationLoading = false
+            }
+        }
     }
 
     fun continueSelectedRegistrationMachine(machineId: MachineId) {
@@ -1800,8 +1920,9 @@ private fun RegistrationApp() {
             ) {
                 val nowMillis = System.currentTimeMillis()
                 if (nowMillis >= nextCloudProfileRefreshAtMillis) {
-                    queueCommandClient.fetchPlayerProfiles()?.let { cloudProfiles ->
-                        mergeMissingCloudPlayerProfiles(cloudProfiles)
+                    queueCommandClient.fetchPlayerProfiles()?.let { cloudPayload ->
+                        mergeCloudPlayerProfiles(cloudPayload.profiles)
+                        botQqNumber = cloudPayload.botQqNumber
                         nextCloudProfileRefreshAtMillis = nowMillis +
                             CLOUD_PROFILE_REFRESH_INTERVAL_MILLIS
                     }
@@ -1917,6 +2038,12 @@ private fun RegistrationApp() {
                                                 machineId = machineId,
                                                 beforeQueue = beforeQueues.getValue(machineName),
                                                 afterQueue = result.state.queues.getValue(machineName),
+                                                publicEventTypeOverride =
+                                                    PublicQueueEventType.ONLINE_REGISTRATION_ADDED
+                                                        .takeIf {
+                                                            command.operation ==
+                                                                RemoteQueueOperation.JOIN_QUEUE
+                                                        },
                                                 source = command.source.auditLogSource
                                             )
                                         }
@@ -1949,6 +2076,87 @@ private fun RegistrationApp() {
                                     }
 
                                     is RemoteQueueOperationDecision.Reject -> {
+                                        queueCommandClient.complete(
+                                            command.commandId,
+                                            applied = false,
+                                            detail = result.detail
+                                        )
+                                    }
+                                }
+                            }
+
+                            is MobileDeviceRegistrationCommand -> {
+                                var decision = decideMobileDeviceRegistration(
+                                    command,
+                                    currentRemoteQueueExecutionState()
+                                )
+                                val profileToPersist =
+                                    (decision as? MobileDeviceRegistrationDecision.Apply)
+                                        ?.profileToPersist
+                                if (profileToPersist != null) {
+                                    val persisted = playerProfilePersistence.persistAndApply(
+                                        profileToPersist
+                                    ) { profile ->
+                                        applyPlayerProfileToState(
+                                            profile,
+                                            source = AuditLogSource.MOBILE_DEVICE
+                                        )
+                                    }
+                                    if (!persisted) {
+                                        localWriteFailureDetail =
+                                            "移动设备登记的玩家资料暂时无法写入本机，应用将继续重试。"
+                                        continue
+                                    }
+                                    decision = decideMobileDeviceRegistration(
+                                        command,
+                                        currentRemoteQueueExecutionState()
+                                    )
+                                }
+                                when (val result = decision) {
+                                    is MobileDeviceRegistrationDecision.Apply -> {
+                                        val beforeQueue = result.changedMachineId.let { machineName ->
+                                            if (machineName == MachineId.A.name) machineA else machineB
+                                        }
+                                        machineA = result.state.queues[MachineId.A.name]
+                                            ?: machineA
+                                        machineB = result.state.queues[MachineId.B.name]
+                                            ?: machineB
+                                        nextKey = maxOf(nextKey, result.state.nextRegistrationKey)
+                                        queueUndoAction = null
+                                        val machineId = MachineId.entries.firstOrNull {
+                                            it.name == result.changedMachineId
+                                        }
+                                        if (machineId != null) {
+                                            appendQueueAuditLog(
+                                                machineId = machineId,
+                                                beforeQueue = beforeQueue,
+                                                afterQueue = result.state.queues
+                                                    .getValue(result.changedMachineId),
+                                                source = AuditLogSource.MOBILE_DEVICE
+                                            )
+                                            if (result.needsAvailabilityConfirmation) {
+                                                enterPlayingConfirmation = machineId
+                                            }
+                                        }
+                                        queueSoundPlayer.play(QueueSoundCue.CONFIRM)
+                                        localWriteFailureDetail = null
+                                        queueCommandClient.complete(
+                                            command.commandId,
+                                            applied = true,
+                                            detail = result.detail
+                                        )
+                                    }
+
+                                    is MobileDeviceRegistrationDecision.AlreadyApplied -> {
+                                        localWriteFailureDetail = null
+                                        queueCommandClient.complete(
+                                            command.commandId,
+                                            applied = true,
+                                            detail = result.detail
+                                        )
+                                    }
+
+                                    is MobileDeviceRegistrationDecision.Reject -> {
                                         queueCommandClient.complete(
                                             command.commandId,
                                             applied = false,
@@ -2134,6 +2342,11 @@ private fun RegistrationApp() {
                             onPlayerLibrary = {
                                 openPlayerLibrary(PlayerProfileContext.JOIN_QUEUE)
                             },
+                            mobileRegistrationEnabled = cloudSyncAvailable &&
+                                queueRuleSettings.websiteSyncEnabled &&
+                                queueCommandClient.isConfigured,
+                            mobileRegistrationLoading = mobileRegistrationLoading,
+                            onMobileRegistration = ::requestMobileRegistrationSession,
                             onBack = { screen = Screen.MACHINE },
                             onContinue = { screen = Screen.PREFERENCE }
                         )
@@ -2193,6 +2406,9 @@ private fun RegistrationApp() {
                             qqNumber = profileQqDraft,
                             qqAlreadyExists = profileQqDraft.isNotBlank() &&
                                 playerProfileQqExists(profileQqDraft, editingPlayerProfileId),
+                            qqVisibility = profileQqVisibilityDraft,
+                            notificationPreferences = profileNotificationDraft,
+                            botQqNumber = botQqNumber,
                             editingExisting = editingPlayerProfileId != null,
                             onNicknameChange = {
                                 profileNicknameDraft = limitCodePointLength(it, 18)
@@ -2202,6 +2418,10 @@ private fun RegistrationApp() {
                             onQqNumberChange = { value ->
                                 profileQqDraft = value.filter { it in '0'..'9' }
                                     .take(MAX_QQ_NUMBER_LENGTH)
+                            },
+                            onQqVisibilityChange = { profileQqVisibilityDraft = it },
+                            onNotificationPreferencesChange = {
+                                profileNotificationDraft = it
                             },
                             onSave = ::savePlayerProfileDraft,
                             onBack = { screen = playerProfileEditorReturnScreen }
@@ -2517,13 +2737,23 @@ private fun RegistrationApp() {
                                 selectedRegistration = null
                             },
                             onCheckIn = {
-                                updateQueue(
-                                    machineId = selection.machineId,
-                                    soundCue = QueueSoundCue.CONFIRM,
-                                    affectedRegistrationKeysOverride =
-                                        listOf(registration.key)
+                                if (
+                                    linkedPlayerProfile?.hasValidContact == true &&
+                                    linkedPlayerProfile.hasCompleteRequiredDetails
                                 ) {
-                                    it.checkIn(registration.key)
+                                    updateQueue(
+                                        machineId = selection.machineId,
+                                        soundCue = QueueSoundCue.CONFIRM,
+                                        publicEventTypeOverride =
+                                            PublicQueueEventType.ONLINE_CHECK_IN_COMPLETED,
+                                        affectedRegistrationKeysOverride =
+                                            listOf(registration.key)
+                                    ) {
+                                        it.checkIn(registration.key)
+                                    }
+                                } else {
+                                    incompleteCheckInProfileId =
+                                        registration.playerProfileId.orEmpty()
                                 }
                                 selectedRegistration = null
                             },
@@ -3342,6 +3572,59 @@ private fun RegistrationApp() {
                     )
                 }
 
+                mobileRegistrationSession?.let { session ->
+                    val machineId = selectedMachine
+                    if (machineId != null) {
+                        MobileRegistrationDialog(
+                            session = session,
+                            machineName = configuredMachineName(machineId),
+                            nowMillis = nowMillis,
+                            onDismiss = { mobileRegistrationSession = null },
+                            onRefresh = {
+                                mobileRegistrationSession = null
+                                requestMobileRegistrationSession()
+                            }
+                        )
+                    } else {
+                        LaunchedEffect(session.sessionId) {
+                            mobileRegistrationSession = null
+                        }
+                    }
+                }
+
+                mobileRegistrationFailureDetail?.let { detail ->
+                    MobileRegistrationFailureDialog(
+                        detail = detail,
+                        retryEnabled = selectedMachine != null && !mobileRegistrationLoading,
+                        onDismiss = { mobileRegistrationFailureDetail = null },
+                        onRetry = {
+                            mobileRegistrationFailureDetail = null
+                            requestMobileRegistrationSession()
+                        }
+                    )
+                }
+
+                botFriendPromptQq?.let { qqNumber ->
+                    BotFriendQrDialog(
+                        qqNumber = qqNumber,
+                        onDismiss = { botFriendPromptQq = null }
+                    )
+                }
+
+                incompleteCheckInProfileId?.let { profileId ->
+                    val profile = playerProfiles.firstOrNull { it.id == profileId }
+                    IncompleteCheckInProfileDialog(
+                        profile = profile,
+                        onDismiss = { incompleteCheckInProfileId = null },
+                        onEditProfile = profile?.let {
+                            {
+                                incompleteCheckInProfileId = null
+                                openEditPlayerProfile(it, Screen.HOME)
+                            }
+                        }
+                    )
+                }
+
                 if (playerProfileWriteInProgress) {
                     PlayerProfileSavingOverlay()
                 }
@@ -3394,7 +3677,8 @@ private fun AuditLogScreen(
         AuditLogSource.ON_SITE_TERMINAL to "现场终端",
         AuditLogSource.QQ_BOT to "QQ Bot",
         AuditLogSource.SYSTEM_AUTOMATIC to "系统自动",
-        AuditLogSource.WEBSITE_REMOTE to "网站远程"
+        AuditLogSource.WEBSITE_REMOTE to "网站远程",
+        AuditLogSource.MOBILE_DEVICE to "移动设备"
     )
     val displayedLogs = logs.filter { entry ->
         (selectedCategory == null || entry.category == selectedCategory) &&
@@ -3521,12 +3805,29 @@ private fun QueueRuleSettingsScreen(
     var machineBRemarkDraft by remember(settings.machineBRemark) {
         mutableStateOf(settings.machineBRemark)
     }
+    var queueSyncEndpointDraft by remember(settings.queueSyncEndpoint) {
+        mutableStateOf(settings.queueSyncEndpoint)
+    }
+    var queueSyncTokenDraft by remember(settings.queueSyncToken) {
+        mutableStateOf(settings.queueSyncToken)
+    }
     var showTakeoverConfirmation by remember { mutableStateOf(false) }
     val normalizedMachineARemark = machineARemarkDraft.trim()
     val normalizedMachineBRemark = machineBRemarkDraft.trim()
     val remarksValid = normalizedMachineARemark.isNotBlank() && normalizedMachineBRemark.isNotBlank()
     val remarksChanged = normalizedMachineARemark != settings.machineARemark ||
         normalizedMachineBRemark != settings.machineBRemark
+    val normalizedQueueSyncEndpointDraft = normalizeQueueSyncEndpoint(queueSyncEndpointDraft)
+    val normalizedQueueSyncTokenDraft = queueSyncTokenDraft.trim()
+    val queueSyncEndpointValid = normalizedQueueSyncEndpointDraft != null
+    val queueSyncTokenValid = isValidQueueSyncToken(normalizedQueueSyncTokenDraft)
+    val queueConnectionConfigured =
+        normalizeQueueSyncEndpoint(settings.queueSyncEndpoint) == settings.queueSyncEndpoint &&
+            isValidQueueSyncToken(settings.queueSyncToken)
+    val queueConnectionEditable = !settings.websiteSyncEnabled
+    val queueConnectionChanged =
+        normalizedQueueSyncEndpointDraft != settings.queueSyncEndpoint ||
+            normalizedQueueSyncTokenDraft != settings.queueSyncToken
 
     Column(Modifier.fillMaxSize().padding(horizontal = 36.dp, vertical = 24.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -3560,14 +3861,116 @@ private fun QueueRuleSettingsScreen(
                     Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
                         .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
                 ) {
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp)) {
+                        Text(
+                            "服务器连接",
+                            color = PrimaryText,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            if (queueConnectionEditable) {
+                                "终端版可以连接自建服务器。连接设置仅保存在本机，令牌不会写入日志。"
+                            } else {
+                                "如需更换服务器，请先关闭网站同步。"
+                            },
+                            color = SecondaryText,
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = queueSyncEndpointDraft,
+                            onValueChange = {
+                                queueSyncEndpointDraft = it.filterNot(Char::isISOControl)
+                                    .take(MAX_QUEUE_SYNC_ENDPOINT_CHARACTERS)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = queueConnectionEditable,
+                            label = { Text("队列 API 地址") },
+                            placeholder = { Text("https://example.com") },
+                            singleLine = true,
+                            isError = queueConnectionEditable && queueSyncEndpointDraft.isNotBlank() &&
+                                !queueSyncEndpointValid,
+                            supportingText = {
+                                Text(
+                                    when {
+                                        queueSyncEndpointDraft.isBlank() -> "请输入服务器的 HTTPS 地址。"
+                                        !queueSyncEndpointValid ->
+                                            "地址必须使用 HTTPS，且不能包含账号、参数或片段。"
+                                        normalizedQueueSyncEndpointDraft != queueSyncEndpointDraft.trim() ->
+                                            "将连接到 $normalizedQueueSyncEndpointDraft"
+                                        else -> "可填写站点地址或完整的队列接口地址。"
+                                    }
+                                )
+                            },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                            shape = RoundedCornerShape(ControlRadius),
+                            colors = playerProfileTextFieldColors()
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        OutlinedTextField(
+                            value = queueSyncTokenDraft,
+                            onValueChange = {
+                                queueSyncTokenDraft = it.filterNot(Char::isISOControl)
+                                    .take(MAX_QUEUE_SYNC_TOKEN_CHARACTERS)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = queueConnectionEditable,
+                            label = { Text("终端同步令牌") },
+                            placeholder = { Text("至少 $MIN_QUEUE_SYNC_TOKEN_BYTES 个字节") },
+                            singleLine = true,
+                            isError = queueConnectionEditable && queueSyncTokenDraft.isNotBlank() &&
+                                !queueSyncTokenValid,
+                            supportingText = {
+                                Text(
+                                    when {
+                                        queueSyncTokenDraft.isBlank() -> "请输入服务器配置的终端同步令牌。"
+                                        !queueSyncTokenValid ->
+                                            "令牌至少 $MIN_QUEUE_SYNC_TOKEN_BYTES 个字节，最多 $MAX_QUEUE_SYNC_TOKEN_CHARACTERS 个字符。"
+                                        else -> "令牌仅保存在本机，并以隐藏形式显示。"
+                                    }
+                                )
+                            },
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            shape = RoundedCornerShape(ControlRadius),
+                            colors = playerProfileTextFieldColors()
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            PrimaryButton(
+                                text = "保存服务器连接",
+                                onClick = {
+                                    onSettingsChange(
+                                        settings.copy(
+                                            queueSyncEndpoint = normalizedQueueSyncEndpointDraft.orEmpty(),
+                                            queueSyncToken = normalizedQueueSyncTokenDraft
+                                        )
+                                    )
+                                },
+                                modifier = Modifier.width(180.dp),
+                                enabled = queueConnectionEditable &&
+                                    queueSyncEndpointValid &&
+                                    queueSyncTokenValid &&
+                                    queueConnectionChanged
+                            )
+                        }
+                    }
+                    HorizontalDivider(color = Separator.copy(alpha = .72f))
                     QueueRuleSettingRow(
                         title = "网站同步",
-                        description = if (settings.websiteSyncEnabled) {
-                            "上传最新队列和玩家资料，并接收服务器待执行的修改。有效登记的 QQ 会显示在网站详情中。"
-                        } else {
-                            "队列与玩家资料只在本机更新。重新开启后，会同步当前完整数据。"
+                        description = when {
+                            !queueConnectionConfigured ->
+                                "请先关闭网站同步并保存有效的服务器地址与终端同步令牌。"
+                            settings.websiteSyncEnabled ->
+                                "上传最新队列和玩家资料，并接收服务器待执行的修改。只有玩家允许公开的 QQ 才会显示在网站详情中。"
+                            else ->
+                                "队列与玩家资料只在本机更新。重新开启后，会同步当前完整数据。"
                         },
                         checked = settings.websiteSyncEnabled,
+                        enabled = settings.websiteSyncEnabled || queueConnectionConfigured,
                         onCheckedChange = {
                             onSettingsChange(
                                 settings.copy(
@@ -4157,6 +4560,7 @@ private fun auditLogSourceLabel(source: AuditLogSource): String = when (source) 
     AuditLogSource.QQ_BOT -> "QQ Bot"
     AuditLogSource.SYSTEM_AUTOMATIC -> "系统自动"
     AuditLogSource.WEBSITE_REMOTE -> "网站远程"
+    AuditLogSource.MOBILE_DEVICE -> "移动设备"
 }
 
 private fun formatAuditLogTimestamp(timestampMillis: Long): String =
@@ -5813,6 +6217,9 @@ private fun CreateRegistrationScreen(
     onTemporarySelect: () -> Unit,
     onGenerateId: () -> Unit,
     onPlayerLibrary: () -> Unit,
+    mobileRegistrationEnabled: Boolean,
+    mobileRegistrationLoading: Boolean,
+    onMobileRegistration: () -> Unit,
     onBack: () -> Unit,
     onContinue: () -> Unit
 ) {
@@ -5840,12 +6247,16 @@ private fun CreateRegistrationScreen(
                 modifier = Modifier.weight(1f)
             )
             OptionCard(
-                title = "使用二维码",
-                description = "使用你的移动设备登录并恢复登记。",
+                title = "使用移动设备登记",
+                description = if (mobileRegistrationLoading) {
+                    "正在创建本次登记二维码…"
+                } else {
+                    "扫码后，在移动设备上选择或新建玩家资料。"
+                },
                 selected = false,
-                enabled = false,
-                badge = "暂不可用",
-                onClick = {},
+                enabled = mobileRegistrationEnabled && !mobileRegistrationLoading,
+                badge = if (mobileRegistrationEnabled) null else "需要网站同步",
+                onClick = onMobileRegistration,
                 modifier = Modifier.weight(1f)
             )
         }
@@ -6066,12 +6477,14 @@ private fun PlayerProfileCard(
             }
             Spacer(Modifier.height(4.dp))
             Text(
-                if (profile.hasValidContact) {
+                if (profile.hasValidContact && profile.hasCompleteRequiredDetails) {
                     profilePreferenceLabel(profile.defaultPreference)
                 } else {
-                    "需要补充 QQ 号"
+                    "需要补全玩家资料"
                 },
-                color = if (profile.hasValidContact) SecondaryText else Color(0xFF9A5B00),
+                color = if (
+                    profile.hasValidContact && profile.hasCompleteRequiredDetails
+                ) SecondaryText else Color(0xFF9A5B00),
                 fontSize = 10.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -6098,11 +6511,16 @@ private fun PlayerProfileEditorScreen(
     defaultPreference: ProfilePlayPreference,
     qqNumber: String,
     qqAlreadyExists: Boolean,
+    qqVisibility: QqVisibility,
+    notificationPreferences: QueueNotificationPreferences,
+    botQqNumber: String?,
     editingExisting: Boolean,
     onNicknameChange: (String) -> Unit,
     onGenderChange: (PlayerGender) -> Unit,
     onDefaultPreferenceChange: (ProfilePlayPreference) -> Unit,
     onQqNumberChange: (String) -> Unit,
+    onQqVisibilityChange: (QqVisibility) -> Unit,
+    onNotificationPreferencesChange: (QueueNotificationPreferences) -> Unit,
     onSave: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -6180,7 +6598,7 @@ private fun PlayerProfileEditorScreen(
                 Spacer(Modifier.height(4.dp))
                 Text(
                     if (BuildConfig.CLOUD_SYNC_AVAILABLE) {
-                        "QQ 号会与玩家资料绑定。开启网站同步后，可用于 QQ Bot 识别玩家和发送相关提醒；加入排队时也会显示在网站登记详情中，便于现场联系。"
+                        "QQ 号会与玩家资料绑定，用于 QQ Bot 识别玩家和发送相关提醒。是否允许网站显示，可以在下方单独设置。"
                     } else {
                         "QQ 号会与玩家资料绑定，并仅保存在本机；本地版不会连接 QQ Bot。"
                     },
@@ -6242,6 +6660,133 @@ private fun PlayerProfileEditorScreen(
                         description = "每次使用这份资料加入排队时，再选择本次偏好。",
                         selected = defaultPreference == ProfilePlayPreference.ASK_EVERY_TIME,
                         onClick = { onDefaultPreferenceChange(ProfilePlayPreference.ASK_EVERY_TIME) }
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius))
+                .background(CardBackground)
+                .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(CardRadius))
+        ) {
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+                Text(
+                    "QQ 显示范围",
+                    color = PrimaryText,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "终端登记详情始终可以查看 QQ；网站只会按照这里的选择显示。",
+                    color = SecondaryText,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp
+                )
+            }
+            HorizontalDivider(color = Separator.copy(alpha = .72f))
+            Row(Modifier.fillMaxWidth()) {
+                ProfilePrivacyChoice(
+                    title = "仅终端显示",
+                    description = "网站队列详情不会公开 QQ。",
+                    selected = qqVisibility == QqVisibility.TERMINAL_ONLY,
+                    onClick = { onQqVisibilityChange(QqVisibility.TERMINAL_ONLY) },
+                    modifier = Modifier.weight(1f)
+                )
+                Box(Modifier.width(1.dp).height(66.dp).background(Separator.copy(alpha = .72f)))
+                ProfilePrivacyChoice(
+                    title = "允许网站显示",
+                    description = "网站登记详情可以显示 QQ，便于现场联系。",
+                    selected = qqVisibility == QqVisibility.PUBLIC_WEBSITE,
+                    onClick = { onQqVisibilityChange(QqVisibility.PUBLIC_WEBSITE) },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius))
+                .background(CardBackground)
+                .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(CardRadius))
+        ) {
+            ProfileNotificationToggle(
+                title = "排队通知",
+                description = if (botQqNumber != null) {
+                    "需要添加 QQ Bot（$botQqNumber）为好友，才能接收主动私信通知。"
+                } else {
+                    "需要添加现场 QQ Bot 为好友，才能接收主动私信通知。Bot QQ 会在同步后显示。"
+                },
+                checked = notificationPreferences.enabled,
+                onCheckedChange = { enabled ->
+                    onNotificationPreferencesChange(
+                        notificationPreferences.copy(enabled = enabled)
+                    )
+                }
+            )
+            HorizontalDivider(color = Separator.copy(alpha = .72f))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                Column(Modifier.weight(1f)) {
+                    ProfileNotificationToggle(
+                        title = "队列状态变化",
+                        description = "加入、退出、切换机台、顺序和本次偏好变化。",
+                        checked = notificationPreferences.queueChanges,
+                        enabled = notificationPreferences.enabled,
+                        onCheckedChange = { checked ->
+                            onNotificationPreferencesChange(
+                                notificationPreferences.copy(queueChanges = checked)
+                            )
+                        }
+                    )
+                    HorizontalDivider(color = Separator.copy(alpha = .58f))
+                    ProfileNotificationToggle(
+                        title = "线上登记与签到",
+                        description = "线上登记创建、签到及未签到移除结果。",
+                        checked = notificationPreferences.onlineCheckIn,
+                        enabled = notificationPreferences.enabled,
+                        onCheckedChange = { checked ->
+                            onNotificationPreferencesChange(
+                                notificationPreferences.copy(onlineCheckIn = checked)
+                            )
+                        }
+                    )
+                    HorizontalDivider(color = Separator.copy(alpha = .58f))
+                    ProfileNotificationToggle(
+                        title = "暂缓一轮、暂时离开和未到场",
+                        description = "相关个人状态及系统处理结果。",
+                        checked = notificationPreferences.absence,
+                        enabled = notificationPreferences.enabled,
+                        onCheckedChange = { checked ->
+                            onNotificationPreferencesChange(
+                                notificationPreferences.copy(absence = checked)
+                            )
+                        }
+                    )
+                }
+                Box(Modifier.width(1.dp).height(216.dp).background(Separator.copy(alpha = .72f)))
+                Column(Modifier.weight(1f)) {
+                    ProfileNotificationToggle(
+                        title = "游玩位置变化",
+                        description = "进入、离开游玩位置及正常轮换。",
+                        checked = notificationPreferences.playingPosition,
+                        enabled = notificationPreferences.enabled,
+                        onCheckedChange = { checked ->
+                            onNotificationPreferencesChange(
+                                notificationPreferences.copy(playingPosition = checked)
+                            )
+                        }
+                    )
+                    HorizontalDivider(color = Separator.copy(alpha = .58f))
+                    ProfileNotificationToggle(
+                        title = "机台及营业状态",
+                        description = "所在机台停止、恢复和登记营业状态变化。",
+                        checked = notificationPreferences.machineStatus,
+                        enabled = notificationPreferences.enabled,
+                        onCheckedChange = { checked ->
+                            onNotificationPreferencesChange(
+                                notificationPreferences.copy(machineStatus = checked)
+                            )
+                        }
                     )
                 }
             }
@@ -6324,6 +6869,82 @@ private fun ProfilePreferenceSelectionRow(
 }
 
 @Composable
+private fun ProfilePrivacyChoice(
+    title: String,
+    description: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier.heightIn(min = 66.dp)
+            .background(if (selected) SoftBlue.copy(alpha = .62f) else Color.Transparent)
+            .clickable(enabled = !selected, onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = PrimaryText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(2.dp))
+            Text(description, color = SecondaryText, fontSize = 10.sp, lineHeight = 15.sp)
+        }
+        Spacer(Modifier.width(12.dp))
+        Box(Modifier.size(22.dp), contentAlignment = Alignment.Center) {
+            if (selected) StraightCheckMark(Modifier.size(14.dp), color = SystemBlue)
+        }
+    }
+}
+
+@Composable
+private fun ProfileNotificationToggle(
+    title: String,
+    description: String,
+    checked: Boolean,
+    enabled: Boolean = true,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 72.dp)
+            .toggleable(
+                value = checked,
+                enabled = enabled,
+                role = Role.Switch,
+                onValueChange = onCheckedChange
+            )
+            .padding(horizontal = 16.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                title,
+                color = if (enabled) PrimaryText else TertiaryText,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                description,
+                color = if (enabled) SecondaryText else TertiaryText,
+                fontSize = 10.sp,
+                lineHeight = 15.sp
+            )
+        }
+        Spacer(Modifier.width(14.dp))
+        Switch(
+            checked = checked,
+            onCheckedChange = null,
+            enabled = enabled,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Color.White,
+                checkedTrackColor = SystemBlue,
+                uncheckedThumbColor = TertiaryText,
+                uncheckedTrackColor = Separator
+            )
+        )
+    }
+}
+
+@Composable
 private fun PlayerProfileDetailScreen(
     profile: PlayerProfile?,
     selectedPreference: PlayPreference?,
@@ -6348,8 +6969,8 @@ private fun PlayerProfileDetailScreen(
         }
         return
     }
-    if (!profile.hasValidContact) {
-        IncompletePlayerContactScreen(
+    if (!profile.hasValidContact || !profile.hasCompleteRequiredDetails) {
+        IncompletePlayerProfileScreen(
             profile = profile,
             continuation = "加入排队",
             onEditProfile = onEditProfile,
@@ -6460,8 +7081,8 @@ private fun ClaimPlayerProfileDetailScreen(
         }
         return
     }
-    if (!profile.hasValidContact) {
-        IncompletePlayerContactScreen(
+    if (!profile.hasValidContact || !profile.hasCompleteRequiredDetails) {
+        IncompletePlayerProfileScreen(
             profile = profile,
             continuation = "认领登记",
             onEditProfile = onEditProfile,
@@ -6543,7 +7164,7 @@ private fun ClaimPlayerProfileDetailScreen(
 }
 
 @Composable
-private fun IncompletePlayerContactScreen(
+private fun IncompletePlayerProfileScreen(
     profile: PlayerProfile,
     continuation: String,
     onEditProfile: () -> Unit,
@@ -6551,8 +7172,8 @@ private fun IncompletePlayerContactScreen(
 ) {
     WizardPage(
         step = "资料待补充",
-        title = "需要补充玩家信息",
-        subtitle = "“${profile.nickname}”的玩家资料还没有有效的 QQ 号。请先完成编辑，再继续$continuation。",
+        title = "需要补全玩家资料",
+        subtitle = "“${profile.nickname}”尚未确认新版资料设置。请先补全并保存，再继续$continuation。",
         onBack = onBack
     ) {
         Row(
@@ -6566,11 +7187,19 @@ private fun IncompletePlayerContactScreen(
             Column(Modifier.weight(1f)) {
                 Text(profile.nickname, color = PrimaryText, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(4.dp))
-                Text("这份资料还没有可用的 QQ 号。", color = Destructive, fontSize = 12.sp)
+                Text(
+                    if (!profile.hasValidContact) {
+                        "需要填写有效的 QQ 号并确认通知设置。"
+                    } else {
+                        "需要确认 QQ 显示范围和排队通知设置。"
+                    },
+                    color = Destructive,
+                    fontSize = 12.sp
+                )
             }
         }
         Spacer(Modifier.height(16.dp))
-        PrimaryButton("编辑并补充 QQ 号", onEditProfile, Modifier.fillMaxWidth())
+        PrimaryButton("前往补全玩家资料", onEditProfile, Modifier.fillMaxWidth())
         Spacer(Modifier.height(9.dp))
         SecondaryButton("返回玩家资料库", onBack, Modifier.fillMaxWidth())
     }
@@ -6842,8 +7471,8 @@ private fun ClaimRegistrationScreen(
                 Modifier.weight(1f)
             )
             OptionCard(
-                "使用二维码",
-                "使用你的移动设备登录并认领登记。",
+                "使用移动设备",
+                "移动设备暂不支持认领已有登记。",
                 false,
                 false,
                 {},
@@ -8856,6 +9485,212 @@ private fun PlayerProfileSavingOverlay() {
 }
 
 @Composable
+private fun MobileRegistrationDialog(
+    session: MobileRegistrationSession,
+    machineName: String,
+    nowMillis: Long,
+    onDismiss: () -> Unit,
+    onRefresh: () -> Unit
+) {
+    val expired = nowMillis >= session.expiresAtMillis
+    ModalSurface(onDismiss, width = 500.dp) {
+        Text(
+            "使用移动设备登记",
+            color = PrimaryText,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(7.dp))
+        Text(
+            if (expired) {
+                "这张二维码已经失效，请重新生成后再扫码。"
+            } else {
+                "使用手机扫描二维码，在网页中为 $machineName 选择或新建玩家资料。"
+            },
+            color = if (expired) Destructive else SecondaryText,
+            fontSize = 13.sp,
+            lineHeight = 20.sp
+        )
+        Spacer(Modifier.height(16.dp))
+        if (!expired) {
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                QrCodeImage(
+                    content = session.registrationUrl,
+                    contentDescription = "移动设备登记二维码",
+                    size = 224.dp
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "二维码将在 ${formatClockTime(session.expiresAtMillis)} 失效",
+                color = TertiaryText,
+                fontSize = 11.sp,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(14.dp))
+            Text(
+                "手机页面可以在完整的玩家资料库中选择玩家；浏览器只会记住上次选择的资料，方便下次快速定位。通过此入口创建的是现场登记，无需另行签到。",
+                color = SecondaryText,
+                fontSize = 12.sp,
+                lineHeight = 19.sp,
+                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                    .background(PageBackground)
+                    .padding(horizontal = 13.dp, vertical = 11.dp)
+            )
+            Spacer(Modifier.height(17.dp))
+            SecondaryButton("关闭", onDismiss, Modifier.fillMaxWidth())
+        } else {
+            PrimaryButton("重新生成二维码", onRefresh, Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
+            CancelAction(onDismiss)
+        }
+    }
+}
+
+@Composable
+private fun MobileRegistrationFailureDialog(
+    detail: String,
+    retryEnabled: Boolean,
+    onDismiss: () -> Unit,
+    onRetry: () -> Unit
+) {
+    ModalSurface(onDismiss, width = 450.dp) {
+        Text(
+            "无法创建移动设备登记",
+            color = PrimaryText,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(detail, color = SecondaryText, fontSize = 13.sp, lineHeight = 20.sp)
+        Spacer(Modifier.height(18.dp))
+        PrimaryButton("重试", onRetry, Modifier.fillMaxWidth(), enabled = retryEnabled)
+        Spacer(Modifier.height(8.dp))
+        CancelAction(onDismiss)
+    }
+}
+
+@Composable
+private fun BotFriendQrDialog(qqNumber: String, onDismiss: () -> Unit) {
+    val contactUri = remember(qqNumber) {
+        "mqqapi://card/show_pslcard?src_type=internal&version=1&uin=$qqNumber" +
+            "&card_type=person&source=qrcode"
+    }
+    ModalSurface(onDismiss, width = 450.dp) {
+        Text(
+            "添加 QQ Bot 好友",
+            color = PrimaryText,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(7.dp))
+        Text(
+            "排队通知需要由 QQ Bot 主动发送私信。请使用 QQ 扫描二维码并添加好友，否则即使开启通知也可能无法收到。",
+            color = SecondaryText,
+            fontSize = 13.sp,
+            lineHeight = 20.sp
+        )
+        Spacer(Modifier.height(16.dp))
+        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+            QrCodeImage(
+                content = contactUri,
+                contentDescription = "QQ Bot 好友二维码",
+                size = 210.dp
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(
+            "QQ：$qqNumber",
+            color = PrimaryText,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.fillMaxWidth(),
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(17.dp))
+        PrimaryButton("我知道了", onDismiss, Modifier.fillMaxWidth())
+    }
+}
+
+@Composable
+private fun IncompleteCheckInProfileDialog(
+    profile: PlayerProfile?,
+    onDismiss: () -> Unit,
+    onEditProfile: (() -> Unit)?
+) {
+    ModalSurface(onDismiss, width = 470.dp) {
+        Text(
+            "需要先补全玩家资料",
+            color = PrimaryText,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            if (profile == null) {
+                "这份线上登记关联的玩家资料暂时不可用，因此不能完成签到。请等待资料同步后重试，或联系现场工作人员。"
+            } else {
+                "“${profile.nickname}”还需要确认 QQ 显示范围和排队通知设置。线上登记会继续保留；保存资料后，请再次点击登记并选择“已到场”完成签到。"
+            },
+            color = SecondaryText,
+            fontSize = 13.sp,
+            lineHeight = 20.sp
+        )
+        Spacer(Modifier.height(18.dp))
+        if (onEditProfile != null) {
+            PrimaryButton("前往补全玩家资料", onEditProfile, Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
+            CancelAction(onDismiss)
+        } else {
+            PrimaryButton("我知道了", onDismiss, Modifier.fillMaxWidth())
+        }
+    }
+}
+
+@Composable
+private fun QrCodeImage(content: String, contentDescription: String, size: Dp) {
+    val bitmap = remember(content) { createQrCodeBitmap(content) }
+    Box(
+        Modifier.size(size + 20.dp).clip(RoundedCornerShape(12.dp))
+            .background(Color.White)
+            .border(1.dp, Separator.copy(alpha = .7f), RoundedCornerShape(12.dp))
+            .padding(10.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = contentDescription,
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            Text(
+                "二维码生成失败",
+                color = Destructive,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+private fun createQrCodeBitmap(content: String, dimension: Int = 640): Bitmap? = runCatching {
+    val matrix = QRCodeWriter().encode(content, BarcodeFormat.QR_CODE, dimension, dimension)
+    val foreground = android.graphics.Color.BLACK
+    val background = android.graphics.Color.WHITE
+    val pixels = IntArray(dimension * dimension) { index ->
+        if (matrix[index % dimension, index / dimension]) foreground else background
+    }
+    Bitmap.createBitmap(dimension, dimension, Bitmap.Config.ARGB_8888).apply {
+        setPixels(pixels, 0, dimension, 0, 0, dimension, dimension)
+    }
+}.getOrNull()
+
+private fun formatClockTime(timestampMillis: Long): String =
+    SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(timestampMillis))
+
+@Composable
 private fun PlayerProfileWriteFailureDialog(detail: String, onDismiss: () -> Unit) {
     ModalSurface(onDismiss) {
         Text("玩家资料未能保存", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
@@ -9091,7 +9926,7 @@ private fun AppDetailsDialog(
         Spacer(Modifier.height(13.dp))
         Text(
             if (cloudSyncStatus != null) {
-                "队列、玩家资料和日志始终先保存在本机。开启网站同步后，当前登记的 QQ 会显示在网页详情中，便于现场联系；完整玩家资料、性别、默认偏好和资料内部编号仍通过私有接口保存。"
+                "队列、玩家资料和日志始终先保存在本机。开启网站同步后，只有玩家选择允许公开时，当前登记的 QQ 才会显示在网页详情中；完整玩家资料、性别、默认偏好和资料内部编号仍通过私有接口保存。"
             } else {
                 "这是不连接网站的纯本地版本。队列、玩家资料和日志只保存在本机，不会上传到服务器。"
             },
@@ -9107,6 +9942,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.5.0",
+            "玩家资料与移动设备登记",
+            "玩家资料新增 QQ 显示范围和分项通知设置，并在终端、云端与 QQ Bot 间同步；现场玩家还可以扫描终端二维码，在手机网页中选择或新建资料并完成登记。"
+        ),
         Triple(
             "0.4.1",
             "线上签到规则与入口控制",

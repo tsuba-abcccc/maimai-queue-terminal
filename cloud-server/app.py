@@ -2,18 +2,19 @@ import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from flask import Flask, current_app, jsonify, request
 
 
-PUBLIC_SCHEMA_VERSION = 4
-SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4}
+PUBLIC_SCHEMA_VERSION = 5
+SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4, 5}
 MAX_PAYLOAD_BYTES = 1024 * 1024
 MAX_REGISTRATIONS_PER_MACHINE = 20
 MAX_PRIVATE_CONTACTS = MAX_REGISTRATIONS_PER_MACHINE * 2
@@ -24,13 +25,24 @@ MAX_LOG_PAGE_SIZE = 100
 MAX_STOP_REASON_DETAIL_CHARACTERS = 40
 PUBLIC_ID_PATTERN = re.compile(r"^[0-9a-f]{24}$")
 QQ_NUMBER_PATTERN = re.compile(r"^[0-9]{5,12}$")
+MOBILE_SESSION_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 PREFERENCES = {"SOLO", "OPEN_TO_JOIN"}
 STOP_REASONS = {"NOT_POWERED_ON", "NETWORK_DISCONNECTED", "MAINTENANCE", "OTHER"}
 REGISTRATION_TYPES = {"TEMPORARY", "PLAYER_PROFILE"}
 PLAYER_GENDERS = {"MALE", "FEMALE", "UNDISCLOSED"}
 PROFILE_PREFERENCES = {"SOLO", "OPEN_TO_JOIN", "ASK_EVERY_TIME"}
+QQ_VISIBILITIES = {"TERMINAL_ONLY", "PUBLIC_WEBSITE"}
+NOTIFICATION_FIELDS = (
+    "notification_enabled",
+    "notify_queue_changes",
+    "notify_playing_position",
+    "notify_online_check_in",
+    "notify_absence",
+    "notify_machine_status",
+)
 PROFILE_UPDATE_COMMAND = "UPDATE_PLAYER_PROFILE"
 QUEUE_OPERATION_COMMAND = "QUEUE_OPERATION"
+MOBILE_REGISTRATION_COMMAND = "MOBILE_DEVICE_REGISTRATION"
 QUEUE_OPERATIONS = {
     "JOIN_QUEUE",
     "DEFER_ONE_ROUND",
@@ -61,6 +73,8 @@ PUBLIC_EVENT_TYPES = {
     "NO_SHOW_MOVED_TO_TAIL",
     "NO_SHOW_REMOVED",
     "TEMPORARY_AWAY_EXPIRED",
+    "ONLINE_REGISTRATION_ADDED",
+    "ONLINE_CHECK_IN_COMPLETED",
     "ONLINE_CHECK_IN_TIMED_OUT",
     "ONLINE_CHECK_IN_MISSED",
     "ABSENCE_CHANGED",
@@ -77,6 +91,7 @@ OPERATION_SOURCES = {
     "QQ_BOT",
     "SYSTEM_AUTOMATIC",
     "WEBSITE_REMOTE",
+    "MOBILE_DEVICE",
 }
 
 
@@ -104,7 +119,18 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         EVENT_RECIPIENT_RETENTION_SECONDS=int(
             os.getenv("QUEUE_EVENT_RECIPIENT_RETENTION_SECONDS", "2592000")
         ),
+        MOBILE_SESSION_TTL_SECONDS=int(
+            os.getenv("QUEUE_MOBILE_SESSION_TTL_SECONDS", "600")
+        ),
+        MOBILE_SESSION_RETENTION_SECONDS=int(
+            os.getenv("QUEUE_MOBILE_SESSION_RETENTION_SECONDS", "86400")
+        ),
         CORS_ORIGIN=os.getenv("QUEUE_CORS_ORIGIN", "https://abcccc.top"),
+        PUBLIC_SITE_URL=os.getenv(
+            "QUEUE_PUBLIC_SITE_URL",
+            f"{os.getenv('QUEUE_CORS_ORIGIN', 'https://abcccc.top').rstrip('/')}"
+            "/queue-status",
+        ).rstrip("/"),
         MAX_CONTENT_LENGTH=MAX_PAYLOAD_BYTES,
         JSON_AS_ASCII=False,
     )
@@ -249,6 +275,15 @@ def initialize_database(database_path: str) -> None:
                 qq_number TEXT,
                 usage_count INTEGER NOT NULL,
                 last_used_at INTEGER,
+                qq_visibility TEXT NOT NULL DEFAULT 'TERMINAL_ONLY',
+                notification_enabled INTEGER NOT NULL DEFAULT 1,
+                notify_queue_changes INTEGER NOT NULL DEFAULT 1,
+                notify_playing_position INTEGER NOT NULL DEFAULT 0,
+                notify_online_check_in INTEGER NOT NULL DEFAULT 1,
+                notify_absence INTEGER NOT NULL DEFAULT 1,
+                notify_machine_status INTEGER NOT NULL DEFAULT 0,
+                setup_version INTEGER NOT NULL DEFAULT 0,
+                profile_revision INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
                 profile_updated_at INTEGER NOT NULL,
                 received_at INTEGER NOT NULL,
@@ -256,10 +291,60 @@ def initialize_database(database_path: str) -> None:
             )
             """
         )
+        player_profile_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(player_profile)")
+        }
+        for column_name, declaration in (
+            ("qq_visibility", "TEXT NOT NULL DEFAULT 'TERMINAL_ONLY'"),
+            ("notification_enabled", "INTEGER NOT NULL DEFAULT 1"),
+            ("notify_queue_changes", "INTEGER NOT NULL DEFAULT 1"),
+            ("notify_playing_position", "INTEGER NOT NULL DEFAULT 0"),
+            ("notify_online_check_in", "INTEGER NOT NULL DEFAULT 1"),
+            ("notify_absence", "INTEGER NOT NULL DEFAULT 1"),
+            ("notify_machine_status", "INTEGER NOT NULL DEFAULT 0"),
+            ("setup_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("profile_revision", "INTEGER NOT NULL DEFAULT 1"),
+        ):
+            if column_name not in player_profile_columns:
+                connection.execute(
+                    f"ALTER TABLE player_profile ADD COLUMN {column_name} {declaration}"
+                )
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS player_profile_qq
             ON player_profile(device_id, qq_number)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS service_identity (
+                profile_scope_id TEXT PRIMARY KEY,
+                bot_qq TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mobile_registration_session (
+                session_id TEXT PRIMARY KEY,
+                session_token TEXT NOT NULL UNIQUE,
+                queue_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                machine_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                command_id TEXT,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                submitted_at INTEGER,
+                UNIQUE(command_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS mobile_registration_session_expiry
+            ON mobile_registration_session(expires_at, submitted_at)
             """
         )
         duplicate_profile_contacts = connection.execute(
@@ -466,6 +551,13 @@ def register_routes(app: Flask) -> None:
             return authorization_error
         return read_bot_command(command_id)
 
+    @app.post("/api/queue-bot/identity")
+    def queue_bot_identity():
+        authorization_error = authorize_bot()
+        if authorization_error is not None:
+            return authorization_error
+        return update_bot_identity()
+
     @app.post("/api/queue-online/profile")
     def queue_online_profile():
         return read_online_profile()
@@ -491,6 +583,25 @@ def register_routes(app: Flask) -> None:
         if authorization_error is not None:
             return authorization_error
         return read_synced_profiles(allow_qq_filter=False)
+
+    @app.post("/api/queue-terminal/mobile-registration-sessions")
+    def queue_terminal_create_mobile_registration_session():
+        authorization_error = authorize_terminal()
+        if authorization_error is not None:
+            return authorization_error
+        return create_mobile_registration_session()
+
+    @app.get("/api/queue-mobile/sessions/<session_token>")
+    def queue_mobile_registration_session(session_token: str):
+        return read_mobile_registration_session(session_token)
+
+    @app.post("/api/queue-mobile/sessions/<session_token>/submit")
+    def queue_mobile_registration_submit(session_token: str):
+        return submit_mobile_registration_session(session_token)
+
+    @app.get("/api/queue-mobile/sessions/<session_token>/result")
+    def queue_mobile_registration_result(session_token: str):
+        return read_mobile_registration_result(session_token)
 
     @app.post("/api/queue-terminal/commands/<command_id>/result")
     def queue_terminal_command_result(command_id: str):
@@ -699,52 +810,11 @@ def publish_snapshot():
         }
         if private_profiles is not None:
             profile_scope_id = current_app.config["PROFILE_SCOPE_ID"]
-            connection.executemany(
-                """
-                UPDATE player_profile
-                SET qq_number = NULL
-                WHERE device_id = ? AND profile_id != ? AND qq_number = ?
-                """,
-                [
-                    (profile_scope_id, profile["profile_id"], profile["qq_number"])
-                    for profile in private_profiles
-                    if profile["qq_number"] is not None
-                ],
-            )
-            connection.executemany(
-                """
-                INSERT INTO player_profile
-                    (device_id, profile_id, nickname, gender, default_preference,
-                     qq_number, usage_count, last_used_at, created_at,
-                     profile_updated_at, received_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(device_id, profile_id) DO UPDATE SET
-                    nickname = excluded.nickname,
-                    gender = excluded.gender,
-                    default_preference = excluded.default_preference,
-                    qq_number = excluded.qq_number,
-                    usage_count = excluded.usage_count,
-                    last_used_at = excluded.last_used_at,
-                    created_at = excluded.created_at,
-                    profile_updated_at = excluded.profile_updated_at,
-                    received_at = excluded.received_at
-                """,
-                [
-                    (
-                        profile_scope_id,
-                        profile["profile_id"],
-                        profile["nickname"],
-                        profile["gender"],
-                        profile["default_preference"],
-                        profile["qq_number"],
-                        profile["usage_count"],
-                        profile["last_used_at"],
-                        profile["created_at"],
-                        profile["updated_at"],
-                        now,
-                    )
-                    for profile in private_profiles
-                ],
+            upsert_player_profiles(
+                connection,
+                profile_scope_id=profile_scope_id,
+                profiles=private_profiles,
+                received_at=now,
             )
         if not onebot_sync_enabled:
             connection.execute(
@@ -768,6 +838,18 @@ def publish_snapshot():
                     PROFILE_UPDATE_COMMAND,
                 ),
             )
+        notification_settings = {
+            row["profile_id"]: row
+            for row in connection.execute(
+                """
+                SELECT profile_id, notification_enabled, notify_queue_changes,
+                       notify_playing_position, notify_online_check_in,
+                       notify_absence, notify_machine_status, setup_version
+                FROM player_profile WHERE device_id = ?
+                """,
+                (current_app.config["PROFILE_SCOPE_ID"],),
+            ).fetchall()
+        }
         for event in sorted(events, key=lambda value: value["occurred_at"]):
             event_registration_ids = (
                 list(previous_queue_contacts)
@@ -802,6 +884,14 @@ def publish_snapshot():
                         for registration_id in event_registration_ids
                         if registration_id in event_contacts
                     )
+                recipient_contacts = [
+                    contact
+                    for contact in recipient_contacts
+                    if profile_allows_event_notification(
+                        notification_settings.get(contact["player_id"]),
+                        event["type"],
+                    )
+                ]
                 connection.executemany(
                     """
                     INSERT INTO queue_event_recipient
@@ -882,6 +972,110 @@ def publish_snapshot():
         connection.commit()
 
     return "", 204
+
+
+def upsert_player_profiles(
+    connection: sqlite3.Connection,
+    *,
+    profile_scope_id: str,
+    profiles: list[dict[str, Any]],
+    received_at: int,
+) -> None:
+    for profile in profiles:
+        current = connection.execute(
+            """
+            SELECT profile_revision, profile_updated_at FROM player_profile
+            WHERE device_id = ? AND profile_id = ?
+            """,
+            (profile_scope_id, profile["profile_id"]),
+        ).fetchone()
+        if current is not None:
+            if profile["legacy_revision"]:
+                if profile["updated_at"] <= current["profile_updated_at"]:
+                    continue
+                profile = {
+                    **profile,
+                    "profile_revision": current["profile_revision"] + 1,
+                }
+            elif profile["profile_revision"] <= current["profile_revision"]:
+                continue
+
+        qq_number = profile["qq_number"]
+        if qq_number is not None:
+            conflicting = connection.execute(
+                """
+                SELECT profile_revision FROM player_profile
+                WHERE device_id = ? AND profile_id != ? AND qq_number = ?
+                """,
+                (profile_scope_id, profile["profile_id"], qq_number),
+            ).fetchone()
+            if (
+                conflicting is not None
+                and conflicting["profile_revision"] >= profile["profile_revision"]
+            ):
+                continue
+            connection.execute(
+                """
+                UPDATE player_profile
+                SET qq_number = NULL, profile_revision = profile_revision + 1
+                WHERE device_id = ? AND profile_id != ? AND qq_number = ?
+                """,
+                (profile_scope_id, profile["profile_id"], qq_number),
+            )
+
+        connection.execute(
+            """
+            INSERT INTO player_profile
+                (device_id, profile_id, nickname, gender, default_preference,
+                 qq_number, usage_count, last_used_at, qq_visibility,
+                 notification_enabled, notify_queue_changes,
+                 notify_playing_position, notify_online_check_in,
+                 notify_absence, notify_machine_status, setup_version,
+                 profile_revision, created_at, profile_updated_at, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_id, profile_id) DO UPDATE SET
+                nickname = excluded.nickname,
+                gender = excluded.gender,
+                default_preference = excluded.default_preference,
+                qq_number = excluded.qq_number,
+                usage_count = excluded.usage_count,
+                last_used_at = excluded.last_used_at,
+                qq_visibility = excluded.qq_visibility,
+                notification_enabled = excluded.notification_enabled,
+                notify_queue_changes = excluded.notify_queue_changes,
+                notify_playing_position = excluded.notify_playing_position,
+                notify_online_check_in = excluded.notify_online_check_in,
+                notify_absence = excluded.notify_absence,
+                notify_machine_status = excluded.notify_machine_status,
+                setup_version = excluded.setup_version,
+                profile_revision = excluded.profile_revision,
+                created_at = excluded.created_at,
+                profile_updated_at = excluded.profile_updated_at,
+                received_at = excluded.received_at
+            """,
+            (
+                profile_scope_id,
+                profile["profile_id"],
+                profile["nickname"],
+                profile["gender"],
+                profile["default_preference"],
+                qq_number,
+                profile["usage_count"],
+                profile["last_used_at"],
+                profile["qq_visibility"],
+                int(profile["notification_enabled"]),
+                int(profile["notify_queue_changes"]),
+                int(profile["notify_playing_position"]),
+                int(profile["notify_online_check_in"]),
+                int(profile["notify_absence"]),
+                int(profile["notify_machine_status"]),
+                profile["setup_version"],
+                profile["profile_revision"],
+                profile["created_at"],
+                profile["updated_at"],
+                received_at,
+            ),
+        )
 
 
 def sync_mode_required_response(
@@ -1220,6 +1414,30 @@ def read_bot_profiles():
     return read_synced_profiles(allow_qq_filter=True)
 
 
+def update_bot_identity():
+    source = request.get_json(silent=True)
+    if not isinstance(source, dict) or set(source) != {"bot_qq"}:
+        return jsonify({"ok": False, "error": "请求内容必须只包含 bot_qq"}), 400
+    try:
+        bot_qq = read_qq_number(source, "bot_qq")
+    except ValidationError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    now = int(time.time())
+    with open_database() as connection:
+        connection.execute(
+            """
+            INSERT INTO service_identity (profile_scope_id, bot_qq, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(profile_scope_id) DO UPDATE SET
+                bot_qq = excluded.bot_qq,
+                updated_at = excluded.updated_at
+            """,
+            (current_app.config["PROFILE_SCOPE_ID"], bot_qq, now),
+        )
+        connection.commit()
+    return jsonify({"ok": True, "bot_qq": bot_qq, "updated_at": now * 1000})
+
+
 def read_synced_profiles(*, allow_qq_filter: bool):
     if allow_qq_filter:
         qq_number, filter_error = read_private_qq_filter()
@@ -1238,8 +1456,11 @@ def read_synced_profiles(*, allow_qq_filter: bool):
             return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
         query = """
             SELECT profile_id, nickname, gender, default_preference, qq_number,
-                   usage_count, last_used_at, created_at, profile_updated_at,
-                   received_at
+                   usage_count, last_used_at, qq_visibility,
+                   notification_enabled, notify_queue_changes,
+                   notify_playing_position, notify_online_check_in,
+                   notify_absence, notify_machine_status, setup_version,
+                   profile_revision, created_at, profile_updated_at, received_at
             FROM player_profile
             WHERE device_id = ?
         """
@@ -1249,11 +1470,18 @@ def read_synced_profiles(*, allow_qq_filter: bool):
             parameters.append(qq_number)
         query += " ORDER BY nickname, profile_id"
         rows = connection.execute(query, parameters).fetchall()
+        identity = connection.execute(
+            """
+            SELECT bot_qq FROM service_identity WHERE profile_scope_id = ?
+            """,
+            (current_app.config["PROFILE_SCOPE_ID"],),
+        ).fetchone()
 
     return jsonify(
         {
             "queue_id": snapshot_row["queue_id"],
             "revision": snapshot_row["revision"],
+            "bot_qq": identity["bot_qq"] if identity is not None else None,
             "profiles": [
                 {
                     "profile_id": row["profile_id"],
@@ -1263,6 +1491,15 @@ def read_synced_profiles(*, allow_qq_filter: bool):
                     "qq_number": row["qq_number"],
                     "usage_count": row["usage_count"],
                     "last_used_at": row["last_used_at"],
+                    "qq_visibility": row["qq_visibility"],
+                    "notification_enabled": bool(row["notification_enabled"]),
+                    "notify_queue_changes": bool(row["notify_queue_changes"]),
+                    "notify_playing_position": bool(row["notify_playing_position"]),
+                    "notify_online_check_in": bool(row["notify_online_check_in"]),
+                    "notify_absence": bool(row["notify_absence"]),
+                    "notify_machine_status": bool(row["notify_machine_status"]),
+                    "setup_version": row["setup_version"],
+                    "profile_revision": row["profile_revision"],
                     "created_at": row["created_at"],
                     "updated_at": row["profile_updated_at"],
                     "synced_at": row["received_at"] * 1000,
@@ -1644,11 +1881,578 @@ def read_website_command(command_id: str):
     return jsonify(command)
 
 
+def cleanup_mobile_registration_sessions(
+    connection: sqlite3.Connection, now: int
+) -> None:
+    retention = max(1, current_app.config["MOBILE_SESSION_RETENTION_SECONDS"])
+    connection.execute(
+        """
+        DELETE FROM mobile_registration_session
+        WHERE COALESCE(submitted_at, expires_at) <= ?
+        """,
+        (now - retention,),
+    )
+
+
+def create_mobile_registration_session():
+    source = request.get_json(silent=True)
+    if not isinstance(source, dict) or set(source) != {
+        "request_id",
+        "queue_id",
+        "machine_id",
+    }:
+        return jsonify({"ok": False, "error": "移动设备登记会话参数不完整"}), 400
+    try:
+        session_id = read_uuid(source, "request_id")
+        queue_id = read_uuid(source, "queue_id")
+        machine_id = read_optional_machine_id(source, "machine_id")
+        if machine_id is None:
+            raise ValidationError("machine_id 机台编号无效")
+    except ValidationError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+
+    device_id = request.headers.get("X-Device-ID", "").strip()
+    now = int(time.time())
+    expires_at = now + max(60, current_app.config["MOBILE_SESSION_TTL_SECONDS"])
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cleanup_mobile_registration_sessions(connection, now)
+        existing = connection.execute(
+            "SELECT * FROM mobile_registration_session WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["queue_id"] != queue_id
+                or existing["device_id"] != device_id
+                or existing["machine_id"] != machine_id
+            ):
+                return jsonify({"ok": False, "error": "request_id 已用于其他登记会话"}), 409
+            connection.commit()
+            return jsonify(serialize_mobile_session(existing)), 200
+
+        snapshot_row = connection.execute(
+            "SELECT queue_id, device_id, payload FROM queue_snapshot WHERE id = 1"
+        ).fetchone()
+        if snapshot_row is None:
+            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+        if snapshot_row["device_id"] != device_id:
+            return jsonify({"ok": False, "error": "当前终端不是正在同步的终端"}), 409
+        if snapshot_row["queue_id"] != queue_id:
+            return jsonify({"ok": False, "error": "排队批次已经变化，请重新打开登记页面"}), 409
+        snapshot = json.loads(snapshot_row["payload"])
+        if not snapshot.get("website_remote_enabled", False):
+            return jsonify({"ok": False, "error": "网站同步已关闭，暂不能使用移动设备登记"}), 409
+        if not snapshot.get("registration_open", True):
+            return jsonify({"ok": False, "error": "现场当前没有使用登记排队"}), 409
+        machine = snapshot.get("machines", {}).get(machine_id)
+        if machine is None:
+            return jsonify({"ok": False, "error": "所选机台不存在"}), 404
+        if not machine.get("operational", False):
+            return jsonify({"ok": False, "error": f"{machine['name']}已停止使用"}), 409
+        if machine.get("registration_count", 0) >= MAX_REGISTRATIONS_PER_MACHINE:
+            return jsonify({"ok": False, "error": f"{machine['name']}的登记已满"}), 409
+
+        session_token = secrets.token_urlsafe(32)
+        connection.execute(
+            """
+            INSERT INTO mobile_registration_session
+                (session_id, session_token, queue_id, device_id, machine_id,
+                 status, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?)
+            """,
+            (
+                session_id,
+                session_token,
+                queue_id,
+                device_id,
+                machine_id,
+                now,
+                expires_at,
+            ),
+        )
+        connection.commit()
+        created = connection.execute(
+            "SELECT * FROM mobile_registration_session WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    return jsonify(serialize_mobile_session(created)), 201
+
+
+def serialize_mobile_session(row: sqlite3.Row) -> dict[str, Any]:
+    token = row["session_token"]
+    return {
+        "session_id": row["session_id"],
+        "session_token": token,
+        "queue_id": row["queue_id"],
+        "machine_id": row["machine_id"],
+        "status": row["status"],
+        "command_id": row["command_id"],
+        "created_at": row["created_at"] * 1000,
+        "expires_at": row["expires_at"] * 1000,
+        "registration_url": (
+            f"{current_app.config['PUBLIC_SITE_URL']}?mobile_registration={token}"
+        ),
+    }
+
+
+def find_mobile_session(connection: sqlite3.Connection, session_token: str):
+    if MOBILE_SESSION_TOKEN_PATTERN.fullmatch(session_token) is None:
+        return None
+    return connection.execute(
+        "SELECT * FROM mobile_registration_session WHERE session_token = ?",
+        (session_token,),
+    ).fetchone()
+
+
+def validate_open_mobile_session(
+    connection: sqlite3.Connection,
+    session: sqlite3.Row,
+    now: int,
+):
+    if session["status"] != "OPEN":
+        return "这次移动设备登记已经提交", 409, "SESSION_SUBMITTED"
+    if session["expires_at"] <= now:
+        return "移动设备登记二维码已过期，请在终端重新打开", 410, "SESSION_EXPIRED"
+    snapshot_row = connection.execute(
+        "SELECT queue_id, device_id, payload, received_at FROM queue_snapshot WHERE id = 1"
+    ).fetchone()
+    if snapshot_row is None:
+        return "排队终端暂未同步", 404, "TERMINAL_NOT_READY"
+    if (
+        snapshot_row["queue_id"] != session["queue_id"]
+        or snapshot_row["device_id"] != session["device_id"]
+    ):
+        return "这次移动设备登记已经失效，请在终端重新打开", 409, "SESSION_STALE"
+    if not snapshot_is_online(snapshot_row):
+        return "现场终端暂时离线，请稍后重试", 503, "TERMINAL_OFFLINE"
+    snapshot = json.loads(snapshot_row["payload"])
+    if not snapshot.get("website_remote_enabled", False):
+        return "网站同步已关闭，暂不能使用移动设备登记", 503, "WEBSITE_SYNC_DISABLED"
+    if not snapshot.get("registration_open", True):
+        return "现场当前没有使用登记排队", 409, "REGISTRATION_CLOSED"
+    machine = snapshot.get("machines", {}).get(session["machine_id"])
+    if machine is None:
+        return "目标机台已经不存在", 409, "MACHINE_NOT_FOUND"
+    if not machine.get("operational", False):
+        return f"{machine['name']}已停止使用", 409, "MACHINE_STOPPED"
+    if machine.get("registration_count", 0) >= MAX_REGISTRATIONS_PER_MACHINE:
+        return f"{machine['name']}的登记已满", 409, "MACHINE_FULL"
+    return snapshot_row, snapshot, machine
+
+
+def read_mobile_registration_session(session_token: str):
+    query = request.args.get("q", "").strip()
+    if len(query) > 32:
+        return jsonify({"ok": False, "error": "搜索内容过长"}), 400
+    now = int(time.time())
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cleanup_mobile_registration_sessions(connection, now)
+        session = find_mobile_session(connection, session_token)
+        if session is None:
+            connection.commit()
+            return jsonify({"ok": False, "error": "没有找到这次移动设备登记"}), 404
+        validation = validate_open_mobile_session(connection, session, now)
+        if isinstance(validation[0], str):
+            detail, status_code, code = validation
+            connection.commit()
+            return jsonify({"ok": False, "code": code, "error": detail}), status_code
+        snapshot_row, snapshot, machine = validation
+        profile_scope_id = current_app.config["PROFILE_SCOPE_ID"]
+        sql = """
+            SELECT profile_id, nickname, gender, default_preference, qq_number,
+                   usage_count, last_used_at, qq_visibility,
+                   notification_enabled, notify_queue_changes,
+                   notify_playing_position, notify_online_check_in,
+                   notify_absence, notify_machine_status, setup_version,
+                   profile_revision
+            FROM player_profile
+            WHERE device_id = ?
+        """
+        parameters: list[Any] = [profile_scope_id]
+        if query:
+            sql += " AND (lower(nickname) LIKE lower(?) OR qq_number LIKE ?)"
+            search = f"%{query}%"
+            parameters.extend((search, search))
+        sql += " ORDER BY usage_count DESC, COALESCE(last_used_at, 0) DESC, nickname, profile_id"
+        profiles = connection.execute(sql, parameters).fetchall()
+        identity = connection.execute(
+            "SELECT bot_qq FROM service_identity WHERE profile_scope_id = ?",
+            (profile_scope_id,),
+        ).fetchone()
+        connection.commit()
+    return jsonify(
+        {
+            "session": {
+                "session_id": session["session_id"],
+                "queue_id": session["queue_id"],
+                "machine_id": session["machine_id"],
+                "machine_name": machine["name"],
+                "expires_at": session["expires_at"] * 1000,
+            },
+            "profiles": [serialize_mobile_profile(row) for row in profiles],
+            "bot_qq": identity["bot_qq"] if identity is not None else None,
+            "capabilities": {
+                "create_profile": True,
+                "complete_profile": True,
+                "edit_complete_profile": False,
+                "terminal_is_source_of_truth": True,
+            },
+        }
+    )
+
+
+def serialize_mobile_profile(profile: sqlite3.Row) -> dict[str, Any]:
+    qq_is_public = profile["qq_visibility"] == "PUBLIC_WEBSITE"
+    return {
+        "profile_id": profile["profile_id"],
+        "nickname": profile["nickname"],
+        "gender": profile["gender"],
+        "default_preference": profile["default_preference"],
+        "qq_number": profile["qq_number"] if qq_is_public else None,
+        "qq_present": bool(profile["qq_number"]),
+        "qq_public": qq_is_public,
+        "notification_enabled": bool(profile["notification_enabled"]),
+        "notify_queue_changes": bool(profile["notify_queue_changes"]),
+        "notify_playing_position": bool(profile["notify_playing_position"]),
+        "notify_online_check_in": bool(profile["notify_online_check_in"]),
+        "notify_absence": bool(profile["notify_absence"]),
+        "notify_machine_status": bool(profile["notify_machine_status"]),
+        "usage_count": profile["usage_count"],
+        "last_used_at": profile["last_used_at"],
+        "setup_complete": bool(profile["setup_version"] >= 1 and profile["qq_number"]),
+        "profile_revision": profile["profile_revision"],
+    }
+
+
+def normalize_mobile_profile_settings(
+    source: Any,
+    *,
+    require_identity_fields: bool,
+    existing_qq: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        raise ValidationError("玩家资料设置不完整")
+    required = {"qq_visibility", *NOTIFICATION_FIELDS}
+    if require_identity_fields:
+        required.update({"nickname", "gender", "default_preference", "qq_number"})
+    elif existing_qq is None:
+        required.add("qq_number")
+    if set(source) != required:
+        raise ValidationError("请确认并保存全部玩家资料设置")
+
+    settings = {
+        "qq_visibility": read_choice(source, "qq_visibility", QQ_VISIBILITIES),
+    }
+    for key in NOTIFICATION_FIELDS:
+        settings[key] = read_boolean(source, key)
+    if require_identity_fields:
+        settings.update(
+            {
+                "nickname": read_string(source, "nickname", maximum_length=18),
+                "gender": read_choice(source, "gender", PLAYER_GENDERS),
+                "default_preference": read_choice(
+                    source, "default_preference", PROFILE_PREFERENCES
+                ),
+            }
+        )
+    qq_number = existing_qq
+    if "qq_number" in source:
+        qq_number = read_qq_number(source, "qq_number")
+    settings["qq_number"] = qq_number
+    settings["setup_version"] = 1
+    return settings
+
+
+def resolve_mobile_registration_preference(
+    default_preference: str, requested_preference: Any
+) -> str:
+    if default_preference == "ASK_EVERY_TIME":
+        if requested_preference not in PREFERENCES:
+            raise ValidationError("请选择本次游玩偏好")
+        return requested_preference
+    if requested_preference is not None and requested_preference != default_preference:
+        raise ValidationError("玩家资料的默认游玩偏好已经变化，请重新确认")
+    return default_preference
+
+
+def submit_mobile_registration_session(session_token: str):
+    source = request.get_json(silent=True)
+    if not isinstance(source, dict):
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+    allowed_fields = {
+        "request_id",
+        "profile_id",
+        "expected_profile_revision",
+        "profile_completion",
+        "new_profile",
+        "preference",
+    }
+    if set(source) - allowed_fields:
+        return jsonify({"ok": False, "error": "请求包含不支持的移动设备登记字段"}), 400
+    try:
+        command_id = read_uuid(source, "request_id")
+    except ValidationError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    profile_id_value = source.get("profile_id")
+    new_profile_source = source.get("new_profile")
+    if (profile_id_value is None) == (new_profile_source is None):
+        return jsonify({"ok": False, "error": "请选择一份玩家资料或新建资料"}), 400
+
+    now = int(time.time())
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cleanup_mobile_registration_sessions(connection, now)
+        expire_pending_commands(connection, now)
+        session = find_mobile_session(connection, session_token)
+        if session is None:
+            connection.commit()
+            return jsonify({"ok": False, "error": "没有找到这次移动设备登记"}), 404
+        if session["status"] == "SUBMITTED":
+            if session["command_id"] != command_id:
+                connection.commit()
+                return jsonify({"ok": False, "error": "这次移动设备登记已经提交"}), 409
+            command = connection.execute(
+                "SELECT * FROM terminal_command WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+            connection.commit()
+            return jsonify(serialize_mobile_command_result(command, session)), 200
+        validation = validate_open_mobile_session(connection, session, now)
+        if isinstance(validation[0], str):
+            detail, status_code, code = validation
+            connection.commit()
+            return jsonify({"ok": False, "code": code, "error": detail}), status_code
+        snapshot_row, snapshot, _machine = validation
+
+        try:
+            profile_scope_id = current_app.config["PROFILE_SCOPE_ID"]
+            if profile_id_value is not None:
+                profile_id = read_uuid(source, "profile_id")
+                profile = connection.execute(
+                    """
+                    SELECT profile_id, nickname, gender, default_preference, qq_number,
+                           qq_visibility, notification_enabled, notify_queue_changes,
+                           notify_playing_position, notify_online_check_in,
+                           notify_absence, notify_machine_status, setup_version,
+                           profile_revision
+                    FROM player_profile
+                    WHERE device_id = ? AND profile_id = ?
+                    """,
+                    (profile_scope_id, profile_id),
+                ).fetchone()
+                if profile is None:
+                    return jsonify({"ok": False, "error": "这份玩家资料已经不存在"}), 404
+                expected_revision = read_integer(
+                    source,
+                    "expected_profile_revision",
+                    minimum=1,
+                    maximum=2**63 - 1,
+                )
+                if expected_revision != profile["profile_revision"]:
+                    return jsonify(
+                        {"ok": False, "error": "玩家资料已经更新，请重新选择后再提交"}
+                    ), 409
+                profile_is_complete = bool(
+                    profile["setup_version"] >= 1 and profile["qq_number"]
+                )
+                completion_source = source.get("profile_completion")
+                if profile_is_complete:
+                    if completion_source is not None:
+                        raise ValidationError("完整玩家资料不能在此页面编辑")
+                    profile_settings = None
+                    actor_qq = profile["qq_number"]
+                else:
+                    profile_settings = normalize_mobile_profile_settings(
+                        completion_source,
+                        require_identity_fields=False,
+                        existing_qq=profile["qq_number"],
+                    )
+                    actor_qq = profile_settings["qq_number"]
+                resolved_preference = resolve_mobile_registration_preference(
+                    profile["default_preference"], source.get("preference")
+                )
+                nickname = profile["nickname"]
+                command_profile = {
+                    "mode": "EXISTING",
+                    "profile_id": profile_id,
+                    "expected_profile_revision": expected_revision,
+                    "completion": profile_settings,
+                }
+            else:
+                if source.get("profile_completion") is not None:
+                    raise ValidationError("新建资料不能同时提交补全资料内容")
+                if source.get("expected_profile_revision") is not None:
+                    raise ValidationError("新建资料不能包含旧资料版本")
+                profile_settings = normalize_mobile_profile_settings(
+                    new_profile_source,
+                    require_identity_fields=True,
+                )
+                actor_qq = profile_settings["qq_number"]
+                nickname = profile_settings["nickname"]
+                resolved_preference = resolve_mobile_registration_preference(
+                    profile_settings["default_preference"], source.get("preference")
+                )
+                profile_id = str(uuid4())
+                command_profile = {
+                    "mode": "NEW",
+                    "profile_id": profile_id,
+                    "profile": profile_settings,
+                }
+        except (ValidationError, ValueError) as error:
+            return jsonify({"ok": False, "error": str(error) or "玩家资料编号无效"}), 400
+
+        duplicate = connection.execute(
+            """
+            SELECT profile_id, nickname, qq_number FROM player_profile
+            WHERE device_id = ? AND profile_id != ?
+              AND (lower(nickname) = lower(?) OR qq_number = ?)
+            """,
+            (profile_scope_id, profile_id, nickname, actor_qq),
+        ).fetchone()
+        if duplicate is not None:
+            detail = (
+                "这个 QQ 已经关联其他玩家资料"
+                if duplicate["qq_number"] == actor_qq
+                else "这个昵称已经用于其他玩家资料"
+            )
+            return jsonify({"ok": False, "error": detail}), 409
+
+        active_registration = connection.execute(
+            """
+            SELECT 1 FROM queue_private_contact
+            WHERE queue_id = ? AND (player_id = ? OR qq_number = ?)
+            """,
+            (session["queue_id"], profile_id, actor_qq),
+        ).fetchone()
+        if active_registration is not None:
+            return jsonify({"ok": False, "error": "这名玩家已经有一份正在排队的登记"}), 409
+        if any(
+            registration["display_id"].casefold() == nickname.casefold()
+            for machine in snapshot.get("machines", {}).values()
+            for registration in all_machine_registrations(machine)
+        ):
+            return jsonify({"ok": False, "error": "这个昵称已经用于当前队列中的其他登记"}), 409
+        pending = connection.execute(
+            """
+            SELECT 1 FROM terminal_command
+            WHERE status = 'PENDING' AND (
+                json_extract(payload, '$.actor_qq') = ?
+                OR json_extract(payload, '$.profile.profile_id') = ?
+                OR json_extract(payload, '$.profile_id') = ?
+            )
+            """,
+            (actor_qq, profile_id, profile_id),
+        ).fetchone()
+        if pending is not None:
+            return jsonify({"ok": False, "error": "这名玩家已有一项操作等待终端处理"}), 409
+
+        payload = {
+            "queue_id": session["queue_id"],
+            "machine_id": session["machine_id"],
+            "actor_qq": actor_qq,
+            "preference": resolved_preference,
+            "operation_source": "MOBILE_DEVICE",
+            "session_id": session["session_id"],
+            "profile": command_profile,
+        }
+        connection.execute(
+            """
+            INSERT INTO terminal_command
+                (command_id, device_id, command_type, payload, status, created_at)
+            VALUES (?, ?, ?, ?, 'PENDING', ?)
+            """,
+            (
+                command_id,
+                snapshot_row["device_id"],
+                MOBILE_REGISTRATION_COMMAND,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE mobile_registration_session
+            SET status = 'SUBMITTED', command_id = ?, submitted_at = ?
+            WHERE session_id = ? AND status = 'OPEN'
+            """,
+            (command_id, now, session["session_id"]),
+        )
+        connection.commit()
+        command = connection.execute(
+            "SELECT * FROM terminal_command WHERE command_id = ?", (command_id,)
+        ).fetchone()
+        submitted = connection.execute(
+            "SELECT * FROM mobile_registration_session WHERE session_id = ?",
+            (session["session_id"],),
+        ).fetchone()
+    return jsonify(serialize_mobile_command_result(command, submitted)), 202
+
+
+def serialize_mobile_command_result(
+    command: sqlite3.Row | None, session: sqlite3.Row
+) -> dict[str, Any]:
+    profile_id = None
+    if command is not None:
+        try:
+            payload = json.loads(command["payload"])
+            profile_id = payload.get("profile", {}).get("profile_id")
+        except (TypeError, ValueError, AttributeError):
+            profile_id = None
+    return {
+        "session_id": session["session_id"],
+        "command_id": session["command_id"],
+        "status": command["status"] if command is not None else "UNAVAILABLE",
+        "profile_id": profile_id,
+        "created_at": command["created_at"] * 1000 if command is not None else None,
+        "completed_at": (
+            command["completed_at"] * 1000
+            if command is not None and command["completed_at"]
+            else None
+        ),
+        "result_detail": command["result_detail"] if command is not None else None,
+    }
+
+
+def read_mobile_registration_result(session_token: str):
+    now = int(time.time())
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cleanup_mobile_registration_sessions(connection, now)
+        expire_pending_commands(connection, now)
+        session = find_mobile_session(connection, session_token)
+        if session is None:
+            connection.commit()
+            return jsonify({"ok": False, "error": "没有找到这次移动设备登记"}), 404
+        if session["status"] != "SUBMITTED" or not session["command_id"]:
+            connection.commit()
+            if session["expires_at"] <= now:
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "SESSION_EXPIRED",
+                        "error": "移动设备登记二维码已过期，请在终端重新打开",
+                    }
+                ), 410
+            return jsonify({"status": "OPEN", "session_id": session["session_id"]})
+        command = connection.execute(
+            "SELECT * FROM terminal_command WHERE command_id = ?",
+            (session["command_id"],),
+        ).fetchone()
+        connection.commit()
+    return jsonify(serialize_mobile_command_result(command, session))
+
+
 def find_player_profile_by_qq(connection: sqlite3.Connection, qq_number: str):
     return connection.execute(
         """
         SELECT profile_id, nickname, gender, default_preference, qq_number,
-               usage_count, last_used_at, created_at, profile_updated_at
+               usage_count, last_used_at, qq_visibility,
+               notification_enabled, notify_queue_changes,
+               notify_playing_position, notify_online_check_in,
+               notify_absence, notify_machine_status, setup_version,
+               profile_revision, created_at, profile_updated_at
         FROM player_profile
         WHERE device_id = ? AND qq_number = ?
         """,
@@ -1665,6 +2469,15 @@ def serialize_player_profile(profile: sqlite3.Row) -> dict[str, Any]:
         "qq_number": profile["qq_number"],
         "usage_count": profile["usage_count"],
         "last_used_at": profile["last_used_at"],
+        "qq_visibility": profile["qq_visibility"],
+        "notification_enabled": bool(profile["notification_enabled"]),
+        "notify_queue_changes": bool(profile["notify_queue_changes"]),
+        "notify_playing_position": bool(profile["notify_playing_position"]),
+        "notify_online_check_in": bool(profile["notify_online_check_in"]),
+        "notify_absence": bool(profile["notify_absence"]),
+        "notify_machine_status": bool(profile["notify_machine_status"]),
+        "setup_version": profile["setup_version"],
+        "profile_revision": profile["profile_revision"],
         "created_at": profile["created_at"],
         "updated_at": profile["profile_updated_at"],
     }
@@ -1771,7 +2584,18 @@ def create_profile_update_command(profile_id: str):
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
 
-    allowed_update_fields = {"nickname", "gender", "default_preference"}
+    allowed_update_fields = {
+        "nickname",
+        "gender",
+        "default_preference",
+        "qq_visibility",
+        "notification_enabled",
+        "notify_queue_changes",
+        "notify_playing_position",
+        "notify_online_check_in",
+        "notify_absence",
+        "notify_machine_status",
+    }
     supplied_update_fields = allowed_update_fields.intersection(source)
     if not supplied_update_fields:
         return jsonify({"ok": False, "error": "没有需要更新的玩家资料字段"}), 400
@@ -1790,6 +2614,20 @@ def create_profile_update_command(profile_id: str):
             requested_update["default_preference"] = read_choice(
                 source, "default_preference", PROFILE_PREFERENCES
             )
+        if "qq_visibility" in source:
+            requested_update["qq_visibility"] = read_choice(
+                source, "qq_visibility", QQ_VISIBILITIES
+            )
+        for key in (
+            "notification_enabled",
+            "notify_queue_changes",
+            "notify_playing_position",
+            "notify_online_check_in",
+            "notify_absence",
+            "notify_machine_status",
+        ):
+            if key in source:
+                requested_update[key] = read_boolean(source, key)
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
     request_identity = {
@@ -1825,7 +2663,10 @@ def create_profile_update_command(profile_id: str):
         profile = connection.execute(
             """
             SELECT profile_id, nickname, gender, default_preference, qq_number,
-                   profile_updated_at
+                   qq_visibility, notification_enabled, notify_queue_changes,
+                   notify_playing_position, notify_online_check_in,
+                   notify_absence, notify_machine_status, setup_version,
+                   profile_revision, profile_updated_at
             FROM player_profile
             WHERE device_id = ? AND profile_id = ?
             """,
@@ -1842,11 +2683,34 @@ def create_profile_update_command(profile_id: str):
             "actor_qq": actor_qq,
             "operation_source": "QQ_BOT",
             "expected_updated_at": profile["profile_updated_at"],
+            "expected_profile_revision": profile["profile_revision"],
             "nickname": requested_update.get("nickname", profile["nickname"]),
             "gender": requested_update.get("gender", profile["gender"]),
             "default_preference": requested_update.get(
                 "default_preference", profile["default_preference"]
             ),
+            "qq_visibility": requested_update.get(
+                "qq_visibility", profile["qq_visibility"]
+            ),
+            "notification_enabled": requested_update.get(
+                "notification_enabled", bool(profile["notification_enabled"])
+            ),
+            "notify_queue_changes": requested_update.get(
+                "notify_queue_changes", bool(profile["notify_queue_changes"])
+            ),
+            "notify_playing_position": requested_update.get(
+                "notify_playing_position", bool(profile["notify_playing_position"])
+            ),
+            "notify_online_check_in": requested_update.get(
+                "notify_online_check_in", bool(profile["notify_online_check_in"])
+            ),
+            "notify_absence": requested_update.get(
+                "notify_absence", bool(profile["notify_absence"])
+            ),
+            "notify_machine_status": requested_update.get(
+                "notify_machine_status", bool(profile["notify_machine_status"])
+            ),
+            "setup_version": profile["setup_version"],
             "_request": request_identity,
         }
 
@@ -2063,6 +2927,44 @@ def serialize_command(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def profile_allows_event_notification(
+    settings: sqlite3.Row | None,
+    event_type: str,
+) -> bool:
+    if (
+        settings is None
+        or not settings["notification_enabled"]
+    ):
+        return False
+    if event_type == "PLAYING_CHANGED":
+        field = "notify_playing_position"
+    elif event_type in {
+        "ONLINE_REGISTRATION_ADDED",
+        "ONLINE_CHECK_IN_COMPLETED",
+        "ONLINE_CHECK_IN_TIMED_OUT",
+        "ONLINE_CHECK_IN_MISSED",
+    }:
+        field = "notify_online_check_in"
+    elif event_type in {
+        "NO_SHOW_DEFERRED",
+        "NO_SHOW_MOVED_TO_TAIL",
+        "NO_SHOW_REMOVED",
+        "TEMPORARY_AWAY_EXPIRED",
+        "ABSENCE_CHANGED",
+    }:
+        field = "notify_absence"
+    elif event_type in {
+        "MACHINE_STOPPED",
+        "MACHINE_RESTORED",
+        "REGISTRATION_OPENED",
+        "REGISTRATION_CLOSED",
+    }:
+        field = "notify_machine_status"
+    else:
+        field = "notify_queue_changes"
+    return bool(settings[field])
+
+
 def cleanup_expired_event_recipients(
     connection: sqlite3.Connection, now: int
 ) -> None:
@@ -2258,7 +3160,10 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
 
     recent_events = normalize_public_events(payload.get("recent_events", []))
     private_player_profiles = (
-        normalize_private_profiles(payload.get("private_player_profiles", []))
+        normalize_private_profiles(
+            payload.get("private_player_profiles", []),
+            schema_version=schema_version,
+        )
         if schema_version >= 3
         else None
     )
@@ -2292,7 +3197,9 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
     }
 
 
-def normalize_private_profiles(source: Any) -> list[dict[str, Any]]:
+def normalize_private_profiles(
+    source: Any, *, schema_version: int
+) -> list[dict[str, Any]]:
     if not isinstance(source, list):
         raise ValidationError("private_player_profiles 必须是数组")
     if len(source) > MAX_PLAYER_PROFILES:
@@ -2308,6 +3215,30 @@ def normalize_private_profiles(source: Any) -> list[dict[str, Any]]:
             or QQ_NUMBER_PATTERN.fullmatch(qq_number) is None
         ):
             raise ValidationError("玩家资料 QQ 号必须是 5 至 12 位数字")
+        if schema_version >= 5:
+            qq_visibility = read_choice(value, "qq_visibility", QQ_VISIBILITIES)
+            notification_enabled = read_boolean(value, "notification_enabled")
+            notify_queue_changes = read_boolean(value, "notify_queue_changes")
+            notify_playing_position = read_boolean(value, "notify_playing_position")
+            notify_online_check_in = read_boolean(value, "notify_online_check_in")
+            notify_absence = read_boolean(value, "notify_absence")
+            notify_machine_status = read_boolean(value, "notify_machine_status")
+            setup_version = read_integer(
+                value, "setup_version", minimum=0, maximum=2**31 - 1
+            )
+            profile_revision = read_integer(
+                value, "profile_revision", minimum=1, maximum=2**63 - 1
+            )
+        else:
+            qq_visibility = "TERMINAL_ONLY"
+            notification_enabled = True
+            notify_queue_changes = True
+            notify_playing_position = False
+            notify_online_check_in = True
+            notify_absence = True
+            notify_machine_status = False
+            setup_version = 0
+            profile_revision = 1
         profiles.append(
             {
                 "profile_id": read_uuid(value, "profile_id"),
@@ -2323,6 +3254,16 @@ def normalize_private_profiles(source: Any) -> list[dict[str, Any]]:
                 "last_used_at": read_optional_integer(
                     value, "last_used_at", minimum=1
                 ),
+                "qq_visibility": qq_visibility,
+                "notification_enabled": notification_enabled,
+                "notify_queue_changes": notify_queue_changes,
+                "notify_playing_position": notify_playing_position,
+                "notify_online_check_in": notify_online_check_in,
+                "notify_absence": notify_absence,
+                "notify_machine_status": notify_machine_status,
+                "setup_version": setup_version,
+                "profile_revision": profile_revision,
+                "legacy_revision": schema_version < 5,
                 "created_at": read_integer(value, "created_at", minimum=1),
                 "updated_at": read_integer(value, "updated_at", minimum=1),
             }
@@ -2343,7 +3284,7 @@ def normalize_private_contacts(
     source: Any,
     machines: dict[str, dict[str, Any]],
     private_profiles: list[dict[str, Any]],
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     if not isinstance(source, list):
         raise ValidationError("private_player_contacts 必须是数组")
     if len(source) > MAX_PRIVATE_CONTACTS:
@@ -2355,7 +3296,7 @@ def normalize_private_contacts(
         for registration in all_machine_registrations(machine)
     }
     profiles = {profile["profile_id"]: profile for profile in private_profiles}
-    contacts: list[dict[str, str]] = []
+    contacts: list[dict[str, Any]] = []
     for value in source:
         if not isinstance(value, dict):
             raise ValidationError("private_player_contacts 包含无效绑定")
@@ -2377,6 +3318,7 @@ def normalize_private_contacts(
                 "registration_id": registration_id,
                 "profile_id": profile_id,
                 "qq_number": qq_number,
+                "public_qq": profile["qq_visibility"] == "PUBLIC_WEBSITE",
             }
         )
 
@@ -2725,10 +3667,12 @@ def all_machine_registrations(machine: dict[str, Any]):
 
 
 def attach_public_registration_contacts(
-    machines: dict[str, dict[str, Any]], contacts: list[dict[str, str]]
+    machines: dict[str, dict[str, Any]], contacts: list[dict[str, Any]]
 ) -> None:
     qq_by_registration_id = {
-        contact["registration_id"]: contact["qq_number"] for contact in contacts
+        contact["registration_id"]: contact["qq_number"]
+        for contact in contacts
+        if contact["public_qq"]
     }
     for machine in machines.values():
         for registration in all_machine_registrations(machine):

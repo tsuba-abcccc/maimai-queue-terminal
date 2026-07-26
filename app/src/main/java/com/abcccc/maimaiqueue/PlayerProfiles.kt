@@ -25,6 +25,22 @@ enum class ProfileSortMode {
     ALPHABETICAL
 }
 
+enum class QqVisibility {
+    TERMINAL_ONLY,
+    PUBLIC_WEBSITE
+}
+
+data class QueueNotificationPreferences(
+    val enabled: Boolean = true,
+    val queueChanges: Boolean = true,
+    val playingPosition: Boolean = false,
+    val onlineCheckIn: Boolean = true,
+    val absence: Boolean = true,
+    val machineStatus: Boolean = false
+)
+
+const val CURRENT_PLAYER_PROFILE_SETUP_VERSION = 1
+
 data class PlayerProfile(
     val id: String,
     val nickname: String,
@@ -34,11 +50,19 @@ data class PlayerProfile(
     val avatarReference: String? = null,
     val usageCount: Int = 0,
     val lastUsedAtMillis: Long? = null,
+    val qqVisibility: QqVisibility = QqVisibility.TERMINAL_ONLY,
+    val notificationPreferences: QueueNotificationPreferences =
+        QueueNotificationPreferences(),
+    val setupVersion: Int = 0,
+    val revision: Long = 1L,
     val createdAtMillis: Long = System.currentTimeMillis(),
     val updatedAtMillis: Long = createdAtMillis
 ) {
     val hasValidContact: Boolean
         get() = normalizedQqNumber() != null && isValidQqNumber(normalizedQqNumber())
+
+    val hasCompleteRequiredDetails: Boolean
+        get() = setupVersion >= CURRENT_PLAYER_PROFILE_SETUP_VERSION
 
     fun normalizedQqNumber(): String? = normalizeOptionalContact(qqNumber)
 
@@ -58,6 +82,7 @@ data class PlayerProfile(
         defaultPreference = preferenceToRemember?.toProfilePlayPreference() ?: defaultPreference,
         usageCount = usageCount + 1,
         lastUsedAtMillis = atMillis,
+        revision = revision + 1L,
         updatedAtMillis = atMillis
     )
 }
@@ -67,6 +92,9 @@ fun createPlayerProfile(
     gender: PlayerGender,
     defaultPreference: ProfilePlayPreference,
     qqNumber: String? = null,
+    qqVisibility: QqVisibility = QqVisibility.TERMINAL_ONLY,
+    notificationPreferences: QueueNotificationPreferences = QueueNotificationPreferences(),
+    setupVersion: Int = CURRENT_PLAYER_PROFILE_SETUP_VERSION,
     createdAtMillis: Long = System.currentTimeMillis()
 ): PlayerProfile = PlayerProfile(
     id = UUID.randomUUID().toString(),
@@ -74,6 +102,10 @@ fun createPlayerProfile(
     gender = gender,
     defaultPreference = defaultPreference,
     qqNumber = qqNumber,
+    qqVisibility = qqVisibility,
+    notificationPreferences = notificationPreferences,
+    setupVersion = setupVersion,
+    revision = 1L,
     createdAtMillis = createdAtMillis,
     updatedAtMillis = createdAtMillis
 ).withCanonicalContact()
@@ -101,12 +133,31 @@ internal fun clearAmbiguousQqBindings(
         if (profile.normalizedQqNumber() in duplicateQqNumbers) {
             profile.copy(
                 qqNumber = null,
+                revision = profile.revision + 1L,
                 updatedAtMillis = maxOf(profile.updatedAtMillis, migratedAtMillis)
             )
         } else {
             profile
         }
     }
+}
+
+internal fun shouldApplyCloudPlayerProfile(
+    cloudProfile: PlayerProfile,
+    localProfiles: List<PlayerProfile>,
+    nicknameConflictsWithQueue: (nickname: String, profileId: String) -> Boolean
+): Boolean {
+    val localSameId = localProfiles.firstOrNull { it.id == cloudProfile.id }
+    if (localSameId != null && cloudProfile.revision <= localSameId.revision) return false
+    val cloudQq = cloudProfile.normalizedQqNumber()
+    if (localProfiles.any { local ->
+            local.id != cloudProfile.id && (
+                local.nickname.equals(cloudProfile.nickname, ignoreCase = true) ||
+                    (cloudQq != null && local.normalizedQqNumber() == cloudQq)
+                )
+        }
+    ) return false
+    return !nicknameConflictsWithQueue(cloudProfile.nickname, cloudProfile.id)
 }
 
 const val MAX_QQ_NUMBER_LENGTH = 12

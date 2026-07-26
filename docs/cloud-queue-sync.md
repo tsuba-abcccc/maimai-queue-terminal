@@ -10,14 +10,14 @@
 
 ## 协议版本
 
-新版终端发布 `schema_version: 4`，服务端继续接受版本 `1`、`2` 和 `3` 的公开队列快照。
+新版终端发布 `schema_version: 5`，服务端继续接受版本 `1` 至 `4` 的旧公开队列快照。
 
 完整请求体限制为 `1 MiB`，单次最多包含 `500` 份玩家资料和 `200` 条公开事件。
 
 ```text
 Authorization: Bearer <QUEUE_SYNC_TOKEN>
 X-Device-ID: <终端 UUID>
-X-Queue-Schema-Version: 4
+X-Queue-Schema-Version: 5
 Content-Type: application/json; charset=utf-8
 ```
 
@@ -26,6 +26,8 @@ Content-Type: application/json; charset=utf-8
 - `website_remote_enabled`：现场终端是否开启网站同步与网站远程命令通道。
 - `queue_rules`：当前是否允许暂缓一轮、暂时离开和创建线上登记，供网站、服务器、Bot 与终端共同校验。
 - 登记字段 `online_registration_pending_check_in`：该登记是否由网站或 Bot 建立且仍未在现场签到。
+
+版本 5 增加玩家资料版本、使用记录、QQ 公开范围和通知设置，并为“使用移动设备登记”提供终端确认命令。旧协议上传的资料会使用保守默认值迁移，不会因此公开 QQ。
 
 `business_hours` 只包含 `enabled`、`outside`、`closing_soon`、`closing_grace`、`closes_at` 和 `registration_closes_at` 六个计算结果，不上传完整营业时间表。`closing_soon` 在营业时段进入闭店前 30 分钟后为 `true`，`closes_at` 是本次闭店时间；`closing_grace` 表示已到闭店时间但现有队列仍在收尾，`registration_closes_at` 是最迟收尾时间。
 
@@ -45,12 +47,25 @@ Content-Type: application/json; charset=utf-8
   "qq_number": "12345678",
   "usage_count": 12,
   "last_used_at": 1784681000000,
+  "qq_visibility": "TERMINAL_ONLY",
+  "notification_enabled": true,
+  "notify_queue_changes": true,
+  "notify_playing_position": false,
+  "notify_online_check_in": true,
+  "notify_absence": true,
+  "notify_machine_status": false,
+  "setup_version": 1,
+  "profile_revision": 7,
   "created_at": 1780000000000,
   "updated_at": 1784681000000
 }
 ```
 
-`qq_number` 对尚未补充资料的旧记录可以为 `null`；创建和编辑资料时必须填写 `5` 至 `12` 位 QQ。云端按 `QUEUE_PROFILE_SCOPE_ID` 保存机厅资料库，终端上传采用增量覆盖，不会因一次空列表误删服务器备份。
+`qq_number` 对尚未补充资料的旧记录可以为 `null`；创建和编辑资料时必须填写 `5` 至 `12` 位 QQ。`qq_visibility` 为 `TERMINAL_ONLY` 或 `PUBLIC_WEBSITE`，只控制当前有效登记是否向公开网站提供 QQ，不影响完整 QQ 在私有接口中的保存和 Bot 身份识别。
+
+六个通知字段依次表示总开关、队列状态、游玩位置、线上登记与签到、暂缓/暂离/未到场、机台及营业状态。总开关关闭时所有分项均不投递；分项值仍保留，以便重新开启总开关后恢复原选择。`setup_version` 用于判断旧资料是否已经确认本版必填设置，`profile_revision` 每次资料变更递增，用于拒绝过期修改。
+
+云端按 `QUEUE_PROFILE_SCOPE_ID` 保存机厅资料库，终端上传采用按 UUID 和 `profile_revision` 合并，不会因一次空列表误删服务器备份。同 UUID 只接受更高版本；昵称或 QQ 冲突时采用更高版本资料，并清除旧冲突资料的 QQ，避免一项身份同时绑定两份资料。
 
 ## 当前登记绑定
 
@@ -76,7 +91,7 @@ Content-Type: application/json; charset=utf-8
 
 `GET /api/queue-logs?queue_id=<UUID>&limit=50&before=<游标>`
 
-只返回白名单内的队列事件，不包含 QQ、性别、资料 UUID 或私有资料编辑日志。每条事件包含 `operation_source`，取值为 `ON_SITE_TERMINAL`、`QQ_BOT`、`SYSTEM_AUTOMATIC` 或预留的 `WEBSITE_REMOTE`。
+只返回白名单内的队列事件，不包含 QQ、性别、资料 UUID 或私有资料编辑日志。每条事件包含 `operation_source`，取值为 `ON_SITE_TERMINAL`、`QQ_BOT`、`SYSTEM_AUTOMATIC`、`MOBILE_DEVICE` 或预留的 `WEBSITE_REMOTE`。
 
 ### 网站线上登记
 
@@ -104,7 +119,7 @@ Authorization: Bearer <QUEUE_BOT_TOKEN>
 
 返回该 QQ 当前是否在队列、所在机台、游玩或等待位置、时间估算、暂缓、暂离和未到场状态。
 
-公开 `GET /api/queue-status` 仅在当前有效登记上附带 `qq_number`，供网站登记详情显示。完整玩家资料、性别、默认偏好和资料 UUID 仍只通过鉴权接口提供；登记离开队列后，其 QQ 不再出现在公开快照中。
+公开 `GET /api/queue-status` 仅在玩家将 `qq_visibility` 设为 `PUBLIC_WEBSITE` 时，才在当前有效登记上附带 `qq_number`，供网站登记详情显示。完整玩家资料和 QQ、性别、默认偏好及资料 UUID 始终只通过鉴权接口提供；登记离开队列后，其 QQ 不再出现在公开快照中。
 
 受控服务也可以使用不含 QQ 查询条件的 `GET /api/queue-bot/players` 读取全部当前登记绑定。响应包含登记对应的 QQ，仅供 Bot 服务内部处理。
 
@@ -116,11 +131,27 @@ Authorization: Bearer <QUEUE_BOT_TOKEN>
 
 `GET /api/queue-bot/profiles` 返回完整私有玩家资料库，包括 QQ、性别、默认偏好和资料 UUID。该接口不得从网站前端调用。
 
+### 上报 Bot QQ
+
+`POST /api/queue-bot/identity`，JSON 请求体为 `{"bot_qq":"<当前 OneBot QQ>"}`。
+
+Koishi 在连接 OneBot 后上报实际登录 QQ，并定期刷新。终端拉取玩家资料时同时获得该 QQ，用于显示添加 Bot 好友的二维码；该身份仅供显示和通知引导，不参与玩家资料或排队权限判断。
+
 ### 查询通知事件
 
 `POST /api/queue-bot/events`，JSON 请求体为 `{"qq":"<QQ号>","after":<游标>,"limit":50}`
 
-事件按递增游标返回。Koishi 保存 `next_cursor` 后只轮询新增事件，避免重复通知。`latest_cursor` 用于首次启动或切换队列时跳过既有日志，防止集中补发历史消息。`affected_players` 用于投递本人相关日志，`operation_source` 说明操作来源，`PLAYING_CHANGED` 可触发上机通知。
+事件按递增游标返回。Koishi 保存 `next_cursor` 后只轮询新增事件，避免重复通知。`latest_cursor` 用于首次启动或切换队列时跳过既有日志，防止集中补发历史消息。`affected_players` 用于投递本人相关日志，`operation_source` 说明操作来源。
+
+事件通知分类与资料字段的映射固定如下：
+
+- `PLAYING_CHANGED` 使用 `notify_playing_position`。
+- 线上登记创建、完成签到、签到超时或轮到时未签到使用 `notify_online_check_in`。
+- 暂缓一轮、暂时离开、未到场及其处理使用 `notify_absence`。
+- 机台停止/恢复、登记排队开启/关闭和营业状态使用 `notify_machine_status`。
+- 其余本人相关登记、位置和队列变化使用 `notify_queue_changes`。
+
+服务器在建立事件收件关系时按当时设置过滤；Koishi 实际发送前再次读取最新资料，因此玩家关闭总开关或对应分项后，尚在重试中的同类消息也会停止。
 
 通知服务使用 `GET /api/queue-bot/events?after=<游标>&limit=50` 全量读取事件。每条事件的 `affected_players` 会包含当时固定的全部 QQ 收件人，因此该响应属于私有数据，不能转发到群聊或公开日志。
 
@@ -156,11 +187,11 @@ Authorization: Bearer <QUEUE_BOT_TOKEN>
 
 ## 终端回流接口
 
-### 恢复缺失资料
+### 同步云端资料
 
 `GET /api/queue-terminal/profiles`
 
-终端仅补回本地不存在的 UUID。同 UUID 以本地内容为准；与本地昵称或 QQ 冲突的云端资料不会自动合并。
+终端读取当前作用域内的完整私有资料库。不存在于本机的 UUID 可以补回；同 UUID 只有云端 `profile_revision` 更高时才会回流。终端仍会拒绝与其他本机资料的昵称、QQ 或当前队列昵称发生冲突的内容，同版本或旧版本不会覆盖本机资料。终端接受回流后先写入本机，再随下一次快照确认给服务器。
 
 ### 拉取命令
 
@@ -169,13 +200,27 @@ Authorization: Bearer <QUEUE_BOT_TOKEN>
 终端约每 `3` 秒读取待执行命令。资料命令同时校验：
 
 1. 资料 UUID 和 QQ 与本地一致。
-2. `expected_updated_at` 与本地版本一致。
+2. `expected_profile_revision` 与本地资料版本一致；`expected_updated_at` 继续用于兼容和辅助校验。
 3. 新昵称不与资料库或当前队列冲突。
 4. 字段符合本机模型允许的枚举和长度。
 
 本地资料已经等于命令目标时，终端视为幂等成功并补发回执。
 
 `QUEUE_OPERATION` 命令还会重新校验队列批次、QQ 与资料绑定、登记编号、机台状态、登记上限、现场功能开关及当前登记状态。只有本机持久化成功后才返回 `APPLIED`。线上加入命令会写入原命令编号，回执丢失后重复拉取仍能识别为已经执行，不会创建第二份登记。
+
+### 使用移动设备登记
+
+`POST /api/queue-terminal/mobile-registration-sessions` 由终端使用同步令牌创建短时会话，请求包含唯一 `request_id`、当前 `queue_id` 和目标 `machine_id`。服务端返回一次性会话令牌、过期时间和网页地址；相同请求重复发送时返回同一会话，参数不一致则拒绝。
+
+移动网页使用以下公开接口，但只能访问对应会话的数据：
+
+- `GET /api/queue-mobile/sessions/<token>?q=<搜索内容>`：读取会话、机台和可选玩家资料。
+- `POST /api/queue-mobile/sessions/<token>/submit`：选择现有资料、补全旧资料或提交新资料，并确认本次游玩偏好。
+- `GET /api/queue-mobile/sessions/<token>/result`：轮询终端最终处理结果。
+
+网页资料列表允许按昵称或 QQ 搜索，但 `TERMINAL_ONLY` 资料只返回“已填写 QQ”和公开范围，不返回 QQ 原文。旧资料补全页会读取并保留现有通知开关，避免覆盖玩家此前通过 Bot 调整的偏好。新建资料或补全设置时必须提交全部资料设置；完整资料不能从移动网页直接编辑。会话固定创建它的终端、队列批次和机台，并在读取和提交时重新检查终端在线、网站同步、登记排队、机台状态和容量。
+
+提交会生成 `MOBILE_DEVICE_REGISTRATION` 待执行命令并立即封闭会话，重复提交不会创建第二项命令。终端再次校验会话、资料版本、昵称、QQ、当前登记、队列批次、机台状态和容量，写入资料与登记后才返回 `APPLIED`。这条路径建立普通现场登记，不带线上登记的待签到状态；成功登记后才增加资料使用次数和最近使用时间。
 
 ### 命令回执
 
@@ -193,7 +238,7 @@ Authorization: Bearer <QUEUE_BOT_TOKEN>
 
 ## 构建与安全
 
-终端配置保存在开发账户的 `~/.gradle/gradle.properties`：
+需要预置连接时，终端构建默认值可以保存在开发账户的 `~/.gradle/gradle.properties`：
 
 ```properties
 ENABLE_TERMINAL_BUILD=true
@@ -201,4 +246,6 @@ QUEUE_SYNC_URL=https://abcccc.top/api/queue-status
 QUEUE_SYNC_TOKEN=<终端令牌>
 ```
 
-同步令牌只会写入显式开启的 `terminal` 产品变体。公开发行必须构建 `assembleLocalRelease`；`local` 变体在 Gradle 中强制使用空地址和空令牌，不能因开发机保存了生产配置而意外带出凭据。现场终端使用 `packageTerminalDebugApk` 或 `assembleTerminalRelease`，生成物不得公开上传。QQ 与玩家资料通过 HTTPS 传输并存入私有数据库；数据库备份、Bot 令牌和终端令牌都应限制读取权限。
+这些值只作为 `terminal` 变体首次运行时的默认连接。管理员也可以先关闭网站同步，再在应用设置中填写 HTTPS 站点根地址或完整接口地址，以及至少 32 个 UTF-8 字节的终端令牌；保存时地址会规范化到 `/api/queue-status`。切换连接会清除上一服务器的同步错误、Bot QQ 和未完成移动登记会话，不会把令牌写入操作日志。
+
+构建默认令牌只会写入显式开启的 `terminal` 产品变体。公开发行必须构建 `assembleLocalRelease`；`local` 变体在 Gradle 中强制使用空地址和空令牌，不能因开发机保存了生产配置而意外带出凭据。现场终端使用 `packageTerminalDebugApk` 或 `assembleTerminalRelease`，生成物不得公开上传。QQ 与玩家资料通过 HTTPS 传输并存入私有数据库；数据库备份、Bot 令牌和终端令牌都应限制读取权限。

@@ -18,7 +18,7 @@ val terminalBuildEnabled = providers.gradleProperty("ENABLE_TERMINAL_BUILD")
     .orElse(false)
 val terminalQueueSyncUrl = if (terminalBuildEnabled.get()) queueSyncUrl.get() else ""
 val terminalQueueSyncToken = if (terminalBuildEnabled.get()) queueSyncToken.get() else ""
-val appVersionName = "0.4.1"
+val appVersionName = "0.5.0"
 
 android {
     namespace = "com.abcccc.maimaiqueue"
@@ -32,7 +32,7 @@ android {
         applicationId = "com.abcccc.maimaiqueue"
         minSdk = 29
         targetSdk = 36
-        versionCode = 31
+        versionCode = 32
         versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -105,6 +105,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation("com.google.zxing:core:3.5.3")
     testImplementation(libs.junit)
     testImplementation(libs.json)
     androidTestImplementation(platform(libs.androidx.compose.bom))

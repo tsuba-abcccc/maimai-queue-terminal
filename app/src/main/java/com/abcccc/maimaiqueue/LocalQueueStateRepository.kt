@@ -115,8 +115,8 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                     put("playerProfileId", registration.playerProfileId ?: JSONObject.NULL)
                     put("requiresOnSiteCheckIn", registration.requiresOnSiteCheckIn)
                     put(
-                        "onlineRegistrationCommandId",
-                        registration.onlineRegistrationCommandId ?: JSONObject.NULL
+                        "originatingCommandId",
+                        registration.originatingCommandId ?: JSONObject.NULL
                     )
                 }
             )
@@ -224,8 +224,10 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                 },
                 playerProfileId = item.optNullableString("playerProfileId"),
                 requiresOnSiteCheckIn = item.optBoolean("requiresOnSiteCheckIn", false),
-                onlineRegistrationCommandId = item
-                    .optNullableString("onlineRegistrationCommandId")
+                originatingCommandId = (
+                    item.optNullableString("originatingCommandId")
+                        ?: item.optNullableString("onlineRegistrationCommandId")
+                    )
                     ?.takeIf { value -> runCatching { java.util.UUID.fromString(value) }.isSuccess }
             )
         }

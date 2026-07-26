@@ -26,7 +26,7 @@ class RemoteQueueOperationsTest {
             5_000L + ONLINE_REGISTRATION_CHECK_IN_TIMEOUT_MILLIS,
             joined.onSiteCheckInDeadlineMillis
         )
-        assertEquals(joinCommand().commandId, joined.onlineRegistrationCommandId)
+        assertEquals(joinCommand().commandId, joined.originatingCommandId)
         assertEquals(3, result.state.nextRegistrationKey)
         assertEquals(1, result.updatedProfile?.usageCount)
     }
@@ -52,7 +52,7 @@ class RemoteQueueOperationsTest {
             isTemporary = false,
             playerProfileId = profile().id,
             requiresOnSiteCheckIn = true,
-            onlineRegistrationCommandId = command.commandId
+            originatingCommandId = command.commandId
         )
 
         val result = decideRemoteQueueOperation(
@@ -178,7 +178,7 @@ class RemoteQueueOperationsTest {
         isTemporary = false,
         playerProfileId = PROFILE_ID,
         requiresOnSiteCheckIn = true,
-        onlineRegistrationCommandId = COMMAND_ID
+        originatingCommandId = COMMAND_ID
     )
 
     private fun joinCommand() = RemoteQueueOperationCommand(
