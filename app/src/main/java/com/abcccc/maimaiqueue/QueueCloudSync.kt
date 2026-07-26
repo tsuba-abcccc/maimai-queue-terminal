@@ -36,7 +36,8 @@ enum class QueueCloudSyncPhase {
 data class QueueCloudSyncStatus(
     val phase: QueueCloudSyncPhase,
     val lastSuccessfulAtMillis: Long? = null,
-    val retryDetail: String? = null
+    val retryDetail: String? = null,
+    val syncMode: QueueSyncMode = QueueSyncMode.UNSPECIFIED
 )
 
 internal fun combinedQueueCloudSyncStatus(
@@ -155,8 +156,10 @@ internal data class QueuePublicDisplaySettings(
     val machineBRemark: String = DEFAULT_MACHINE_B_REMARK,
     val websiteRemoteEnabled: Boolean = true,
     val oneBotSyncEnabled: Boolean = true,
+    val syncMode: QueueSyncMode = QueueSyncMode.UNSPECIFIED,
     val allowDeferOneRound: Boolean = true,
     val allowTemporaryLeave: Boolean = true,
+    val allowOnlineRegistration: Boolean = true,
     val businessHours: QueuePublicBusinessHours = QueuePublicBusinessHours()
 )
 
@@ -214,6 +217,9 @@ internal class HttpQueueStatePublisher(
                     setRequestProperty("Authorization", "Bearer $token")
                     setRequestProperty("X-Device-ID", terminalId)
                     setRequestProperty("X-Queue-Schema-Version", SYNC_SCHEMA_VERSION.toString())
+                    displaySettings.syncMode.headerValue?.let { mode ->
+                        setRequestProperty("X-Queue-Sync-Mode", mode)
+                    }
                 }
                 try {
                     connection.outputStream.use { it.write(body) }
@@ -563,6 +569,7 @@ internal class QueueCloudSyncController(
     private var enabled = initiallyEnabled
     private var publishJob: Job? = null
     private var lastSuccessfulAtMillis: Long? = null
+    private var lastSyncMode = QueueSyncMode.UNSPECIFIED
 
     init {
         if (enabled && publisher.isConfigured) startPublishLoop()
@@ -580,7 +587,8 @@ internal class QueueCloudSyncController(
             onStatusChange(
                 QueueCloudSyncStatus(
                     phase = QueueCloudSyncPhase.DISABLED,
-                    lastSuccessfulAtMillis = lastSuccessfulAtMillis
+                    lastSuccessfulAtMillis = lastSuccessfulAtMillis,
+                    syncMode = lastSyncMode
                 )
             )
             return
@@ -593,7 +601,8 @@ internal class QueueCloudSyncController(
         onStatusChange(
             QueueCloudSyncStatus(
                 phase = QueueCloudSyncPhase.CONFIGURED,
-                lastSuccessfulAtMillis = lastSuccessfulAtMillis
+                lastSuccessfulAtMillis = lastSuccessfulAtMillis,
+                syncMode = lastSyncMode
             )
         )
         startPublishLoop()
@@ -645,7 +654,8 @@ internal class QueueCloudSyncController(
             onStatusChange(
                 QueueCloudSyncStatus(
                     phase = QueueCloudSyncPhase.SYNCING,
-                    lastSuccessfulAtMillis = lastSuccessfulAtMillis
+                    lastSuccessfulAtMillis = lastSuccessfulAtMillis,
+                    syncMode = payloadToPublish.displaySettings.syncMode
                 )
             )
             when (val result = publisher.publish(
@@ -657,12 +667,14 @@ internal class QueueCloudSyncController(
                 QueuePublishResult.Success -> {
                     if (!enabled) return
                     lastSuccessfulAtMillis = System.currentTimeMillis()
+                    lastSyncMode = payloadToPublish.displaySettings.syncMode
                     retryDelayMillis = INITIAL_RETRY_MILLIS
                     waitBeforeNextPublishMillis = HEARTBEAT_INTERVAL_MILLIS
                     onStatusChange(
                         QueueCloudSyncStatus(
                             phase = QueueCloudSyncPhase.SYNCED,
-                            lastSuccessfulAtMillis = lastSuccessfulAtMillis
+                            lastSuccessfulAtMillis = lastSuccessfulAtMillis,
+                            syncMode = lastSyncMode
                         )
                     )
                 }
@@ -675,7 +687,8 @@ internal class QueueCloudSyncController(
                         QueueCloudSyncStatus(
                             phase = QueueCloudSyncPhase.WAITING_TO_RETRY,
                             lastSuccessfulAtMillis = lastSuccessfulAtMillis,
-                            retryDetail = result.detail
+                            retryDetail = result.detail,
+                            syncMode = payloadToPublish.displaySettings.syncMode
                         )
                     )
                 }
@@ -822,6 +835,7 @@ internal fun buildPublicQueueSnapshot(
         JSONObject().apply {
             put("allow_defer_one_round", displaySettings.allowDeferOneRound)
             put("allow_temporary_leave", displaySettings.allowTemporaryLeave)
+            put("allow_online_registration", displaySettings.allowOnlineRegistration)
         }
     )
     put(

@@ -23,8 +23,8 @@ Content-Type: application/json; charset=utf-8
 
 版本 3 增加私有玩家资料、当前登记联系信息、QQ Bot 联动状态和营业时间计算结果。版本 4 继续增加：
 
-- `website_remote_enabled`：现场终端是否允许网站创建线上登记。
-- `queue_rules`：当前是否允许暂缓一轮和暂时离开，供 Bot 在展示操作前判断。
+- `website_remote_enabled`：现场终端是否开启网站同步与网站远程命令通道。
+- `queue_rules`：当前是否允许暂缓一轮、暂时离开和创建线上登记，供网站、服务器、Bot 与终端共同校验。
 - 登记字段 `online_registration_pending_check_in`：该登记是否由网站或 Bot 建立且仍未在现场签到。
 
 `business_hours` 只包含 `enabled`、`outside`、`closing_soon`、`closing_grace`、`closes_at` 和 `registration_closes_at` 六个计算结果，不上传完整营业时间表。`closing_soon` 在营业时段进入闭店前 30 分钟后为 `true`，`closes_at` 是本次闭店时间；`closing_grace` 表示已到闭店时间但现有队列仍在收尾，`registration_closes_at` 是最迟收尾时间。
@@ -84,7 +84,7 @@ Content-Type: application/json; charset=utf-8
 - `POST /api/queue-online/join`：提交 `request_id`、QQ、机台编号和按需提供的本次游玩偏好。
 - `GET /api/queue-online/commands/<command_id>`：查询终端是否已应用或拒绝该登记。
 
-这组接口不返回完整玩家资料库，也不能修改已有队列。仅在终端在线、网站同步开启且登记排队开放时接受新登记。线上登记进入等待末端后带有待签到状态；完成现场签到前保留顺序，但不进入游玩位置，也不提供确定的等待时间估算。
+这组接口不返回完整玩家资料库，也不能修改已有队列。仅在终端在线、网站同步开启、现场规则允许线上登记且登记排队开放时接受新登记。线上登记进入等待末端后带有待签到状态；完成现场签到前暂时保留顺序，不提供确定的等待时间估算。30 分钟从终端实际建立登记时开始计算；到期仍未签到时终端会自动移除，如果登记更早轮到进入游玩位置，也会立即移除。服务器不独立计时或修改队列。
 
 ## 私有 Bot 接口
 
@@ -152,7 +152,7 @@ Authorization: Bearer <QUEUE_BOT_TOKEN>
 
 基础请求包含 `request_id`、`actor_qq` 和 `operation`。加入或切换机台时附带 `machine_id` / `target_machine_id`，修改本次偏好时附带 `preference`。支持线上加入、退出、暂缓一轮、暂时离开、取消对应状态、切换机台和修改本次游玩偏好。
 
-服务器只接受与 `actor_qq` 当前绑定相符的本人登记。待签到的线上登记仅允许退出；暂缓、暂离、机台状态、队列容量和固定组合等规则会在服务器和终端分别校验。相同 `request_id` 保证幂等。
+服务器只接受与 `actor_qq` 当前绑定相符的本人登记。待签到的线上登记仅允许退出；其 30 分钟签到时限和轮到时自动退出规则由终端执行。“允许线上登记”关闭后只拒绝新建线上登记，不影响查询、通知、资料同步或已有登记的退出。暂缓、暂离、机台状态、队列容量和固定组合等规则会在服务器和终端分别校验。相同 `request_id` 保证幂等。
 
 ## 终端回流接口
 

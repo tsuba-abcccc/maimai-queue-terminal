@@ -45,6 +45,7 @@ type QueueOperation =
 interface QueueRules {
   allow_defer_one_round: boolean;
   allow_temporary_leave: boolean;
+  allow_online_registration?: boolean;
 }
 
 interface QueueRegistration {
@@ -82,6 +83,7 @@ interface QueueStatus {
   queue_id: string;
   captured_at: number;
   registration_open: boolean;
+  test_data?: boolean;
   onebot_sync_enabled?: boolean;
   queue_rules?: QueueRules;
   business_hours?: {
@@ -127,6 +129,7 @@ interface BotPlayersResponse {
   queue_id: string;
   received_at?: number;
   registration_open?: boolean;
+  test_data?: boolean;
   business_hours?: QueueStatus["business_hours"];
   queue_rules?: QueueRules;
   terminal?: {
@@ -673,6 +676,9 @@ async function joinQueueFromBot(
   if (queue.onebot_sync_enabled === false) {
     throw new Error("现场终端已关闭 QQ Bot 联动。");
   }
+  if (queue.queue_rules?.allow_online_registration === false) {
+    throw new Error("现场规则暂不允许线上登记。");
+  }
   if (!queue.registration_open) {
     throw new Error("现场当前没有使用登记排队，请在现场自然排队。");
   }
@@ -734,13 +740,13 @@ async function joinQueueFromBot(
     return [
       "线上登记已经提交，正在等待现场终端确认。",
       "",
-      "确认成功后，到达现场仍需在终端点击自己的登记，再点击“已到场”完成签到。签到前，这份登记不会进入游玩位置。",
+      "终端确认创建后，请在 30 分钟内到达现场，并在终端点击自己的登记，再点击“已到场”完成签到。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。",
     ].join("\n");
   }
   return [
     `已经加入${compactMachineName(machine.name)} 的等待顺序。`,
     "",
-    "这是一份线上登记。到达现场后，请在终端点击自己的登记，再点击“已到场”完成签到。签到前，这份登记不会进入游玩位置。",
+    "这是一份线上登记。请在创建登记后的 30 分钟内到达现场，并在终端点击自己的登记，再点击“已到场”完成签到。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。",
   ].join("\n");
 }
 
@@ -1290,9 +1296,7 @@ async function processNotificationEvent(
         throw new Error("当前没有可用的 OneBot 实例");
       }
       const current = await api.getPlayers(delivery.qqNumber);
-      const status = current.players.length
-        ? `\n\n${formatOwnQueue(current.players, undefined, current)}`
-        : "";
+      const status = formatNotificationQueueStatus(current.players);
       await bot.sendPrivateMessage(
         delivery.qqNumber,
         formatQueueNotification(event, status),
@@ -1530,6 +1534,9 @@ export function formatQueue(queue: QueueStatus): string {
     ? ""
     : "·自然排队";
   const lines = [`当前队列·${terminalStatus}${queueMode}`];
+  if (queue.test_data) {
+    lines.push("", "当前数据是测试数据。");
+  }
   if (queue.terminal.online) {
     lines.push("");
   } else {
@@ -1624,7 +1631,8 @@ export function formatOwnQueue(
   queue?: QueueStatus,
   personalSnapshot?: Pick<
     BotPlayersResponse,
-    "terminal" | "registration_open" | "business_hours" | "queue_rules"
+    "terminal" | "registration_open" | "test_data" | "business_hours" |
+      "queue_rules"
   >,
 ): string {
   if (!players.length) return "当前没有正在排队的登记。";
@@ -1736,6 +1744,11 @@ export function formatOwnQueue(
         currentPreference ? `游玩偏好：${currentPreference}。` : ""
       }`,
     ];
+    if (player.online_registration_pending_check_in) {
+      lines.push(
+        "签到要求：请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。",
+      );
+    }
     if (machineState) lines.push(`机台状态：${machineState}`);
     if (coPlayerDisplayIds.length) {
       lines.push(`共同游玩：${coPlayerDisplayIds.join("、")}。`);
@@ -1750,6 +1763,9 @@ export function formatOwnQueue(
     personalSnapshot?.registration_open;
   const queueRules = queue?.queue_rules ?? personalSnapshot?.queue_rules;
   const notices: string[] = [];
+  if (queue?.test_data || personalSnapshot?.test_data) {
+    notices.push("当前数据是测试数据。");
+  }
   if (terminalOnline === false) {
     notices.push("终端暂时离线，以下为最近一次同步状态。");
   }
@@ -1798,13 +1814,37 @@ export function formatOwnQueueActions(
   return actions;
 }
 
+export function formatNotificationQueueStatus(players: BotPlayer[]): string {
+  return players.map((player) => {
+    const subject = players.length === 1 ? "你" : `“${player.display_id}”`;
+    if (player.position === "PLAYING") {
+      return `现在，${subject}正在游玩位置 ${player.machine_id}。`;
+    }
+
+    const position = player.position_index === null
+      ? `机台 ${player.machine_id} 的等待顺序`
+      : `队列位置 ${player.machine_id}${player.position_index}`;
+    const estimatedWaitMinutes = typeof player.estimated_wait_minutes === "number" &&
+        Number.isFinite(player.estimated_wait_minutes)
+      ? Math.max(0, Math.trunc(player.estimated_wait_minutes))
+      : null;
+    const estimate = estimatedWaitMinutes === null
+      ? "暂时无法估算等待时间"
+      : estimatedWaitMinutes <= 0
+      ? "当前可以游玩"
+      : `约 ${estimatedWaitMinutes} 分钟后可以游玩`;
+    return `现在，${subject}位于${position}，${estimate}。`;
+  }).join("\n");
+}
+
 export function formatQueueNotification(
   event: Pick<QueueEvent, "title" | "detail">,
   status = "",
 ): string {
-  return compactMiddleDots(
-    `【排队通知】\n\n${event.title}\n${event.detail}${status}`,
-  );
+  const blocks = ["【排队通知】", `${event.title}\n${event.detail}`];
+  const normalizedStatus = status.trim();
+  if (normalizedStatus) blocks.push(normalizedStatus);
+  return compactMiddleDots(blocks.join("\n\n"));
 }
 
 function compactMiddleDots(value: string): string {

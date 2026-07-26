@@ -475,6 +475,31 @@ class QueueModelsTest {
     }
 
     @Test
+    fun overtimeCorrectionRemovesOnlyPendingRegistrationFromAMixedPosition() {
+        val correctedAt = 9_000L
+        val pending = registration(1).copy(requiresOnSiteCheckIn = true)
+        val availablePartner = registration(2)
+        val corrected = MachineQueue(
+            playing = listOf(registration(9, PlayPreference.SOLO)),
+            waiting = listOf(
+                pending,
+                availablePartner,
+                registration(3, PlayPreference.SOLO),
+                registration(4, PlayPreference.SOLO)
+            ),
+            playingStartedAtMillis = 123L
+        ).advanceToWaitingPosition(setOf(3), correctedAt)
+
+        assertEquals(listOf(3), corrected.playing.map { it.key })
+        assertFalse(corrected.allRegistrations.any { it.key == pending.key })
+        assertEquals(listOf(4, 9, 2), corrected.waiting.map { it.key })
+        assertEquals(
+            correctedAt,
+            corrected.waiting.first { it.key == availablePartner.key }.lastPlayedAtMillis
+        )
+    }
+
+    @Test
     fun overtimeCorrectionRequiresACompletePositionAfterTheFirstWaitingPosition() {
         val pairedTarget = listOf(registration(3), registration(4))
         val original = MachineQueue(
@@ -1751,7 +1776,7 @@ class QueueModelsTest {
     }
 
     @Test
-    fun pendingOnlineRegistrationIsSkippedWithoutDelayingAvailablePlayers() {
+    fun pendingOnlineRegistrationIsRemovedWhenItsPlayingOpportunityIsReached() {
         val nowMillis = 6_000_000L
         val pending = registration(2).copy(requiresOnSiteCheckIn = true)
         val queue = MachineQueue(
@@ -1772,13 +1797,12 @@ class QueueModelsTest {
         val advanced = queue.finishRound(nowMillis)
 
         assertEquals(listOf(1, 3), advanced.playing.map { it.key })
-        assertEquals(2, advanced.waiting.first().key)
-        assertTrue(advanced.waiting.first().requiresOnSiteCheckIn)
-        assertEquals(0, advanced.waiting.first().temporaryAwaySkippedTurns)
+        assertEquals(listOf(4, 9), advanced.waiting.map { it.key })
+        assertFalse(advanced.allRegistrations.any { it.key == pending.key })
     }
 
     @Test
-    fun pendingOnlineRegistrationRemainsInOrderAcrossSeveralRounds() {
+    fun removedPendingOnlineRegistrationDoesNotReappearAcrossLaterRounds() {
         val pending = registration(1, PlayPreference.SOLO).copy(requiresOnSiteCheckIn = true)
         val initial = MachineQueue(
             playing = listOf(registration(9, PlayPreference.SOLO)),
@@ -1793,10 +1817,55 @@ class QueueModelsTest {
         val afterSecondRound = afterFirstRound.finishRound(2_000L)
 
         assertEquals(listOf(2), afterFirstRound.playing.map { it.key })
-        assertEquals(listOf(1, 3, 9), afterFirstRound.waiting.map { it.key })
+        assertEquals(listOf(3, 9), afterFirstRound.waiting.map { it.key })
         assertEquals(listOf(3), afterSecondRound.playing.map { it.key })
-        assertEquals(listOf(1, 9, 2), afterSecondRound.waiting.map { it.key })
-        assertTrue(afterSecondRound.waiting.first().requiresOnSiteCheckIn)
+        assertEquals(listOf(9, 2), afterSecondRound.waiting.map { it.key })
+        assertFalse(afterSecondRound.allRegistrations.any { it.key == pending.key })
+    }
+
+    @Test
+    fun pendingOnlineRegistrationExpiresAfterThirtyMinutesWithoutStartingNextRound() {
+        val createdAtMillis = 8_000_000L
+        val pending = registration(1).copy(
+            createdAtMillis = createdAtMillis,
+            requiresOnSiteCheckIn = true
+        )
+        val available = registration(2, PlayPreference.SOLO)
+        val queue = MachineQueue(waiting = listOf(pending, available))
+
+        assertEquals(
+            queue,
+            queue.removeExpiredOnlineRegistrations(
+                createdAtMillis + ONLINE_REGISTRATION_CHECK_IN_TIMEOUT_MILLIS - 1L
+            )
+        )
+
+        val expired = queue.removeExpiredOnlineRegistrations(
+            createdAtMillis + ONLINE_REGISTRATION_CHECK_IN_TIMEOUT_MILLIS
+        )
+
+        assertTrue(expired.playing.isEmpty())
+        assertEquals(listOf(2), expired.waiting.map { it.key })
+    }
+
+    @Test
+    fun completedCheckInCancelsTheThirtyMinuteExpiry() {
+        val createdAtMillis = 9_000_000L
+        val queue = MachineQueue(
+            waiting = listOf(
+                registration(1).copy(
+                    createdAtMillis = createdAtMillis,
+                    requiresOnSiteCheckIn = true
+                )
+            )
+        ).checkIn(1)
+
+        assertEquals(
+            queue,
+            queue.removeExpiredOnlineRegistrations(
+                createdAtMillis + ONLINE_REGISTRATION_CHECK_IN_TIMEOUT_MILLIS
+            )
+        )
     }
 
     @Test

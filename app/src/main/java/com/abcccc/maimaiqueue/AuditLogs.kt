@@ -26,6 +26,8 @@ enum class PublicQueueEventType {
     NO_SHOW_MOVED_TO_TAIL,
     NO_SHOW_REMOVED,
     TEMPORARY_AWAY_EXPIRED,
+    ONLINE_CHECK_IN_TIMED_OUT,
+    ONLINE_CHECK_IN_MISSED,
     ABSENCE_CHANGED,
     MACHINE_STOPPED,
     MACHINE_RESTORED,
@@ -85,6 +87,8 @@ fun createQueueAuditLog(
     val afterByKey = after.allRegistrations.associateBy { it.key }
     val added = after.allRegistrations.filter { it.key !in beforeByKey }
     val removed = before.allRegistrations.filter { it.key !in afterByKey }
+    val removedPendingCheckIn = removed.filter { it.requiresOnSiteCheckIn }
+    val otherRemoved = removed.filterNot { it.requiresOnSiteCheckIn }
     val temporaryAwayExpired = removed.filter {
         it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
             it.temporaryAwaySkippedTurns >= 3
@@ -101,10 +105,22 @@ fun createQueueAuditLog(
     }
     if (removed.isNotEmpty()) {
         changeKinds += "removed"
-        details += if (publicEventTypeOverride == PublicQueueEventType.NO_SHOW_REMOVED) {
-            "${quotedNames(removed)}本次未到场，登记已移除"
-        } else {
-            "移除 ${quotedNames(removed)}"
+        when (publicEventTypeOverride) {
+            PublicQueueEventType.NO_SHOW_REMOVED ->
+                details += "${quotedNames(removed)}本次未到场，登记已移除"
+            PublicQueueEventType.ONLINE_CHECK_IN_TIMED_OUT -> {
+                if (removedPendingCheckIn.isNotEmpty()) {
+                    details += "${quotedNames(removedPendingCheckIn)}未在创建线上登记后的 30 分钟内完成现场签到，登记已自动移除"
+                }
+                if (otherRemoved.isNotEmpty()) details += "移除 ${quotedNames(otherRemoved)}"
+            }
+            PublicQueueEventType.ONLINE_CHECK_IN_MISSED -> {
+                if (removedPendingCheckIn.isNotEmpty()) {
+                    details += "${quotedNames(removedPendingCheckIn)}轮到进入游玩位置时尚未完成现场签到，登记已自动移除"
+                }
+                if (otherRemoved.isNotEmpty()) details += "移除 ${quotedNames(otherRemoved)}"
+            }
+            else -> details += "移除 ${quotedNames(removed)}"
         }
         if (temporaryAwayExpired.isNotEmpty()) {
             details += "${quotedNames(temporaryAwayExpired)}在暂时离开期间第四次轮到，已自动退出排队"
@@ -227,6 +243,8 @@ fun createQueueAuditLog(
         PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场 · 已移至队尾"
         PublicQueueEventType.NO_SHOW_REMOVED -> "未到场 · 已移除登记"
         PublicQueueEventType.TEMPORARY_AWAY_EXPIRED -> "暂时离开已达轮空上限"
+        PublicQueueEventType.ONLINE_CHECK_IN_TIMED_OUT -> "线上登记签到超时"
+        PublicQueueEventType.ONLINE_CHECK_IN_MISSED -> "未签到登记已自动移除"
         else -> when {
             "added" in changeKinds && "removed" !in changeKinds -> "新增登记"
             "removed" in changeKinds && "added" !in changeKinds -> "移除登记"

@@ -47,6 +47,8 @@ RESULT_SOURCE_SERVER_MIGRATION = "SERVER_MIGRATION"
 RESULT_SOURCE_BOT_DISABLED = "BOT_DISABLED"
 COMMAND_TIMEOUT_DETAIL = "终端未在有效时间内处理这次修改，请重新提交。"
 BOT_DISABLED_DETAIL = "QQ Bot 联动已关闭，这次修改没有执行。"
+TEST_SYNC_ENDED_DETAIL = "测试同步已经结束，这次修改没有执行，请重新提交。"
+SYNC_MODES = {"test", "takeover"}
 MACHINE_NAMES = {"A": "左侧 · 机台 A", "B": "右侧 · 机台 B"}
 MAX_MACHINE_REMARK_CHARACTERS = 8
 PUBLIC_EVENT_TYPES = {
@@ -59,6 +61,8 @@ PUBLIC_EVENT_TYPES = {
     "NO_SHOW_MOVED_TO_TAIL",
     "NO_SHOW_REMOVED",
     "TEMPORARY_AWAY_EXPIRED",
+    "ONLINE_CHECK_IN_TIMED_OUT",
+    "ONLINE_CHECK_IN_MISSED",
     "ABSENCE_CHANGED",
     "MACHINE_STOPPED",
     "MACHINE_RESTORED",
@@ -390,7 +394,8 @@ def register_routes(app: Flask) -> None:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = (
-            "Authorization, Content-Type, X-Device-ID, X-Queue-Schema-Version"
+            "Authorization, Content-Type, X-Device-ID, X-Queue-Schema-Version, "
+            "X-Queue-Sync-Mode"
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"
         response.headers["Pragma"] = "no-cache"
@@ -504,6 +509,10 @@ def publish_snapshot():
     if not device_id or len(device_id) > 128:
         return jsonify({"ok": False, "error": "终端编号无效"}), 400
 
+    requested_sync_mode = request.headers.get("X-Queue-Sync-Mode", "").strip().lower()
+    if requested_sync_mode and requested_sync_mode not in SYNC_MODES:
+        return jsonify({"ok": False, "error": "同步方式无效"}), 400
+
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
@@ -528,14 +537,56 @@ def publish_snapshot():
         contact["registration_id"] for contact in private_contacts
     }
     now = int(time.time())
-    serialized = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
 
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         cleanup_expired_event_recipients(connection, now)
         current = connection.execute(
-            "SELECT queue_id, revision, device_id, received_at FROM queue_snapshot WHERE id = 1"
+            """
+            SELECT queue_id, revision, payload, device_id, received_at
+            FROM queue_snapshot WHERE id = 1
+            """
         ).fetchone()
+        current_payload = json.loads(current["payload"]) if current is not None else None
+        current_is_test = bool(current_payload and current_payload.get("test_data", False))
+        incoming_is_test = requested_sync_mode == "test"
+        primary_device_id = current_app.config["PRIMARY_DEVICE_ID"]
+        incoming_is_primary = bool(primary_device_id) and device_id == primary_device_id
+        current_is_online = bool(
+            current
+            and now - current["received_at"]
+            <= current_app.config["ONLINE_TIMEOUT_SECONDS"]
+        )
+
+        if current is None:
+            # There is no existing queue to displace, so the first authenticated terminal can
+            # establish the official snapshot without a takeover choice.
+            incoming_is_test = requested_sync_mode == "test"
+        elif current["device_id"] == device_id:
+            if not requested_sync_mode:
+                incoming_is_test = current_is_test
+        elif incoming_is_primary:
+            # The configured primary terminal always restores the official view. This is what
+            # makes a test session temporary even if the test terminal is still running.
+            incoming_is_test = requested_sync_mode == "test"
+        else:
+            if current_is_online:
+                connection.rollback()
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "TERMINAL_STILL_ONLINE",
+                        "error": "另一终端仍在线，暂不能开始测试或接管同步",
+                    }
+                ), 409
+            if not requested_sync_mode:
+                connection.rollback()
+                return sync_mode_required_response(
+                    current_payload, normalized, current_is_online
+                )
+
+        normalized["test_data"] = incoming_is_test
+        serialized = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
         previous_queue_contacts = {}
         if current is not None and current["queue_id"] != queue_id:
             previous_queue_contacts = {
@@ -552,17 +603,6 @@ def publish_snapshot():
         retired = connection.execute(
             "SELECT 1 FROM retired_queue WHERE queue_id = ?", (queue_id,)
         ).fetchone()
-
-        if current is not None and current["device_id"] != device_id:
-            primary_device_id = current_app.config["PRIMARY_DEVICE_ID"]
-            incoming_is_primary = bool(primary_device_id) and device_id == primary_device_id
-            current_is_online = (
-                now - current["received_at"]
-                <= current_app.config["ONLINE_TIMEOUT_SECONDS"]
-            )
-            if not incoming_is_primary and current_is_online:
-                connection.rollback()
-                return jsonify({"ok": False, "error": "另一终端仍在线，暂不能接管同步"}), 409
 
         if retired is not None:
             connection.rollback()
@@ -811,17 +851,64 @@ def publish_snapshot():
             (queue_id, queue_id),
         )
         if current is not None and current["device_id"] != device_id:
-            connection.execute(
-                """
-                UPDATE terminal_command
-                SET device_id = ?, claimed_at = NULL, claimed_terminal = NULL
-                WHERE status = 'PENDING'
-                """,
-                (device_id,),
-            )
+            if incoming_is_test:
+                # Official commands remain assigned to the official terminal while a temporary
+                # test queue is active.
+                pass
+            elif current_is_test:
+                connection.execute(
+                    """
+                    UPDATE terminal_command
+                    SET status = 'REJECTED', completed_at = ?, result_detail = ?,
+                        result_source = ?
+                    WHERE status = 'PENDING' AND device_id = ?
+                    """,
+                    (
+                        now,
+                        TEST_SYNC_ENDED_DETAIL,
+                        RESULT_SOURCE_SERVER_MIGRATION,
+                        current["device_id"],
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE terminal_command
+                    SET device_id = ?, claimed_at = NULL, claimed_terminal = NULL
+                    WHERE status = 'PENDING'
+                    """,
+                    (device_id,),
+                )
         connection.commit()
 
     return "", 204
+
+
+def sync_mode_required_response(
+    current_payload: dict[str, Any] | None,
+    incoming_payload: dict[str, Any],
+    current_online: bool,
+):
+    return jsonify(
+        {
+            "ok": False,
+            "code": "SYNC_MODE_REQUIRED",
+            "error": "请选择测试同步或接管同步后再继续",
+            "current_registration_count": snapshot_registration_count(current_payload),
+            "local_registration_count": snapshot_registration_count(incoming_payload),
+            "current_terminal_online": current_online,
+        }
+    ), 409
+
+
+def snapshot_registration_count(snapshot: dict[str, Any] | None) -> int:
+    if not snapshot:
+        return 0
+    return sum(
+        machine.get("registration_count", 0)
+        for machine in snapshot.get("machines", {}).values()
+        if isinstance(machine, dict)
+    )
 
 
 def read_snapshot():
@@ -1002,6 +1089,7 @@ def read_bot_players():
             "revision": snapshot_row["revision"],
             "received_at": snapshot_row["received_at"] * 1000,
             "registration_open": snapshot.get("registration_open", True),
+            "test_data": bool(snapshot.get("test_data", False)),
             "business_hours": snapshot.get("business_hours")
             or normalize_public_business_hours(None),
             "queue_rules": snapshot.get("queue_rules")
@@ -1015,7 +1103,7 @@ def read_bot_players():
             "capabilities": {
                 "read_players": True,
                 "remote_actions": True,
-                "online_registration": True,
+                "online_registration": online_registration_allowed(snapshot),
             },
         }
     )
@@ -1229,6 +1317,9 @@ def read_online_profile():
         ).fetchone()
         if snapshot_row is None:
             return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+        snapshot = json.loads(snapshot_row["payload"])
+        if not online_registration_allowed(snapshot):
+            return jsonify({"ok": False, "error": "现场规则暂不允许线上登记"}), 503
         profile = find_player_profile_by_qq(connection, qq_number)
         if profile is None:
             return jsonify(
@@ -1241,7 +1332,6 @@ def read_online_profile():
                     ),
                 }
             ), 404
-        snapshot = json.loads(snapshot_row["payload"])
         registrations = find_qq_registration_contexts(
             connection, snapshot_row["queue_id"], snapshot, qq_number
         )
@@ -1266,6 +1356,7 @@ def read_online_profile():
                 "online_registration": bool(
                     terminal_online
                     and snapshot.get("website_remote_enabled", False)
+                    and online_registration_allowed(snapshot)
                 ),
                 "terminal_is_source_of_truth": True,
             },
@@ -1349,7 +1440,7 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
             return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
         snapshot = json.loads(snapshot_row["payload"])
         availability_error = remote_operation_availability_error(
-            snapshot_row, snapshot, operation_source
+            snapshot_row, snapshot, operation_source, operation
         )
         if availability_error is not None:
             detail, status_code = availability_error
@@ -1449,6 +1540,8 @@ def build_queue_operation_payload(
     }
 
     if operation == "JOIN_QUEUE":
+        if not online_registration_allowed(snapshot):
+            return None, ("现场规则暂不允许线上登记", 409)
         if registration_contexts:
             return None, ("你已经有一份正在排队的登记，不能重复加入", 409)
         if not snapshot.get("registration_open", True):
@@ -1640,6 +1733,7 @@ def remote_operation_availability_error(
     snapshot_row: sqlite3.Row,
     snapshot: dict[str, Any],
     operation_source: str,
+    operation: str,
 ):
     if not snapshot_is_online(snapshot_row):
         return "现场终端暂时离线，暂不能执行远程排队操作", 503
@@ -1649,6 +1743,8 @@ def remote_operation_availability_error(
         return "现场终端已关闭网站同步，暂不能在线操作", 503
     if operation_source == "QQ_BOT" and not snapshot.get("onebot_sync_enabled", True):
         return "现场终端已关闭 QQ Bot 联动", 503
+    if operation == "JOIN_QUEUE" and not online_registration_allowed(snapshot):
+        return "现场规则暂不允许线上登记", 503
     return None
 
 
@@ -2023,6 +2119,7 @@ def public_capabilities(
         snapshot
         and terminal_online
         and snapshot.get("website_remote_enabled", False)
+        and online_registration_allowed(snapshot)
     )
     return {
         "public_logs": True,
@@ -2032,6 +2129,13 @@ def public_capabilities(
         "online_registration": online_registration,
         "transport": "polling",
     }
+
+
+def online_registration_allowed(snapshot: dict[str, Any]) -> bool:
+    queue_rules = snapshot.get("queue_rules")
+    return not isinstance(queue_rules, dict) or queue_rules.get(
+        "allow_online_registration", True
+    ) is not False
 
 
 def authorize_terminal():
@@ -2363,12 +2467,17 @@ def normalize_public_queue_rules(source: Any) -> dict[str, bool]:
         return {
             "allow_defer_one_round": True,
             "allow_temporary_leave": True,
+            "allow_online_registration": True,
         }
     if not isinstance(source, dict):
         raise ValidationError("queue_rules 必须是对象")
+    allow_online_registration = source.get("allow_online_registration", True)
+    if type(allow_online_registration) is not bool:
+        raise ValidationError("allow_online_registration 必须是布尔值")
     return {
         "allow_defer_one_round": read_boolean(source, "allow_defer_one_round"),
         "allow_temporary_leave": read_boolean(source, "allow_temporary_leave"),
+        "allow_online_registration": allow_online_registration,
     }
 
 

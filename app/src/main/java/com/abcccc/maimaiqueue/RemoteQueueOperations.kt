@@ -45,6 +45,7 @@ internal data class RemoteQueueExecutionState(
     val acceptingNewRegistrations: Boolean,
     val websiteRemoteEnabled: Boolean,
     val oneBotSyncEnabled: Boolean,
+    val allowOnlineRegistration: Boolean,
     val allowDeferOneRound: Boolean,
     val allowTemporaryLeave: Boolean
 )
@@ -63,7 +64,8 @@ internal sealed interface RemoteQueueOperationDecision {
 
 internal fun decideRemoteQueueOperation(
     command: RemoteQueueOperationCommand,
-    state: RemoteQueueExecutionState
+    state: RemoteQueueExecutionState,
+    appliedAtMillis: Long = System.currentTimeMillis()
 ): RemoteQueueOperationDecision {
     fun reject(detail: String) = RemoteQueueOperationDecision.Reject(detail)
     fun already(detail: String) = RemoteQueueOperationDecision.AlreadyApplied(detail)
@@ -91,7 +93,12 @@ internal fun decideRemoteQueueOperation(
             .flatMap { it.allRegistrations.asSequence() }
             .firstOrNull { it.onlineRegistrationCommandId == command.commandId }
         if (exactRegistration != null) {
-            return already("线上登记已经加入等待顺序。")
+            return already(
+                "线上登记已经加入等待顺序。请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。"
+            )
+        }
+        if (!state.allowOnlineRegistration) {
+            return reject("现场规则暂不允许线上登记。")
         }
         if (!state.acceptingNewRegistrations) {
             return reject("现场当前没有使用登记排队，暂不能线上加入排队。")
@@ -130,7 +137,7 @@ internal fun decideRemoteQueueOperation(
             displayId = profile.nickname,
             preference = resolvedPreference,
             isTemporary = false,
-            createdAtMillis = command.createdAtMillis,
+            createdAtMillis = appliedAtMillis,
             gender = profile.gender,
             playerProfileId = profile.id,
             requiresOnSiteCheckIn = true,
@@ -142,9 +149,9 @@ internal fun decideRemoteQueueOperation(
         if (updatedQueue.registrationCount != queue.registrationCount + 1) {
             return reject("终端未能建立线上登记，请重新查询后再试。")
         }
-        val usedProfile = if ((profile.lastUsedAtMillis ?: Long.MIN_VALUE) < command.createdAtMillis) {
+        val usedProfile = if ((profile.lastUsedAtMillis ?: Long.MIN_VALUE) < appliedAtMillis) {
             profile.recordUsage(
-                atMillis = maxOf(command.createdAtMillis, profile.updatedAtMillis + 1L)
+                atMillis = maxOf(appliedAtMillis, profile.updatedAtMillis + 1L)
             )
         } else {
             null
@@ -154,7 +161,7 @@ internal fun decideRemoteQueueOperation(
                 queues = state.queues + (machineId to updatedQueue),
                 nextRegistrationKey = state.nextRegistrationKey + 1
             ),
-            detail = "线上登记已加入机台 $machineId 的等待顺序，等待现场签到。",
+            detail = "线上登记已加入机台 $machineId 的等待顺序。请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。",
             changedMachineIds = setOf(machineId),
             updatedProfile = usedProfile
         )

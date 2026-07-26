@@ -3,11 +3,19 @@ package com.abcccc.maimaiqueue
 import android.content.Context
 import java.time.DayOfWeek
 
+enum class QueueSyncMode(val headerValue: String?) {
+    UNSPECIFIED(null),
+    TEST("test"),
+    TAKEOVER("takeover")
+}
+
 data class QueueRuleSettings(
     val allowDeferOneRound: Boolean = true,
     val allowTemporaryLeave: Boolean = true,
+    val allowOnlineRegistration: Boolean = true,
     val websiteSyncEnabled: Boolean = true,
     val oneBotSyncEnabled: Boolean = true,
+    val syncMode: QueueSyncMode = QueueSyncMode.UNSPECIFIED,
     val machineARemark: String = DEFAULT_MACHINE_A_REMARK,
     val machineBRemark: String = DEFAULT_MACHINE_B_REMARK,
     val businessHours: BusinessHoursSettings = BusinessHoursSettings()
@@ -27,9 +35,21 @@ class LocalQueueRuleSettingsRepository(context: Context) {
         return QueueRuleSettings(
             allowDeferOneRound = preferences.getBoolean(KEY_ALLOW_DEFER_ONE_ROUND, true),
             allowTemporaryLeave = preferences.getBoolean(KEY_ALLOW_TEMPORARY_LEAVE, true),
+            allowOnlineRegistration = preferences.getBoolean(
+                KEY_ALLOW_ONLINE_REGISTRATION,
+                true
+            ),
             websiteSyncEnabled = websiteSyncEnabled,
             oneBotSyncEnabled = websiteSyncEnabled &&
                 preferences.getBoolean(KEY_ONEBOT_SYNC_ENABLED, true),
+            syncMode = runCatching {
+                QueueSyncMode.valueOf(
+                    preferences.getString(
+                        KEY_SYNC_MODE,
+                        QueueSyncMode.UNSPECIFIED.name
+                    ).orEmpty()
+                )
+            }.getOrDefault(QueueSyncMode.UNSPECIFIED),
             machineARemark = normalizeMachineRemark(
                 preferences.getString(KEY_MACHINE_A_REMARK, DEFAULT_MACHINE_A_REMARK),
                 DEFAULT_MACHINE_A_REMARK
@@ -57,8 +77,10 @@ class LocalQueueRuleSettingsRepository(context: Context) {
         preferences.edit()
             .putBoolean(KEY_ALLOW_DEFER_ONE_ROUND, settings.allowDeferOneRound)
             .putBoolean(KEY_ALLOW_TEMPORARY_LEAVE, settings.allowTemporaryLeave)
+            .putBoolean(KEY_ALLOW_ONLINE_REGISTRATION, settings.allowOnlineRegistration)
             .putBoolean(KEY_WEBSITE_SYNC_ENABLED, settings.websiteSyncEnabled)
             .putBoolean(KEY_ONEBOT_SYNC_ENABLED, oneBotSyncEnabled)
+            .putString(KEY_SYNC_MODE, settings.syncMode.name)
             .putBoolean(KEY_BUSINESS_HOURS_ENABLED, settings.businessHours.enabled)
             .putBoolean(KEY_WEEKLY_BUSINESS_HOURS_ENABLED, settings.businessHours.useWeeklySchedule)
             .putInt(KEY_DEFAULT_OPENING_MINUTES, settings.businessHours.defaultHours.openingMinutes)
@@ -103,8 +125,10 @@ class LocalQueueRuleSettingsRepository(context: Context) {
         const val PREFERENCES_NAME = "queue_rule_settings"
         const val KEY_ALLOW_DEFER_ONE_ROUND = "allow_defer_one_round"
         const val KEY_ALLOW_TEMPORARY_LEAVE = "allow_temporary_leave"
+        const val KEY_ALLOW_ONLINE_REGISTRATION = "allow_online_registration"
         const val KEY_WEBSITE_SYNC_ENABLED = "website_sync_enabled"
         const val KEY_ONEBOT_SYNC_ENABLED = "onebot_sync_enabled"
+        const val KEY_SYNC_MODE = "sync_mode"
         const val KEY_MACHINE_A_REMARK = "machine_a_remark"
         const val KEY_MACHINE_B_REMARK = "machine_b_remark"
         const val KEY_BUSINESS_HOURS_ENABLED = "business_hours_enabled"

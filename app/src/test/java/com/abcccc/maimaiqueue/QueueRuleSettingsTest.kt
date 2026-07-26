@@ -9,6 +9,7 @@ class QueueRuleSettingsTest {
         val settings = QueueRuleSettings()
 
         assertEquals(true, settings.websiteSyncEnabled)
+        assertEquals(true, settings.allowOnlineRegistration)
         assertEquals("左侧", settings.machineARemark)
         assertEquals("右侧", settings.machineBRemark)
     }

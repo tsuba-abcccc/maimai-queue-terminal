@@ -255,6 +255,32 @@ class AuditLogsTest {
     }
 
     @Test
+    fun onlineCheckInRemovalLogsDistinguishTimeoutFromMissedOpportunity() {
+        val pending = registration(1, "线上玩家").copy(requiresOnSiteCheckIn = true)
+        val currentPlayer = registration(2, "本轮玩家", PlayPreference.SOLO)
+        val timeoutLog = queueLog(
+            before = MachineQueue(waiting = listOf(pending)),
+            after = MachineQueue(),
+            publicEventTypeOverride = PublicQueueEventType.ONLINE_CHECK_IN_TIMED_OUT
+        )!!
+        val missedLog = queueLog(
+            before = MachineQueue(
+                playing = listOf(currentPlayer),
+                waiting = listOf(pending)
+            ),
+            after = MachineQueue(),
+            publicEventTypeOverride = PublicQueueEventType.ONLINE_CHECK_IN_MISSED
+        )!!
+
+        assertEquals("机台 A · 线上登记签到超时", timeoutLog.title)
+        assertTrue(timeoutLog.detail.contains("30 分钟内完成现场签到"))
+        assertEquals("机台 A · 未签到登记已自动移除", missedLog.title)
+        assertTrue(missedLog.detail.contains("“线上玩家”轮到进入游玩位置时"))
+        assertTrue(missedLog.detail.contains("移除 “本轮玩家”"))
+        assertFalse(missedLog.detail.contains("“本轮玩家”轮到进入游玩位置时"))
+    }
+
+    @Test
     fun claimingARegistrationTakesPriorityOverTheAccompanyingNicknameChange() {
         val temporary = registration(1, "临时昵称").copy(isTemporary = true)
         val claimed = temporary.copy(

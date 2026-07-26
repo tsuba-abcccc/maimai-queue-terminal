@@ -7,6 +7,7 @@ const {
   formatMachineReplyHint,
   formatOwnQueue,
   formatOwnQueueActions,
+  formatNotificationQueueStatus,
   machineCanAcceptRegistration,
   formatQueue,
   formatQueueNotification,
@@ -198,6 +199,31 @@ test('formats both machines without exposing private profile fields', () => {
   assert.doesNotMatch(text, /暂无等待登记/)
   assert.match(text, /游玩位置 A·空闲\n\n【墙侧·机台 B】/)
   assert.doesNotMatch(text, /qq_number|profile_id/)
+})
+
+test('labels test queue data in queue and personal status messages', () => {
+  const queue = {
+    queue_id: 'queue-test',
+    captured_at: Date.now(),
+    registration_open: true,
+    test_data: true,
+    terminal: { online: true },
+    machines: {},
+  }
+
+  assert.match(formatQueue(queue), /^当前队列·终端在线\n\n当前数据是测试数据。$/)
+  assert.match(
+    formatOwnQueue([{
+      registration_id: 'registration-1',
+      profile_id: 'profile-1',
+      display_id: '小雨',
+      machine_id: 'A',
+      position: 'WAITING',
+      position_index: 1,
+      online_registration_pending_check_in: true,
+    }], queue),
+    /\n\n当前数据是测试数据。\n\n/,
+  )
 })
 
 test('keeps preserved registrations visible while a machine is stopped', () => {
@@ -614,20 +640,63 @@ test('shows both the thirty-minute closing warning and the closing grace period'
   assert.match(closingSoonText, /请留意后续队列安排。/)
 })
 
-test('formats queue notifications with the canonical heading and compact middle dots', () => {
+test('queue notifications append only the concise current position', () => {
+  const status = formatNotificationQueueStatus([{
+    registration_id: 'registration-checked-in',
+    profile_id: 'profile-checked-in',
+    qq_number: '12345678',
+    display_id: '啊波呲',
+    machine_id: 'A',
+    position: 'WAITING',
+    position_index: 1,
+    estimated_wait_minutes: 10,
+    preference: 'OPEN_TO_JOIN',
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+  }])
   const message = formatQueueNotification(
     {
-      title: '机台 A · 游玩位置已更新',
-      detail: '小雨 · 已进入游玩位置。',
+      title: '左侧日框 · 机台 A · 线上登记签到状态已更新',
+      detail: '“啊波呲”已在现场完成签到。',
     },
-    '\n\n未到场记录 1 次 · 上次处理：移至队尾',
+    status,
   )
 
   assert.equal(
     message,
-    '【排队通知】\n\n机台 A·游玩位置已更新\n小雨·已进入游玩位置。\n\n未到场记录 1 次·上次处理：移至队尾',
+    '【排队通知】\n\n左侧日框·机台 A·线上登记签到状态已更新\n“啊波呲”已在现场完成签到。\n\n现在，你位于队列位置 A1，约 10 分钟后可以游玩。',
   )
   assert.doesNotMatch(message, /\s·|·\s/)
+  assert.doesNotMatch(message, /你好|游玩偏好|暂缓一轮|退出排队/)
+})
+
+test('notification position summaries handle playing and unavailable estimates', () => {
+  const base = {
+    registration_id: 'registration-status',
+    profile_id: 'profile-status',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'B',
+    position_index: 2,
+    estimated_wait_minutes: null,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+  }
+
+  assert.equal(
+    formatNotificationQueueStatus([{ ...base, position: 'WAITING' }]),
+    '现在，你位于队列位置 B2，暂时无法估算等待时间。',
+  )
+  assert.equal(
+    formatNotificationQueueStatus([{ ...base, position: 'PLAYING' }]),
+    '现在，你正在游玩位置 B。',
+  )
 })
 
 test('shows the pending check-in state and only allows leaving the queue', () => {

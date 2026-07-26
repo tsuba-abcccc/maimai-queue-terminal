@@ -54,6 +54,7 @@ class QueueCloudSnapshotTest {
                 machineARemark = "入口侧",
                 machineBRemark = "墙侧",
                 oneBotSyncEnabled = false,
+                allowOnlineRegistration = false,
                 businessHours = QueuePublicBusinessHours(
                     enabled = true,
                     outsideBusinessHours = true,
@@ -69,6 +70,9 @@ class QueueCloudSnapshotTest {
         assertEquals("入口侧 · 机台 A", machines.getJSONObject("A").getString("name"))
         assertEquals("墙侧 · 机台 B", machines.getJSONObject("B").getString("name"))
         assertFalse(snapshot.getBoolean("onebot_sync_enabled"))
+        assertFalse(
+            snapshot.getJSONObject("queue_rules").getBoolean("allow_online_registration")
+        )
         assertTrue(businessHours.getBoolean("enabled"))
         assertTrue(businessHours.getBoolean("outside"))
         assertFalse(businessHours.getBoolean("closing_soon"))

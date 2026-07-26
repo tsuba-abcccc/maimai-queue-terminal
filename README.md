@@ -1,6 +1,6 @@
 # maimai Q
 
-[![Version](https://img.shields.io/badge/version-0.4.0-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
+[![Version](https://img.shields.io/badge/version-0.4.1-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
 [![Android](https://img.shields.io/badge/Android-10%2B-34C759?logo=android&logoColor=white)](https://developer.android.com/about/versions/10)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-007AFF)](https://developer.android.com/compose)
@@ -16,7 +16,7 @@
 - [在线查看当前队列](https://abcccc.top/queue-status)
 - [玩家使用手册](docs/user-manual.md)
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
-- [0.1.0 至 0.4.0 更新日志](docs/update.md)
+- [0.1.0 至 0.4.1 更新日志](docs/update.md)
 - [云端同步协议](docs/cloud-queue-sync.md)
 - [后端部署说明](cloud-server/README.md)
 
@@ -66,8 +66,8 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将两�
 - 使用玩家资料认领临时登记，保留原机台和位置，并将昵称更新为资料昵称。
 - 修改本次游玩偏好时，不会意外覆盖玩家资料的默认偏好。
 - 性别和 QQ 只在需要的详情页面显示，不出现在公开排队表面。
-- 网站和 QQ Bot 可使用已绑定的 QQ 玩家资料加入排队；线上登记到场后需在终端完成签到。
-- 待签到登记保留原有等待顺序，但不参与游玩位置分配和等待时间估算；签到后恢复为普通登记。
+- 网站和 QQ Bot 可使用已绑定的 QQ 玩家资料加入排队；线上登记必须在创建后的 30 分钟内到终端完成现场签到。
+- 待签到登记暂时保留在原有等待顺序中，不参与等待时间估算；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。
 
 ### 队列编辑和纠错
 
@@ -99,6 +99,7 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将两�
 - 网络失败不会阻止现场操作，应用会在后台自动重试。
 - 首页显示已同步、同步中、待重试、已关闭或未配置等状态。
 - 现场终端版可分别关闭网站同步和“QQ Bot 联动”；关闭后对应的线上入口与远程操作不可用。
+- 现场终端可单独关闭“允许线上登记”；关闭后网站和 QQ Bot 仍可查询及管理已有登记，但不能创建新的线上登记。
 - 闭店前 30 分钟，App、网站和 QQ Bot 会统一显示提醒；预计无法在闭店前轮到时，App 还会在创建登记前说明风险。闭店后，三端统一显示收尾状态。
 - 网站提供两台队列、位置详情、时间估算、公开日志、“标记为自己”和线上加入排队入口。
 - 标记后可查看自己的位置、预计时间、共同游玩对象和未到场等处理结果。
@@ -178,7 +179,7 @@ app/build/outputs/apk/local/debug/app-local-debug.apk
 .\gradlew.bat :app:packageLocalDebugApk
 ```
 
-文件会复制到 `output/apk/maimai-Q-0.4.0-local.apk`。
+文件会复制到 `output/apk/maimai-Q-0.4.1-local.apk`。
 
 macOS 或 Linux 使用：
 
@@ -251,7 +252,7 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 - 公开分发版与现场终端版应使用不同签名和不同配置。
 - 现场终端 APK 只在受控设备间传递；令牌泄漏后立即在服务端轮换。
 
-现场终端文件会复制到 `output/apk/maimai-Q-0.4.0-terminal.apk`，不得作为 GitHub 公开 Release 附件。
+现场终端文件会复制到 `output/apk/maimai-Q-0.4.1-terminal.apk`，不得作为 GitHub 公开 Release 附件。
 
 ## 部署队列 API
 
@@ -340,7 +341,7 @@ maimai-queue-terminal/
 - 二维码入口已经预留，但当前版本尚未启用。
 - 玩家资料以终端本机为准，并可私有同步到服务器；云端只补回本机缺失资料。
 - 网站与 Koishi Bot 的线上登记仅接受现场终端玩家资料库中已绑定 QQ 的玩家；新资料仍需在现场建立。
-- 线上登记到场后必须在终端签到；网站暂不提供暂缓、暂离、切换机台、修改偏好或退出排队等队列管理操作。
+- 线上登记必须在创建后的 30 分钟内到终端签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出。网站暂不提供暂缓、暂离、切换机台、修改偏好或退出排队等队列管理操作。
 - QQ Bot 只允许玩家管理与发送者 QQ 对应的本人登记，不提供远程调整其他玩家或整条队列的能力。
 - 当前公开站点的前端源码不在本仓库中。
 - 仓库没有包含可公开使用的生产同步令牌或正式签名密钥。

@@ -83,7 +83,19 @@ data class Registration(
 ) {
     val canEnterPlayingPosition: Boolean
         get() = absenceStatus == QueueAbsenceStatus.NONE && !requiresOnSiteCheckIn
+
+    val onSiteCheckInDeadlineMillis: Long?
+        get() = if (requiresOnSiteCheckIn) {
+            createdAtMillis + ONLINE_REGISTRATION_CHECK_IN_TIMEOUT_MILLIS
+        } else {
+            null
+        }
+
+    fun hasExpiredOnSiteCheckIn(atMillis: Long): Boolean =
+        onSiteCheckInDeadlineMillis?.let { atMillis >= it } == true
 }
+
+internal const val ONLINE_REGISTRATION_CHECK_IN_TIMEOUT_MILLIS = 30L * 60L * 1_000L
 
 data class FriendPairPlan(
     val originalWaiting: List<Registration>,
@@ -337,24 +349,26 @@ data class MachineQueue(
         val temporarilyAwayRegistrations = mutableListOf<Registration>()
 
         positions.take(targetIndex).forEach { position ->
-            val hasTemporarilyAway = position.any {
+            // Reaching a later position means every earlier pending online
+            // registration has already missed its opportunity and must leave.
+            val remainingPosition = position.filterNot { it.requiresOnSiteCheckIn }
+            if (remainingPosition.isEmpty()) return@forEach
+
+            val hasTemporarilyAway = remainingPosition.any {
                 it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
             }
-            val hasOneRoundDeferral = position.any {
+            val hasOneRoundDeferral = remainingPosition.any {
                 it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
             }
             when {
-                position.any { it.requiresOnSiteCheckIn } -> {
-                    retainedUnavailableRegistrations += position
-                }
                 hasTemporarilyAway -> {
-                    val isFixedPair = position.size == 2 &&
-                        position[0].fixedPartnerKey == position[1].key &&
-                        position[1].fixedPartnerKey == position[0].key
+                    val isFixedPair = remainingPosition.size == 2 &&
+                        remainingPosition[0].fixedPartnerKey == remainingPosition[1].key &&
+                        remainingPosition[1].fixedPartnerKey == remainingPosition[0].key
                     if (isFixedPair) {
-                        val skippedTurns = position.maxOf { it.temporaryAwaySkippedTurns }
+                        val skippedTurns = remainingPosition.maxOf { it.temporaryAwaySkippedTurns }
                         if (skippedTurns < 3) {
-                            temporarilyAwayRegistrations += position.map {
+                            temporarilyAwayRegistrations += remainingPosition.map {
                                 it.copy(
                                     absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
                                     temporaryAwaySkippedTurns = skippedTurns + 1
@@ -362,7 +376,7 @@ data class MachineQueue(
                             }
                         }
                     } else {
-                        position.forEach { registration ->
+                        remainingPosition.forEach { registration ->
                             when (registration.absenceStatus) {
                                 QueueAbsenceStatus.TEMPORARILY_AWAY -> {
                                     if (registration.temporaryAwaySkippedTurns < 3) {
@@ -384,7 +398,7 @@ data class MachineQueue(
                     }
                 }
                 hasOneRoundDeferral -> {
-                    retainedUnavailableRegistrations += position.map { registration ->
+                    retainedUnavailableRegistrations += remainingPosition.map { registration ->
                         if (registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND) {
                             registration.copy(absenceStatus = QueueAbsenceStatus.NONE)
                         } else {
@@ -392,7 +406,7 @@ data class MachineQueue(
                         }
                     }
                 }
-                else -> completedRegistrations += position.map { registration ->
+                else -> completedRegistrations += remainingPosition.map { registration ->
                     registration.copy(
                         absenceStatus = QueueAbsenceStatus.NONE,
                         temporaryAwaySkippedTurns = 0,
@@ -988,6 +1002,17 @@ data class MachineQueue(
     fun remove(registrationKey: Int): MachineQueue =
         removeAll(setOf(registrationKey))
 
+    fun expiredOnlineRegistrationKeys(atMillis: Long): Set<Int> = waiting
+        .asSequence()
+        .filter { it.hasExpiredOnSiteCheckIn(atMillis) }
+        .mapTo(mutableSetOf()) { it.key }
+
+    /** Removes timed-out online registrations without starting an intentionally empty round. */
+    fun removeExpiredOnlineRegistrations(atMillis: Long): MachineQueue {
+        val expiredKeys = expiredOnlineRegistrationKeys(atMillis)
+        return if (expiredKeys.isEmpty()) this else removeAll(expiredKeys)
+    }
+
     fun checkIn(registrationKey: Int): MachineQueue = transformRegistrations(setOf(registrationKey)) {
         if (it.requiresOnSiteCheckIn) it.copy(requiresOnSiteCheckIn = false) else it
     }
@@ -1118,7 +1143,10 @@ data class MachineQueue(
             remainingGroup.forEach { registration ->
                 when {
                     registration.key !in crossedUnavailableKeys -> retained += registration
-                    registration.requiresOnSiteCheckIn -> retained += registration
+                    registration.requiresOnSiteCheckIn -> {
+                        // An online registration remains provisional until check-in. Reaching
+                        // its playing opportunity consumes the registration instead of a turn.
+                    }
                     registration.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY -> {
                         if (registration.temporaryAwaySkippedTurns < 3) {
                             movedToTail += registration.copy(

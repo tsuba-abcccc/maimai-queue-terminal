@@ -14,13 +14,18 @@ class RemoteQueueOperationsTest {
             nextKey = 2
         )
 
-        val result = decideRemoteQueueOperation(joinCommand(), state)
+        val result = decideRemoteQueueOperation(joinCommand(), state, appliedAtMillis = 5_000L)
 
         assertTrue(result is RemoteQueueOperationDecision.Apply)
         result as RemoteQueueOperationDecision.Apply
         val joined = result.state.queues.getValue("A").waiting.single()
         assertEquals("资料玩家", joined.displayId)
         assertTrue(joined.requiresOnSiteCheckIn)
+        assertEquals(5_000L, joined.createdAtMillis)
+        assertEquals(
+            5_000L + ONLINE_REGISTRATION_CHECK_IN_TIMEOUT_MILLIS,
+            joined.onSiteCheckInDeadlineMillis
+        )
         assertEquals(joinCommand().commandId, joined.onlineRegistrationCommandId)
         assertEquals(3, result.state.nextRegistrationKey)
         assertEquals(1, result.updatedProfile?.usageCount)
@@ -52,7 +57,9 @@ class RemoteQueueOperationsTest {
 
         val result = decideRemoteQueueOperation(
             command,
-            state(machineA = MachineQueue(waiting = listOf(pending)), nextKey = 3)
+            state(machineA = MachineQueue(waiting = listOf(pending)), nextKey = 3).copy(
+                allowOnlineRegistration = false
+            )
         )
 
         assertTrue(result is RemoteQueueOperationDecision.AlreadyApplied)
@@ -107,9 +114,17 @@ class RemoteQueueOperationsTest {
             joinCommand(),
             state().copy(websiteRemoteEnabled = false)
         )
+        val onlineRegistrationDisabled = decideRemoteQueueOperation(
+            joinCommand(),
+            state().copy(allowOnlineRegistration = false)
+        )
 
         assertTrue(capacity is RemoteQueueOperationDecision.Reject)
         assertTrue(disabled is RemoteQueueOperationDecision.Reject)
+        assertEquals(
+            "现场规则暂不允许线上登记。",
+            (onlineRegistrationDisabled as RemoteQueueOperationDecision.Reject).detail
+        )
     }
 
     @Test
@@ -137,6 +152,7 @@ class RemoteQueueOperationsTest {
         acceptingNewRegistrations = true,
         websiteRemoteEnabled = true,
         oneBotSyncEnabled = true,
+        allowOnlineRegistration = true,
         allowDeferOneRound = true,
         allowTemporaryLeave = true
     )

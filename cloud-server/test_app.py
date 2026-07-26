@@ -1870,7 +1870,7 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertEqual(400, response.status_code)
 
-    def test_primary_terminal_has_priority_and_cross_device_takeover_preserves_queues(self):
+    def test_secondary_terminal_must_choose_test_or_takeover_after_primary_goes_offline(self):
         self.app.config["ALLOWED_DEVICE_ID"] = ""
         self.app.config["PRIMARY_DEVICE_ID"] = "terminal-1"
         primary = self.snapshot(queue_id="00000000-0000-0000-0000-000000000001")
@@ -1897,12 +1897,22 @@ class QueueStatusApiTest(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(
-            204,
-            self.client.post(
-                "/api/queue-status", json=secondary, headers=secondary_headers
-            ).status_code,
+        choice_required = self.client.post(
+            "/api/queue-status", json=secondary, headers=secondary_headers
         )
+        self.assertEqual(409, choice_required.status_code)
+        self.assertEqual("SYNC_MODE_REQUIRED", choice_required.get_json()["code"])
+        self.assertEqual(1, choice_required.get_json()["current_registration_count"])
+        self.assertEqual(1, choice_required.get_json()["local_registration_count"])
+
+        test_started = self.client.post(
+            "/api/queue-status",
+            json=secondary,
+            headers={**secondary_headers, "X-Queue-Sync-Mode": "test"},
+        )
+        self.assertEqual(204, test_started.status_code)
+        self.assertTrue(self.client.get("/api/queue-status").get_json()["test_data"])
+
         self.assertEqual(
             204,
             self.client.post(
@@ -1921,8 +1931,93 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertEqual("terminal-1", current["terminal"]["id"])
         self.assertEqual(primary["queue_id"], current["queue_id"])
+        self.assertFalse(current["test_data"])
         self.assertNotIn(primary["queue_id"], retired_queue_ids)
         self.assertNotIn(secondary["queue_id"], retired_queue_ids)
+
+    def test_explicit_takeover_publishes_official_data_after_current_terminal_is_offline(self):
+        self.app.config["ALLOWED_DEVICE_ID"] = ""
+        self.app.config["PRIMARY_DEVICE_ID"] = "terminal-1"
+        primary = self.snapshot(queue_id="00000000-0000-0000-0000-000000000011")
+        secondary = self.snapshot(queue_id="00000000-0000-0000-0000-000000000012")
+        self.client.post("/api/queue-status", json=primary, headers=self.headers)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE queue_snapshot SET received_at = ? WHERE id = 1",
+                (int(time.time()) - 91,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        response = self.client.post(
+            "/api/queue-status",
+            json=secondary,
+            headers={
+                **self.headers,
+                "X-Device-ID": "terminal-2",
+                "X-Queue-Sync-Mode": "takeover",
+            },
+        )
+        current = self.client.get("/api/queue-status").get_json()
+
+        self.assertEqual(204, response.status_code)
+        self.assertEqual("terminal-2", current["terminal"]["id"])
+        self.assertFalse(current["test_data"])
+
+    def test_primary_restore_rejects_only_commands_created_for_test_terminal(self):
+        self.app.config["ALLOWED_DEVICE_ID"] = ""
+        self.app.config["PRIMARY_DEVICE_ID"] = "terminal-1"
+        primary = self.snapshot(queue_id="00000000-0000-0000-0000-000000000021")
+        primary["schema_version"] = 3
+        primary["private_player_profiles"] = [self.player_profile()]
+        primary["private_player_contacts"] = []
+        self.client.post("/api/queue-status", json=primary, headers=self.headers)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE queue_snapshot SET received_at = ? WHERE id = 1",
+                (int(time.time()) - 91,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        test_snapshot = copy.deepcopy(primary)
+        test_snapshot["queue_id"] = "00000000-0000-0000-0000-000000000022"
+        secondary_headers = {
+            **self.headers,
+            "X-Device-ID": "terminal-2",
+            "X-Queue-Sync-Mode": "test",
+        }
+        self.client.post(
+            "/api/queue-status", json=test_snapshot, headers=secondary_headers
+        )
+        command_id = "00000000-0000-0000-0000-000000000784"
+        created = self.client.patch(
+            f"/api/queue-bot/profiles/{self.profile_id}",
+            json={
+                "request_id": command_id,
+                "actor_qq": "12345678",
+                "nickname": "测试资料修改",
+            },
+            headers=self.bot_headers,
+        )
+        self.assertEqual(202, created.status_code)
+
+        primary["revision"] += 1
+        restored = self.client.post(
+            "/api/queue-status", json=primary, headers=self.headers
+        )
+        command = self.client.get(
+            f"/api/queue-bot/commands/{command_id}", headers=self.bot_headers
+        ).get_json()
+
+        self.assertEqual(204, restored.status_code)
+        self.assertEqual("REJECTED", command["status"])
+        self.assertEqual("SERVER_MIGRATION", command["result_source"])
+        self.assertIn("测试同步已经结束", command["result_detail"])
 
     def test_schema_v2_preserves_valid_machine_names(self):
         snapshot = self.snapshot()
@@ -2045,6 +2140,64 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("QUEUE_OPERATION", commands[0]["type"])
         self.assertEqual("JOIN_QUEUE", commands[0]["payload"]["operation"])
         self.assertEqual("WEBSITE_REMOTE", commands[0]["payload"]["operation_source"])
+
+    def test_online_registration_switch_blocks_new_joins_but_keeps_existing_management(self):
+        snapshot = self.remote_ready_snapshot(
+            with_registration=True,
+            allow_online_registration=False,
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+
+        public_status = self.client.get("/api/queue-status").get_json()
+        website_profile = self.client.post(
+            "/api/queue-online/profile", json={"qq": "12345678"}
+        )
+        website_join = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000421",
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+        bot_join = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000422",
+                "actor_qq": "12345678",
+                "operation": "JOIN_QUEUE",
+                "machine_id": "A",
+            },
+            headers=self.bot_headers,
+        )
+        bot_players = self.client.post(
+            "/api/queue-bot/players",
+            json={"qq": "12345678"},
+            headers=self.bot_headers,
+        )
+        bot_leave = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000423",
+                "actor_qq": "12345678",
+                "operation": "LEAVE_QUEUE",
+                "machine_id": "A",
+            },
+            headers=self.bot_headers,
+        )
+
+        self.assertFalse(public_status["capabilities"]["online_registration"])
+        self.assertEqual(503, website_profile.status_code)
+        self.assertEqual("现场规则暂不允许线上登记", website_profile.get_json()["error"])
+        self.assertEqual(503, website_join.status_code)
+        self.assertEqual(503, bot_join.status_code)
+        self.assertEqual(200, bot_players.status_code)
+        self.assertEqual(202, bot_leave.status_code)
 
     def test_online_join_requires_a_current_preference_when_profile_asks_each_time(self):
         snapshot = self.remote_ready_snapshot(default_preference="ASK_EVERY_TIME")
@@ -2175,6 +2328,7 @@ class QueueStatusApiTest(unittest.TestCase):
         default_preference="OPEN_TO_JOIN",
         with_registration=False,
         pending_check_in=False,
+        allow_online_registration=True,
     ):
         snapshot = self.snapshot(revision=revision)
         snapshot.update(
@@ -2184,6 +2338,7 @@ class QueueStatusApiTest(unittest.TestCase):
             queue_rules={
                 "allow_defer_one_round": True,
                 "allow_temporary_leave": True,
+                "allow_online_registration": allow_online_registration,
             },
         )
         profile = self.player_profile()
