@@ -9,6 +9,7 @@ const {
   formatOwnQueueActions,
   formatNotificationQueueStatus,
   machineCanAcceptRegistration,
+  onlineRegistrationProfileCompletionNotice,
   formatQueue,
   formatQueueNotification,
   nicknameValidationError,
@@ -18,6 +19,14 @@ const {
   parsePreference,
   parseNotificationPreference,
 } = require('../lib')
+
+test('explains the extra on-site step for legacy online-registration profiles', () => {
+  const notice = onlineRegistrationProfileCompletionNotice(0)
+
+  assert.match(notice, /先在终端补全资料/)
+  assert.match(notice, /再点击“已到场”完成签到/)
+  assert.equal(onlineRegistrationProfileCompletionNotice(1), null)
+})
 
 test('help text uses a message-safe profile menu', () => {
   assert.doesNotMatch(HELP_TEXT, /[<>]/)

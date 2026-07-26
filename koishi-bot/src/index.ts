@@ -735,6 +735,16 @@ function registerNotificationCommands(
     .alias("排队通知")
     .action(async ({ session }, state) =>
       withCommandError(async () => {
+        const queue = await api.getQueue();
+        if (queue.onebot_sync_enabled === false) {
+          return [
+            "排队通知",
+            "",
+            "系统通知：暂未启用",
+            "",
+            "现场终端已关闭 QQ Bot 联动，暂时不能读取或修改个人通知设置。",
+          ].join("\n");
+        }
         const current = await requireNotificationProfile(api, session);
         const requested = parseNotificationPreference(state);
         if (state?.trim() && requested === null) {
@@ -823,6 +833,14 @@ interface CurrentQueueRegistration {
   player: BotPlayer;
 }
 
+export function onlineRegistrationProfileCompletionNotice(
+  setupVersion?: number,
+): string | null {
+  return (setupVersion ?? 0) < 1
+    ? "这份玩家资料尚未补全通知偏好和 QQ 显示范围。到达现场后，请先在终端补全资料，再点击“已到场”完成签到。"
+    : null;
+}
+
 async function joinQueueFromBot(
   api: QueueApi,
   config: Config,
@@ -835,6 +853,9 @@ async function joinQueueFromBot(
     api.getQueue(),
   ]);
   const profile = requireSingleProfile(profilesResponse.profiles);
+  const profileCompletionNotice = onlineRegistrationProfileCompletionNotice(
+    profile.setup_version,
+  );
   if (playersResponse.players.length) {
     throw new Error("你已经有一份正在排队的登记，不能重复加入。请先发送“我的排队”查看。");
   }
@@ -909,12 +930,14 @@ async function joinQueueFromBot(
       "线上登记已经提交，正在等待现场终端确认。",
       "",
       "终端确认创建后，请在 30 分钟内到达现场，并在终端点击自己的登记，再点击“已到场”完成签到。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。",
+      ...(profileCompletionNotice ? ["", profileCompletionNotice] : []),
     ].join("\n");
   }
   return [
     `已经加入${compactMachineName(machine.name)} 的等待顺序。`,
     "",
     "这是一份线上登记。请在创建登记后的 30 分钟内到达现场，并在终端点击自己的登记，再点击“已到场”完成签到。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。",
+    ...(profileCompletionNotice ? ["", profileCompletionNotice] : []),
   ].join("\n");
 }
 

@@ -310,6 +310,9 @@ test('uses documented defaults and formats the cloud notification menu', () => {
   assert.match(menu, /QQ Bot（123456789）/)
   assert.match(menu, /关闭排队通知/)
   assert.match(menu, /开启游玩位置通知/)
+
+  const unavailableMenu = formatNotificationPreferenceMenu(profile, false, '123456789')
+  assert.match(unavailableMenu, /系统通知：暂未启用/)
 })
 
 test('disabled recipients are skipped without blocking later queue events', async () => {

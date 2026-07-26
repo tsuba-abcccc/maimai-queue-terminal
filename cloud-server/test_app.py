@@ -2146,6 +2146,33 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("JOIN_QUEUE", commands[0]["payload"]["operation"])
         self.assertEqual("WEBSITE_REMOTE", commands[0]["payload"]["operation_source"])
 
+    def test_legacy_profile_can_join_online_before_completing_setup(self):
+        snapshot = self.remote_ready_snapshot(revision=22)
+        snapshot["private_player_profiles"][0]["setup_version"] = 0
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+
+        profile = self.client.post(
+            "/api/queue-online/profile", json={"qq": "12345678"}
+        )
+        joined = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000420",
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+
+        self.assertEqual(200, profile.status_code)
+        self.assertEqual(0, profile.get_json()["profile"]["setup_version"])
+        self.assertEqual(202, joined.status_code)
+        self.assertEqual("PENDING", joined.get_json()["status"])
+
     def test_online_registration_switch_blocks_new_joins_but_keeps_existing_management(self):
         snapshot = self.remote_ready_snapshot(
             with_registration=True,
