@@ -2140,6 +2140,11 @@ private fun RegistrationApp() {
                                         }
                                         queueSoundPlayer.play(QueueSoundCue.CONFIRM)
                                         localWriteFailureDetail = null
+                                        if (command.matchesSession(mobileRegistrationSession)) {
+                                            mobileRegistrationSession = null
+                                            mobileRegistrationFailureDetail = null
+                                            screen = Screen.HOME
+                                        }
                                         queueCommandClient.complete(
                                             command.commandId,
                                             applied = true,
@@ -2149,6 +2154,11 @@ private fun RegistrationApp() {
 
                                     is MobileDeviceRegistrationDecision.AlreadyApplied -> {
                                         localWriteFailureDetail = null
+                                        if (command.matchesSession(mobileRegistrationSession)) {
+                                            mobileRegistrationSession = null
+                                            mobileRegistrationFailureDetail = null
+                                            screen = Screen.HOME
+                                        }
                                         queueCommandClient.complete(
                                             command.commandId,
                                             applied = true,

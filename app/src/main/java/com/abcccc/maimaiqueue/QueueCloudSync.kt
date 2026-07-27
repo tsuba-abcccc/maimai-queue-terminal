@@ -697,6 +697,7 @@ private fun parseMobileDeviceRegistration(
         MobileDeviceRegistrationCommand(
             commandId = command.getString("command_id"),
             createdAtMillis = command.getLong("created_at"),
+            sessionId = payload.optionalNonBlankString("session_id"),
             queueId = payload.getString("queue_id"),
             machineId = payload.getString("machine_id"),
             actorQq = payload.getString("actor_qq"),
@@ -717,6 +718,8 @@ private fun parseMobileDeviceRegistration(
         }
     }.getOrNull()?.takeIf { parsed ->
         runCatching { UUID.fromString(parsed.commandId) }.isSuccess &&
+            (parsed.sessionId == null ||
+                runCatching { UUID.fromString(parsed.sessionId) }.isSuccess) &&
             runCatching { UUID.fromString(parsed.queueId) }.isSuccess &&
             runCatching { UUID.fromString(parsed.profileId) }.isSuccess &&
             parsed.createdAtMillis > 0L &&

@@ -20,6 +20,7 @@ internal data class MobileNewPlayerProfile(
 internal data class MobileDeviceRegistrationCommand(
     override val commandId: String,
     val createdAtMillis: Long,
+    val sessionId: String?,
     val queueId: String,
     val machineId: String,
     val actorQq: String,
@@ -32,6 +33,10 @@ internal data class MobileDeviceRegistrationCommand(
     val createsProfile: Boolean
         get() = newProfile != null
 }
+
+internal fun MobileDeviceRegistrationCommand.matchesSession(
+    session: MobileRegistrationSession?
+): Boolean = sessionId != null && sessionId == session?.sessionId
 
 internal sealed interface MobileDeviceRegistrationDecision {
     data class Apply(

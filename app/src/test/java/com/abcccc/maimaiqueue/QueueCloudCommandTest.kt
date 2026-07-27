@@ -97,6 +97,7 @@ class QueueCloudCommandTest {
 
         assertEquals(1, parsed.size)
         val command = parsed.single() as MobileDeviceRegistrationCommand
+        assertEquals("00000000-0000-0000-0000-000000000820", command.sessionId)
         assertEquals("A", command.machineId)
         assertEquals(3L, command.expectedProfileRevision)
         assertEquals(PlayPreference.OPEN_TO_JOIN, command.preference)

@@ -224,9 +224,27 @@ class MobileDeviceRegistrationTest {
         assertEquals(2, result.state.queues.getValue("A").registrationCount)
     }
 
+    @Test
+    fun commandMatchesOnlyItsOriginatingMobileSession() {
+        val command = command()
+        val originatingSession = MobileRegistrationSession(
+            sessionId = "00000000-0000-0000-0000-000000000820",
+            registrationUrl = "https://example.test/mobile",
+            expiresAtMillis = 60_000L
+        )
+        val newerSession = originatingSession.copy(
+            sessionId = "00000000-0000-0000-0000-000000000829"
+        )
+
+        assertTrue(command.matchesSession(originatingSession))
+        assertTrue(!command.matchesSession(newerSession))
+        assertTrue(!command.copy(sessionId = null).matchesSession(originatingSession))
+    }
+
     private fun command() = MobileDeviceRegistrationCommand(
         commandId = "00000000-0000-0000-0000-000000000821",
         createdAtMillis = 2_000L,
+        sessionId = "00000000-0000-0000-0000-000000000820",
         queueId = "00000000-0000-0000-0000-000000000001",
         machineId = "A",
         actorQq = "12345678",

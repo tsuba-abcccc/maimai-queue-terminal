@@ -2428,14 +2428,18 @@ def submit_mobile_registration_session(session_token: str):
             )
             return jsonify({"ok": False, "error": detail}), 409
 
-        active_registration = connection.execute(
-            """
-            SELECT 1 FROM queue_private_contact
-            WHERE queue_id = ? AND (player_id = ? OR qq_number = ?)
-            """,
-            (session["queue_id"], profile_id, actor_qq),
-        ).fetchone()
-        if active_registration is not None:
+        active_registration_ids = {
+            row["registration_id"]
+            for row in connection.execute(
+                """
+                SELECT registration_id FROM queue_private_contact
+                WHERE queue_id = ? AND (player_id = ? OR qq_number = ?)
+                """,
+                (session["queue_id"], profile_id, actor_qq),
+            ).fetchall()
+        }
+        current_registration_ids = set(index_snapshot_registrations(snapshot))
+        if active_registration_ids & current_registration_ids:
             return jsonify({"ok": False, "error": "这名玩家已经有一份正在排队的登记"}), 409
         if any(
             registration["display_id"].casefold() == nickname.casefold()

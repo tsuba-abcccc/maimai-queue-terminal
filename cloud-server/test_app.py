@@ -2435,6 +2435,61 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual(409, reused.status_code)
 
+    def test_mobile_registration_allows_rejoining_after_the_previous_registration_left(self):
+        active_snapshot = self.remote_ready_snapshot(revision=20, with_registration=True)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=active_snapshot, headers=self.headers
+            ).status_code,
+        )
+        created = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000823",
+                "queue_id": active_snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        ).get_json()
+        token = created["session_token"]
+        submission = {
+            "request_id": "00000000-0000-0000-0000-000000000824",
+            "profile_id": self.profile_id,
+            "expected_profile_revision": 3,
+        }
+
+        while_active = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit", json=submission
+        )
+        self.assertEqual(409, while_active.status_code)
+        self.assertEqual(
+            "这名玩家已经有一份正在排队的登记",
+            while_active.get_json()["error"],
+        )
+
+        departed_snapshot = self.remote_ready_snapshot(revision=21)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=departed_snapshot, headers=self.headers
+            ).status_code,
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            retained_contact_count = connection.execute(
+                "SELECT COUNT(*) FROM queue_private_contact WHERE queue_id = ?",
+                (active_snapshot["queue_id"],),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        after_departure = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit", json=submission
+        )
+        self.assertEqual(1, retained_contact_count)
+        self.assertEqual(202, after_departure.status_code)
+
     def test_mobile_registration_requires_explicit_completion_for_legacy_profiles(self):
         snapshot = self.remote_ready_snapshot(revision=21)
         legacy_profile = snapshot["private_player_profiles"][0]
