@@ -160,6 +160,15 @@ internal fun shouldApplyCloudPlayerProfile(
     return !nicknameConflictsWithQueue(cloudProfile.nickname, cloudProfile.id)
 }
 
+internal fun PlayerProfile.isContactlessLegacyAliasOf(canonical: PlayerProfile): Boolean =
+    id != canonical.id &&
+        !hasValidContact &&
+        !hasCompleteRequiredDetails &&
+        canonical.hasValidContact &&
+        nickname.equals(canonical.nickname, ignoreCase = true) &&
+        gender == canonical.gender &&
+        defaultPreference == canonical.defaultPreference
+
 const val MAX_QQ_NUMBER_LENGTH = 12
 private val QQ_NUMBER_LENGTH_RANGE = 5..MAX_QQ_NUMBER_LENGTH
 

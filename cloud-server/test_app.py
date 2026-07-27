@@ -2512,6 +2512,111 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertFalse(completion["notify_online_check_in"])
         self.assertTrue(completion["notify_machine_status"])
 
+    def test_mobile_registration_uses_contact_profile_instead_of_legacy_alias(self):
+        snapshot = self.remote_ready_snapshot(revision=22)
+        snapshot["private_player_profiles"][0]["setup_version"] = 0
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        alias_id = "00000000-0000-0000-0000-000000000902"
+        connection = sqlite3.connect(self.database_path)
+        try:
+            profile_scope_id = connection.execute(
+                "SELECT device_id FROM player_profile WHERE profile_id = ?",
+                (self.profile_id,),
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO player_profile
+                    (device_id, profile_id, nickname, gender, default_preference,
+                     qq_number, usage_count, last_used_at, created_at,
+                     profile_updated_at, received_at, qq_visibility,
+                     notification_enabled, notify_queue_changes,
+                     notify_playing_position, notify_online_check_in,
+                     notify_absence, notify_machine_status, setup_version,
+                     profile_revision)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    profile_scope_id,
+                    alias_id,
+                    "公开昵称",
+                    "UNDISCLOSED",
+                    "OPEN_TO_JOIN",
+                    37,
+                    850_000,
+                    700_000,
+                    850_000,
+                    int(time.time()),
+                    "TERMINAL_ONLY",
+                    1,
+                    1,
+                    0,
+                    1,
+                    1,
+                    0,
+                    0,
+                    1,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        created = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000833",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        ).get_json()
+        token = created["session_token"]
+        opened = self.client.get(
+            f"/api/queue-mobile/sessions/{token}"
+        ).get_json()
+
+        self.assertEqual(
+            [self.profile_id],
+            [profile["profile_id"] for profile in opened["profiles"]],
+        )
+        self.assertEqual(self.profile_id, opened["profile_aliases"][alias_id])
+
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000834",
+                "profile_id": alias_id,
+                "expected_profile_revision": 1,
+                "profile_completion": {
+                    "qq_number": "12345678",
+                    "qq_visibility": "TERMINAL_ONLY",
+                    "notification_enabled": True,
+                    "notify_queue_changes": True,
+                    "notify_playing_position": False,
+                    "notify_online_check_in": True,
+                    "notify_absence": True,
+                    "notify_machine_status": False,
+                },
+            },
+        )
+
+        self.assertEqual(202, submitted.status_code)
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+        command = next(
+            item
+            for item in commands
+            if item["command_id"] == "00000000-0000-0000-0000-000000000834"
+        )
+        self.assertEqual(self.profile_id, command["payload"]["profile"]["profile_id"])
+        self.assertEqual(3, command["payload"]["profile"]["expected_profile_revision"])
+
     def test_mobile_registration_can_create_a_complete_player_profile(self):
         snapshot = self.remote_ready_snapshot(revision=22)
         self.assertEqual(

@@ -2077,6 +2077,12 @@ def read_mobile_registration_session(session_token: str):
             parameters.extend((search, search))
         sql += " ORDER BY usage_count DESC, COALESCE(last_used_at, 0) DESC, nickname, profile_id"
         profiles = connection.execute(sql, parameters).fetchall()
+        profile_aliases = find_mobile_profile_aliases(profiles)
+        profiles = [
+            profile
+            for profile in profiles
+            if profile["profile_id"] not in profile_aliases
+        ]
         identity = connection.execute(
             "SELECT bot_qq FROM service_identity WHERE profile_scope_id = ?",
             (profile_scope_id,),
@@ -2092,6 +2098,7 @@ def read_mobile_registration_session(session_token: str):
                 "expires_at": session["expires_at"] * 1000,
             },
             "profiles": [serialize_mobile_profile(row) for row in profiles],
+            "profile_aliases": profile_aliases,
             "bot_qq": identity["bot_qq"] if identity is not None else None,
             "capabilities": {
                 "create_profile": True,
@@ -2124,6 +2131,39 @@ def serialize_mobile_profile(profile: sqlite3.Row) -> dict[str, Any]:
         "setup_complete": bool(profile["setup_version"] >= 1 and profile["qq_number"]),
         "profile_revision": profile["profile_revision"],
     }
+
+
+def is_contactless_legacy_profile_alias(
+    candidate: sqlite3.Row, canonical: sqlite3.Row
+) -> bool:
+    return bool(
+        candidate["profile_id"] != canonical["profile_id"]
+        and not candidate["qq_number"]
+        and candidate["setup_version"] < 1
+        and canonical["qq_number"]
+        and candidate["nickname"].casefold() == canonical["nickname"].casefold()
+        and candidate["gender"] == canonical["gender"]
+        and candidate["default_preference"] == canonical["default_preference"]
+    )
+
+
+def find_mobile_profile_aliases(
+    profiles: list[sqlite3.Row],
+) -> dict[str, str]:
+    by_nickname: dict[str, list[sqlite3.Row]] = {}
+    for profile in profiles:
+        by_nickname.setdefault(profile["nickname"].casefold(), []).append(profile)
+
+    aliases: dict[str, str] = {}
+    for matching_profiles in by_nickname.values():
+        contact_profiles = [profile for profile in matching_profiles if profile["qq_number"]]
+        if len(contact_profiles) != 1:
+            continue
+        canonical = contact_profiles[0]
+        for candidate in matching_profiles:
+            if is_contactless_legacy_profile_alias(candidate, canonical):
+                aliases[candidate["profile_id"]] = canonical["profile_id"]
+    return aliases
 
 
 def normalize_mobile_profile_settings(
@@ -2254,12 +2294,51 @@ def submit_mobile_registration_session(session_token: str):
                     return jsonify(
                         {"ok": False, "error": "玩家资料已经更新，请重新选择后再提交"}
                     ), 409
+                completion_source = source.get("profile_completion")
+                resolved_legacy_alias = False
+                proposed_qq = (
+                    completion_source.get("qq_number")
+                    if isinstance(completion_source, dict)
+                    else None
+                )
+                if (
+                    not profile["qq_number"]
+                    and isinstance(proposed_qq, str)
+                    and QQ_NUMBER_PATTERN.fullmatch(proposed_qq)
+                ):
+                    contact_profile = connection.execute(
+                        """
+                        SELECT profile_id, nickname, gender, default_preference,
+                               qq_number, qq_visibility, notification_enabled,
+                               notify_queue_changes, notify_playing_position,
+                               notify_online_check_in, notify_absence,
+                               notify_machine_status, setup_version,
+                               profile_revision
+                        FROM player_profile
+                        WHERE device_id = ? AND qq_number = ?
+                        """,
+                        (profile_scope_id, proposed_qq),
+                    ).fetchone()
+                    if (
+                        contact_profile is not None
+                        and is_contactless_legacy_profile_alias(
+                            profile, contact_profile
+                        )
+                    ):
+                        profile = contact_profile
+                        profile_id = profile["profile_id"]
+                        expected_revision = profile["profile_revision"]
+                        completion_source = {
+                            key: value
+                            for key, value in completion_source.items()
+                            if key != "qq_number"
+                        }
+                        resolved_legacy_alias = True
                 profile_is_complete = bool(
                     profile["setup_version"] >= 1 and profile["qq_number"]
                 )
-                completion_source = source.get("profile_completion")
                 if profile_is_complete:
-                    if completion_source is not None:
+                    if completion_source is not None and not resolved_legacy_alias:
                         raise ValidationError("完整玩家资料不能在此页面编辑")
                     profile_settings = None
                     actor_qq = profile["qq_number"]
@@ -2303,14 +2382,27 @@ def submit_mobile_registration_session(session_token: str):
         except (ValidationError, ValueError) as error:
             return jsonify({"ok": False, "error": str(error) or "玩家资料编号无效"}), 400
 
-        duplicate = connection.execute(
+        duplicates = connection.execute(
             """
-            SELECT profile_id, nickname, qq_number FROM player_profile
+            SELECT profile_id, nickname, gender, default_preference, qq_number,
+                   setup_version
+            FROM player_profile
             WHERE device_id = ? AND profile_id != ?
               AND (lower(nickname) = lower(?) OR qq_number = ?)
             """,
             (profile_scope_id, profile_id, nickname, actor_qq),
-        ).fetchone()
+        ).fetchall()
+        duplicate = next(
+            (
+                candidate
+                for candidate in duplicates
+                if not (
+                    profile_id_value is not None
+                    and is_contactless_legacy_profile_alias(candidate, profile)
+                )
+            ),
+            None,
+        )
         if duplicate is not None:
             detail = (
                 "这个 QQ 已经关联其他玩家资料"

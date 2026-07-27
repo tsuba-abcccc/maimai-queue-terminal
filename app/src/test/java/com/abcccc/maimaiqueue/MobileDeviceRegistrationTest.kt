@@ -64,6 +64,56 @@ class MobileDeviceRegistrationTest {
     }
 
     @Test
+    fun contactlessLegacyAliasDoesNotBlockTheCanonicalProfile() {
+        val canonical = profile().copy(setupVersion = 0)
+        val legacyAlias = canonical.copy(
+            id = "00000000-0000-0000-0000-000000000902",
+            qqNumber = null,
+            usageCount = 37
+        )
+        val requested = command().copy(
+            completion = MobileProfileCompletion(
+                qqNumber = "12345678",
+                qqVisibility = QqVisibility.TERMINAL_ONLY,
+                notificationPreferences = QueueNotificationPreferences(),
+                setupVersion = CURRENT_PLAYER_PROFILE_SETUP_VERSION
+            )
+        )
+
+        val result = decideMobileDeviceRegistration(
+            requested,
+            state(profile = canonical).copy(playerProfiles = listOf(canonical, legacyAlias))
+        )
+
+        assertTrue(result is MobileDeviceRegistrationDecision.Apply)
+        result as MobileDeviceRegistrationDecision.Apply
+        assertEquals(canonical.id, result.profileToPersist?.id)
+        assertEquals(canonical.id, result.state.queues.getValue("A")
+            .allRegistrations.single().playerProfileId)
+    }
+
+    @Test
+    fun conflictingProfileWithDifferentIdentityStillBlocksRegistration() {
+        val canonical = profile()
+        val conflictingProfile = canonical.copy(
+            id = "00000000-0000-0000-0000-000000000903",
+            qqNumber = null,
+            gender = PlayerGender.FEMALE,
+            setupVersion = 0
+        )
+
+        val result = decideMobileDeviceRegistration(
+            command(),
+            state(profile = canonical).copy(
+                playerProfiles = listOf(canonical, conflictingProfile)
+            )
+        )
+
+        assertTrue(result is MobileDeviceRegistrationDecision.Reject)
+        assertTrue((result as MobileDeviceRegistrationDecision.Reject).detail.contains("昵称"))
+    }
+
+    @Test
     fun completedProfileCanResumeAfterProfileWasPersistedBeforeQueueMutation() {
         val incomplete = profile().copy(setupVersion = 0)
         val requested = command().copy(

@@ -159,7 +159,8 @@ internal fun decideMobileDeviceRegistration(
         return reject("玩家资料绑定的 QQ 已经变化，请重新扫码。")
     }
     val duplicateProfile = state.playerProfiles.any { profile ->
-        profile.id != profileBeforeUsage.id && (
+        profile.id != profileBeforeUsage.id &&
+            !profile.isContactlessLegacyAliasOf(profileBeforeUsage) && (
             profile.nickname.equals(profileBeforeUsage.nickname, ignoreCase = true) ||
                 profile.normalizedQqNumber() == profileBeforeUsage.normalizedQqNumber()
             )
