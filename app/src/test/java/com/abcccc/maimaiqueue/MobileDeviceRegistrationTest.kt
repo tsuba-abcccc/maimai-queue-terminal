@@ -34,6 +34,18 @@ class MobileDeviceRegistrationTest {
     }
 
     @Test
+    fun persistedReceiptPreventsReplayAfterThePlayerHasLeftTheQueue() {
+        val requested = command()
+        val replay = decideMobileDeviceRegistration(
+            requested,
+            state(),
+            appliedCommandIds = setOf(requested.commandId)
+        )
+
+        assertTrue(replay is MobileDeviceRegistrationDecision.AlreadyApplied)
+    }
+
+    @Test
     fun incompleteProfileRequiresCompletionAndPersistsSelectedDefaults() {
         val incomplete = profile().copy(setupVersion = 0)
         val withoutCompletion = decideMobileDeviceRegistration(

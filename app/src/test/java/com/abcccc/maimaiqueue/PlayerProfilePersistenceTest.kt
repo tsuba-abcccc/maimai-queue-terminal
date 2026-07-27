@@ -155,6 +155,36 @@ class PlayerProfilePersistenceTest {
         assertEquals(listOf("persist:profile-1"), events)
     }
 
+    @Test
+    fun cloudAliasRemovesOldCopyWithoutMovingItsQqToTheCanonicalProfile() = runBlocking {
+        val repository = FakePlayerProfileRepository()
+        val coordinator = PlayerProfilePersistenceCoordinator(repository)
+        val oldId = "00000000-0000-0000-0000-000000000901"
+        val currentId = "00000000-0000-0000-0000-000000000902"
+        val oldProfile = profile(oldId).copy(
+            nickname = "同一玩家",
+            qqNumber = "12345678",
+            setupVersion = CURRENT_PLAYER_PROFILE_SETUP_VERSION
+        )
+        val currentProfile = profile(currentId).copy(
+            nickname = "同一玩家",
+            qqNumber = null,
+            setupVersion = 0
+        )
+
+        val result = coordinator.reconcileCloudProfiles(
+            cloudProfiles = listOf(currentProfile),
+            profileAliases = mapOf(oldId to currentId),
+            currentProfiles = { listOf(oldProfile, currentProfile) },
+            nicknameConflictsWithQueue = { _, _, _ -> false }
+        ) as CloudPlayerProfilePersistenceResult.Success
+
+        assertEquals(listOf(currentId), result.profiles.map(PlayerProfile::id))
+        assertEquals(null, result.profiles.single().qqNumber)
+        assertEquals(mapOf(oldId to currentId), result.appliedAliases)
+        assertEquals(result.profiles, repository.replacedProfiles)
+    }
+
     private fun profile(id: String) = PlayerProfile(
         id = id,
         nickname = "玩家$id",
@@ -182,6 +212,7 @@ class PlayerProfilePersistenceTest {
     ) : PlayerProfileRepository {
         val writtenIds = mutableListOf<String>()
         val writtenProfiles = mutableListOf<PlayerProfile>()
+        var replacedProfiles: List<PlayerProfile>? = null
 
         override suspend fun getProfiles(): List<PlayerProfile> = emptyList()
 
@@ -191,6 +222,11 @@ class PlayerProfilePersistenceTest {
             events?.add("persist:${profile.id}")
             if (profile.id in throwingIds) error("simulated write failure")
             return profile.id !in failedIds
+        }
+
+        override suspend fun replaceProfiles(profiles: List<PlayerProfile>): Boolean {
+            replacedProfiles = profiles
+            return true
         }
     }
 }

@@ -381,6 +381,9 @@ private fun RegistrationApp() {
     val playerProfilePersistence = remember(playerProfileRepository) {
         PlayerProfilePersistenceCoordinator(playerProfileRepository)
     }
+    val mobileRegistrationReceiptRepository = remember(context) {
+        LocalMobileRegistrationCommandReceiptRepository(context)
+    }
     val auditLogRepository = remember(context) { LocalAuditLogRepository(context) }
     val queueStateRepository = remember(context) { LocalQueueStateRepository(context) }
     val queueRuleSettingsRepository = remember(context) {
@@ -460,6 +463,10 @@ private fun RegistrationApp() {
     val queueRevision = remember { AtomicLong(0L) }
     var playerProfiles by remember { mutableStateOf<List<PlayerProfile>>(emptyList()) }
     var playerProfilesLoaded by remember { mutableStateOf(false) }
+    var appliedMobileRegistrationCommandIds by remember {
+        mutableStateOf<Set<String>>(emptySet())
+    }
+    var mobileRegistrationReceiptsLoaded by remember { mutableStateOf(false) }
     var auditLogs by remember { mutableStateOf<List<AuditLogEntry>>(emptyList()) }
     var queueRuleSettings by remember { mutableStateOf(initialQueueRuleSettings) }
     fun configuredMachineName(machineId: MachineId): String = machineName(
@@ -556,6 +563,12 @@ private fun RegistrationApp() {
     LaunchedEffect(playerProfileRepository) {
         playerProfiles = playerProfileRepository.getProfiles()
         playerProfilesLoaded = true
+    }
+
+    LaunchedEffect(mobileRegistrationReceiptRepository) {
+        appliedMobileRegistrationCommandIds =
+            mobileRegistrationReceiptRepository.getAppliedCommandIds()
+        mobileRegistrationReceiptsLoaded = true
     }
 
     LaunchedEffect(auditLogRepository) {
@@ -1095,7 +1108,8 @@ private fun RegistrationApp() {
 
     fun playerProfileNicknameConflictsWithQueue(
         nickname: String,
-        profileId: String? = editingPlayerProfileId
+        profileId: String? = editingPlayerProfileId,
+        equivalentProfileIds: Set<String> = emptySet()
     ): Boolean {
         val normalizedNickname = nickname.trim()
         if (normalizedNickname.isBlank()) return false
@@ -1107,6 +1121,7 @@ private fun RegistrationApp() {
         return (machineA.allRegistrations + machineB.allRegistrations).any { registration ->
             registration.key != claimRegistrationKey &&
                 registration.playerProfileId != profileId &&
+                registration.playerProfileId !in equivalentProfileIds &&
                 registration.displayId.trim().equals(normalizedNickname, ignoreCase = true)
         }
     }
@@ -1188,42 +1203,67 @@ private fun RegistrationApp() {
         }
     }
 
-    suspend fun mergeCloudPlayerProfiles(cloudProfiles: List<PlayerProfile>) {
-        if (cloudProfiles.isEmpty()) {
+    suspend fun mergeCloudPlayerProfiles(cloudPayload: PlayerProfileSyncPayload) {
+        if (cloudPayload.profiles.isEmpty() && cloudPayload.profileAliases.isEmpty()) {
             cloudProfileRestoreFailureDetail = null
             return
         }
-        val result = playerProfilePersistence.persistIndividually(
-            profiles = cloudProfiles,
-            shouldPersist = { profile ->
-                shouldApplyCloudPlayerProfile(
-                    cloudProfile = profile,
-                    localProfiles = playerProfiles,
-                    nicknameConflictsWithQueue = ::playerProfileNicknameConflictsWithQueue
-                )
-            },
-            onPersisted = { profile ->
-                applyPlayerProfileToState(
-                    profile,
-                    recordAudit = false,
-                    source = AuditLogSource.SYSTEM_AUTOMATIC
+        val result = playerProfilePersistence.reconcileCloudProfiles(
+            cloudProfiles = cloudPayload.profiles,
+            profileAliases = cloudPayload.profileAliases,
+            currentProfiles = { playerProfiles },
+            nicknameConflictsWithQueue = { nickname, profileId, equivalentProfileIds ->
+                playerProfileNicknameConflictsWithQueue(
+                    nickname = nickname,
+                    profileId = profileId,
+                    equivalentProfileIds = equivalentProfileIds
                 )
             }
         )
-        cloudProfileRestoreFailureDetail = result.failedProfiles
-            .takeIf { it.isNotEmpty() }
-            ?.let { failed ->
-                "有 ${failed.size} 份云端玩家资料暂时无法写入本机，将继续重试。"
+        when (result) {
+            CloudPlayerProfilePersistenceResult.PersistenceFailed -> {
+                cloudProfileRestoreFailureDetail =
+                    "云端玩家资料暂时无法写入本机，将继续重试。"
             }
-        if (result.persistedProfiles.isNotEmpty()) {
-            appendAuditLog(
-                createAuditLogEntry(
-                    category = AuditLogCategory.PLAYER_PROFILE,
-                    title = "同步云端玩家资料",
-                    detail = "已从服务器写入 ${result.persistedProfiles.size} 份新增或较新的玩家资料。",
-                    source = AuditLogSource.SYSTEM_AUTOMATIC
-                )
-            )
+
+            is CloudPlayerProfilePersistenceResult.Success -> {
+                cloudProfileRestoreFailureDetail = null
+                playerProfiles = result.profiles
+                machineA = result.profiles.fold(
+                    machineA.resolvePlayerProfileAliases(
+                        result.appliedAliases,
+                        result.profiles
+                    )
+                ) { queue, profile ->
+                    queue.syncPlayerProfileDetails(profile.id, profile.nickname, profile.gender)
+                }
+                machineB = result.profiles.fold(
+                    machineB.resolvePlayerProfileAliases(
+                        result.appliedAliases,
+                        result.profiles
+                    )
+                ) { queue, profile ->
+                    queue.syncPlayerProfileDetails(profile.id, profile.nickname, profile.gender)
+                }
+                if (result.profilesChanged) {
+                    val details = buildList {
+                        if (result.appliedProfiles.isNotEmpty()) {
+                            add("写入 ${result.appliedProfiles.size} 份新增或较新的资料")
+                        }
+                        if (result.appliedAliases.isNotEmpty()) {
+                            add("清理 ${result.appliedAliases.size} 份旧资料副本")
+                        }
+                    }.joinToString("，")
+                    appendAuditLog(
+                        createAuditLogEntry(
+                            category = AuditLogCategory.PLAYER_PROFILE,
+                            title = "同步云端玩家资料",
+                            detail = "已从服务器$details。",
+                            source = AuditLogSource.SYSTEM_AUTOMATIC
+                        )
+                    )
+                }
+            }
         }
     }
 
@@ -1910,14 +1950,25 @@ private fun RegistrationApp() {
         queueRuleSettings.websiteSyncEnabled,
         queueRuleSettings.oneBotSyncEnabled,
         playerProfilesLoaded,
+        mobileRegistrationReceiptsLoaded,
         queuePersistenceReady,
         pendingQueueRestore
     ) {
         var nextCloudProfileRefreshAtMillis = 0L
         var localWriteFailureDetail: String? = null
+        suspend fun persistMobileRegistrationReceipt(commandId: String): Boolean {
+            if (commandId in appliedMobileRegistrationCommandIds) return true
+            if (!mobileRegistrationReceiptRepository.recordApplied(commandId)) return false
+            appliedMobileRegistrationCommandIds = appendRecentCommandId(
+                appliedMobileRegistrationCommandIds.toList(),
+                commandId
+            ).toSet()
+            return true
+        }
         while (true) {
             if (
                 playerProfilesLoaded &&
+                mobileRegistrationReceiptsLoaded &&
                 queuePersistenceReady &&
                 pendingQueueRestore == null &&
                 cloudSyncAvailable &&
@@ -1927,7 +1978,7 @@ private fun RegistrationApp() {
                 val nowMillis = System.currentTimeMillis()
                 if (nowMillis >= nextCloudProfileRefreshAtMillis) {
                     queueCommandClient.fetchPlayerProfiles()?.let { cloudPayload ->
-                        mergeCloudPlayerProfiles(cloudPayload.profiles)
+                        mergeCloudPlayerProfiles(cloudPayload)
                         botQqNumber = cloudPayload.botQqNumber
                         nextCloudProfileRefreshAtMillis = nowMillis +
                             CLOUD_PROFILE_REFRESH_INTERVAL_MILLIS
@@ -2094,7 +2145,8 @@ private fun RegistrationApp() {
                             is MobileDeviceRegistrationCommand -> {
                                 var decision = decideMobileDeviceRegistration(
                                     command,
-                                    currentRemoteQueueExecutionState()
+                                    currentRemoteQueueExecutionState(),
+                                    appliedMobileRegistrationCommandIds
                                 )
                                 val profileToPersist =
                                     (decision as? MobileDeviceRegistrationDecision.Apply)
@@ -2115,7 +2167,8 @@ private fun RegistrationApp() {
                                     }
                                     decision = decideMobileDeviceRegistration(
                                         command,
-                                        currentRemoteQueueExecutionState()
+                                        currentRemoteQueueExecutionState(),
+                                        appliedMobileRegistrationCommandIds
                                     )
                                 }
                                 when (val result = decision) {
@@ -2144,6 +2197,11 @@ private fun RegistrationApp() {
                                                 enterPlayingConfirmation = machineId
                                             }
                                         }
+                                        if (!persistMobileRegistrationReceipt(command.commandId)) {
+                                            localWriteFailureDetail =
+                                                "移动设备登记的执行记录暂时无法写入本机，应用将继续重试。"
+                                            continue
+                                        }
                                         queueSoundPlayer.play(QueueSoundCue.CONFIRM)
                                         localWriteFailureDetail = null
                                         if (command.matchesSession(mobileRegistrationSession)) {
@@ -2159,6 +2217,11 @@ private fun RegistrationApp() {
                                     }
 
                                     is MobileDeviceRegistrationDecision.AlreadyApplied -> {
+                                        if (!persistMobileRegistrationReceipt(command.commandId)) {
+                                            localWriteFailureDetail =
+                                                "移动设备登记的执行记录暂时无法写入本机，应用将继续重试。"
+                                            continue
+                                        }
                                         localWriteFailureDetail = null
                                         if (command.matchesSession(mobileRegistrationSession)) {
                                             mobileRegistrationSession = null
@@ -9966,6 +10029,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.5.2",
+            "资料同步与移动登记可靠性",
+            "修正旧资料通过 QQ 查询重新出现、同秒同步反转资料身份和终端未清理旧副本的问题；移动设备登记执行后会在本机保存命令记录，结果回传失败也不会在玩家离队后重复建立登记。"
+        ),
         Triple(
             "0.5.1",
             "移动设备登记修正",

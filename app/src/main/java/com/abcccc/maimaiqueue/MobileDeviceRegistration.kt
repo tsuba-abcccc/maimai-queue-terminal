@@ -53,9 +53,15 @@ internal sealed interface MobileDeviceRegistrationDecision {
 
 internal fun decideMobileDeviceRegistration(
     command: MobileDeviceRegistrationCommand,
-    state: RemoteQueueExecutionState
+    state: RemoteQueueExecutionState,
+    appliedCommandIds: Set<String> = emptySet()
 ): MobileDeviceRegistrationDecision {
     fun reject(detail: String) = MobileDeviceRegistrationDecision.Reject(detail)
+    if (command.commandId in appliedCommandIds) {
+        return MobileDeviceRegistrationDecision.AlreadyApplied(
+            "已通过移动设备加入排队。"
+        )
+    }
     val exactRegistration = state.queues.values.asSequence()
         .flatMap { it.allRegistrations.asSequence() }
         .firstOrNull { it.originatingCommandId == command.commandId }

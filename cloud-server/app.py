@@ -317,6 +317,15 @@ def initialize_database(database_path: str) -> None:
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS current_player_profile (
+                profile_scope_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                PRIMARY KEY(profile_scope_id, profile_id)
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS service_identity (
                 profile_scope_id TEXT PRIMARY KEY,
                 bot_qq TEXT NOT NULL,
@@ -810,6 +819,11 @@ def publish_snapshot():
         }
         if private_profiles is not None:
             profile_scope_id = current_app.config["PROFILE_SCOPE_ID"]
+            replace_current_player_profile_ids(
+                connection,
+                profile_scope_id=profile_scope_id,
+                profile_ids={profile["profile_id"] for profile in private_profiles},
+            )
             upsert_player_profiles(
                 connection,
                 profile_scope_id=profile_scope_id,
@@ -1011,24 +1025,43 @@ def upsert_player_profiles(
         if qq_number is not None:
             conflicting = connection.execute(
                 """
-                SELECT profile_revision FROM player_profile
+                SELECT profile_id, profile_revision FROM player_profile
                 WHERE device_id = ? AND profile_id != ? AND qq_number = ?
                 """,
                 (profile_scope_id, profile["profile_id"], qq_number),
             ).fetchone()
+            conflicting_is_historical_alias = bool(
+                conflicting is not None
+                and stored_profile_is_historical_alias(
+                    connection,
+                    profile_scope_id=profile_scope_id,
+                    source_profile_id=conflicting["profile_id"],
+                    canonical_profile_id=profile["profile_id"],
+                )
+            )
             if (
                 conflicting is not None
                 and conflicting["profile_revision"] >= profile["profile_revision"]
+                and not conflicting_is_historical_alias
             ):
                 continue
-            connection.execute(
-                """
-                UPDATE player_profile
-                SET qq_number = NULL, profile_revision = profile_revision + 1
-                WHERE device_id = ? AND profile_id != ? AND qq_number = ?
-                """,
-                (profile_scope_id, profile["profile_id"], qq_number),
-            )
+            if conflicting_is_historical_alias:
+                connection.execute(
+                    """
+                    DELETE FROM player_profile
+                    WHERE device_id = ? AND profile_id = ?
+                    """,
+                    (profile_scope_id, conflicting["profile_id"]),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE player_profile
+                    SET qq_number = NULL, profile_revision = profile_revision + 1
+                    WHERE device_id = ? AND profile_id != ? AND qq_number = ?
+                    """,
+                    (profile_scope_id, profile["profile_id"], qq_number),
+                )
 
         connection.execute(
             """
@@ -1083,6 +1116,74 @@ def upsert_player_profiles(
                 received_at,
             ),
         )
+
+
+def replace_current_player_profile_ids(
+    connection: sqlite3.Connection,
+    *,
+    profile_scope_id: str,
+    profile_ids: set[str],
+) -> None:
+    connection.execute(
+        "DELETE FROM current_player_profile WHERE profile_scope_id = ?",
+        (profile_scope_id,),
+    )
+    connection.executemany(
+        """
+        INSERT INTO current_player_profile(profile_scope_id, profile_id)
+        VALUES (?, ?)
+        """,
+        [(profile_scope_id, profile_id) for profile_id in sorted(profile_ids)],
+    )
+
+
+def read_current_player_profile_ids(
+    connection: sqlite3.Connection, profile_scope_id: str
+) -> set[str]:
+    return {
+        row["profile_id"]
+        for row in connection.execute(
+            """
+            SELECT profile_id FROM current_player_profile
+            WHERE profile_scope_id = ?
+            """,
+            (profile_scope_id,),
+        ).fetchall()
+    }
+
+
+def stored_profile_is_historical_alias(
+    connection: sqlite3.Connection,
+    *,
+    profile_scope_id: str,
+    source_profile_id: str,
+    canonical_profile_id: str,
+) -> bool:
+    current_profile_ids = read_current_player_profile_ids(
+        connection, profile_scope_id
+    )
+    if (
+        canonical_profile_id not in current_profile_ids
+        or source_profile_id in current_profile_ids
+    ):
+        return False
+    profiles = connection.execute(
+        """
+        SELECT profile_id, nickname, gender, default_preference, qq_number,
+               setup_version
+        FROM player_profile
+        WHERE device_id = ? AND profile_id IN (?, ?)
+        """,
+        (profile_scope_id, source_profile_id, canonical_profile_id),
+    ).fetchall()
+    profiles_by_id = {profile["profile_id"]: profile for profile in profiles}
+    source = profiles_by_id.get(source_profile_id)
+    canonical = profiles_by_id.get(canonical_profile_id)
+    return bool(
+        source is not None
+        and canonical is not None
+        and are_legacy_profile_aliases(source, canonical)
+    )
 
 
 def sync_mode_required_response(
@@ -1464,7 +1565,9 @@ def read_synced_profiles(*, allow_qq_filter: bool):
         ).fetchone()
         if snapshot_row is None:
             return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
-        query = """
+        profile_scope_id = current_app.config["PROFILE_SCOPE_ID"]
+        rows = connection.execute(
+            """
             SELECT profile_id, nickname, gender, default_preference, qq_number,
                    usage_count, last_used_at, qq_visibility,
                    notification_enabled, notify_queue_changes,
@@ -1473,21 +1576,30 @@ def read_synced_profiles(*, allow_qq_filter: bool):
                    profile_revision, created_at, profile_updated_at, received_at
             FROM player_profile
             WHERE device_id = ?
-        """
-        parameters: list[Any] = [current_app.config["PROFILE_SCOPE_ID"]]
-        if qq_number:
-            query += " AND qq_number = ?"
-            parameters.append(qq_number)
-        query += " ORDER BY nickname, profile_id"
-        rows = connection.execute(query, parameters).fetchall()
-        profile_aliases = find_mobile_profile_aliases(
-            rows, current_received_at=snapshot_row["received_at"]
+            ORDER BY nickname, profile_id
+            """,
+            (profile_scope_id,),
+        ).fetchall()
+        current_profile_ids = read_current_player_profile_ids(
+            connection, profile_scope_id
         )
-        rows = [
-            row
-            for row in rows
-            if row["profile_id"] not in profile_aliases
+        profile_aliases = find_mobile_profile_aliases(
+            rows, current_profile_ids=current_profile_ids
+        )
+        canonical_rows = [
+            row for row in rows if row["profile_id"] not in profile_aliases
         ]
+        if qq_number:
+            matching_profile_ids = {
+                profile_aliases.get(row["profile_id"], row["profile_id"])
+                for row in rows
+                if row["qq_number"] == qq_number
+            }
+            canonical_rows = [
+                row
+                for row in canonical_rows
+                if row["profile_id"] in matching_profile_ids
+            ]
         identity = connection.execute(
             """
             SELECT bot_qq FROM service_identity WHERE profile_scope_id = ?
@@ -1523,7 +1635,7 @@ def read_synced_profiles(*, allow_qq_filter: bool):
                     "updated_at": row["profile_updated_at"],
                     "synced_at": row["received_at"] * 1000,
                 }
-                for row in rows
+                for row in canonical_rows
             ],
             "capabilities": {
                 "profile_updates": allow_qq_filter,
@@ -2079,7 +2191,8 @@ def read_mobile_registration_session(session_token: str):
             return jsonify({"ok": False, "code": code, "error": detail}), status_code
         snapshot_row, snapshot, machine = validation
         profile_scope_id = current_app.config["PROFILE_SCOPE_ID"]
-        sql = """
+        profiles = connection.execute(
+            """
             SELECT profile_id, nickname, gender, default_preference, qq_number,
                    usage_count, last_used_at, qq_visibility,
                    notification_enabled, notify_queue_changes,
@@ -2088,21 +2201,38 @@ def read_mobile_registration_session(session_token: str):
                    profile_revision, received_at
             FROM player_profile
             WHERE device_id = ?
-        """
-        parameters: list[Any] = [profile_scope_id]
-        if query:
-            sql += " AND (lower(nickname) LIKE lower(?) OR qq_number LIKE ?)"
-            search = f"%{query}%"
-            parameters.extend((search, search))
-        sql += " ORDER BY usage_count DESC, COALESCE(last_used_at, 0) DESC, nickname, profile_id"
-        profiles = connection.execute(sql, parameters).fetchall()
-        profile_aliases = find_mobile_profile_aliases(
-            profiles, current_received_at=snapshot_row["received_at"]
+            ORDER BY usage_count DESC, COALESCE(last_used_at, 0) DESC,
+                     nickname, profile_id
+            """,
+            (profile_scope_id,),
+        ).fetchall()
+        current_profile_ids = read_current_player_profile_ids(
+            connection, profile_scope_id
         )
-        profiles = [
+        profile_aliases = find_mobile_profile_aliases(
+            profiles, current_profile_ids=current_profile_ids
+        )
+        canonical_profiles = [
             profile
             for profile in profiles
             if profile["profile_id"] not in profile_aliases
+        ]
+        if query:
+            folded_query = query.casefold()
+            matching_profile_ids = {
+                profile_aliases.get(profile["profile_id"], profile["profile_id"])
+                for profile in profiles
+                if folded_query in profile["nickname"].casefold()
+                or (profile["qq_number"] and query in profile["qq_number"])
+            }
+            canonical_profiles = [
+                profile
+                for profile in canonical_profiles
+                if profile["profile_id"] in matching_profile_ids
+            ]
+        profiles = [
+            profile
+            for profile in canonical_profiles
         ]
         identity = connection.execute(
             "SELECT bot_qq FROM service_identity WHERE profile_scope_id = ?",
@@ -2170,16 +2300,10 @@ def are_legacy_profile_aliases(
     )
 
 
-def profile_was_seen_in_snapshot(
-    profile: sqlite3.Row, snapshot_received_at: int
-) -> bool:
-    return profile["received_at"] >= snapshot_received_at
-
-
 def find_mobile_profile_aliases(
     profiles: list[sqlite3.Row],
     *,
-    current_received_at: int | None = None,
+    current_profile_ids: set[str] | None = None,
 ) -> dict[str, str]:
     by_identity: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
     for profile in profiles:
@@ -2195,16 +2319,14 @@ def find_mobile_profile_aliases(
         contact_profiles = [profile for profile in matching_profiles if profile["qq_number"]]
         if len(contact_profiles) > 1:
             continue
-        current_profiles = (
-            [
+        if current_profile_ids is not None:
+            current_profiles = [
                 profile
                 for profile in matching_profiles
-                if profile_was_seen_in_snapshot(profile, current_received_at)
+                if profile["profile_id"] in current_profile_ids
             ]
-            if current_received_at is not None
-            else []
-        )
-        if len(current_profiles) == 1:
+            if len(current_profiles) != 1:
+                continue
             canonical = current_profiles[0]
         elif len(contact_profiles) == 1:
             canonical = contact_profiles[0]
@@ -2403,18 +2525,17 @@ def submit_mobile_registration_session(session_token: str):
             """,
             (profile_scope_id, profile_id, nickname, actor_qq),
         ).fetchall()
+        current_profile_ids = read_current_player_profile_ids(
+            connection, profile_scope_id
+        )
         duplicate = next(
             (
                 candidate
                 for candidate in duplicates
                 if not (
                     profile_id_value is not None
-                    and profile_was_seen_in_snapshot(
-                        profile, snapshot_row["received_at"]
-                    )
-                    and not profile_was_seen_in_snapshot(
-                        candidate, snapshot_row["received_at"]
-                    )
+                    and profile["profile_id"] in current_profile_ids
+                    and candidate["profile_id"] not in current_profile_ids
                     and are_legacy_profile_aliases(candidate, profile)
                 )
             ),
@@ -2564,19 +2685,39 @@ def read_mobile_registration_result(session_token: str):
 
 
 def find_player_profile_by_qq(connection: sqlite3.Connection, qq_number: str):
-    return connection.execute(
+    profile_scope_id = current_app.config["PROFILE_SCOPE_ID"]
+    profiles = connection.execute(
         """
         SELECT profile_id, nickname, gender, default_preference, qq_number,
                usage_count, last_used_at, qq_visibility,
                notification_enabled, notify_queue_changes,
                notify_playing_position, notify_online_check_in,
                notify_absence, notify_machine_status, setup_version,
-               profile_revision, created_at, profile_updated_at
+               profile_revision, created_at, profile_updated_at, received_at
         FROM player_profile
-        WHERE device_id = ? AND qq_number = ?
+        WHERE device_id = ?
         """,
-        (current_app.config["PROFILE_SCOPE_ID"], qq_number),
-    ).fetchone()
+        (profile_scope_id,),
+    ).fetchall()
+    matching_profile = next(
+        (profile for profile in profiles if profile["qq_number"] == qq_number),
+        None,
+    )
+    if matching_profile is None:
+        return None
+    aliases = find_mobile_profile_aliases(
+        profiles,
+        current_profile_ids=read_current_player_profile_ids(
+            connection, profile_scope_id
+        ),
+    )
+    canonical_id = aliases.get(
+        matching_profile["profile_id"], matching_profile["profile_id"]
+    )
+    return next(
+        (profile for profile in profiles if profile["profile_id"] == canonical_id),
+        None,
+    )
 
 
 def serialize_player_profile(profile: sqlite3.Row) -> dict[str, Any]:

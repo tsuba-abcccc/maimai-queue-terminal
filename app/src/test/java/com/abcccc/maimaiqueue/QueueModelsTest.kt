@@ -7,6 +7,41 @@ import org.junit.Test
 
 class QueueModelsTest {
     @Test
+    fun playerProfileAliasUpdatesQueueReferenceAndVisibleDetails() {
+        val oldId = "00000000-0000-0000-0000-000000000901"
+        val currentId = "00000000-0000-0000-0000-000000000902"
+        val profile = PlayerProfile(
+            id = currentId,
+            nickname = "当前昵称",
+            gender = PlayerGender.FEMALE,
+            defaultPreference = ProfilePlayPreference.OPEN_TO_JOIN,
+            createdAtMillis = 100L,
+            updatedAtMillis = 100L
+        )
+        val queue = MachineQueue(
+            waiting = listOf(
+                Registration(
+                    key = 1,
+                    displayId = "旧昵称",
+                    preference = PlayPreference.OPEN_TO_JOIN,
+                    isTemporary = false,
+                    createdAtMillis = 100L,
+                    playerProfileId = oldId
+                )
+            )
+        )
+
+        val updated = queue.resolvePlayerProfileAliases(
+            mapOf(oldId to currentId),
+            listOf(profile)
+        ).waiting.single()
+
+        assertEquals(currentId, updated.playerProfileId)
+        assertEquals("当前昵称", updated.displayId)
+        assertEquals(PlayerGender.FEMALE, updated.gender)
+    }
+
+    @Test
     fun roundEndPreviewIncludesCurrentPlayersWhenEveryWaitingRegistrationIsUnavailable() {
         val current = registration(1, PlayPreference.SOLO)
         val deferred = registration(2, PlayPreference.SOLO).copy(

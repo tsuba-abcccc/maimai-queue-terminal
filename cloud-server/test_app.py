@@ -6,6 +6,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from unittest.mock import patch
 from uuid import UUID
 
 from app import create_app
@@ -2678,6 +2679,86 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual(alias_id, command["payload"]["profile"]["profile_id"])
         self.assertEqual(1, command["payload"]["profile"]["expected_profile_revision"])
+
+        completed_snapshot = copy.deepcopy(snapshot)
+        completed_snapshot["revision"] = 23
+        completed_snapshot["private_player_profiles"][0].update(
+            qq_number="12345678",
+            setup_version=1,
+            profile_revision=2,
+            updated_at=900_000,
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=completed_snapshot, headers=self.headers
+            ).status_code,
+        )
+        completed_profiles = self.client.post(
+            "/api/queue-bot/profiles",
+            json={"qq": "12345678"},
+            headers=self.bot_headers,
+        ).get_json()
+
+        self.assertEqual(
+            [alias_id],
+            [profile["profile_id"] for profile in completed_profiles["profiles"]],
+        )
+        self.assertEqual("12345678", completed_profiles["profiles"][0]["qq_number"])
+        self.assertEqual({}, completed_profiles["profile_aliases"])
+
+    def test_profile_aliases_are_resolved_before_qq_search_in_the_same_second(self):
+        alias_id = "00000000-0000-0000-0000-000000000902"
+        with patch("app.time.time", return_value=1_700_000_000):
+            original = self.remote_ready_snapshot(revision=21)
+            self.assertEqual(
+                204,
+                self.client.post(
+                    "/api/queue-status", json=original, headers=self.headers
+                ).status_code,
+            )
+
+            current = self.remote_ready_snapshot(revision=22)
+            current["private_player_profiles"][0].update(
+                profile_id=alias_id,
+                qq_number=None,
+                setup_version=0,
+                profile_revision=1,
+                created_at=700_000,
+                updated_at=850_000,
+            )
+            self.assertEqual(
+                204,
+                self.client.post(
+                    "/api/queue-status", json=current, headers=self.headers
+                ).status_code,
+            )
+
+            created = self.client.post(
+                "/api/queue-terminal/mobile-registration-sessions",
+                json={
+                    "request_id": "00000000-0000-0000-0000-000000000835",
+                    "queue_id": current["queue_id"],
+                    "machine_id": "A",
+                },
+                headers=self.headers,
+            ).get_json()
+            mobile_profiles = self.client.get(
+                f"/api/queue-mobile/sessions/{created['session_token']}?q=12345678"
+            ).get_json()["profiles"]
+            bot_profiles = self.client.post(
+                "/api/queue-bot/profiles",
+                json={"qq": "12345678"},
+                headers=self.bot_headers,
+            ).get_json()["profiles"]
+            website_profile = self.client.post(
+                "/api/queue-online/profile", json={"qq": "12345678"}
+            ).get_json()["profile"]
+
+        self.assertEqual([alias_id], [profile["profile_id"] for profile in mobile_profiles])
+        self.assertEqual([alias_id], [profile["profile_id"] for profile in bot_profiles])
+        self.assertEqual(alias_id, website_profile["profile_id"])
+        self.assertIsNone(bot_profiles[0]["qq_number"])
 
     def test_mobile_registration_can_create_a_complete_player_profile(self):
         snapshot = self.remote_ready_snapshot(revision=22)

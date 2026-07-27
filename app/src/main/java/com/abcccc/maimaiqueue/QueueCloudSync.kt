@@ -163,6 +163,7 @@ internal interface QueueCommandClient {
 
 internal data class PlayerProfileSyncPayload(
     val profiles: List<PlayerProfile>,
+    val profileAliases: Map<String, String>,
     val botQqNumber: String?
 )
 
@@ -358,14 +359,7 @@ internal class HttpQueueCommandClient(
                     requireSuccessfulResponse(connection)
                     val response = connection.inputStream.bufferedReader(Charsets.UTF_8)
                         .use { it.readText() }
-                    val payload = JSONObject(response)
-                    val profiles = payload.getJSONArray("profiles")
-                    PlayerProfileSyncPayload(profiles = buildList {
-                        repeat(profiles.length()) { index ->
-                            parsePlayerProfile(profiles.optJSONObject(index))?.let(::add)
-                        }
-                    }, botQqNumber = payload.optionalNonBlankString("bot_qq")
-                        ?.takeIf(::isValidQqNumber))
+                    parsePlayerProfileSyncPayload(response)
                 } finally {
                     connection.disconnect()
                 }
@@ -527,61 +521,118 @@ internal class HttpQueueCommandClient(
         }
     }
 
-    private fun parsePlayerProfile(source: JSONObject?): PlayerProfile? {
-        if (source == null) return null
-        return runCatching {
-            val qqNumber = if (source.isNull("qq_number")) {
-                null
-            } else {
-                source.getString("qq_number")
-            }
-            PlayerProfile(
-                id = source.getString("profile_id"),
-                nickname = source.getString("nickname").trim(),
-                gender = PlayerGender.valueOf(source.getString("gender")),
-                defaultPreference = ProfilePlayPreference.valueOf(
-                    source.getString("default_preference")
-                ),
-                qqNumber = qqNumber,
-                usageCount = source.getInt("usage_count"),
-                lastUsedAtMillis = if (source.isNull("last_used_at")) {
-                    null
-                } else {
-                    source.getLong("last_used_at")
-                },
-                qqVisibility = QqVisibility.valueOf(
-                    source.optString("qq_visibility", QqVisibility.TERMINAL_ONLY.name)
-                ),
-                notificationPreferences = QueueNotificationPreferences(
-                    enabled = source.optBoolean("notification_enabled", true),
-                    queueChanges = source.optBoolean("notify_queue_changes", true),
-                    playingPosition = source.optBoolean("notify_playing_position", false),
-                    onlineCheckIn = source.optBoolean("notify_online_check_in", true),
-                    absence = source.optBoolean("notify_absence", true),
-                    machineStatus = source.optBoolean("notify_machine_status", false)
-                ),
-                setupVersion = source.optInt("setup_version", 0).coerceAtLeast(0),
-                revision = source.optLong("profile_revision", 1L).coerceAtLeast(1L),
-                createdAtMillis = source.getLong("created_at"),
-                updatedAtMillis = source.getLong("updated_at")
-            ).withCanonicalContact()
-        }.getOrNull()?.takeIf { profile ->
-            runCatching { UUID.fromString(profile.id) }.isSuccess &&
-                profile.nickname.isNotBlank() &&
-                profile.nickname.codePointCount(0, profile.nickname.length) <= 18 &&
-                profile.usageCount >= 0 &&
-                profile.createdAtMillis > 0L &&
-                profile.updatedAtMillis > 0L &&
-                (profile.qqNumber == null || isValidQqNumber(profile.qqNumber))
-        }
-    }
-
     private companion object {
         const val LOG_TAG = "QueueCommandSync"
         const val MAX_COMMAND_DETAIL_LENGTH = 500
         const val MAX_ERROR_BODY_LENGTH = 512
     }
 }
+
+internal fun parsePlayerProfileSyncPayload(response: String): PlayerProfileSyncPayload {
+    val payload = JSONObject(response)
+    val sourceProfiles = payload.getJSONArray("profiles")
+    val profiles = buildList {
+        repeat(sourceProfiles.length()) { index ->
+            parseSyncedPlayerProfile(sourceProfiles.optJSONObject(index))?.let(::add)
+        }
+    }
+    return PlayerProfileSyncPayload(
+        profiles = profiles,
+        profileAliases = parsePlayerProfileAliases(
+            payload.optJSONObject("profile_aliases"),
+            profiles.mapTo(mutableSetOf(), PlayerProfile::id)
+        ),
+        botQqNumber = payload.optionalNonBlankString("bot_qq")
+            ?.takeIf(::isValidQqNumber)
+    )
+}
+
+private fun parseSyncedPlayerProfile(source: JSONObject?): PlayerProfile? {
+    if (source == null) return null
+    return runCatching {
+        val qqNumber = if (source.isNull("qq_number")) {
+            null
+        } else {
+            source.getString("qq_number")
+        }
+        PlayerProfile(
+            id = source.getString("profile_id"),
+            nickname = source.getString("nickname").trim(),
+            gender = PlayerGender.valueOf(source.getString("gender")),
+            defaultPreference = ProfilePlayPreference.valueOf(
+                source.getString("default_preference")
+            ),
+            qqNumber = qqNumber,
+            usageCount = source.getInt("usage_count"),
+            lastUsedAtMillis = if (source.isNull("last_used_at")) {
+                null
+            } else {
+                source.getLong("last_used_at")
+            },
+            qqVisibility = QqVisibility.valueOf(
+                source.optString("qq_visibility", QqVisibility.TERMINAL_ONLY.name)
+            ),
+            notificationPreferences = QueueNotificationPreferences(
+                enabled = source.optBoolean("notification_enabled", true),
+                queueChanges = source.optBoolean("notify_queue_changes", true),
+                playingPosition = source.optBoolean("notify_playing_position", false),
+                onlineCheckIn = source.optBoolean("notify_online_check_in", true),
+                absence = source.optBoolean("notify_absence", true),
+                machineStatus = source.optBoolean("notify_machine_status", false)
+            ),
+            setupVersion = source.optInt("setup_version", 0).coerceAtLeast(0),
+            revision = source.optLong("profile_revision", 1L).coerceAtLeast(1L),
+            createdAtMillis = source.getLong("created_at"),
+            updatedAtMillis = source.getLong("updated_at")
+        ).withCanonicalContact()
+    }.getOrNull()?.takeIf { profile ->
+        runCatching { UUID.fromString(profile.id) }.isSuccess &&
+            profile.nickname.isNotBlank() &&
+            profile.nickname.codePointCount(0, profile.nickname.length) <= 18 &&
+            profile.usageCount >= 0 &&
+            profile.createdAtMillis > 0L &&
+            profile.updatedAtMillis > 0L &&
+            (profile.qqNumber == null || isValidQqNumber(profile.qqNumber))
+    }
+}
+
+private fun parsePlayerProfileAliases(
+    source: JSONObject?,
+    canonicalProfileIds: Set<String>
+): Map<String, String> {
+    source ?: return emptyMap()
+    val rawAliases = buildMap {
+        val keys = source.keys()
+        while (keys.hasNext() && size < MAX_PROFILE_ALIASES) {
+            val sourceId = keys.next()
+            val targetId = source.optString(sourceId)
+            if (
+                sourceId != targetId &&
+                sourceId !in canonicalProfileIds &&
+                isUuid(sourceId) &&
+                isUuid(targetId)
+            ) {
+                put(sourceId, targetId)
+            }
+        }
+    }
+    return buildMap {
+        rawAliases.keys.forEach { sourceId ->
+            val visited = mutableSetOf<String>()
+            var targetId = sourceId
+            while (targetId in rawAliases && visited.add(targetId)) {
+                targetId = rawAliases.getValue(targetId)
+            }
+            if (targetId in canonicalProfileIds && targetId !in visited) {
+                put(sourceId, targetId)
+            }
+        }
+    }
+}
+
+private fun isUuid(value: String): Boolean = runCatching { UUID.fromString(value) }.isSuccess
+
+private const val MAX_PROFILE_ALIASES = 500
 
 private const val PROFILE_UPDATE_COMMAND = "UPDATE_PLAYER_PROFILE"
 private const val QUEUE_OPERATION_COMMAND = "QUEUE_OPERATION"

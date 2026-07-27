@@ -17,6 +17,17 @@ internal sealed interface PlayerProfileCommandPersistenceResult {
     data object PersistenceFailed : PlayerProfileCommandPersistenceResult
 }
 
+internal sealed interface CloudPlayerProfilePersistenceResult {
+    data class Success(
+        val profiles: List<PlayerProfile>,
+        val appliedProfiles: List<PlayerProfile>,
+        val appliedAliases: Map<String, String>,
+        val profilesChanged: Boolean
+    ) : CloudPlayerProfilePersistenceResult
+
+    data object PersistenceFailed : CloudPlayerProfilePersistenceResult
+}
+
 internal class PlayerProfilePersistenceCoordinator(
     private val repository: PlayerProfileRepository
 ) {
@@ -70,6 +81,76 @@ internal class PlayerProfilePersistenceCoordinator(
         )
     }
 
+    suspend fun reconcileCloudProfiles(
+        cloudProfiles: List<PlayerProfile>,
+        profileAliases: Map<String, String>,
+        currentProfiles: () -> List<PlayerProfile>,
+        nicknameConflictsWithQueue: (
+            nickname: String,
+            profileId: String,
+            equivalentProfileIds: Set<String>
+        ) -> Boolean
+    ): CloudPlayerProfilePersistenceResult = writeMutex.withLock {
+        val localProfiles = currentProfiles()
+        val cloudById = cloudProfiles.associateBy(PlayerProfile::id)
+        val validAliases = profileAliases.filter { (sourceId, targetId) ->
+            sourceId != targetId && targetId in cloudById
+        }
+        val aliasSources = validAliases.keys
+        val workingProfiles = localProfiles
+            .filterNot { it.id in aliasSources }
+            .toMutableList()
+        val appliedProfiles = mutableListOf<PlayerProfile>()
+
+        cloudProfiles.forEach { cloudProfile ->
+            val equivalentIds = validAliases
+                .filterValues { it == cloudProfile.id }
+                .keys
+            if (shouldApplyCloudPlayerProfile(
+                    cloudProfile = cloudProfile,
+                    localProfiles = workingProfiles,
+                    nicknameConflictsWithQueue = { nickname, profileId ->
+                        nicknameConflictsWithQueue(nickname, profileId, equivalentIds)
+                    }
+                )
+            ) {
+                val existingIndex = workingProfiles.indexOfFirst { it.id == cloudProfile.id }
+                if (existingIndex >= 0) {
+                    workingProfiles[existingIndex] = cloudProfile
+                } else {
+                    workingProfiles += cloudProfile
+                }
+                appliedProfiles += cloudProfile
+            }
+        }
+
+        val persistedIds = workingProfiles.mapTo(mutableSetOf(), PlayerProfile::id)
+        val appliedAliases = validAliases.filterValues { it in persistedIds }
+        val unappliedAliasSources = aliasSources - appliedAliases.keys
+        val workingById = workingProfiles.associateBy(PlayerProfile::id).toMutableMap()
+        localProfiles
+            .filter { it.id in unappliedAliasSources }
+            .forEach { workingById[it.id] = it }
+        val orderedProfiles = buildList {
+            localProfiles.forEach { localProfile ->
+                workingById.remove(localProfile.id)?.let(::add)
+            }
+            workingProfiles.forEach { profile ->
+                workingById.remove(profile.id)?.let(::add)
+            }
+        }
+        val profilesChanged = orderedProfiles != localProfiles
+        if (profilesChanged && !replaceAll(orderedProfiles)) {
+            return@withLock CloudPlayerProfilePersistenceResult.PersistenceFailed
+        }
+        CloudPlayerProfilePersistenceResult.Success(
+            profiles = orderedProfiles,
+            appliedProfiles = appliedProfiles,
+            appliedAliases = appliedAliases,
+            profilesChanged = profilesChanged
+        )
+    }
+
     suspend fun processCommand(
         command: PlayerProfileUpdateCommand,
         currentProfiles: () -> List<PlayerProfile>,
@@ -106,6 +187,14 @@ internal class PlayerProfilePersistenceCoordinator(
 
     private suspend fun persist(profile: PlayerProfile): Boolean = try {
         repository.upsertProfile(profile)
+    } catch (error: CancellationException) {
+        throw error
+    } catch (_: Exception) {
+        false
+    }
+
+    private suspend fun replaceAll(profiles: List<PlayerProfile>): Boolean = try {
+        repository.replaceProfiles(profiles)
     } catch (error: CancellationException) {
         throw error
     } catch (_: Exception) {

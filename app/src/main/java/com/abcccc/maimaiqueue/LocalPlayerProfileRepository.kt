@@ -11,6 +11,7 @@ import org.json.JSONObject
 interface PlayerProfileRepository {
     suspend fun getProfiles(): List<PlayerProfile>
     suspend fun upsertProfile(profile: PlayerProfile): Boolean
+    suspend fun replaceProfiles(profiles: List<PlayerProfile>): Boolean
 }
 
 class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
@@ -41,6 +42,13 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
             saveProfiles(profiles)
         }
     }
+
+    override suspend fun replaceProfiles(profiles: List<PlayerProfile>): Boolean =
+        withContext(Dispatchers.IO) {
+            writeMutex.withLock {
+                saveProfiles(profiles)
+            }
+        }
 
     private fun loadProfiles(): List<PlayerProfile> {
         val serialized = preferences.getString(KEY_PROFILES, null) ?: return emptyList()

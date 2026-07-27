@@ -6,6 +6,51 @@ import org.junit.Test
 
 class QueueCloudCommandTest {
     @Test
+    fun playerProfileSyncParsesOnlyAliasesThatResolveToReturnedProfiles() {
+        val canonicalId = "00000000-0000-0000-0000-000000000902"
+        val validSourceId = "00000000-0000-0000-0000-000000000901"
+        val cycleFirstId = "00000000-0000-0000-0000-000000000903"
+        val cycleSecondId = "00000000-0000-0000-0000-000000000904"
+        val parsed = parsePlayerProfileSyncPayload(
+            """
+            {
+              "profiles": [{
+                "profile_id": "$canonicalId",
+                "nickname": "当前资料",
+                "gender": "UNDISCLOSED",
+                "default_preference": "OPEN_TO_JOIN",
+                "qq_number": null,
+                "usage_count": 3,
+                "last_used_at": null,
+                "qq_visibility": "TERMINAL_ONLY",
+                "notification_enabled": true,
+                "notify_queue_changes": true,
+                "notify_playing_position": false,
+                "notify_online_check_in": true,
+                "notify_absence": true,
+                "notify_machine_status": false,
+                "setup_version": 0,
+                "profile_revision": 1,
+                "created_at": 100,
+                "updated_at": 100
+              }],
+              "profile_aliases": {
+                "$validSourceId": "$canonicalId",
+                "$cycleFirstId": "$cycleSecondId",
+                "$cycleSecondId": "$cycleFirstId",
+                "not-a-uuid": "$canonicalId"
+              },
+              "bot_qq": "12345678"
+            }
+            """.trimIndent()
+        )
+
+        assertEquals(mapOf(validSourceId to canonicalId), parsed.profileAliases)
+        assertEquals(canonicalId, parsed.profiles.single().id)
+        assertEquals("12345678", parsed.botQqNumber)
+    }
+
+    @Test
     fun terminalCommandResponseParsesProfileAndQueueOperations() {
         val parsed = parseRemoteTerminalCommands(
             """
