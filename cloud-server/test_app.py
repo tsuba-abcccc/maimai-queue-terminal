@@ -2396,15 +2396,23 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertFalse(opened_payload["profiles"][0]["qq_public"])
 
         command_id = "00000000-0000-0000-0000-000000000821"
+        submission = {
+            "request_id": command_id,
+            "profile_id": self.profile_id,
+            "expected_profile_revision": 3,
+        }
         submitted = self.client.post(
             f"/api/queue-mobile/sessions/{token}/submit",
-            json={
-                "request_id": command_id,
-                "profile_id": self.profile_id,
-                "expected_profile_revision": 3,
-            },
+            json=submission,
         )
         self.assertEqual(202, submitted.status_code)
+        repeated = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json=submission,
+        )
+        self.assertEqual(200, repeated.status_code)
+        self.assertEqual(command_id, repeated.get_json()["command_id"])
+        self.assertEqual("PENDING", repeated.get_json()["status"])
         commands = self.client.get(
             "/api/queue-terminal/commands", headers=self.headers
         ).get_json()["commands"]
@@ -2466,6 +2474,10 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(
             "这名玩家已经有一份正在排队的登记",
             while_active.get_json()["error"],
+        )
+        self.assertEqual(
+            "PLAYER_ALREADY_REGISTERED",
+            while_active.get_json()["code"],
         )
 
         departed_snapshot = self.remote_ready_snapshot(revision=21)

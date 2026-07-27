@@ -1611,7 +1611,13 @@ private fun RegistrationApp() {
                     queueId = requestedQueueId,
                     machineId = machineId.name
                 )
-                if (queueId != requestedQueueId || selectedMachine != machineId) return@launch
+                if (
+                    queueId != requestedQueueId ||
+                    selectedMachine != machineId ||
+                    screen != Screen.CREATE_REGISTRATION ||
+                    !queueRuleSettings.websiteSyncEnabled ||
+                    !queueCommandClient.isConfigured
+                ) return@launch
                 if (session == null) {
                     mobileRegistrationFailureDetail =
                         queueCommandClient.commandSyncFailureDetail
@@ -2167,6 +2173,10 @@ private fun RegistrationApp() {
                                     }
 
                                     is MobileDeviceRegistrationDecision.Reject -> {
+                                        if (command.matchesSession(mobileRegistrationSession)) {
+                                            mobileRegistrationSession = null
+                                            mobileRegistrationFailureDetail = result.detail
+                                        }
                                         queueCommandClient.complete(
                                             command.commandId,
                                             applied = false,
@@ -3605,7 +3615,11 @@ private fun RegistrationApp() {
                 mobileRegistrationFailureDetail?.let { detail ->
                     MobileRegistrationFailureDialog(
                         detail = detail,
-                        retryEnabled = selectedMachine != null && !mobileRegistrationLoading,
+                        retryEnabled = selectedMachine != null &&
+                            cloudSyncAvailable &&
+                            queueRuleSettings.websiteSyncEnabled &&
+                            queueCommandClient.isConfigured &&
+                            !mobileRegistrationLoading,
                         onDismiss = { mobileRegistrationFailureDetail = null },
                         onRetry = {
                             mobileRegistrationFailureDetail = null
@@ -9952,6 +9966,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.5.1",
+            "移动设备登记修正",
+            "修正旧资料重复副本导致 QQ 显示为空且无法补全，以及玩家离队后仍被误判为已有登记的问题；移动登记成功后终端会自动返回首页，失败时会关闭失效二维码并显示原因，同时避免迟到的二维码请求跨页面弹出。"
+        ),
         Triple(
             "0.5.0",
             "玩家资料与移动设备登记",

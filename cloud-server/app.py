@@ -2440,7 +2440,13 @@ def submit_mobile_registration_session(session_token: str):
         }
         current_registration_ids = set(index_snapshot_registrations(snapshot))
         if active_registration_ids & current_registration_ids:
-            return jsonify({"ok": False, "error": "这名玩家已经有一份正在排队的登记"}), 409
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "PLAYER_ALREADY_REGISTERED",
+                    "error": "这名玩家已经有一份正在排队的登记",
+                }
+            ), 409
         if any(
             registration["display_id"].casefold() == nickname.casefold()
             for machine in snapshot.get("machines", {}).values()
