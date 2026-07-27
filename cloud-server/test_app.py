@@ -2585,6 +2585,17 @@ class QueueStatusApiTest(unittest.TestCase):
             [profile["profile_id"] for profile in opened["profiles"]],
         )
         self.assertEqual(self.profile_id, opened["profile_aliases"][alias_id])
+        synced_profiles = self.client.get(
+            "/api/queue-terminal/profiles", headers=self.headers
+        ).get_json()
+        self.assertEqual(
+            [self.profile_id],
+            [profile["profile_id"] for profile in synced_profiles["profiles"]],
+        )
+        self.assertEqual(
+            self.profile_id,
+            synced_profiles["profile_aliases"][alias_id],
+        )
 
         submitted = self.client.post(
             f"/api/queue-mobile/sessions/{token}/submit",

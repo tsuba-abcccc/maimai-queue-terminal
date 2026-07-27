@@ -1470,6 +1470,12 @@ def read_synced_profiles(*, allow_qq_filter: bool):
             parameters.append(qq_number)
         query += " ORDER BY nickname, profile_id"
         rows = connection.execute(query, parameters).fetchall()
+        profile_aliases = find_mobile_profile_aliases(rows)
+        rows = [
+            row
+            for row in rows
+            if row["profile_id"] not in profile_aliases
+        ]
         identity = connection.execute(
             """
             SELECT bot_qq FROM service_identity WHERE profile_scope_id = ?
@@ -1482,6 +1488,7 @@ def read_synced_profiles(*, allow_qq_filter: bool):
             "queue_id": snapshot_row["queue_id"],
             "revision": snapshot_row["revision"],
             "bot_qq": identity["bot_qq"] if identity is not None else None,
+            "profile_aliases": profile_aliases,
             "profiles": [
                 {
                     "profile_id": row["profile_id"],
