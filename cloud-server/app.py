@@ -990,6 +990,13 @@ def upsert_player_profiles(
             (profile_scope_id, profile["profile_id"]),
         ).fetchone()
         if current is not None:
+            connection.execute(
+                """
+                UPDATE player_profile SET received_at = ?
+                WHERE device_id = ? AND profile_id = ?
+                """,
+                (received_at, profile_scope_id, profile["profile_id"]),
+            )
             if profile["legacy_revision"]:
                 if profile["updated_at"] <= current["profile_updated_at"]:
                     continue
@@ -1450,7 +1457,10 @@ def read_synced_profiles(*, allow_qq_filter: bool):
 
     with open_database() as connection:
         snapshot_row = connection.execute(
-            "SELECT device_id, queue_id, revision FROM queue_snapshot WHERE id = 1"
+            """
+            SELECT device_id, queue_id, revision, received_at
+            FROM queue_snapshot WHERE id = 1
+            """
         ).fetchone()
         if snapshot_row is None:
             return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
@@ -1470,7 +1480,9 @@ def read_synced_profiles(*, allow_qq_filter: bool):
             parameters.append(qq_number)
         query += " ORDER BY nickname, profile_id"
         rows = connection.execute(query, parameters).fetchall()
-        profile_aliases = find_mobile_profile_aliases(rows)
+        profile_aliases = find_mobile_profile_aliases(
+            rows, current_received_at=snapshot_row["received_at"]
+        )
         rows = [
             row
             for row in rows
@@ -2073,7 +2085,7 @@ def read_mobile_registration_session(session_token: str):
                    notification_enabled, notify_queue_changes,
                    notify_playing_position, notify_online_check_in,
                    notify_absence, notify_machine_status, setup_version,
-                   profile_revision
+                   profile_revision, received_at
             FROM player_profile
             WHERE device_id = ?
         """
@@ -2084,7 +2096,9 @@ def read_mobile_registration_session(session_token: str):
             parameters.extend((search, search))
         sql += " ORDER BY usage_count DESC, COALESCE(last_used_at, 0) DESC, nickname, profile_id"
         profiles = connection.execute(sql, parameters).fetchall()
-        profile_aliases = find_mobile_profile_aliases(profiles)
+        profile_aliases = find_mobile_profile_aliases(
+            profiles, current_received_at=snapshot_row["received_at"]
+        )
         profiles = [
             profile
             for profile in profiles
@@ -2140,35 +2154,64 @@ def serialize_mobile_profile(profile: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def is_contactless_legacy_profile_alias(
-    candidate: sqlite3.Row, canonical: sqlite3.Row
+def are_legacy_profile_aliases(
+    first: sqlite3.Row, second: sqlite3.Row
 ) -> bool:
     return bool(
-        candidate["profile_id"] != canonical["profile_id"]
-        and not candidate["qq_number"]
-        and candidate["setup_version"] < 1
-        and canonical["qq_number"]
-        and candidate["nickname"].casefold() == canonical["nickname"].casefold()
-        and candidate["gender"] == canonical["gender"]
-        and candidate["default_preference"] == canonical["default_preference"]
+        first["profile_id"] != second["profile_id"]
+        and first["nickname"].casefold() == second["nickname"].casefold()
+        and first["gender"] == second["gender"]
+        and first["default_preference"] == second["default_preference"]
+        and not (first["qq_number"] and second["qq_number"])
+        and (
+            (not first["qq_number"] and first["setup_version"] < 1)
+            or (not second["qq_number"] and second["setup_version"] < 1)
+        )
     )
+
+
+def profile_was_seen_in_snapshot(
+    profile: sqlite3.Row, snapshot_received_at: int
+) -> bool:
+    return profile["received_at"] >= snapshot_received_at
 
 
 def find_mobile_profile_aliases(
     profiles: list[sqlite3.Row],
+    *,
+    current_received_at: int | None = None,
 ) -> dict[str, str]:
-    by_nickname: dict[str, list[sqlite3.Row]] = {}
+    by_identity: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
     for profile in profiles:
-        by_nickname.setdefault(profile["nickname"].casefold(), []).append(profile)
+        identity = (
+            profile["nickname"].casefold(),
+            profile["gender"],
+            profile["default_preference"],
+        )
+        by_identity.setdefault(identity, []).append(profile)
 
     aliases: dict[str, str] = {}
-    for matching_profiles in by_nickname.values():
+    for matching_profiles in by_identity.values():
         contact_profiles = [profile for profile in matching_profiles if profile["qq_number"]]
-        if len(contact_profiles) != 1:
+        if len(contact_profiles) > 1:
             continue
-        canonical = contact_profiles[0]
+        current_profiles = (
+            [
+                profile
+                for profile in matching_profiles
+                if profile_was_seen_in_snapshot(profile, current_received_at)
+            ]
+            if current_received_at is not None
+            else []
+        )
+        if len(current_profiles) == 1:
+            canonical = current_profiles[0]
+        elif len(contact_profiles) == 1:
+            canonical = contact_profiles[0]
+        else:
+            continue
         for candidate in matching_profiles:
-            if is_contactless_legacy_profile_alias(candidate, canonical):
+            if are_legacy_profile_aliases(candidate, canonical):
                 aliases[candidate["profile_id"]] = canonical["profile_id"]
     return aliases
 
@@ -2283,7 +2326,7 @@ def submit_mobile_registration_session(session_token: str):
                            qq_visibility, notification_enabled, notify_queue_changes,
                            notify_playing_position, notify_online_check_in,
                            notify_absence, notify_machine_status, setup_version,
-                           profile_revision
+                           profile_revision, received_at
                     FROM player_profile
                     WHERE device_id = ? AND profile_id = ?
                     """,
@@ -2302,50 +2345,11 @@ def submit_mobile_registration_session(session_token: str):
                         {"ok": False, "error": "玩家资料已经更新，请重新选择后再提交"}
                     ), 409
                 completion_source = source.get("profile_completion")
-                resolved_legacy_alias = False
-                proposed_qq = (
-                    completion_source.get("qq_number")
-                    if isinstance(completion_source, dict)
-                    else None
-                )
-                if (
-                    not profile["qq_number"]
-                    and isinstance(proposed_qq, str)
-                    and QQ_NUMBER_PATTERN.fullmatch(proposed_qq)
-                ):
-                    contact_profile = connection.execute(
-                        """
-                        SELECT profile_id, nickname, gender, default_preference,
-                               qq_number, qq_visibility, notification_enabled,
-                               notify_queue_changes, notify_playing_position,
-                               notify_online_check_in, notify_absence,
-                               notify_machine_status, setup_version,
-                               profile_revision
-                        FROM player_profile
-                        WHERE device_id = ? AND qq_number = ?
-                        """,
-                        (profile_scope_id, proposed_qq),
-                    ).fetchone()
-                    if (
-                        contact_profile is not None
-                        and is_contactless_legacy_profile_alias(
-                            profile, contact_profile
-                        )
-                    ):
-                        profile = contact_profile
-                        profile_id = profile["profile_id"]
-                        expected_revision = profile["profile_revision"]
-                        completion_source = {
-                            key: value
-                            for key, value in completion_source.items()
-                            if key != "qq_number"
-                        }
-                        resolved_legacy_alias = True
                 profile_is_complete = bool(
                     profile["setup_version"] >= 1 and profile["qq_number"]
                 )
                 if profile_is_complete:
-                    if completion_source is not None and not resolved_legacy_alias:
+                    if completion_source is not None:
                         raise ValidationError("完整玩家资料不能在此页面编辑")
                     profile_settings = None
                     actor_qq = profile["qq_number"]
@@ -2392,7 +2396,7 @@ def submit_mobile_registration_session(session_token: str):
         duplicates = connection.execute(
             """
             SELECT profile_id, nickname, gender, default_preference, qq_number,
-                   setup_version
+                   setup_version, received_at
             FROM player_profile
             WHERE device_id = ? AND profile_id != ?
               AND (lower(nickname) = lower(?) OR qq_number = ?)
@@ -2405,7 +2409,13 @@ def submit_mobile_registration_session(session_token: str):
                 for candidate in duplicates
                 if not (
                     profile_id_value is not None
-                    and is_contactless_legacy_profile_alias(candidate, profile)
+                    and profile_was_seen_in_snapshot(
+                        profile, snapshot_row["received_at"]
+                    )
+                    and not profile_was_seen_in_snapshot(
+                        candidate, snapshot_row["received_at"]
+                    )
+                    and are_legacy_profile_aliases(candidate, profile)
                 )
             ),
             None,
