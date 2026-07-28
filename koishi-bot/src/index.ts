@@ -516,7 +516,7 @@ export function apply(ctx: Context, config: Config) {
         const profiles = (await api.getProfiles(qq)).profiles;
         return profiles.length
           ? "你已有玩家资料，但当前没有正在排队的登记。"
-          : "当前 QQ 尚未绑定终端中的玩家资料。请先在机厅终端创建资料。";
+          : "当前 QQ 尚未绑定终端中的玩家资料。请先在现场终端创建玩家资料，并填写当前 QQ。";
       })
     );
 
@@ -586,7 +586,7 @@ export function apply(ctx: Context, config: Config) {
       withCommandError(async () => {
         const queue = await api.getQueue();
         if (queue.onebot_sync_enabled === false) {
-          throw new Error("现场终端已关闭 QQ Bot 联动。");
+          throw new Error("现场终端已关闭 QQ Bot 联动。请联系现场工作人员开启后再试。");
         }
         return formatQueue(queue);
       })
@@ -611,7 +611,7 @@ export function apply(ctx: Context, config: Config) {
         const profiles = (await api.getProfiles(qq)).profiles;
 
         if (!profiles.length) {
-          return "当前 QQ 尚未绑定玩家资料，不能使用资料修改功能。请先在机厅终端创建玩家资料。";
+          return "当前 QQ 尚未绑定玩家资料，不能使用资料修改功能。请先在现场终端创建玩家资料，并填写当前 QQ。";
         }
 
         requireSingleProfile(profiles);
@@ -860,13 +860,13 @@ async function joinQueueFromBot(
     throw new Error("你已经有一份正在排队的登记，不能重复加入。请先发送“我的排队”查看。");
   }
   if (!queue.terminal.online) {
-    throw new Error("现场终端暂时离线，暂不能加入排队。");
+    throw new Error("现场终端暂时离线，暂不能加入排队。请稍后重试，或在现场终端操作。");
   }
   if (queue.onebot_sync_enabled === false) {
-    throw new Error("现场终端已关闭 QQ Bot 联动。");
+    throw new Error("现场终端已关闭 QQ Bot 联动。请联系现场工作人员开启后再试。");
   }
   if (queue.queue_rules?.allow_online_registration === false) {
-    throw new Error("现场规则暂不允许线上登记。");
+    throw new Error("现场规则暂不允许线上登记。请在现场终端加入排队。");
   }
   if (!queue.registration_open) {
     throw new Error("现场当前没有使用登记排队，请在现场自然排队。");
@@ -874,7 +874,7 @@ async function joinQueueFromBot(
 
   const machines = sortedMachines(queue).filter(machineCanAcceptRegistration);
   if (!machines.length) {
-    throw new Error("当前没有可以加入排队的机台。");
+    throw new Error("当前没有可以加入排队的机台。请发送“查看队列”确认机台状态，稍后再试。");
   }
   const machineInput = await resolveQueueCommandInput(
     session,
@@ -1014,7 +1014,7 @@ async function transferQueueMachine(
     machine.id !== current.player.machine_id && machineCanAcceptRegistration(machine)
   );
   if (!candidates.length) {
-    throw new Error("当前没有其他可以转入的机台。");
+    throw new Error("当前没有其他可以转入的机台。请发送“查看队列”确认机台状态，稍后再试。");
   }
   let target = candidates[0];
   if (candidates.length > 1) {
@@ -1122,7 +1122,7 @@ async function requireCurrentQueueRegistration(
   const qq = requireQqSession(session);
   const response = await api.getPlayers(qq);
   if (!response.players.length) {
-    throw new Error("当前没有正在排队的登记。");
+    throw new Error("当前没有正在排队的登记。可以发送“加入排队”创建线上登记，或在现场终端加入。");
   }
   if (response.players.length > 1) {
     throw new Error("当前 QQ 对应多份排队登记，请先联系现场工作人员处理。");
@@ -1253,9 +1253,11 @@ export function formatMachineChoice(machine: QueueMachine): string {
   if (typeof machine.new_registration_estimated_wait_minutes === "number") {
     details.push(
       machine.new_registration_estimated_wait_minutes <= 0
-        ? "预计很快可以游玩"
+        ? "预计不足 1 分钟"
         : `约 ${machine.new_registration_estimated_wait_minutes} 分钟后`,
     );
+  } else {
+    details.push("暂时无法估算");
   }
   return details.length
     ? `${machine.id.toUpperCase()}（${details.join("，")}）`
@@ -1840,13 +1842,17 @@ export function formatQueue(queue: QueueStatus): string {
   } else {
     lines.push("以下为最近一次同步状态。", "");
   }
-  if (queue.business_hours?.closing_grace) {
+  if (queue.terminal.online && queue.business_hours?.closing_grace) {
     lines.push(
       "今日营业时间已结束",
       "不再接收新登记。现有队列处理完毕后将关闭，最迟保留 20 分钟。",
       "",
     );
-  } else if (queue.business_hours?.enabled && queue.business_hours.closing_soon) {
+  } else if (
+    queue.terminal.online &&
+    queue.business_hours?.enabled &&
+    queue.business_hours.closing_soon
+  ) {
     lines.push(
       "将在 30 分钟内闭店",
       "请留意后续队列安排。",
@@ -1854,12 +1860,12 @@ export function formatQueue(queue: QueueStatus): string {
     );
   }
   for (const machine of sortedMachines(queue)) {
-    lines.push(formatMachine(machine), "");
+    lines.push(formatMachine(machine, queue.terminal.online), "");
   }
   return lines.join("\n").trimEnd();
 }
 
-function formatMachine(machine: QueueMachine): string {
+function formatMachine(machine: QueueMachine, terminalOnline = true): string {
   const waitingCount = machine.waiting_positions.reduce(
     (total, position) => total + position.registrations.length,
     0,
@@ -1889,13 +1895,15 @@ function formatMachine(machine: QueueMachine): string {
 
   const sections = [overview];
   if (machine.playing.length) {
-    const elapsed = machine.operational && machine.playing_started_at
+    const elapsed = terminalOnline && machine.operational && machine.playing_started_at
       ? Math.max(
         0,
         Math.floor((Date.now() - machine.playing_started_at) / 60_000),
       )
       : null;
-    const playingState = machine.operational
+    const playingState = !terminalOnline
+      ? "·状态待更新"
+      : machine.operational
       ? elapsed === null ? "" : `·${elapsed} 分钟`
       : "·已暂停";
     sections.push(
@@ -1908,12 +1916,25 @@ function formatMachine(machine: QueueMachine): string {
     sections.push([`游玩位置 ${machine.id}·空闲`]);
   }
   for (const position of machine.waiting_positions) {
-    const estimate = machine.operational &&
-        position.estimated_wait_minutes !== null
-      ? position.estimated_wait_minutes <= 0
-        ? "·即将游玩"
+    const hasPendingCheckIn = position.registrations.some((registration) =>
+      registration.online_registration_pending_check_in
+    );
+    const hasTemporaryAway = position.registrations.some((registration) =>
+      registration.temporarily_away
+    );
+    const estimate = !terminalOnline
+      ? "·状态待更新"
+      : machine.operational
+      ? hasPendingCheckIn
+        ? "·签到后可估算"
+        : hasTemporaryAway
+        ? "·暂时离开，无法估算"
+        : position.estimated_wait_minutes === null
+        ? "·暂时无法估算"
+        : position.estimated_wait_minutes <= 0
+        ? "·不足 1 分钟后"
         : `·约 ${position.estimated_wait_minutes} 分钟后`
-      : "";
+      : "·机台恢复使用后重新估算";
     sections.push(
       [
         `位置 ${machine.id}${position.index}${estimate}`,
@@ -1933,6 +1954,8 @@ export function formatOwnQueue(
       "queue_rules"
   >,
 ): string {
+  const terminalOnline = queue?.terminal.online ??
+    personalSnapshot?.terminal?.online;
   if (!players.length) return "当前没有正在排队的登记。";
   const status = players.map((player) => {
     const machine = queue?.machines[player.machine_id];
@@ -1954,14 +1977,14 @@ export function formatOwnQueue(
       ? machine.playing_started_at
       : player.playing_started_at;
     const elapsed = player.position === "PLAYING" &&
-        machineOperational !== false && playingStartedAt
+        terminalOnline !== false && machineOperational !== false && playingStartedAt
       ? Math.max(
         0,
         Math.floor((Date.now() - playingStartedAt) / 60_000),
       )
       : null;
     const location = player.position === "PLAYING"
-      ? machineOperational === false
+      ? machineOperational === false || terminalOnline === false
         ? `位于游玩位置 ${player.machine_id}`
         : `正在游玩位置 ${player.machine_id}${
           elapsed === null ? "" : `，已游玩 ${elapsed} 分钟`
@@ -1972,11 +1995,17 @@ export function formatOwnQueue(
       ? Math.max(0, Math.trunc(player.estimated_wait_minutes))
       : null;
     const estimate = player.position === "WAITING" &&
-        !player.online_registration_pending_check_in &&
-        machineOperational !== false &&
-        estimatedWaitMinutes !== null
-      ? estimatedWaitMinutes <= 0
-        ? "，预计现在可以游玩"
+        !player.online_registration_pending_check_in
+      ? terminalOnline === false
+        ? "，终端恢复同步后重新估算"
+        : machineOperational === false
+        ? "，机台恢复使用后重新估算"
+        : player.temporarily_away
+        ? "，暂时离开期间无法估算等待时间"
+        : estimatedWaitMinutes === null
+        ? "，暂时无法估算"
+        : estimatedWaitMinutes <= 0
+        ? "，不足 1 分钟后可以游玩"
         : `，约 ${estimatedWaitMinutes} 分钟后可以游玩`
       : "";
     const machineStopReason = machine
@@ -2054,8 +2083,6 @@ export function formatOwnQueue(
     if (states.length) lines.push(`当前状态：${states.join("；")}。`);
     return lines.join("\n");
   }).join("\n\n");
-  const terminalOnline = queue?.terminal.online ??
-    personalSnapshot?.terminal?.online;
   const businessHours = queue?.business_hours ?? personalSnapshot?.business_hours;
   const registrationOpen = queue?.registration_open ??
     personalSnapshot?.registration_open;
@@ -2069,12 +2096,16 @@ export function formatOwnQueue(
   }
   if (businessHours?.enabled && businessHours.outside) {
     notices.push(
-      businessHours.closing_grace
+      terminalOnline !== false && businessHours.closing_grace
         ? "今日营业时间已结束，现有队列正在收尾。"
         : "当前不在营业时间。",
     );
   } else {
-    if (businessHours?.enabled && businessHours.closing_soon) {
+    if (
+      terminalOnline !== false &&
+      businessHours?.enabled &&
+      businessHours.closing_soon
+    ) {
       notices.push("将在 30 分钟内闭店，请留意后续队列安排。");
     }
     if (registrationOpen === false) {
@@ -2126,10 +2157,16 @@ export function formatNotificationQueueStatus(players: BotPlayer[]): string {
         Number.isFinite(player.estimated_wait_minutes)
       ? Math.max(0, Math.trunc(player.estimated_wait_minutes))
       : null;
-    const estimate = estimatedWaitMinutes === null
-      ? "暂时无法估算等待时间"
+    const estimate = player.online_registration_pending_check_in
+      ? "签到后可以估算等待时间"
+      : player.temporarily_away
+      ? "暂时离开期间无法估算等待时间"
+      : player.machine_operational === false
+      ? "机台恢复使用后重新估算"
+      : estimatedWaitMinutes === null
+      ? "暂时无法估算"
       : estimatedWaitMinutes <= 0
-      ? "当前可以游玩"
+      ? "不足 1 分钟后可以游玩"
       : `约 ${estimatedWaitMinutes} 分钟后可以游玩`;
     return `现在，${subject}位于${position}，${estimate}。`;
   }).join("\n");
@@ -2308,7 +2345,9 @@ export function apiBaseValidationError(value: string): string | null {
 }
 
 function requireSingleProfile(profiles: PlayerProfile[]): PlayerProfile {
-  if (!profiles.length) throw new Error("当前 QQ 尚未绑定终端中的玩家资料。");
+  if (!profiles.length) {
+    throw new Error("当前 QQ 尚未绑定终端中的玩家资料。请先在现场终端创建玩家资料，并填写当前 QQ。");
+  }
   if (profiles.length > 1) {
     throw new Error("当前 QQ 绑定了多份资料，请先联系现场工作人员处理。");
   }

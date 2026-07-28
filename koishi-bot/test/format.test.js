@@ -36,7 +36,7 @@ test('help text uses a message-safe profile menu', () => {
   assert.match(HELP_TEXT, /设置 QQ 后才能使用/)
 })
 
-test('formats waiting estimate and absence state for the current QQ', () => {
+test('does not present a wait estimate while the current QQ is temporarily away', () => {
   const text = formatOwnQueue([{
     registration_id: 'registration-1',
     profile_id: 'profile-1',
@@ -54,7 +54,8 @@ test('formats waiting estimate and absence state for the current QQ', () => {
   }])
 
   assert.match(text, /队列位置 A2/)
-  assert.match(text, /约 18 分钟后/)
+  assert.match(text, /暂时离开期间无法估算等待时间/)
+  assert.doesNotMatch(text, /约 18 分钟后/)
   assert.match(text, /暂时离开·已轮空 2 次/)
   assert.match(text, /未到场记录 1 次/)
   assert.match(text, /未到场记录 1 次·上次处理：暂缓一轮/)
@@ -81,12 +82,12 @@ test('shows move-to-end as the latest no-show handling result', () => {
   assert.match(text, /上次处理：移至队尾/)
 })
 
-test('describes a zero-minute personal estimate as ready now', () => {
+test('describes a zero-minute personal estimate as under one minute', () => {
   const text = formatOwnQueue([{
     registration_id: 'registration-ready',
     profile_id: 'profile-ready',
     qq_number: '87654321',
-    display_id: '即将上机',
+    display_id: '即将游玩',
     machine_id: 'B',
     position: 'WAITING',
     position_index: 1,
@@ -98,11 +99,11 @@ test('describes a zero-minute personal estimate as ready now', () => {
     last_no_show_action_was_defer: false,
   }])
 
-  assert.match(text, /预计现在可以游玩/)
+  assert.match(text, /不足 1 分钟后可以游玩/)
   assert.doesNotMatch(text, /约 0 分钟后/)
 })
 
-test('omits the estimate when an older personal response has no estimate field', () => {
+test('explains a missing estimate from an older personal response', () => {
   const text = formatOwnQueue([{
     registration_id: 'registration-without-estimate',
     profile_id: 'profile-without-estimate',
@@ -118,7 +119,7 @@ test('omits the estimate when an older personal response has no estimate field',
     last_no_show_action_was_defer: false,
   }])
 
-  assert.match(text, /^你好，旧数据玩家。\n\n你位于队列位置 A1。/)
+  assert.match(text, /^你好，旧数据玩家。\n\n你位于队列位置 A1，暂时无法估算。/)
   assert.doesNotMatch(text, /undefined|约 .* 分钟后/)
 })
 
@@ -167,6 +168,27 @@ test('shows business-hours state in personal queue output and notifications', ()
   assert.match(text, /^你好，小雨。\n\n今日营业时间已结束，现有队列正在收尾。\n\n/)
   assert.match(text, /你位于队列位置 A1/)
   assert.match(closingSoonText, /^你好，小雨。\n\n将在 30 分钟内闭店，请留意后续队列安排。\n\n/)
+
+  const offlineClosingSoonText = formatOwnQueue([player], undefined, {
+    ...personalSnapshot,
+    terminal: { online: false },
+    business_hours: {
+      enabled: true,
+      outside: false,
+      closing_soon: true,
+      closing_grace: false,
+      closes_at: Date.now() + 30 * 60_000,
+      registration_closes_at: null,
+    },
+  })
+  const offlineClosingGraceText = formatOwnQueue([player], undefined, {
+    ...personalSnapshot,
+    terminal: { online: false },
+  })
+
+  assert.doesNotMatch(offlineClosingSoonText, /将在 30 分钟内闭店/)
+  assert.match(offlineClosingGraceText, /当前不在营业时间。/)
+  assert.doesNotMatch(offlineClosingGraceText, /现有队列正在收尾/)
 })
 
 test('formats both machines without exposing private profile fields', () => {
@@ -280,7 +302,7 @@ test('keeps preserved registrations visible while a machine is stopped', () => {
   assert.match(text, /登记顺序已保留/)
   assert.match(
     text,
-    /位置 A1\n - 小雨 \(允许加入\)\n    - 暂时离开·已轮空 2 次\n    - 未到场记录 1 次/,
+    /位置 A1·机台恢复使用后重新估算\n - 小雨 \(允许加入\)\n    - 暂时离开·已轮空 2 次\n    - 未到场记录 1 次/,
   )
   assert.match(text, /1 个等待位置·1 个登记/)
   assert.doesNotMatch(text, /约 0 分钟后/)
@@ -492,7 +514,7 @@ test('describes a retained playing position as a location while its machine is s
   assert.doesNotMatch(text, /已游玩 \d+ 分钟/)
 })
 
-test('adds current preference, elapsed time, and stale warning to own status', () => {
+test('stops the personal playing timer while the terminal is offline', () => {
   const player = {
     registration_id: 'registration-1',
     profile_id: 'profile-1',
@@ -545,7 +567,9 @@ test('adds current preference, elapsed time, and stale warning to own status', (
   })
 
   assert.match(text, /^你好，小雨。\n\n终端暂时离线/)
-  assert.match(text, /正在游玩位置 A，已游玩 [45] 分钟/)
+  assert.match(text, /位于游玩位置 A/)
+  assert.doesNotMatch(text, /正在游玩位置 A/)
+  assert.doesNotMatch(text, /已游玩 \d+ 分钟/)
   assert.match(text, /游玩偏好：单人游玩/)
 })
 
@@ -700,12 +724,83 @@ test('notification position summaries handle playing and unavailable estimates',
 
   assert.equal(
     formatNotificationQueueStatus([{ ...base, position: 'WAITING' }]),
-    '现在，你位于队列位置 B2，暂时无法估算等待时间。',
+    '现在，你位于队列位置 B2，暂时无法估算。',
   )
   assert.equal(
     formatNotificationQueueStatus([{ ...base, position: 'PLAYING' }]),
     '现在，你正在游玩位置 B。',
   )
+  assert.equal(
+    formatNotificationQueueStatus([{
+      ...base,
+      position: 'WAITING',
+      estimated_wait_minutes: 12,
+      temporarily_away: true,
+    }]),
+    '现在，你位于队列位置 B2，暂时离开期间无法估算等待时间。',
+  )
+  assert.equal(
+    formatNotificationQueueStatus([{
+      ...base,
+      position: 'WAITING',
+      estimated_wait_minutes: 12,
+      online_registration_pending_check_in: true,
+    }]),
+    '现在，你位于队列位置 B2，签到后可以估算等待时间。',
+  )
+})
+
+test('does not keep advancing public timers or estimates while the terminal is offline', () => {
+  const text = formatQueue({
+    queue_id: 'queue-offline',
+    captured_at: Date.now() - 5 * 60_000,
+    registration_open: true,
+    business_hours: {
+      enabled: true,
+      outside: false,
+      closing_soon: true,
+      closing_grace: false,
+      closes_at: Date.now() + 25 * 60_000,
+      registration_closes_at: null,
+    },
+    terminal: { online: false },
+    machines: {
+      A: {
+        id: 'A',
+        name: '入口侧 · 机台 A',
+        operational: true,
+        stop_reason: null,
+        playing_started_at: Date.now() - 25 * 60_000,
+        playing: [{
+          registration_id: 'registration-playing',
+          display_id: '小雨',
+          preference: 'SOLO',
+          deferred_once: false,
+          temporarily_away: false,
+          temporary_away_skipped_turns: 0,
+          no_show_count: 0,
+        }],
+        waiting_positions: [{
+          index: 1,
+          estimated_wait_minutes: 9,
+          registrations: [{
+            registration_id: 'registration-waiting',
+            display_id: '青空',
+            preference: 'OPEN_TO_JOIN',
+            deferred_once: false,
+            temporarily_away: false,
+            temporary_away_skipped_turns: 0,
+            no_show_count: 0,
+          }],
+        }],
+      },
+    },
+  })
+
+  assert.match(text, /游玩位置 A·状态待更新/)
+  assert.match(text, /位置 A1·状态待更新/)
+  assert.doesNotMatch(text, /25 分钟|约 9 分钟后/)
+  assert.doesNotMatch(text, /将在 30 分钟内闭店/)
 })
 
 test('shows the pending check-in state and only allows leaving the queue', () => {
@@ -770,6 +865,7 @@ test('formats pending check-in registrations in the public queue', () => {
     machines: { A: machine('A'), B: machine('B') },
   })
 
+  assert.match(text, /位置 A1·签到后可估算/)
   assert.match(text, /糍粑 \(允许加入\)\n    - 线上登记·待签到/)
 })
 
@@ -809,6 +905,8 @@ test('accepts concise machine letters, full names, and unique remarks', () => {
   ]
   assert.equal(parseMachineChoice('A', machines), machines[0])
   assert.equal(parseMachineChoice('b', machines), machines[1])
+  assert.equal(parseMachineChoice('  a  ', machines), machines[0])
+  assert.equal(parseMachineChoice('\t右侧\n', machines), machines[1])
   assert.equal(parseMachineChoice('机台 A', machines), machines[0])
   assert.equal(parseMachineChoice('右侧·机台B', machines), machines[1])
   assert.equal(parseMachineChoice('左侧', machines), machines[0])
@@ -829,7 +927,11 @@ test('presents machine choices with the short letter first', () => {
     { id: 'B', name: '机台 B', new_registration_estimated_wait_minutes: 0 },
   ]
   assert.equal(formatMachineChoice(machines[0]), 'A（左侧日框，约 12 分钟后）')
-  assert.equal(formatMachineChoice(machines[1]), 'B（预计很快可以游玩）')
+  assert.equal(formatMachineChoice(machines[1]), 'B（预计不足 1 分钟）')
+  assert.equal(
+    formatMachineChoice({ id: 'C', name: '机台 C' }),
+    'C（暂时无法估算）',
+  )
   assert.equal(
     formatMachineReplyHint(machines),
     '回复 A、B，也可以回复括号中的机台备注。',

@@ -2,7 +2,7 @@
 
 该插件把 Koishi OneBot 与 maimai Q 私有 API 连接起来。QQ 号来自 OneBot 会话身份，玩家不能在命令中指定其他人的 QQ。
 
-插件采用独立版本号，当前版本为 `0.3.0`，不会跟随 Android 应用版本同步递增。
+插件采用独立版本号，当前版本为 `0.3.1`，不会跟随 Android 应用版本同步递增。
 
 ## 当前功能
 
@@ -70,10 +70,10 @@ pnpm run build
 pnpm pack
 ```
 
-`pnpm pack` 会再次构建并生成 `koishi-plugin-maimai-q-0.3.0.tgz`。将该文件放到运行 Koishi 的机器，在 Koishi 项目根目录执行：
+`pnpm pack` 会再次构建并生成 `koishi-plugin-maimai-q-0.3.1.tgz`。将该文件放到运行 Koishi 的机器，在 Koishi 项目根目录执行：
 
 ```bash
-pnpm add -w /absolute/path/to/koishi-plugin-maimai-q-0.3.0.tgz
+pnpm add -w /absolute/path/to/koishi-plugin-maimai-q-0.3.1.tgz
 ```
 
 应使用 pnpm 的本地包安装命令，不要在插件源码目录与 Koishi 项目之间直接复制 `node_modules`。

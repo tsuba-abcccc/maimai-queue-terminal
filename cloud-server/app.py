@@ -2455,7 +2455,13 @@ def submit_mobile_registration_session(session_token: str):
                     (profile_scope_id, profile_id),
                 ).fetchone()
                 if profile is None:
-                    return jsonify({"ok": False, "error": "这份玩家资料已经不存在"}), 404
+                    return jsonify(
+                        {
+                            "ok": False,
+                            "code": "PROFILE_NOT_FOUND",
+                            "error": "这份玩家资料已经不存在",
+                        }
+                    ), 404
                 expected_revision = read_integer(
                     source,
                     "expected_profile_revision",
@@ -2464,7 +2470,11 @@ def submit_mobile_registration_session(session_token: str):
                 )
                 if expected_revision != profile["profile_revision"]:
                     return jsonify(
-                        {"ok": False, "error": "玩家资料已经更新，请重新选择后再提交"}
+                        {
+                            "ok": False,
+                            "code": "PROFILE_UPDATED",
+                            "error": "玩家资料已经更新，请重新选择后再提交",
+                        }
                     ), 409
                 completion_source = source.get("profile_completion")
                 profile_is_complete = bool(
@@ -2513,7 +2523,13 @@ def submit_mobile_registration_session(session_token: str):
                     "profile": profile_settings,
                 }
         except (ValidationError, ValueError) as error:
-            return jsonify({"ok": False, "error": str(error) or "玩家资料编号无效"}), 400
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "PROFILE_SETTINGS_INVALID",
+                    "error": str(error) or "玩家资料编号无效",
+                }
+            ), 400
 
         duplicates = connection.execute(
             """
@@ -2542,12 +2558,22 @@ def submit_mobile_registration_session(session_token: str):
             None,
         )
         if duplicate is not None:
-            detail = (
-                "这个 QQ 已经关联其他玩家资料"
-                if duplicate["qq_number"] == actor_qq
-                else "这个昵称已经用于其他玩家资料"
-            )
-            return jsonify({"ok": False, "error": detail}), 409
+            duplicate_qq = duplicate["qq_number"] == actor_qq
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": (
+                        "QQ_ALREADY_USED"
+                        if duplicate_qq
+                        else "NICKNAME_ALREADY_USED"
+                    ),
+                    "error": (
+                        "这个 QQ 已经关联其他玩家资料"
+                        if duplicate_qq
+                        else "这个昵称已经用于其他玩家资料"
+                    ),
+                }
+            ), 409
 
         active_registration_ids = {
             row["registration_id"]
@@ -2573,7 +2599,13 @@ def submit_mobile_registration_session(session_token: str):
             for machine in snapshot.get("machines", {}).values()
             for registration in all_machine_registrations(machine)
         ):
-            return jsonify({"ok": False, "error": "这个昵称已经用于当前队列中的其他登记"}), 409
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "NICKNAME_IN_QUEUE",
+                    "error": "这个昵称已经用于当前队列中的其他登记",
+                }
+            ), 409
         pending = connection.execute(
             """
             SELECT 1 FROM terminal_command
@@ -2586,7 +2618,13 @@ def submit_mobile_registration_session(session_token: str):
             (actor_qq, profile_id, profile_id),
         ).fetchone()
         if pending is not None:
-            return jsonify({"ok": False, "error": "这名玩家已有一项操作等待终端处理"}), 409
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "PLAYER_OPERATION_PENDING",
+                    "error": "这名玩家已有一项操作等待终端处理",
+                }
+            ), 409
 
         payload = {
             "queue_id": session["queue_id"],

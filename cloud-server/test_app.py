@@ -2820,6 +2820,68 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertIsNone(profile.get("completion"))
         UUID(profile["profile_id"])
 
+    def test_mobile_registration_profile_conflicts_return_actionable_codes(self):
+        snapshot = self.remote_ready_snapshot(revision=23)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        created = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000842",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        ).get_json()
+        endpoint = f"/api/queue-mobile/sessions/{created['session_token']}/submit"
+
+        def new_profile_submission(request_id, nickname, qq_number):
+            return {
+                "request_id": request_id,
+                "preference": "OPEN_TO_JOIN",
+                "new_profile": {
+                    "nickname": nickname,
+                    "gender": "UNDISCLOSED",
+                    "default_preference": "OPEN_TO_JOIN",
+                    "qq_number": qq_number,
+                    "qq_visibility": "TERMINAL_ONLY",
+                    "notification_enabled": True,
+                    "notify_queue_changes": True,
+                    "notify_playing_position": False,
+                    "notify_online_check_in": True,
+                    "notify_absence": True,
+                    "notify_machine_status": False,
+                },
+            }
+
+        duplicate_qq = self.client.post(
+            endpoint,
+            json=new_profile_submission(
+                "00000000-0000-0000-0000-000000000843",
+                "移动新玩家",
+                "12345678",
+            ),
+        )
+        duplicate_nickname = self.client.post(
+            endpoint,
+            json=new_profile_submission(
+                "00000000-0000-0000-0000-000000000844",
+                "公开昵称",
+                "87654321",
+            ),
+        )
+
+        self.assertEqual(409, duplicate_qq.status_code)
+        self.assertEqual("QQ_ALREADY_USED", duplicate_qq.get_json()["code"])
+        self.assertEqual(409, duplicate_nickname.status_code)
+        self.assertEqual(
+            "NICKNAME_ALREADY_USED", duplicate_nickname.get_json()["code"]
+        )
+
     def test_mobile_registration_rechecks_machine_state_before_submission(self):
         snapshot = self.remote_ready_snapshot(revision=23)
         self.assertEqual(

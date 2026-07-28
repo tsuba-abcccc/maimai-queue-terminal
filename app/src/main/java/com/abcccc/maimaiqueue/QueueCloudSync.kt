@@ -5,7 +5,9 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -36,20 +38,30 @@ enum class QueueCloudSyncPhase {
 data class QueueCloudSyncStatus(
     val phase: QueueCloudSyncPhase,
     val lastSuccessfulAtMillis: Long? = null,
+    val retryStartedAtMillis: Long? = null,
+    val lastErrorAtMillis: Long? = null,
     val retryDetail: String? = null,
     val syncMode: QueueSyncMode = QueueSyncMode.UNSPECIFIED
 )
 
 internal fun combinedQueueCloudSyncStatus(
     publicStatus: QueueCloudSyncStatus,
-    privateFailureDetail: String?
+    privateFailureDetail: String?,
+    privateFailureRetryStartedAtMillis: Long? = null,
+    privateFailureLastErrorAtMillis: Long? = privateFailureRetryStartedAtMillis
 ): QueueCloudSyncStatus {
     val privateDetail = privateFailureDetail?.trim()?.takeIf { it.isNotEmpty() }
-        ?: return publicStatus
+    val combinedLastErrorAtMillis = listOfNotNull(
+        publicStatus.lastErrorAtMillis,
+        privateFailureLastErrorAtMillis
+    ).maxOrNull()
+    if (privateDetail == null) {
+        return publicStatus.copy(lastErrorAtMillis = combinedLastErrorAtMillis)
+    }
     if (publicStatus.phase == QueueCloudSyncPhase.DISABLED ||
         publicStatus.phase == QueueCloudSyncPhase.NOT_CONFIGURED
     ) {
-        return publicStatus
+        return publicStatus.copy(lastErrorAtMillis = combinedLastErrorAtMillis)
     }
     val combinedDetail = listOfNotNull(
         publicStatus.retryDetail?.takeIf {
@@ -59,6 +71,11 @@ internal fun combinedQueueCloudSyncStatus(
     ).distinct().joinToString("；")
     return publicStatus.copy(
         phase = QueueCloudSyncPhase.WAITING_TO_RETRY,
+        retryStartedAtMillis = listOfNotNull(
+            publicStatus.retryStartedAtMillis,
+            privateFailureRetryStartedAtMillis
+        ).minOrNull(),
+        lastErrorAtMillis = combinedLastErrorAtMillis,
         retryDetail = combinedDetail
     )
 }
@@ -150,7 +167,9 @@ internal fun decidePlayerProfileUpdate(
 internal interface QueueCommandClient {
     val isConfigured: Boolean
     val profileSyncFailureDetail: String?
+    val profileSyncLastErrorAtMillis: Long?
     val commandSyncFailureDetail: String?
+    val commandSyncLastErrorAtMillis: Long?
     suspend fun fetchPlayerProfiles(): PlayerProfileSyncPayload?
     suspend fun fetchPendingCommands(): List<RemoteTerminalCommand>?
     suspend fun createMobileRegistrationSession(
@@ -331,7 +350,15 @@ internal class HttpQueueCommandClient(
         private set
 
     @Volatile
+    override var profileSyncLastErrorAtMillis: Long? = null
+        private set
+
+    @Volatile
     override var commandSyncFailureDetail: String? = null
+        private set
+
+    @Volatile
+    override var commandSyncLastErrorAtMillis: Long? = null
         private set
 
     override val isConfigured: Boolean
@@ -343,7 +370,9 @@ internal class HttpQueueCommandClient(
             token = token.trim()
         )
         profileSyncFailureDetail = null
+        profileSyncLastErrorAtMillis = null
         commandSyncFailureDetail = null
+        commandSyncLastErrorAtMillis = null
     }
 
     override suspend fun fetchPlayerProfiles(): PlayerProfileSyncPayload? =
@@ -371,6 +400,7 @@ internal class HttpQueueCommandClient(
                 onFailure = { error ->
                     Log.w(LOG_TAG, "Player profile fetch failed", error)
                     profileSyncFailureDetail = queuePublishFailureDetail(error)
+                    profileSyncLastErrorAtMillis = System.currentTimeMillis()
                     null
                 }
             )
@@ -401,6 +431,7 @@ internal class HttpQueueCommandClient(
                 onFailure = { error ->
                     Log.w(LOG_TAG, "Queue command fetch failed", error)
                     commandSyncFailureDetail = queuePublishFailureDetail(error)
+                    commandSyncLastErrorAtMillis = System.currentTimeMillis()
                     null
                 }
             )
@@ -449,6 +480,7 @@ internal class HttpQueueCommandClient(
             onFailure = { error ->
                 Log.w(LOG_TAG, "Mobile registration session creation failed", error)
                 commandSyncFailureDetail = queuePublishFailureDetail(error)
+                commandSyncLastErrorAtMillis = System.currentTimeMillis()
                 null
             }
         )
@@ -485,6 +517,7 @@ internal class HttpQueueCommandClient(
             onFailure = { error ->
                 Log.w(LOG_TAG, "Queue command completion failed", error)
                 commandSyncFailureDetail = queuePublishFailureDetail(error)
+                commandSyncLastErrorAtMillis = System.currentTimeMillis()
                 false
             }
         )
@@ -868,7 +901,10 @@ internal class QueueCloudSyncController(
     @Volatile
     private var enabled = initiallyEnabled
     private var publishJob: Job? = null
+    private var latestSubmittedPayload: QueuePublishPayload? = null
     private var lastSuccessfulAtMillis: Long? = null
+    private var retryStartedAtMillis: Long? = null
+    private var lastErrorAtMillis: Long? = null
     private var lastSyncMode = QueueSyncMode.UNSPECIFIED
 
     init {
@@ -881,6 +917,7 @@ internal class QueueCloudSyncController(
         if (!enabled) {
             publishJob?.cancel()
             publishJob = null
+            retryStartedAtMillis = null
             while (updates.tryReceive().isSuccess) {
                 // Discard states queued before the user disabled website sync.
             }
@@ -888,6 +925,7 @@ internal class QueueCloudSyncController(
                 QueueCloudSyncStatus(
                     phase = QueueCloudSyncPhase.DISABLED,
                     lastSuccessfulAtMillis = lastSuccessfulAtMillis,
+                    lastErrorAtMillis = lastErrorAtMillis,
                     syncMode = lastSyncMode
                 )
             )
@@ -902,6 +940,8 @@ internal class QueueCloudSyncController(
             QueueCloudSyncStatus(
                 phase = QueueCloudSyncPhase.CONFIGURED,
                 lastSuccessfulAtMillis = lastSuccessfulAtMillis,
+                retryStartedAtMillis = retryStartedAtMillis,
+                lastErrorAtMillis = lastErrorAtMillis,
                 syncMode = lastSyncMode
             )
         )
@@ -919,8 +959,17 @@ internal class QueueCloudSyncController(
             onStatusChange(QueueCloudSyncStatus(QueueCloudSyncPhase.NOT_CONFIGURED))
             return
         }
+        val payload = QueuePublishPayload(state, auditLogs, displaySettings, playerProfiles)
+        latestSubmittedPayload = payload
         startPublishLoop()
-        updates.trySend(QueuePublishPayload(state, auditLogs, displaySettings, playerProfiles))
+        updates.trySend(payload)
+    }
+
+    fun refresh() {
+        if (!enabled || !publisher.isConfigured) return
+        val payload = latestSubmittedPayload ?: return
+        startPublishLoop()
+        updates.trySend(payload)
     }
 
     private fun startPublishLoop() {
@@ -951,22 +1000,37 @@ internal class QueueCloudSyncController(
 
             val payloadToPublish = latestPayload ?: continue
             if (!enabled) return
-            onStatusChange(
-                QueueCloudSyncStatus(
-                    phase = QueueCloudSyncPhase.SYNCING,
-                    lastSuccessfulAtMillis = lastSuccessfulAtMillis,
-                    syncMode = payloadToPublish.displaySettings.syncMode
-                )
-            )
-            when (val result = publisher.publish(
-                payloadToPublish.state,
-                payloadToPublish.auditLogs,
-                payloadToPublish.displaySettings,
-                payloadToPublish.playerProfiles
-            )) {
+            val result = coroutineScope {
+                val slowSyncIndicator = launch {
+                    delay(SYNCING_INDICATOR_DELAY_MILLIS)
+                    if (enabled) {
+                        onStatusChange(
+                            QueueCloudSyncStatus(
+                                phase = QueueCloudSyncPhase.SYNCING,
+                                lastSuccessfulAtMillis = lastSuccessfulAtMillis,
+                                retryStartedAtMillis = retryStartedAtMillis,
+                                lastErrorAtMillis = lastErrorAtMillis,
+                                syncMode = payloadToPublish.displaySettings.syncMode
+                            )
+                        )
+                    }
+                }
+                try {
+                    publisher.publish(
+                        payloadToPublish.state,
+                        payloadToPublish.auditLogs,
+                        payloadToPublish.displaySettings,
+                        payloadToPublish.playerProfiles
+                    )
+                } finally {
+                    slowSyncIndicator.cancel()
+                }
+            }
+            when (result) {
                 QueuePublishResult.Success -> {
                     if (!enabled) return
                     lastSuccessfulAtMillis = System.currentTimeMillis()
+                    retryStartedAtMillis = null
                     lastSyncMode = payloadToPublish.displaySettings.syncMode
                     retryDelayMillis = INITIAL_RETRY_MILLIS
                     waitBeforeNextPublishMillis = HEARTBEAT_INTERVAL_MILLIS
@@ -974,6 +1038,7 @@ internal class QueueCloudSyncController(
                         QueueCloudSyncStatus(
                             phase = QueueCloudSyncPhase.SYNCED,
                             lastSuccessfulAtMillis = lastSuccessfulAtMillis,
+                            lastErrorAtMillis = lastErrorAtMillis,
                             syncMode = lastSyncMode
                         )
                     )
@@ -981,12 +1046,17 @@ internal class QueueCloudSyncController(
 
                 is QueuePublishResult.Failure -> {
                     if (!enabled) return
+                    val failedAtMillis = System.currentTimeMillis()
+                    if (retryStartedAtMillis == null) retryStartedAtMillis = failedAtMillis
+                    lastErrorAtMillis = failedAtMillis
                     waitBeforeNextPublishMillis = retryDelayMillis
                     retryDelayMillis = (retryDelayMillis * 2).coerceAtMost(MAX_RETRY_MILLIS)
                     onStatusChange(
                         QueueCloudSyncStatus(
                             phase = QueueCloudSyncPhase.WAITING_TO_RETRY,
                             lastSuccessfulAtMillis = lastSuccessfulAtMillis,
+                            retryStartedAtMillis = retryStartedAtMillis,
+                            lastErrorAtMillis = lastErrorAtMillis,
                             retryDetail = result.detail,
                             syncMode = payloadToPublish.displaySettings.syncMode
                         )
@@ -998,6 +1068,7 @@ internal class QueueCloudSyncController(
 
     private companion object {
         const val HEARTBEAT_INTERVAL_MILLIS = 30_000L
+        const val SYNCING_INDICATOR_DELAY_MILLIS = 500L
         const val INITIAL_RETRY_MILLIS = 2_000L
         const val MAX_RETRY_MILLIS = 60_000L
     }
