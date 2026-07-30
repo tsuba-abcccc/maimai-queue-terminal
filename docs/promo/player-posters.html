@@ -1,0 +1,953 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1080, initial-scale=1">
+  <title>maimai Q 玩家宣传图</title>
+  <style>
+    :root {
+      --bg: #f5f5f7;
+      --surface: #ffffff;
+      --surface-2: #fafafc;
+      --text: #1d1d1f;
+      --secondary: #6e6e73;
+      --tertiary: #8e8e93;
+      --line: #d2d2d7;
+      --blue: #007aff;
+      --blue-soft: #eaf3ff;
+      --green: #087f73;
+      --green-soft: #e8f7f4;
+      --amber: #b85c00;
+      --amber-soft: #fff1dc;
+      --red: #c9342c;
+      --red-soft: #ffefee;
+      --dark: #202124;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      width: 1080px;
+      min-height: 1440px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Microsoft YaHei", "Noto Sans CJK SC", "PingFang SC", sans-serif;
+    }
+
+    body { overflow: hidden; }
+
+    .poster {
+      position: relative;
+      width: 1080px;
+      height: 1440px;
+      padding: 64px 72px 58px;
+      overflow: hidden;
+      background: var(--bg);
+    }
+
+    .poster::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 12px;
+      background: var(--blue);
+    }
+
+    .brand-line,
+    .poster-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .brand {
+      font-size: 34px;
+      line-height: 1;
+      font-weight: 800;
+    }
+
+    .brand strong { color: var(--blue); }
+
+    .series {
+      color: var(--secondary);
+      font-size: 17px;
+      font-weight: 700;
+    }
+
+    .kicker {
+      margin-top: 86px;
+      color: var(--blue);
+      font-size: 22px;
+      line-height: 1.4;
+      font-weight: 700;
+    }
+
+    h1 {
+      margin: 16px 0 0;
+      max-width: 900px;
+      font-size: 70px;
+      line-height: 1.18;
+      font-weight: 900;
+      letter-spacing: 0;
+    }
+
+    .lede {
+      margin: 28px 0 0;
+      max-width: 860px;
+      color: var(--secondary);
+      font-size: 27px;
+      line-height: 1.72;
+      font-weight: 500;
+    }
+
+    .poster-footer {
+      position: absolute;
+      left: 72px;
+      right: 72px;
+      bottom: 42px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+      color: var(--tertiary);
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .board {
+      margin-top: 54px;
+      padding: 26px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .board-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 20px;
+    }
+
+    .board-title { font-size: 25px; font-weight: 800; }
+    .board-meta { color: var(--secondary); font-size: 17px; font-weight: 600; }
+
+    .queue-row {
+      display: grid;
+      grid-template-columns: 1.12fr .92fr .92fr;
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .queue-cell {
+      min-height: 116px;
+      padding: 18px 20px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-2);
+    }
+
+    .queue-cell.playing {
+      border-color: #75b7ff;
+      background: var(--blue-soft);
+    }
+
+    .cell-label { color: var(--secondary); font-size: 15px; font-weight: 700; }
+    .cell-name { margin-top: 9px; font-size: 22px; font-weight: 850; }
+    .cell-note { margin-top: 7px; color: var(--secondary); font-size: 14px; line-height: 1.45; }
+
+    .benefits {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin-top: 20px;
+    }
+
+    .benefit {
+      padding: 18px 20px;
+      border-left: 5px solid var(--blue);
+      background: var(--surface);
+    }
+
+    .benefit b { display: block; font-size: 20px; }
+    .benefit span { display: block; margin-top: 6px; color: var(--secondary); font-size: 14px; line-height: 1.45; }
+
+    .rule-note {
+      margin-top: 20px;
+      padding: 16px 20px;
+      border: 1px solid #b7d7ff;
+      border-radius: 8px;
+      background: var(--blue-soft);
+      color: #245f99;
+      font-size: 16px;
+      line-height: 1.55;
+      font-weight: 700;
+    }
+
+    .flow {
+      position: relative;
+      margin-top: 48px;
+    }
+
+    .flow::before {
+      content: "";
+      position: absolute;
+      top: 48px;
+      bottom: 48px;
+      left: 37px;
+      width: 2px;
+      background: var(--line);
+    }
+
+    .flow-step {
+      position: relative;
+      display: grid;
+      grid-template-columns: 76px 1fr 210px;
+      gap: 22px;
+      align-items: center;
+      min-height: 140px;
+      padding: 18px 22px 18px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .flow-step:last-child { border-bottom: 0; }
+
+    .step-no {
+      position: relative;
+      z-index: 1;
+      width: 76px;
+      height: 76px;
+      display: grid;
+      place-items: center;
+      border: 2px solid var(--blue);
+      border-radius: 50%;
+      background: var(--bg);
+      color: var(--blue);
+      font-size: 22px;
+      font-weight: 900;
+    }
+
+    .step-title { font-size: 27px; font-weight: 850; }
+    .step-copy { margin-top: 8px; color: var(--secondary); font-size: 18px; line-height: 1.55; }
+    .step-side { color: var(--tertiary); font-size: 16px; line-height: 1.5; text-align: right; font-weight: 650; }
+
+    .quote {
+      margin-top: 24px;
+      padding: 22px 26px;
+      border-left: 6px solid var(--blue);
+      background: var(--surface);
+      font-size: 22px;
+      line-height: 1.5;
+      font-weight: 800;
+    }
+
+    .preference-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-top: 48px;
+    }
+
+    .preference {
+      min-height: 260px;
+      padding: 26px 24px;
+      border-top: 7px solid var(--blue);
+      background: var(--surface);
+    }
+
+    .preference:nth-child(2) { border-top-color: var(--green); }
+    .preference:nth-child(3) { border-top-color: var(--amber); }
+    .preference-code { color: var(--tertiary); font-size: 16px; font-weight: 800; }
+    .preference h2 { margin: 22px 0 0; font-size: 30px; line-height: 1.28; }
+    .preference p { margin: 18px 0 0; color: var(--secondary); font-size: 18px; line-height: 1.65; }
+
+    .pairing {
+      margin-top: 24px;
+      padding: 28px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-2);
+    }
+
+    .pairing-title { font-size: 20px; font-weight: 800; }
+    .pairing-line { display: flex; align-items: center; gap: 12px; margin-top: 22px; }
+    .player-chip,
+    .group-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 54px;
+      padding: 0 20px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      font-size: 17px;
+      font-weight: 800;
+    }
+
+    .player-chip.open { border-color: #77c8bd; color: var(--green); background: var(--green-soft); }
+    .player-chip.solo { border-color: #8cc3ff; color: #1d65aa; background: var(--blue-soft); }
+    .group-chip { border-color: #e8b976; color: #8b5000; background: var(--amber-soft); }
+    .arrow { color: var(--tertiary); font-size: 26px; font-weight: 900; }
+
+    .status-list {
+      display: grid;
+      gap: 14px;
+      margin-top: 44px;
+    }
+
+    .status-row {
+      display: grid;
+      grid-template-columns: 220px 1fr;
+      gap: 28px;
+      align-items: center;
+      min-height: 112px;
+      padding: 20px 24px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .status-name {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      min-height: 48px;
+      padding: 0 16px;
+      border-radius: 8px;
+      background: var(--amber-soft);
+      color: var(--amber);
+      font-size: 20px;
+      font-weight: 850;
+    }
+
+    .status-row:nth-child(2) .status-name { background: var(--amber-soft); color: var(--amber); }
+    .status-row:nth-child(3) .status-name { background: var(--green-soft); color: var(--green); }
+    .status-row:nth-child(4) .status-name { background: var(--red-soft); color: var(--red); }
+    .status-copy { color: var(--secondary); font-size: 18px; line-height: 1.62; }
+    .status-copy b { color: var(--text); }
+
+    .online-layout {
+      display: grid;
+      grid-template-columns: 430px 1fr;
+      gap: 34px;
+      margin-top: 42px;
+      align-items: start;
+    }
+
+    .phone {
+      width: 430px;
+      height: 670px;
+      padding: 22px;
+      border: 3px solid #2c2c2e;
+      border-radius: 28px;
+      background: var(--surface);
+    }
+
+    .phone-top { display: flex; justify-content: space-between; color: var(--secondary); font-size: 14px; font-weight: 800; }
+    .phone h2 { margin: 32px 0 6px; font-size: 31px; }
+    .phone-sub { color: var(--secondary); font-size: 14px; }
+
+    .mini-machine {
+      margin-top: 26px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-2);
+    }
+
+    .mini-machine-title { font-size: 19px; font-weight: 850; }
+    .mini-meta { margin-top: 5px; color: var(--secondary); font-size: 13px; }
+    .mini-position { margin-top: 14px; padding: 14px; border: 1px solid #8cc3ff; border-radius: 8px; background: var(--blue-soft); }
+    .mini-position b { display: block; color: var(--blue); font-size: 14px; }
+    .mini-players { display: flex; gap: 8px; margin-top: 10px; }
+    .mini-player { flex: 1; padding: 12px 10px; border-radius: 6px; background: var(--surface); font-size: 14px; font-weight: 800; }
+    .mini-player span { display: block; margin-top: 5px; color: var(--secondary); font-size: 11px; font-weight: 600; }
+
+    .channels { display: grid; gap: 14px; }
+    .channel {
+      min-height: 150px;
+      padding: 24px;
+      border-left: 6px solid var(--blue);
+      background: var(--surface);
+    }
+
+    .channel:nth-child(2) { border-left-color: var(--green); }
+    .channel:nth-child(3) { border-left-color: var(--dark); }
+    .channel-label { color: var(--tertiary); font-size: 15px; font-weight: 800; }
+    .channel h2 { margin: 12px 0 0; font-size: 26px; }
+    .channel p { margin: 12px 0 0; color: var(--secondary); font-size: 17px; line-height: 1.55; }
+
+    .online-note {
+      margin-top: 16px;
+      padding: 18px 20px;
+      border: 1px solid #b7d7ff;
+      border-radius: 8px;
+      color: #245f99;
+      background: var(--blue-soft);
+      font-size: 16px;
+      line-height: 1.55;
+      font-weight: 700;
+    }
+
+    .boundary-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      margin-top: 48px;
+    }
+
+    .boundary-column {
+      min-height: 390px;
+      padding: 28px;
+      background: var(--surface);
+      border-top: 7px solid var(--green);
+    }
+
+    .boundary-column.no { border-top-color: var(--red); }
+    .boundary-column h2 { margin: 0; font-size: 30px; }
+    .boundary-item { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--line); }
+    .boundary-item b { display: block; font-size: 21px; }
+    .boundary-item span { display: block; margin-top: 8px; color: var(--secondary); font-size: 17px; line-height: 1.55; }
+
+    .cta {
+      margin-top: 24px;
+      padding: 26px 30px;
+      background: var(--dark);
+      color: #ffffff;
+    }
+
+    .cta b { display: block; font-size: 28px; }
+    .cta span { display: block; margin-top: 10px; color: #d5d5d7; font-size: 17px; line-height: 1.55; }
+
+    .poster-board-logic .kicker,
+    .poster-join-guide .kicker,
+    .poster-quick-help .kicker,
+    .poster-feature-use .kicker { margin-top: 58px; }
+
+    .poster-board-logic h1,
+    .poster-join-guide h1,
+    .poster-quick-help h1,
+    .poster-feature-use h1 { font-size: 64px; }
+
+    .poster-board-logic .lede,
+    .poster-join-guide .lede,
+    .poster-quick-help .lede,
+    .poster-feature-use .lede { margin-top: 20px; }
+
+    .logic-demo { margin-top: 30px; }
+
+    .logic-source {
+      padding: 20px 22px 22px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .logic-source-head,
+    .logic-path-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 20px;
+    }
+
+    .logic-source-title,
+    .logic-path-title { font-size: 21px; font-weight: 850; }
+    .logic-source-note,
+    .logic-path-kind { color: var(--secondary); font-size: 14px; font-weight: 700; }
+
+    .logic-queue {
+      display: grid;
+      grid-template-columns: 1.12fr 1fr 1fr;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .logic-cell {
+      min-height: 92px;
+      padding: 13px 15px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-2);
+    }
+
+    .logic-cell.playing {
+      border-color: #8cc3ff;
+      background: var(--blue-soft);
+    }
+
+    .logic-label { color: var(--secondary); font-size: 13px; font-weight: 750; }
+    .logic-names { margin-top: 8px; font-size: 18px; line-height: 1.35; font-weight: 850; }
+
+    .logic-branch {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 52px;
+    }
+
+    .logic-branch::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 25px;
+      height: 1px;
+      background: var(--line);
+    }
+
+    .logic-branch span {
+      position: relative;
+      padding: 7px 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--bg);
+      color: var(--secondary);
+      font-size: 14px;
+      font-weight: 800;
+    }
+
+    .logic-paths {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+
+    .logic-path {
+      min-height: 292px;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-top: 6px solid var(--green);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .logic-path.terminal { border-top-color: var(--blue); }
+
+    .logic-action {
+      min-height: 55px;
+      margin-top: 12px;
+      color: var(--secondary);
+      font-size: 15px;
+      line-height: 1.55;
+    }
+
+    .logic-path .logic-queue { gap: 7px; margin-top: 14px; }
+    .logic-path .logic-cell { min-height: 116px; padding: 11px; }
+    .logic-path .logic-label { font-size: 11px; }
+    .logic-path .logic-names { font-size: 16px; }
+
+    .logic-equal {
+      display: grid;
+      grid-template-columns: 74px 1fr;
+      gap: 16px;
+      align-items: center;
+      margin-top: 18px;
+      padding: 16px 22px;
+      border: 1px solid #b7d7ff;
+      border-radius: 8px;
+      background: var(--blue-soft);
+    }
+
+    .logic-equal-mark {
+      color: var(--blue);
+      font-size: 48px;
+      line-height: 1;
+      text-align: center;
+      font-weight: 900;
+    }
+
+    .logic-equal b { display: block; color: #1d65aa; font-size: 22px; }
+    .logic-equal span { display: block; margin-top: 5px; color: #47749f; font-size: 14px; line-height: 1.5; font-weight: 650; }
+
+    .guide-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 36px;
+    }
+
+    .guide-step {
+      position: relative;
+      min-height: 230px;
+      padding: 26px 26px 24px 94px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .guide-number {
+      position: absolute;
+      top: 26px;
+      left: 24px;
+      width: 48px;
+      height: 48px;
+      display: grid;
+      place-items: center;
+      border: 2px solid var(--blue);
+      border-radius: 50%;
+      color: var(--blue);
+      font-size: 17px;
+      font-weight: 900;
+    }
+
+    .guide-step h2 { margin: 2px 0 0; font-size: 25px; }
+    .guide-step p { margin: 12px 0 0; color: var(--secondary); font-size: 17px; line-height: 1.58; }
+    .guide-tags { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+    .guide-tag { padding: 7px 10px; border-radius: 6px; background: var(--surface-2); color: var(--secondary); font-size: 13px; font-weight: 750; }
+    .guide-step:last-child .guide-tag { background: var(--green-soft); color: var(--green); }
+
+    .guide-alert {
+      display: grid;
+      grid-template-columns: 200px 1fr;
+      gap: 22px;
+      align-items: center;
+      margin-top: 18px;
+      padding: 18px 22px;
+      border: 1px solid #efc182;
+      border-radius: 8px;
+      background: var(--amber-soft);
+    }
+
+    .guide-alert b { color: var(--amber); font-size: 18px; }
+    .guide-alert span { color: #79532c; font-size: 15px; line-height: 1.55; font-weight: 650; }
+
+    .faq-list {
+      display: grid;
+      gap: 13px;
+      margin-top: 34px;
+    }
+
+    .faq-item {
+      display: grid;
+      grid-template-columns: 58px 280px 1fr;
+      gap: 20px;
+      align-items: center;
+      min-height: 130px;
+      padding: 20px 24px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .faq-mark {
+      width: 48px;
+      height: 48px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-size: 22px;
+      font-weight: 900;
+    }
+
+    .faq-question { font-size: 20px; line-height: 1.45; font-weight: 850; }
+    .faq-answer { color: var(--secondary); font-size: 16px; line-height: 1.62; }
+    .faq-answer b { color: var(--text); }
+
+    .faq-bottom {
+      margin-top: 18px;
+      padding: 17px 22px;
+      border-left: 6px solid var(--blue);
+      background: var(--surface);
+      color: var(--secondary);
+      font-size: 16px;
+      line-height: 1.55;
+      font-weight: 650;
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 34px;
+    }
+
+    .feature-card {
+      min-height: 244px;
+      padding: 24px 26px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .feature-card:nth-child(1) { border-top: 6px solid var(--amber); }
+    .feature-card:nth-child(2) { border-top: 6px solid var(--amber); }
+    .feature-card:nth-child(3) { border-top: 6px solid var(--green); }
+    .feature-card:nth-child(4) { border-top: 6px solid var(--blue); }
+
+    .feature-name { font-size: 25px; font-weight: 850; }
+    .feature-when { margin-top: 8px; color: var(--tertiary); font-size: 13px; font-weight: 750; }
+    .feature-card p { margin: 18px 0 0; color: var(--secondary); font-size: 17px; line-height: 1.62; }
+    .feature-card p b { color: var(--text); }
+
+    .feature-outcome {
+      display: inline-flex;
+      align-items: center;
+      min-height: 38px;
+      margin-top: 16px;
+      padding: 0 12px;
+      border-radius: 6px;
+      background: var(--surface-2);
+      color: var(--secondary);
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .feature-note {
+      margin-top: 18px;
+      padding: 17px 22px;
+      border: 1px solid #b7d7ff;
+      border-radius: 8px;
+      background: var(--blue-soft);
+      color: #245f99;
+      font-size: 15px;
+      line-height: 1.55;
+      font-weight: 700;
+    }
+
+    body[data-card] .poster { display: none; }
+    body[data-card="1"] .poster[data-poster="1"],
+    body[data-card="2"] .poster[data-poster="2"],
+    body[data-card="3"] .poster[data-poster="3"],
+    body[data-card="4"] .poster[data-poster="4"],
+    body[data-card="5"] .poster[data-poster="5"],
+    body[data-card="6"] .poster[data-poster="6"],
+    body[data-card="7"] .poster[data-poster="7"],
+    body[data-card="8"] .poster[data-poster="8"],
+    body[data-card="9"] .poster[data-poster="9"],
+    body[data-card="10"] .poster[data-poster="10"] { display: block; }
+  </style>
+</head>
+<body>
+  <section class="poster" data-poster="1">
+    <div class="brand-line"><div class="brand">maimai <strong>Q</strong></div><div class="series">PLAYER QUEUE SYSTEM · 01</div></div>
+    <div class="kicker">面向舞萌现场的玩家排队系统</div>
+    <h1>队伍走到哪，<br>心里都有数。</h1>
+    <p class="lede">现场登记，手机查看。顺序、预计等待、游玩偏好和离开状态，都能清楚确认。</p>
+
+    <div class="board">
+      <div class="board-head"><div class="board-title">左侧日框 · 机台 A</div><div class="board-meta">2 个等待位置 · 4 个登记</div></div>
+      <div class="queue-row">
+        <div class="queue-cell playing"><div class="cell-label">游玩位置 A · 已游玩 8 分钟</div><div class="cell-name">青空　北川</div><div class="cell-note">本轮正在进行</div></div>
+        <div class="queue-cell"><div class="cell-label">位置 A1 · 约 7 分钟后</div><div class="cell-name">小雨　夏夜</div><div class="cell-note">允许他人加入</div></div>
+        <div class="queue-cell"><div class="cell-label">位置 A2 · 约 22 分钟后</div><div class="cell-name">星河</div><div class="cell-note">单人游玩</div></div>
+      </div>
+    </div>
+
+    <div class="benefits">
+      <div class="benefit"><b>顺序看得见</b><span>现在到哪一组，不用反复确认</span></div>
+      <div class="benefit"><b>等待有估时</b><span>根据当前轮次和偏好动态计算</span></div>
+      <div class="benefit"><b>状态说得清</b><span>暂缓、暂离、签到都有明确标记</span></div>
+    </div>
+    <div class="rule-note">不是线上预约，也不会替任何人占位。现场安排仍以终端记录和场地规则为准。</div>
+    <div class="poster-footer"><span>玩家自制排队工具 · 与游戏官方无关</span><span>功能以现场实际开放为准</span></div>
+  </section>
+
+  <section class="poster" data-poster="2">
+    <div class="brand-line"><div class="brand">maimai <strong>Q</strong></div><div class="series">DAILY FLOW · 02</div></div>
+    <div class="kicker">今天怎么用？</div>
+    <h1>从登记到轮到你，<br>每一步都有数。</h1>
+    <p class="lede">流程没有变复杂，只是把原来靠记忆和口头传递的信息放到了明面上。</p>
+
+    <div class="flow">
+      <div class="flow-step"><div class="step-no">01</div><div><div class="step-title">现场登记</div><div class="step-copy">选择机台，并确认本次游玩偏好。</div></div><div class="step-side">临时登记<br>玩家资料库<br>移动设备登记</div></div>
+      <div class="flow-step"><div class="step-no">02</div><div><div class="step-title">安心等待</div><div class="step-copy">查看队列位置和预计时间，队伍走到哪一目了然。</div></div><div class="step-side">终端查看<br>网页查看</div></div>
+      <div class="flow-step"><div class="step-no">03</div><div><div class="step-title">按规则处理变化</div><div class="step-copy">临时有事时使用暂缓一轮或暂时离开，不靠口头“留位置”。</div></div><div class="step-side">状态有标记<br>处理有记录</div></div>
+      <div class="flow-step"><div class="step-no">04</div><div><div class="step-title">进入游玩位置</div><div class="step-copy">本轮结束后，系统按队列规则安排下一组。</div></div><div class="step-side">偏好会参与<br>实际组合计算</div></div>
+    </div>
+    <div class="quote">少问一句“现在到谁了”，多一点时间安心打歌。</div>
+    <div class="poster-footer"><span>maimai Q · 日常使用</span><span>预计时间会随现场队列变化</span></div>
+  </section>
+
+  <section class="poster" data-poster="3">
+    <div class="brand-line"><div class="brand">maimai <strong>Q</strong></div><div class="series">PLAY PREFERENCE · 03</div></div>
+    <div class="kicker">不是一条队列硬排到底</div>
+    <h1>单人、拼机、固排，<br>都按本次选择来。</h1>
+    <p class="lede">系统使用正式规则名称记录偏好，并同时计算实际组合与预计等待。</p>
+
+    <div class="preference-grid">
+      <div class="preference"><div class="preference-code">01 · SOLO</div><h2>单人游玩</h2><p>本轮只安排自己，不与其他登记自动组成同一轮。</p></div>
+      <div class="preference"><div class="preference-code">02 · OPEN</div><h2>允许他人加入</h2><p>可以和另一位同样开放的玩家组成共同游玩。</p></div>
+      <div class="preference"><div class="preference-code">03 · FIXED</div><h2>固定组合</h2><p>与指定朋友保持同组，不参与自动重新配对。</p></div>
+    </div>
+
+    <div class="pairing">
+      <div class="pairing-title">队列计算示意</div>
+      <div class="pairing-line"><span class="player-chip open">青空 · 允许加入</span><span class="player-chip open">北川 · 允许加入</span><span class="arrow">→</span><span class="group-chip">共同游玩一轮</span></div>
+      <div class="pairing-line"><span class="player-chip solo">小雨 · 单人游玩</span><span class="arrow">→</span><span class="group-chip">单独游玩一轮</span></div>
+    </div>
+    <div class="rule-note">“拼机”只是玩家常用说法，系统内统一显示“允许他人加入”。</div>
+    <div class="poster-footer"><span>maimai Q · 游玩偏好</span><span>本次选择不会随意覆盖默认偏好</span></div>
+  </section>
+
+  <section class="poster" data-poster="4">
+    <div class="brand-line"><div class="brand">maimai <strong>Q</strong></div><div class="series">QUEUE STATUS · 04</div></div>
+    <div class="kicker">临时有事，也能把状态说清楚</div>
+    <h1>不用再靠口头<br>“帮我留一下”。</h1>
+    <p class="lede">不同状态有不同规则，不会把暂离、暂缓和未签到混成一回事。</p>
+
+    <div class="status-list">
+      <div class="status-row"><div class="status-name">暂缓一轮</div><div class="status-copy"><b>只跳过下一次机会。</b>登记位置不移动，触发后自动解除。</div></div>
+      <div class="status-row"><div class="status-name">暂时离开</div><div class="status-copy"><b>暂时不参与排队计算。</b>回来后需要手动取消；连续轮空会按规则处理。</div></div>
+      <div class="status-row"><div class="status-name">线上登记 · 待签到</div><div class="status-copy"><b>30 分钟内到终端完成签到。</b>轮到时仍未签到，相关登记会退出队列。</div></div>
+      <div class="status-row"><div class="status-name">未到场</div><div class="status-copy"><b>记录现场确认后的处理结果。</b>不会与暂缓一轮或暂时离开混用。</div></div>
+    </div>
+    <div class="quote">谁被跳过、为什么被处理，队列里都有状态，也有记录。</div>
+    <div class="poster-footer"><span>maimai Q · 状态规则</span><span>具体处理以现场终端提示为准</span></div>
+  </section>
+
+  <section class="poster" data-poster="5">
+    <div class="brand-line"><div class="brand">maimai <strong>Q</strong></div><div class="series">WEB & BOT · 05</div></div>
+    <div class="kicker">不用一直守着终端</div>
+    <h1>队伍走到哪，<br>手机也能看。</h1>
+    <p class="lede">网站负责展示，QQ Bot 负责查询与提醒；现场终端仍然是最终依据。</p>
+
+    <div class="online-layout">
+      <div class="phone">
+        <div class="phone-top"><span>排队登记</span><span>04:46</span></div>
+        <h2>当前队列</h2><div class="phone-sub">现场数据将自动刷新</div>
+        <div class="mini-machine">
+          <div class="mini-machine-title">左侧日框 · 机台 A</div><div class="mini-meta">2 个等待位置 · 4 个登记</div>
+          <div class="mini-position"><b>游玩位置 A · 已游玩 8 分钟</b><div class="mini-players"><div class="mini-player">青空<span>允许他人加入</span></div><div class="mini-player">北川<span>允许他人加入</span></div></div></div>
+          <div class="mini-position" style="border-color:#d2d2d7;background:#fafafc"><b style="color:#6e6e73">位置 A1 · 约 7 分钟后</b><div class="mini-players"><div class="mini-player">小雨<span>单人游玩</span></div></div></div>
+        </div>
+      </div>
+      <div>
+        <div class="channels">
+          <div class="channel"><div class="channel-label">WEB</div><h2>网页查看</h2><p>查看当前队列、自己的位置、预计时间和现场状态。</p></div>
+          <div class="channel"><div class="channel-label">QQ BOT</div><h2>查询与提醒</h2><p>查询自己的排队状态；添加 Bot 好友后，可接收与你有关的私信提醒。</p></div>
+          <div class="channel"><div class="channel-label">TERMINAL</div><h2>终端最终确认</h2><p>远程请求不会直接覆盖队列，仍由现场终端按规则校验。</p></div>
+        </div>
+        <div class="online-note">网络暂时断开时，现场终端仍可继续完成排队操作。</div>
+      </div>
+    </div>
+    <div class="poster-footer"><span>maimai Q · 网站与 QQ Bot</span><span>仅展示场地实际开放的功能</span></div>
+  </section>
+
+  <section class="poster" data-poster="6">
+    <div class="brand-line"><div class="brand">maimai <strong>Q</strong></div><div class="series">READ BEFORE USE · 06</div></div>
+    <div class="kicker">先把边界说清楚</div>
+    <h1>它不是抢号工具，<br>是把现场排队说明白。</h1>
+    <p class="lede">规则没有被绕开，信息只是变得更透明、更容易确认。</p>
+
+    <div class="boundary-grid">
+      <div class="boundary-column">
+        <h2>它负责什么</h2>
+        <div class="boundary-item"><b>记录现场登记</b><span>清楚展示当前游玩位置和等待顺序。</span></div>
+        <div class="boundary-item"><b>按偏好计算组合</b><span>单人、允许他人加入和固定组合分别处理。</span></div>
+        <div class="boundary-item"><b>同步队列状态</b><span>让玩家在终端之外也能了解当前进度。</span></div>
+      </div>
+      <div class="boundary-column no">
+        <h2>它不代表什么</h2>
+        <div class="boundary-item"><b>不是线上预约</b><span>线上登记仍需要按提示完成现场签到。</span></div>
+        <div class="boundary-item"><b>不会替人占位</b><span>未到场、未签到和暂离都有明确处理规则。</span></div>
+        <div class="boundary-item"><b>不绕过现场管理</b><span>所有安排以终端记录和场地规则为准。</span></div>
+      </div>
+    </div>
+    <div class="cta"><b>到店后，从现场终端开始。</b><span>想用手机完成现场登记，可以扫描终端上的“使用移动设备登记”二维码。</span></div>
+    <div class="poster-footer"><span>玩家自制排队工具 · 与游戏官方无关</span><span>规则照旧，信息更清楚</span></div>
+  </section>
+
+  <section class="poster poster-board-logic" data-poster="7">
+    <div class="brand-line"><div class="brand">maimai <strong>Q</strong></div><div class="series">BOARD LOGIC · 07</div></div>
+    <div class="kicker">和实体排卡板一样理解</div>
+    <h1>手动怎样挪，<br>终端就怎样走。</h1>
+    <p class="lede">不是另一套陌生规则。相同登记状态、相同排队规则、相同操作，得到相同的队列结果。</p>
+
+    <div class="logic-demo">
+      <div class="logic-source">
+        <div class="logic-source-head"><div class="logic-source-title">本轮结束前</div><div class="logic-source-note">同一块“排卡板”</div></div>
+        <div class="logic-queue">
+          <div class="logic-cell playing"><div class="logic-label">游玩位置 A</div><div class="logic-names">青空　北川</div></div>
+          <div class="logic-cell"><div class="logic-label">位置 A1</div><div class="logic-names">小雨　夏夜</div></div>
+          <div class="logic-cell"><div class="logic-label">位置 A2</div><div class="logic-names">星河　羽毛</div></div>
+        </div>
+      </div>
+
+      <div class="logic-branch"><span>结束本轮，按正常顺序轮换</span></div>
+
+      <div class="logic-paths">
+        <div class="logic-path manual">
+          <div class="logic-path-head"><div class="logic-path-title">实体排卡板</div><div class="logic-path-kind">手动挪卡</div></div>
+          <div class="logic-action">A1 进入游玩位置，A2 前移；本轮玩家回到等待队列末端。</div>
+          <div class="logic-queue">
+            <div class="logic-cell playing"><div class="logic-label">游玩位置 A</div><div class="logic-names">小雨<br>夏夜</div></div>
+            <div class="logic-cell"><div class="logic-label">位置 A1</div><div class="logic-names">星河<br>羽毛</div></div>
+            <div class="logic-cell"><div class="logic-label">位置 A2</div><div class="logic-names">青空<br>北川</div></div>
+          </div>
+        </div>
+        <div class="logic-path terminal">
+          <div class="logic-path-head"><div class="logic-path-title">maimai Q 终端</div><div class="logic-path-kind">规则轮换</div></div>
+          <div class="logic-action">点击结束本轮后，系统按同样的顺序移动每一组登记。</div>
+          <div class="logic-queue">
+            <div class="logic-cell playing"><div class="logic-label">游玩位置 A</div><div class="logic-names">小雨<br>夏夜</div></div>
+            <div class="logic-cell"><div class="logic-label">位置 A1</div><div class="logic-names">星河<br>羽毛</div></div>
+            <div class="logic-cell"><div class="logic-label">位置 A2</div><div class="logic-names">青空<br>北川</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="logic-equal"><div class="logic-equal-mark">=</div><div><b>与实体排卡板逻辑一致，结果始终一致。</b><span>暂缓一轮、暂时离开、游玩偏好等状态，也会先按各自规则处理，再得到对应的轮换结果。</span></div></div>
+    </div>
+    <div class="poster-footer"><span>玩家自制排队工具 · 与游戏官方无关</span><span>规则照旧，操作更清楚</span></div>
+  </section>
+
+  <section class="poster poster-join-guide" data-poster="8">
+    <div class="brand-line"><div class="brand">maimai <strong>Q</strong></div><div class="series">JOIN THE QUEUE · 08</div></div>
+    <div class="kicker">加入排队</div>
+    <h1>四步加入，<br>位置当场确认。</h1>
+    <p class="lede">从现场终端开始，或使用场地已经开放的移动入口；每一步都会告诉你接下来做什么。</p>
+
+    <div class="guide-grid">
+      <div class="guide-step"><div class="guide-number">01</div><h2>选择登记入口</h2><p>在终端直接登记，也可以扫描终端二维码，使用移动设备完成现场登记。</p><div class="guide-tags"><span class="guide-tag">现场终端</span><span class="guide-tag">移动设备</span></div></div>
+      <div class="guide-step"><div class="guide-number">02</div><h2>确认玩家与机台</h2><p>选择玩家资料，并确认要加入的机台。没有长期资料时，可按现场入口创建或使用临时登记。</p><div class="guide-tags"><span class="guide-tag">玩家资料库</span><span class="guide-tag">机台 A / B</span></div></div>
+      <div class="guide-step"><div class="guide-number">03</div><h2>选择本次偏好</h2><p>单人游玩、允许他人加入或固定组合。本次选择会参与实际组合和等待估算。</p><div class="guide-tags"><span class="guide-tag">单人游玩</span><span class="guide-tag">允许他人加入</span><span class="guide-tag">固定组合</span></div></div>
+      <div class="guide-step"><div class="guide-number">04</div><h2>确认队列位置</h2><p>登记成功后查看自己的队列位置。终端会回到队列首页，并标出刚加入的位置。</p><div class="guide-tags"><span class="guide-tag">登记完成</span><span class="guide-tag">位置已确认</span></div></div>
+    </div>
+    <div class="guide-alert"><b>线上登记还要签到</b><span>请在 30 分钟内到现场终端点击“已到场”；轮到时仍未签到，相关登记会退出队列。</span></div>
+    <div class="poster-footer"><span>maimai Q · 加入排队</span><span>入口以现场实际开放为准</span></div>
+  </section>
+
+  <section class="poster poster-quick-help" data-poster="9">
+    <div class="brand-line"><div class="brand">maimai <strong>Q</strong></div><div class="series">QUICK HELP · 09</div></div>
+    <div class="kicker">常见问题</div>
+    <h1>遇到这些情况，<br>先看这里。</h1>
+    <p class="lede">队列一直在变化，但每种状态都有明确含义。下面四项是最容易产生疑问的地方。</p>
+
+    <div class="faq-list">
+      <div class="faq-item"><div class="faq-mark">?</div><div class="faq-question">预计等待时间<br>为什么变了？</div><div class="faq-answer">它会跟随轮次、游玩偏好和队列状态重新计算，<b>是当前估算，不是保证时间。</b></div></div>
+      <div class="faq-item"><div class="faq-mark">?</div><div class="faq-question">线上登记<br>为什么退出了队列？</div><div class="faq-answer">线上登记需要在 <b>30 分钟内</b>到终端签到；如果轮到时仍未签到，也会退出队列。</div></div>
+      <div class="faq-item"><div class="faq-mark">?</div><div class="faq-question">临时有事离开，<br>该选哪个状态？</div><div class="faq-answer">只跳过下一次机会，选<b>暂缓一轮</b>；需要持续离开，选<b>暂时离开</b>，回来后手动取消。</div></div>
+      <div class="faq-item"><div class="faq-mark">?</div><div class="faq-question">网页和现场显示<br>暂时不同怎么办？</div><div class="faq-answer">网络同步可能稍有延迟，可以先刷新页面；<b>现场安排始终以终端记录为准。</b></div></div>
+    </div>
+    <div class="faq-bottom">仍有疑问时，先点击自己的登记查看完整状态与处理记录，再向现场管理者确认。</div>
+    <div class="poster-footer"><span>maimai Q · 常见问题</span><span>具体处理以现场终端提示为准</span></div>
+  </section>
+
+  <section class="poster poster-feature-use" data-poster="10">
+    <div class="brand-line"><div class="brand">maimai <strong>Q</strong></div><div class="series">FEATURE GUIDE · 10</div></div>
+    <div class="kicker">特色功能怎么用？</div>
+    <h1>状态选对了，<br>队列就不会猜。</h1>
+    <p class="lede">每个功能只解决一种现场情况。系统会按对应规则处理，并把结果清楚显示给玩家。</p>
+
+    <div class="feature-grid">
+      <div class="feature-card"><div class="feature-name">暂缓一轮</div><div class="feature-when">适合：只想跳过下一次机会</div><p>登记位置保持不变，本次轮到时跳过；<b>触发一次后自动解除。</b></p><div class="feature-outcome">不需要手动取消</div></div>
+      <div class="feature-card"><div class="feature-name">暂时离开</div><div class="feature-when">适合：需要离开一段时间</div><p>暂时不参与队列计算，回来后手动取消。<b>最多连续轮空 3 次</b>，再次轮到仍未返回会退出队列。</p><div class="feature-outcome">回来后记得取消</div></div>
+      <div class="feature-card"><div class="feature-name">线上登记与签到</div><div class="feature-when">适合：场地已开放线上加入排队</div><p>加入后先标记为待签到。请在 <b>30 分钟内</b>到终端点击“已到场”，轮到时未签到会退出队列。</p><div class="feature-outcome">签到后转为正常登记</div></div>
+      <div class="feature-card"><div class="feature-name">标记为自己</div><div class="feature-when">适合：用手机持续查看进度</div><p>在网页标记自己的登记后，个人状态会显示在顶部，方便查看位置、估时和状态变化。</p><div class="feature-outcome">只影响本机浏览器显示</div></div>
+    </div>
+    <div class="feature-note">功能是否开放，以现场终端设置为准。状态处理完成后，可以在登记详情或网站个人状态中查看结果。</div>
+    <div class="poster-footer"><span>maimai Q · 特色功能</span><span>选对状态，按规则排队</span></div>
+  </section>
+
+  <script>
+    const card = new URLSearchParams(window.location.search).get("card");
+    if (card && /^(?:[1-9]|10)$/.test(card)) document.body.dataset.card = card;
+  </script>
+</body>
+</html>

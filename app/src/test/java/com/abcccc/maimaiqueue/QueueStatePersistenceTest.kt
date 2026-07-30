@@ -95,6 +95,18 @@ class QueueStatePersistenceTest {
     }
 
     @Test
+    fun newestValidSnapshotWinsAcrossPrimaryAndBackup() {
+        val primary = state().copy(revision = 8L, savedAtMillis = 2_000L)
+        val olderBackup = state().copy(revision = 7L, savedAtMillis = 3_000L)
+        val newerBackup = state().copy(revision = 9L, savedAtMillis = 1_000L)
+
+        assertEquals(primary, newestPersistedQueueState(primary, olderBackup))
+        assertEquals(newerBackup, newestPersistedQueueState(primary, newerBackup))
+        assertEquals(primary, newestPersistedQueueState(primary, null))
+        assertEquals(olderBackup, newestPersistedQueueState(null, olderBackup))
+    }
+
+    @Test
     fun anOlderSnapshotCannotOverwriteANewerQueueBatch() {
         val previous = state().copy(revision = 80L)
         val stalePreviousBatchSnapshot = state().copy(
@@ -218,5 +230,48 @@ class QueueStatePersistenceTest {
 
         assertFalse(restored.playing.single().requiresOnSiteCheckIn)
         assertTrue(restored.waiting.single().requiresOnSiteCheckIn)
+    }
+
+    @Test
+    fun restoredQueueRemovesStatesThatConflictWithPlayingOrPendingCheckIn() {
+        val restored = normalizeRestoredMachineQueue(
+            MachineQueue(
+                playing = listOf(
+                    Registration(
+                        key = 1,
+                        displayId = "游玩玩家",
+                        preference = PlayPreference.SOLO,
+                        absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+                        temporaryAwaySkippedTurns = 2,
+                        createdAtMillis = 100L
+                    )
+                ),
+                waiting = listOf(
+                    Registration(
+                        key = 2,
+                        displayId = "线上玩家",
+                        preference = PlayPreference.OPEN_TO_JOIN,
+                        absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND,
+                        fixedPartnerKey = 3,
+                        requiresOnSiteCheckIn = true,
+                        createdAtMillis = 200L
+                    ),
+                    Registration(
+                        key = 3,
+                        displayId = "现场玩家",
+                        preference = PlayPreference.OPEN_TO_JOIN,
+                        fixedPartnerKey = 2,
+                        createdAtMillis = 300L
+                    )
+                )
+            )
+        )
+
+        assertEquals(QueueAbsenceStatus.NONE, restored.playing.single().absenceStatus)
+        assertEquals(0, restored.playing.single().temporaryAwaySkippedTurns)
+        assertEquals(QueueAbsenceStatus.NONE, restored.waiting.first().absenceStatus)
+        assertEquals(null, restored.waiting.first().fixedPartnerKey)
+        assertEquals(null, restored.waiting.last().fixedPartnerKey)
+        assertTrue(restored.invariantViolations().isEmpty())
     }
 }

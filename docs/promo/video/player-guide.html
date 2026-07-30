@@ -1,0 +1,828 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1080, initial-scale=1">
+  <title>maimai Q 玩家使用视频</title>
+  <style>
+    :root {
+      --bg: #f5f5f7;
+      --surface: #ffffff;
+      --ink: #1d1d1f;
+      --muted: #6e6e73;
+      --line: #d2d2d7;
+      --blue: #087cff;
+      --blue-soft: #e8f2ff;
+      --green: #158844;
+      --green-soft: #e9f7ef;
+      --orange: #a65f00;
+      --orange-soft: #fff3df;
+      --red: #c43838;
+      --red-soft: #fff0f0;
+    }
+
+    * { box-sizing: border-box; }
+
+    html,
+    body {
+      width: 1080px;
+      height: 1920px;
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0 0 auto;
+      height: 14px;
+      background: var(--blue);
+      z-index: 20;
+    }
+
+    .scene {
+      display: none;
+      width: 1080px;
+      height: 1920px;
+      padding: 72px 68px 58px;
+      flex-direction: column;
+      background: var(--bg);
+    }
+
+    .topline,
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .topline { min-height: 56px; }
+
+    .brand {
+      font-size: 34px;
+      font-weight: 800;
+    }
+
+    .brand b { color: var(--blue); }
+
+    .chapter,
+    .footer {
+      color: var(--muted);
+      font-size: 21px;
+      font-weight: 700;
+    }
+
+    .footer {
+      min-height: 42px;
+      padding-top: 22px;
+      border-top: 1px solid var(--line);
+    }
+
+    .content {
+      display: flex;
+      flex: 1;
+      min-height: 0;
+      flex-direction: column;
+      justify-content: center;
+    }
+
+    .eyebrow {
+      margin-bottom: 22px;
+      color: var(--blue);
+      font-size: 25px;
+      font-weight: 800;
+    }
+
+    h1,
+    h2,
+    p { margin: 0; }
+
+    h1 {
+      max-width: 930px;
+      font-size: 82px;
+      line-height: 1.18;
+      font-weight: 850;
+    }
+
+    h2 {
+      font-size: 58px;
+      line-height: 1.24;
+      font-weight: 820;
+    }
+
+    .lede {
+      max-width: 900px;
+      margin-top: 30px;
+      color: var(--muted);
+      font-size: 31px;
+      line-height: 1.65;
+    }
+
+    .lead-strong {
+      color: var(--ink);
+      font-weight: 760;
+    }
+
+    .rule {
+      width: 86px;
+      height: 8px;
+      margin: 34px 0;
+      background: var(--blue);
+    }
+
+    .pill-row {
+      display: flex;
+      gap: 14px;
+      margin-top: 46px;
+      flex-wrap: wrap;
+    }
+
+    .pill {
+      padding: 15px 20px;
+      border: 1px solid #b9d8ff;
+      border-radius: 999px;
+      background: var(--blue-soft);
+      color: #075fbf;
+      font-size: 23px;
+      font-weight: 700;
+    }
+
+    .scene-number {
+      margin-bottom: 28px;
+      color: var(--blue);
+      font-size: 26px;
+      font-weight: 800;
+    }
+
+    .section-title {
+      font-size: 98px;
+      line-height: 1.12;
+    }
+
+    .section-copy {
+      max-width: 850px;
+      margin-top: 34px;
+      color: var(--muted);
+      font-size: 32px;
+      line-height: 1.65;
+    }
+
+    .tablet {
+      position: relative;
+      width: 944px;
+      margin-top: 48px;
+      overflow: hidden;
+      border: 10px solid #29292c;
+      border-radius: 8px;
+      background: #29292c;
+      box-shadow: 0 22px 56px rgba(29, 29, 31, 0.16);
+    }
+
+    .tablet img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .tablet.crop-register {
+      height: 650px;
+      background: #f5f5f7;
+    }
+
+    .tablet.crop-register img {
+      width: 1920px;
+      max-width: none;
+      transform: translate(-10px, -140px);
+    }
+
+    .screen-note {
+      display: flex;
+      gap: 18px;
+      align-items: flex-start;
+      margin-top: 34px;
+      padding: 25px 28px;
+      border-left: 6px solid var(--blue);
+      background: var(--surface);
+      font-size: 26px;
+      line-height: 1.55;
+    }
+
+    .step-badge {
+      flex: 0 0 auto;
+      display: grid;
+      width: 48px;
+      height: 48px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--blue);
+      color: white;
+      font-size: 24px;
+      font-weight: 800;
+    }
+
+    .tap-ring {
+      position: absolute;
+      width: 86px;
+      height: 86px;
+      border: 5px solid var(--blue);
+      border-radius: 50%;
+      box-shadow: 0 0 0 14px rgba(8, 124, 255, 0.18);
+    }
+
+    .compare-intro {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      margin-top: 52px;
+    }
+
+    .compare-card {
+      padding: 28px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .compare-card b {
+      display: block;
+      margin-bottom: 14px;
+      font-size: 28px;
+    }
+
+    .compare-card span {
+      color: var(--muted);
+      font-size: 23px;
+      line-height: 1.55;
+    }
+
+    .queue-compare {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 22px;
+      margin-top: 44px;
+    }
+
+    .queue-board {
+      padding: 25px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .queue-board.physical {
+      background: #eef0f3;
+      border-color: #c7c9cd;
+    }
+
+    .board-label {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+      font-size: 24px;
+      font-weight: 800;
+    }
+
+    .board-label small {
+      color: var(--muted);
+      font-size: 18px;
+      font-weight: 650;
+    }
+
+    .position-row {
+      display: grid;
+      grid-template-columns: 92px 1fr;
+      gap: 12px;
+      align-items: stretch;
+      margin-top: 13px;
+    }
+
+    .position-name {
+      display: flex;
+      align-items: center;
+      color: var(--muted);
+      font-size: 19px;
+      font-weight: 750;
+      line-height: 1.35;
+    }
+
+    .player-pair {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      min-height: 82px;
+      padding: 8px;
+      border: 1px solid #cfd1d5;
+      border-radius: 6px;
+      background: #f8f8fa;
+    }
+
+    .playing .player-pair {
+      border-color: #83baff;
+      background: var(--blue-soft);
+    }
+
+    .player-card {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid #dedfe2;
+      border-radius: 5px;
+      background: white;
+      font-size: 20px;
+      font-weight: 780;
+    }
+
+    .physical .player-card {
+      border-color: #aeb1b6;
+      background: #fffefb;
+      box-shadow: 0 2px 5px rgba(29, 29, 31, 0.1);
+    }
+
+    .move-strip,
+    .proof {
+      display: flex;
+      align-items: center;
+      margin-top: 28px;
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .move-strip {
+      justify-content: space-between;
+      padding: 22px 26px;
+      border: 1px solid var(--line);
+      font-size: 23px;
+      font-weight: 750;
+    }
+
+    .move-strip b { color: var(--blue); }
+
+    .proof {
+      gap: 22px;
+      padding: 26px 28px;
+      border: 1px solid #a9dfbf;
+      background: var(--green-soft);
+    }
+
+    .proof-mark {
+      display: grid;
+      width: 58px;
+      height: 58px;
+      flex: 0 0 auto;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--green);
+      color: white;
+      font-size: 31px;
+      font-weight: 900;
+    }
+
+    .proof b,
+    .proof span { display: block; }
+
+    .proof b {
+      font-size: 28px;
+      margin-bottom: 6px;
+    }
+
+    .proof span {
+      color: #376248;
+      font-size: 21px;
+      line-height: 1.5;
+    }
+
+    .split-layout {
+      display: grid;
+      grid-template-columns: 474px 1fr;
+      gap: 38px;
+      align-items: center;
+      margin-top: 40px;
+    }
+
+    .phone {
+      width: 474px;
+      height: 1030px;
+      padding: 12px;
+      overflow: hidden;
+      border-radius: 34px;
+      background: #202124;
+      box-shadow: 0 22px 56px rgba(29, 29, 31, 0.18);
+    }
+
+    .phone-screen {
+      width: 450px;
+      height: 1006px;
+      overflow: hidden;
+      border-radius: 24px;
+      background: white;
+    }
+
+    .phone-screen img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .status-list,
+    .faq-list {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .status-card,
+    .faq-card {
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .status-card b,
+    .faq-card b {
+      display: block;
+      margin-bottom: 9px;
+      font-size: 25px;
+    }
+
+    .status-card span,
+    .faq-card span {
+      color: var(--muted);
+      font-size: 21px;
+      line-height: 1.55;
+    }
+
+    .status-card.orange {
+      border-color: #efd49d;
+      background: var(--orange-soft);
+    }
+
+    .status-card.orange b { color: var(--orange); }
+
+    .status-card.green {
+      border-color: #acd9c0;
+      background: var(--green-soft);
+    }
+
+    .status-card.green b { color: var(--green); }
+
+    .status-card.red {
+      border-color: #e7b7b7;
+      background: var(--red-soft);
+    }
+
+    .status-card.red b { color: var(--red); }
+
+    .preference-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin-top: 30px;
+    }
+
+    .preference-card {
+      min-height: 170px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-top: 6px solid var(--blue);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .preference-card:nth-child(2) { border-top-color: var(--green); }
+    .preference-card:nth-child(3) { border-top-color: var(--orange); }
+
+    .preference-card b {
+      display: block;
+      margin-bottom: 12px;
+      font-size: 24px;
+    }
+
+    .preference-card span {
+      color: var(--muted);
+      font-size: 19px;
+      line-height: 1.5;
+    }
+
+    .bot-message {
+      padding: 28px;
+      white-space: pre-line;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      font-size: 21px;
+      line-height: 1.7;
+      box-shadow: 0 14px 36px rgba(29, 29, 31, 0.09);
+    }
+
+    .bot-message b {
+      display: block;
+      margin-bottom: 14px;
+      font-size: 25px;
+    }
+
+    .boundary-note {
+      margin-top: 30px;
+      padding: 22px 24px;
+      border-left: 6px solid var(--blue);
+      background: var(--blue-soft);
+      color: #17598f;
+      font-size: 21px;
+      line-height: 1.55;
+    }
+
+    .closing-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-top: 54px;
+    }
+
+    .closing-item {
+      min-height: 170px;
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .closing-item b {
+      display: block;
+      margin-bottom: 12px;
+      font-size: 25px;
+    }
+
+    .closing-item span {
+      color: var(--muted);
+      font-size: 20px;
+      line-height: 1.5;
+    }
+
+    .scene-01 .content { justify-content: center; }
+    .scene-01 h1 { font-size: 102px; }
+    .scene-01 .brand { font-size: 48px; }
+
+    .scene-02 .content,
+    .scene-03 .content,
+    .scene-04 .content,
+    .scene-06 .content,
+    .scene-07 .content,
+    .scene-08 .content,
+    .scene-09 .content,
+    .scene-11 .content,
+    .scene-12 .content,
+    .scene-13 .content,
+    .scene-14 .content,
+    .scene-15 .content { justify-content: flex-start; padding-top: 78px; }
+  </style>
+</head>
+<body>
+  <section class="scene scene-01" data-scene="01">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">PLAYER GUIDE</div></div>
+    <div class="content">
+      <div class="eyebrow">面向舞萌现场的玩家排队系统</div>
+      <h1>队伍走到哪，<br>心里都有数。</h1>
+      <div class="rule"></div>
+      <p class="lede">现场登记，手机查看。顺序、预计等待、游玩偏好和离开状态，都能清楚确认。</p>
+      <div class="pill-row"><span class="pill">加入排队</span><span class="pill">查看进度</span><span class="pill">处理临时状态</span></div>
+    </div>
+    <div class="footer"><span>玩家使用指南</span><span>01 / 16</span></div>
+  </section>
+
+  <section class="scene scene-02" data-scene="02">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">QUEUE LOGIC · 01</div></div>
+    <div class="content">
+      <div class="eyebrow">先说最重要的</div>
+      <h2>逻辑与实体排卡板一致</h2>
+      <p class="lede">它不是另一套排队规则。登记按先后排列，再根据本次游玩偏好组成每一轮。</p>
+      <div class="compare-intro">
+        <div class="compare-card"><b>实体排卡板</b><span>当前组完成后，把玩家卡移到队尾，后面的组依次前移。</span></div>
+        <div class="compare-card"><b>终端队列</b><span>执行同一次“本轮结束”，系统按同样顺序完成整组轮换。</span></div>
+      </div>
+      <div class="proof"><div class="proof-mark">✓</div><div><b>手动怎样挪，终端就怎样走</b><span>相同登记状态、相同排队规则、相同操作，得到相同的队列结果。</span></div></div>
+    </div>
+    <div class="footer"><span>排队板只是从实体变成数字</span><span>02 / 16</span></div>
+  </section>
+
+  <section class="scene scene-03" data-scene="03">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">QUEUE LOGIC · 02</div></div>
+    <div class="content">
+      <div class="eyebrow">本轮结束前</div>
+      <h2>两边记录的是同一条队伍</h2>
+      <div class="queue-compare">
+        <div class="queue-board physical">
+          <div class="board-label"><span>实体排卡板</span><small>手动摆卡</small></div>
+          <div class="position-row playing"><div class="position-name">游玩位置</div><div class="player-pair"><div class="player-card">青空</div><div class="player-card">北川</div></div></div>
+          <div class="position-row"><div class="position-name">位置 A1</div><div class="player-pair"><div class="player-card">小雨</div><div class="player-card">夏夜</div></div></div>
+          <div class="position-row"><div class="position-name">位置 A2</div><div class="player-pair"><div class="player-card">星河</div><div class="player-card">羽毛</div></div></div>
+        </div>
+        <div class="queue-board">
+          <div class="board-label"><span>终端队列</span><small>数字记录</small></div>
+          <div class="position-row playing"><div class="position-name">游玩位置</div><div class="player-pair"><div class="player-card">青空</div><div class="player-card">北川</div></div></div>
+          <div class="position-row"><div class="position-name">位置 A1</div><div class="player-pair"><div class="player-card">小雨</div><div class="player-card">夏夜</div></div></div>
+          <div class="position-row"><div class="position-name">位置 A2</div><div class="player-pair"><div class="player-card">星河</div><div class="player-card">羽毛</div></div></div>
+        </div>
+      </div>
+      <div class="move-strip"><span>当前组：<b>青空、北川</b></span><span>下一组：<b>小雨、夏夜</b></span></div>
+      <p class="lede">现在同时执行一次“本轮结束并开始下一轮”。</p>
+    </div>
+    <div class="footer"><span>相同队列 · 相同操作</span><span>03 / 16</span></div>
+  </section>
+
+  <section class="scene scene-04" data-scene="04">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">QUEUE LOGIC · 03</div></div>
+    <div class="content">
+      <div class="eyebrow">本轮结束后</div>
+      <h2>和手动挪卡，结果始终一致</h2>
+      <div class="queue-compare">
+        <div class="queue-board physical">
+          <div class="board-label"><span>实体排卡板</span><small>青空、北川移到队尾</small></div>
+          <div class="position-row playing"><div class="position-name">游玩位置</div><div class="player-pair"><div class="player-card">小雨</div><div class="player-card">夏夜</div></div></div>
+          <div class="position-row"><div class="position-name">位置 A1</div><div class="player-pair"><div class="player-card">星河</div><div class="player-card">羽毛</div></div></div>
+          <div class="position-row"><div class="position-name">位置 A2</div><div class="player-pair"><div class="player-card">青空</div><div class="player-card">北川</div></div></div>
+        </div>
+        <div class="queue-board">
+          <div class="board-label"><span>终端队列</span><small>系统完成同一次轮换</small></div>
+          <div class="position-row playing"><div class="position-name">游玩位置</div><div class="player-pair"><div class="player-card">小雨</div><div class="player-card">夏夜</div></div></div>
+          <div class="position-row"><div class="position-name">位置 A1</div><div class="player-pair"><div class="player-card">星河</div><div class="player-card">羽毛</div></div></div>
+          <div class="position-row"><div class="position-name">位置 A2</div><div class="player-pair"><div class="player-card">青空</div><div class="player-card">北川</div></div></div>
+        </div>
+      </div>
+      <div class="proof"><div class="proof-mark">✓</div><div><b>当前组回到队尾，下一组进入游玩位置</b><span>单人、允许他人加入和固定组合会按各自规则处理，但队列先后不会凭空改变。</span></div></div>
+    </div>
+    <div class="footer"><span>实体排卡板逻辑一致</span><span>04 / 16</span></div>
+  </section>
+
+  <section class="scene" data-scene="05">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">HOW TO JOIN</div></div>
+    <div class="content">
+      <div class="scene-number">01</div>
+      <h1 class="section-title">加入排队</h1>
+      <p class="section-copy">选择机台、确认登记、选择本次游玩偏好。完成后，再核对自己的队列位置。</p>
+    </div>
+    <div class="footer"><span>在现场终端开始</span><span>05 / 16</span></div>
+  </section>
+
+  <section class="scene scene-06" data-scene="06">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">加入排队 · 1 / 3</div></div>
+    <div class="content">
+      <div class="eyebrow">第一步</div>
+      <h2>选择实际要游玩的机台</h2>
+      <div class="tablet"><img src="../../../tmp/queue-step.png" alt="终端选择机台页面"><div class="tap-ring" style="left:220px;top:300px"></div></div>
+      <div class="screen-note"><div class="step-badge">1</div><div><span class="lead-strong">两台机台的队列彼此独立。</span><br>先确认机台，避免加入错误的等待顺序。</div></div>
+    </div>
+    <div class="footer"><span>选择机台</span><span>06 / 16</span></div>
+  </section>
+
+  <section class="scene scene-07" data-scene="07">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">加入排队 · 2 / 3</div></div>
+    <div class="content">
+      <div class="eyebrow">第二步</div>
+      <h2>选择玩家资料或创建临时登记</h2>
+      <div class="tablet crop-register"><img src="../../../tmp/queue-step3.png" alt="终端创建登记页面"><div class="tap-ring" style="left:470px;top:360px"></div></div>
+      <div class="screen-note"><div class="step-badge">2</div><div>昵称应当便于现场辨认。已有资料的玩家直接从资料库选择，不需要重复创建。</div></div>
+    </div>
+    <div class="footer"><span>确认玩家</span><span>07 / 16</span></div>
+  </section>
+
+  <section class="scene scene-08" data-scene="08">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">加入排队 · 3 / 3</div></div>
+    <div class="content">
+      <div class="eyebrow">第三步</div>
+      <h2>确认本次游玩偏好</h2>
+      <div class="tablet"><img src="../../../tmp/queue-step4.png" alt="终端选择游玩偏好页面"><div class="tap-ring" style="left:695px;top:225px"></div></div>
+      <div class="screen-note"><div class="step-badge">3</div><div>偏好会参与本轮分组。常规拼机选择“允许他人加入”；独自游玩或固定组合按实际情况选择。</div></div>
+    </div>
+    <div class="footer"><span>本次游玩偏好</span><span>08 / 16</span></div>
+  </section>
+
+  <section class="scene scene-09" data-scene="09">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">加入排队 · 完成</div></div>
+    <div class="content">
+      <div class="eyebrow">登记完成</div>
+      <h2>回到首页，确认自己的位置</h2>
+      <div class="tablet"><img src="../../../tmp/queue-step5.png" alt="终端排队首页"></div>
+      <div class="screen-note"><div class="step-badge">✓</div><div><span class="lead-strong">位置 A1、A2 表示等待组，不一定只包含一名玩家。</span><br>游玩位置显示当前应当正在机台游玩的玩家。</div></div>
+    </div>
+    <div class="footer"><span>登记成功后再离开终端</span><span>09 / 16</span></div>
+  </section>
+
+  <section class="scene" data-scene="10">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">QUICK HELP</div></div>
+    <div class="content">
+      <div class="scene-number">02</div>
+      <h1 class="section-title">常见问题</h1>
+      <p class="section-copy">先看登记状态，再按对应规则处理。不要因为暂时找不到自己而重复登记。</p>
+    </div>
+    <div class="footer"><span>问题处理</span><span>10 / 16</span></div>
+  </section>
+
+  <section class="scene scene-11" data-scene="11">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">常见问题 · 临时有事</div></div>
+    <div class="content">
+      <div class="eyebrow">临时有事怎么办？</div>
+      <h2>按离开时长选择状态</h2>
+      <div class="split-layout">
+        <div class="phone"><div class="phone-screen"><img src="../../../.codex-tmp/queue-status-0.5.3-mobile-online.png" alt="网站队列状态"></div></div>
+        <div class="status-list">
+          <div class="status-card orange"><b>暂缓一轮</b><span>只跳过一次。触发后自动解除，登记位置不必手动移到队尾。</span></div>
+          <div class="status-card orange"><b>暂时离开</b><span>持续轮空，回场后需要手动解除。连续轮空三次后，再次轮到会退出排队。</span></div>
+          <div class="status-card green"><b>不会堵住队首</b><span>系统会忽略暂时不可进入游玩位置的登记，继续按有效顺序安排。</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="footer"><span>状态会显示在登记上</span><span>11 / 16</span></div>
+  </section>
+
+  <section class="scene scene-12" data-scene="12">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">常见问题 · 线上登记</div></div>
+    <div class="content">
+      <div class="eyebrow">为什么线上登记后还不能游玩？</div>
+      <h2>到场后，还需要完成签到</h2>
+      <div class="split-layout">
+        <div class="phone"><div class="phone-screen"><img src="../../../tmp/queue-online-mobile.png" alt="线上登记完成页面"></div></div>
+        <div class="status-list">
+          <div class="status-card green"><b>在现场终端点击“已到场”</b><span>完成签到后，线上登记才会转换为正常登记。</span></div>
+          <div class="status-card red"><b>30 分钟未签到</b><span>登记会自动移除；提示中的规则固定写明为 30 分钟。</span></div>
+          <div class="status-card red"><b>轮到时仍未签到</b><span>登记同样会被移除，系统继续安排后方有效玩家。</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="footer"><span>线上登记不等于线上预约</span><span>12 / 16</span></div>
+  </section>
+
+  <section class="scene scene-13" data-scene="13">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">常见问题 · 估时与位置</div></div>
+    <div class="content">
+      <div class="eyebrow">预计时间变了，或者找不到自己？</div>
+      <h2>先确认机台、位置和状态</h2>
+      <div class="tablet"><img src="../../../tmp/queue-step5.png" alt="终端排队位置"></div>
+      <div class="faq-list" style="margin-top:30px">
+        <div class="faq-card"><b>预计等待时间会随队列变化</b><span>暂缓、暂离、现场调整和实际游玩时长都会影响估算；它不是实际游玩时间的保证。</span></div>
+        <div class="faq-card"><b>不要重复登记</b><span>先检查是否选错机台、是否处于未到场或待签到状态；仍不一致时，请找现场工作人员核对终端。</span></div>
+      </div>
+    </div>
+    <div class="footer"><span>终端记录是现场最终依据</span><span>13 / 16</span></div>
+  </section>
+
+  <section class="scene scene-14" data-scene="14">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">FEATURES · 游玩偏好</div></div>
+    <div class="content">
+      <div class="eyebrow">特色功能</div>
+      <h2>不是只排人，也会按玩法分组</h2>
+      <div class="tablet"><img src="../../../tmp/queue-step4.png" alt="游玩偏好选择"></div>
+      <div class="preference-grid">
+        <div class="preference-card"><b>单人游玩</b><span>独占一轮，不会自动加入其他玩家。</span></div>
+        <div class="preference-card"><b>允许他人加入</b><span>按有效顺序与下一名开放玩家组成一组。</span></div>
+        <div class="preference-card"><b>固定组合</b><span>两份登记作为整体处理，通常共同游玩。</span></div>
+      </div>
+    </div>
+    <div class="footer"><span>偏好参与每一轮组合计算</span><span>14 / 16</span></div>
+  </section>
+
+  <section class="scene scene-15" data-scene="15">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">FEATURES · 网站与 QQ Bot</div></div>
+    <div class="content">
+      <div class="eyebrow">特色功能</div>
+      <h2>不用一直守着终端</h2>
+      <div class="split-layout">
+        <div class="phone"><div class="phone-screen"><img src="../../../.codex-tmp/queue-status-0.5.3-mobile-online.png" alt="手机查看队列"></div></div>
+        <div>
+          <div class="status-card green" style="margin-bottom:18px"><b>网站查看</b><span>查看队列位置、预计等待、游玩偏好和现场状态。</span></div>
+          <div class="bot-message"><b>【排队通知】</b>左侧日框·机台 A·线上登记签到状态已更新
+“青空”已在现场完成签到。
+
+现在，你位于队列位置 A1，约 10 分钟后可以游玩。</div>
+          <div class="boundary-note">添加 Bot 好友后，才能收到与你有关的私信提醒。现场终端仍然是最终依据。</div>
+        </div>
+      </div>
+    </div>
+    <div class="footer"><span>网站查看 · QQ Bot 提醒</span><span>15 / 16</span></div>
+  </section>
+
+  <section class="scene" data-scene="16">
+    <div class="topline"><div class="brand">maimai <b>Q</b></div><div class="chapter">READY TO PLAY</div></div>
+    <div class="content">
+      <div class="eyebrow">记住这三件事</div>
+      <h1>规则照旧，<br>信息更清楚。</h1>
+      <div class="closing-grid">
+        <div class="closing-item"><b>先在终端登记</b><span>确认机台、玩家和本次游玩偏好。</span></div>
+        <div class="closing-item"><b>再看队列状态</b><span>位置、估时和临时状态都会清楚显示。</span></div>
+        <div class="closing-item"><b>轮到时现场核对</b><span>所有安排以终端记录和场地规则为准。</span></div>
+      </div>
+      <p class="lede">队伍走到哪，心里都有数。</p>
+    </div>
+    <div class="footer"><span>玩家自制排队工具 · 与游戏官方无关</span><span>16 / 16</span></div>
+  </section>
+
+  <script>
+    const scene = new URLSearchParams(window.location.search).get("scene") || "01";
+    const active = document.querySelector(`[data-scene="${scene}"]`);
+    if (active) active.style.display = "flex";
+  </script>
+</body>
+</html>

@@ -51,70 +51,62 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
         }
 
     private fun loadProfiles(): List<PlayerProfile> {
-        val serialized = preferences.getString(KEY_PROFILES, null) ?: return emptyList()
-        return runCatching {
-            val array = JSONArray(serialized)
-            buildList {
-                repeat(array.length()) { index ->
-                    val item = array.optJSONObject(index) ?: return@repeat
-                    val id = item.optString("id").takeIf { it.isNotBlank() } ?: return@repeat
-                    val nickname = item.optString("nickname").trim().takeIf { it.isNotBlank() }
-                        ?: return@repeat
-                    val gender = enumValueOrDefault(
-                        item.optString("gender"),
-                        PlayerGender.UNDISCLOSED
-                    )
-                    val preference = enumValueOrDefault(
-                        item.optString("defaultPreference"),
-                        ProfilePlayPreference.OPEN_TO_JOIN
-                    )
-                    val createdAtMillis = item.optLong("createdAtMillis", 0L)
-                        .takeIf { it > 0L } ?: System.currentTimeMillis()
-                    add(
-                        PlayerProfile(
-                            id = id,
-                            nickname = nickname,
-                            gender = gender,
-                            defaultPreference = preference,
-                            qqNumber = item.optNullableString("qqNumber"),
-                            avatarReference = item.optNullableString("avatarReference"),
-                            usageCount = item.optInt("usageCount", 0).coerceAtLeast(0),
-                            lastUsedAtMillis = item.optLongOrNull("lastUsedAtMillis"),
-                            qqVisibility = enumValueOrDefault(
-                                item.optString("qqVisibility"),
-                                QqVisibility.TERMINAL_ONLY
-                            ),
-                            notificationPreferences = QueueNotificationPreferences(
-                                enabled = item.optBoolean("notificationEnabled", true),
-                                queueChanges = item.optBoolean(
-                                    "notifyQueueChanges",
-                                    true
-                                ),
-                                playingPosition = item.optBoolean(
-                                    "notifyPlayingPosition",
-                                    false
-                                ),
-                                onlineCheckIn = item.optBoolean(
-                                    "notifyOnlineCheckIn",
-                                    true
-                                ),
-                                absence = item.optBoolean("notifyAbsence", true),
-                                machineStatus = item.optBoolean(
-                                    "notifyMachineStatus",
-                                    false
-                                )
-                            ),
-                            setupVersion = item.optInt("setupVersion", 0).coerceAtLeast(0),
-                            revision = item.optLong("revision", 1L).coerceAtLeast(1L),
-                            createdAtMillis = createdAtMillis,
-                            updatedAtMillis = item.optLong("updatedAtMillis", 0L)
-                                .takeIf { it > 0L } ?: createdAtMillis
-                        ).withCanonicalContact()
-                    )
-                }
-            }
-        }.getOrDefault(emptyList())
+        val primary = preferences.getString(KEY_PROFILES, null)?.let(::decodeProfiles)
+        if (primary != null) return primary
+        return preferences.getString(KEY_BACKUP_PROFILES, null)
+            ?.let(::decodeProfiles)
+            .orEmpty()
     }
+
+    private fun decodeProfiles(serialized: String): List<PlayerProfile>? = runCatching {
+        val array = JSONArray(serialized)
+        val profiles = mutableListOf<PlayerProfile>()
+        repeat(array.length()) { index ->
+            val item = array.optJSONObject(index) ?: return@runCatching null
+            val id = item.optString("id").takeIf { it.isNotBlank() }
+                ?: return@runCatching null
+            val nickname = item.optString("nickname").trim().takeIf { it.isNotBlank() }
+                ?: return@runCatching null
+            val gender = enumValueOrDefault(
+                item.optString("gender"),
+                PlayerGender.UNDISCLOSED
+            )
+            val preference = enumValueOrDefault(
+                item.optString("defaultPreference"),
+                ProfilePlayPreference.OPEN_TO_JOIN
+            )
+            val createdAtMillis = item.optLong("createdAtMillis", 0L)
+                .takeIf { it > 0L } ?: System.currentTimeMillis()
+            profiles += PlayerProfile(
+                id = id,
+                nickname = nickname,
+                gender = gender,
+                defaultPreference = preference,
+                qqNumber = item.optNullableString("qqNumber"),
+                avatarReference = item.optNullableString("avatarReference"),
+                usageCount = item.optInt("usageCount", 0).coerceAtLeast(0),
+                lastUsedAtMillis = item.optLongOrNull("lastUsedAtMillis"),
+                qqVisibility = enumValueOrDefault(
+                    item.optString("qqVisibility"),
+                    QqVisibility.TERMINAL_ONLY
+                ),
+                notificationPreferences = QueueNotificationPreferences(
+                    enabled = item.optBoolean("notificationEnabled", true),
+                    queueChanges = item.optBoolean("notifyQueueChanges", true),
+                    playingPosition = item.optBoolean("notifyPlayingPosition", false),
+                    onlineCheckIn = item.optBoolean("notifyOnlineCheckIn", true),
+                    absence = item.optBoolean("notifyAbsence", true),
+                    machineStatus = item.optBoolean("notifyMachineStatus", false)
+                ),
+                setupVersion = item.optInt("setupVersion", 0).coerceAtLeast(0),
+                revision = item.optLong("revision", 1L).coerceAtLeast(1L),
+                createdAtMillis = createdAtMillis,
+                updatedAtMillis = item.optLong("updatedAtMillis", 0L)
+                    .takeIf { it > 0L } ?: createdAtMillis
+            ).withCanonicalContact()
+        }
+        profiles
+    }.getOrNull()
 
     private fun saveProfiles(profiles: List<PlayerProfile>): Boolean {
         val array = JSONArray()
@@ -144,7 +136,15 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                 }
             )
         }
-        return preferences.edit().putString(KEY_PROFILES, array.toString()).commit()
+        val serialized = array.toString()
+        val currentPrimary = preferences.getString(KEY_PROFILES, null)
+            ?.takeIf { decodeProfiles(it) != null }
+        val currentBackup = preferences.getString(KEY_BACKUP_PROFILES, null)
+            ?.takeIf { decodeProfiles(it) != null }
+        return preferences.edit()
+            .putString(KEY_BACKUP_PROFILES, currentPrimary ?: currentBackup ?: serialized)
+            .putString(KEY_PROFILES, serialized)
+            .commit()
     }
 
     private inline fun <reified T : Enum<T>> enumValueOrDefault(value: String, default: T): T =
@@ -158,5 +158,6 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
 
     private companion object {
         const val KEY_PROFILES = "profiles"
+        const val KEY_BACKUP_PROFILES = "previous_valid_profiles"
     }
 }

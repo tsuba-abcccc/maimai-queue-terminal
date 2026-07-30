@@ -49,6 +49,11 @@ data class PersistedQueueState(
 }
 
 class LocalQueueStateRepository(context: Context) : QueueStateRepository {
+    private data class StoredQueueState(
+        val serialized: String,
+        val state: PersistedQueueState
+    )
+
     private val saveMutex = Mutex()
     private val preferences = context.applicationContext.getSharedPreferences(
         "queue_state",
@@ -57,24 +62,47 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
 
     override suspend fun getState(): PersistedQueueState? = withContext(Dispatchers.IO) {
         saveMutex.withLock {
-            preferences.getString(KEY_STATE, null)?.let(::decodeState)
+            newestStoredQueueState(
+                readStoredState(KEY_STATE),
+                readStoredState(KEY_BACKUP_STATE)
+            )?.state
         }
     }
 
     override suspend fun saveState(state: PersistedQueueState): QueueStateSaveResult =
         withContext(Dispatchers.IO) {
         saveMutex.withLock {
-            val persistedState = preferences.getString(KEY_STATE, null)?.let(::decodeState)
-            if (!shouldPersistQueueState(state, persistedState)) {
+            val primaryState = readStoredState(KEY_STATE)
+            val backupState = readStoredState(KEY_BACKUP_STATE)
+            val persistedState = newestStoredQueueState(primaryState, backupState)
+            if (!shouldPersistQueueState(state, persistedState?.state)) {
                 return@withLock QueueStateSaveResult.SUPERSEDED
             }
+            val serialized = encodeState(state).toString()
+            val previousValidSnapshot = persistedState?.serialized ?: serialized
             val saved = runCatching {
                 preferences.edit()
-                    .putString(KEY_STATE, encodeState(state).toString())
+                    .putString(KEY_BACKUP_STATE, previousValidSnapshot)
+                    .putString(KEY_STATE, serialized)
                     .commit()
             }.getOrDefault(false)
             if (saved) QueueStateSaveResult.SAVED else QueueStateSaveResult.FAILED
         }
+    }
+
+    private fun readStoredState(key: String): StoredQueueState? {
+        val serialized = preferences.getString(key, null) ?: return null
+        val state = decodeState(serialized) ?: return null
+        return StoredQueueState(serialized, state)
+    }
+
+    private fun newestStoredQueueState(
+        primary: StoredQueueState?,
+        backup: StoredQueueState?
+    ): StoredQueueState? = when (newestPersistedQueueState(primary?.state, backup?.state)) {
+        primary?.state -> primary
+        backup?.state -> backup
+        else -> null
     }
 
     private fun encodeState(state: PersistedQueueState): JSONObject = JSONObject().apply {
@@ -260,6 +288,7 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
 
     private companion object {
         const val KEY_STATE = "latest"
+        const val KEY_BACKUP_STATE = "previous_valid"
         const val MIN_SUPPORTED_SCHEMA_VERSION = 1
         const val SCHEMA_VERSION = 4
         const val MAX_REGISTRATIONS_PER_MACHINE = 20
@@ -281,7 +310,11 @@ internal fun normalizeRestoredMachineStatus(status: MachineStatus): MachineStatu
 
 internal fun normalizeRestoredMachineQueue(queue: MachineQueue): MachineQueue {
     val playing = normalizeRestoredRegistrations(queue.playing).map {
-        it.copy(requiresOnSiteCheckIn = false)
+        it.copy(
+            absenceStatus = QueueAbsenceStatus.NONE,
+            temporaryAwaySkippedTurns = 0,
+            requiresOnSiteCheckIn = false
+        )
     }
     val waiting = normalizeRestoredRegistrations(queue.waiting)
     return queue.copy(
@@ -298,21 +331,28 @@ private fun normalizeRestoredRegistrations(
     val individuallyNormalized = registrations.map { registration ->
         val displayId = registration.displayId.trim().takeCodePoints(MAX_SYNCED_NICKNAME_CODE_POINTS)
         val noShowCount = registration.noShowCount.coerceIn(0, MAX_SYNCED_NO_SHOW_COUNT)
+        val normalizedAbsenceStatus = if (registration.requiresOnSiteCheckIn) {
+            QueueAbsenceStatus.NONE
+        } else {
+            registration.absenceStatus
+        }
         registration.copy(
             displayId = displayId,
             temporaryAwaySkippedTurns = if (
-                registration.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
+                normalizedAbsenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
             ) {
                 registration.temporaryAwaySkippedTurns.coerceIn(0, 3)
             } else {
                 0
             },
+            absenceStatus = normalizedAbsenceStatus,
             createdAtMillis = registration.createdAtMillis.coerceAtLeast(1L),
             lastPlayedAtMillis = registration.lastPlayedAtMillis?.takeIf { it > 0L },
             noShowCount = noShowCount,
             lastNoShowActionWasDefer = noShowCount > 0 &&
                 registration.lastNoShowActionWasDefer,
-            fixedPartnerKey = registration.fixedPartnerKey?.takeIf { it > 0 },
+            fixedPartnerKey = registration.fixedPartnerKey
+                ?.takeIf { it > 0 && !registration.requiresOnSiteCheckIn },
             playerProfileId = registration.playerProfileId?.trim()?.takeIf { it.isNotEmpty() }
         )
     }
@@ -364,6 +404,17 @@ internal fun shouldPersistQueueState(
     candidate: PersistedQueueState,
     persisted: PersistedQueueState?
 ): Boolean = persisted == null || candidate.revision > persisted.revision
+
+internal fun newestPersistedQueueState(
+    primary: PersistedQueueState?,
+    backup: PersistedQueueState?
+): PersistedQueueState? = when {
+    primary == null -> backup
+    backup == null -> primary
+    backup.revision > primary.revision -> backup
+    backup.revision == primary.revision && backup.savedAtMillis > primary.savedAtMillis -> backup
+    else -> primary
+}
 
 private fun isValidQueueId(value: String): Boolean = runCatching {
     UUID.fromString(value)

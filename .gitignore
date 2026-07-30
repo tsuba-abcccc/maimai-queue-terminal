@@ -3,9 +3,14 @@
 /local.properties
 /.agents/
 /.codex/
+/.codex-tmp/
 /.idea/
 /.kotlin/
 /tmp/
+/docs/promo/video/frames/
+/docs/promo/video/motion-frames/
+/docs/promo/video/qa/
+/docs/promo/video/qa-motion/
 /koishi-bot/node_modules/
 /koishi-bot/lib/
 /koishi-bot/*.tsbuildinfo

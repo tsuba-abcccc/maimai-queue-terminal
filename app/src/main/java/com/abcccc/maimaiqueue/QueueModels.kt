@@ -1354,6 +1354,8 @@ internal fun sanitizeFriendPairs(registrations: List<Registration>): List<Regist
         val partnerIndex = partnerKey?.let { indexByKey[it] }
         val validPair = partner != null &&
             partner.fixedPartnerKey == registration.key &&
+            !registration.requiresOnSiteCheckIn &&
+            !partner.requiresOnSiteCheckIn &&
             partner.requiresOnSiteCheckIn == registration.requiresOnSiteCheckIn &&
             partnerIndex != null &&
             kotlin.math.abs(partnerIndex - index) == 1

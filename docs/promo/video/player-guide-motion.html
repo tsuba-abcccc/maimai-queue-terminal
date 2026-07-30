@@ -1,0 +1,1089 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1080, initial-scale=1">
+  <title>maimai Q 连续操作演示</title>
+  <style>
+    :root {
+      --bg: #f5f5f7;
+      --surface: #ffffff;
+      --surface-2: #fafafc;
+      --ink: #1d1d1f;
+      --muted: #6e6e73;
+      --tertiary: #8e8e93;
+      --line: #d2d2d7;
+      --blue: #087cff;
+      --blue-soft: #e8f2ff;
+      --green: #158844;
+      --green-soft: #e9f7ef;
+      --orange: #a65f00;
+      --orange-soft: #fff3df;
+      --red: #c43838;
+      --red-soft: #fff0f0;
+      --dark: #242426;
+    }
+
+    * { box-sizing: border-box; }
+
+    html,
+    body {
+      width: 1080px;
+      height: 1920px;
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0 0 auto;
+      z-index: 100;
+      height: 14px;
+      background: var(--blue);
+    }
+
+    .global-top {
+      position: fixed;
+      z-index: 90;
+      top: 58px;
+      left: 68px;
+      right: 68px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .brand { font-size: 34px; font-weight: 850; }
+    .brand b { color: var(--blue); }
+    .chapter { color: var(--muted); font-size: 20px; font-weight: 750; }
+
+    .global-footer {
+      position: fixed;
+      z-index: 90;
+      left: 68px;
+      right: 68px;
+      bottom: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+      color: var(--tertiary);
+      font-size: 17px;
+      font-weight: 650;
+    }
+
+    .progress-track {
+      position: fixed;
+      z-index: 110;
+      left: 0;
+      bottom: 0;
+      width: 100%;
+      height: 8px;
+      background: #e0e0e4;
+    }
+
+    .progress-value { width: 0; height: 100%; background: var(--blue); }
+
+    .scene {
+      position: absolute;
+      inset: 0;
+      display: none;
+      padding: 150px 68px 100px;
+      overflow: hidden;
+      background: var(--bg);
+    }
+
+    .scene.active { display: block; }
+    .eyebrow { color: var(--blue); font-size: 25px; font-weight: 800; }
+
+    h1,
+    h2,
+    h3,
+    p { margin: 0; }
+
+    h1 { font-size: 82px; line-height: 1.18; font-weight: 880; }
+    h2 { font-size: 58px; line-height: 1.24; font-weight: 850; }
+    h3 { font-size: 27px; line-height: 1.35; }
+
+    .lede {
+      max-width: 900px;
+      margin-top: 28px;
+      color: var(--muted);
+      font-size: 30px;
+      line-height: 1.62;
+    }
+
+    .accent-rule { width: 88px; height: 8px; margin: 34px 0; background: var(--blue); }
+
+    .intro-content {
+      display: flex;
+      height: 1540px;
+      flex-direction: column;
+      justify-content: center;
+    }
+
+    .intro-content h1 { margin-top: 22px; font-size: 102px; }
+
+    .intro-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-top: 42px;
+    }
+
+    .intro-pill {
+      padding: 14px 20px;
+      border: 1px solid #b9d8ff;
+      border-radius: 999px;
+      background: var(--blue-soft);
+      color: #075fbf;
+      font-size: 22px;
+      font-weight: 750;
+    }
+
+    .deploy-layout {
+      display: grid;
+      grid-template-columns: 1fr 470px;
+      gap: 40px;
+      align-items: center;
+      height: 1530px;
+    }
+
+    .deploy-copy h2 { margin-top: 18px; }
+    .deploy-copy .lede { font-size: 27px; }
+
+    .deploy-list { display: grid; gap: 14px; margin-top: 34px; }
+
+    .deploy-item {
+      display: grid;
+      grid-template-columns: 42px 1fr;
+      gap: 14px;
+      align-items: center;
+      padding: 17px 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 20px;
+      line-height: 1.45;
+    }
+
+    .deploy-check {
+      display: grid;
+      width: 36px;
+      height: 36px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--green-soft);
+      color: var(--green);
+      font-size: 21px;
+      font-weight: 900;
+    }
+
+    .device {
+      position: relative;
+      width: 450px;
+      height: 760px;
+      padding: 14px;
+      border-radius: 28px;
+      background: #242426;
+      box-shadow: 0 28px 64px rgba(29, 29, 31, .2);
+    }
+
+    .device-camera {
+      position: absolute;
+      top: 8px;
+      left: 50%;
+      width: 46px;
+      height: 5px;
+      border-radius: 3px;
+      background: #505054;
+      transform: translateX(-50%);
+    }
+
+    .device-screen {
+      position: relative;
+      width: 422px;
+      height: 732px;
+      overflow: hidden;
+      border-radius: 17px;
+      background: var(--bg);
+    }
+
+    .mini-app { padding: 38px 26px; }
+    .mini-app-title { font-size: 32px; font-weight: 850; }
+    .mini-app-sub { margin-top: 8px; color: var(--muted); font-size: 15px; }
+    .mini-queue { margin-top: 28px; padding: 18px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+    .mini-queue h3 { font-size: 20px; }
+    .mini-position { margin-top: 13px; padding: 14px; border: 1px solid #9bc8ff; border-radius: 7px; background: var(--blue-soft); }
+    .mini-position b { display: block; color: #1768b3; font-size: 14px; }
+    .mini-position span { display: block; margin-top: 8px; font-size: 18px; font-weight: 800; }
+    .mini-start { margin-top: 28px; padding: 17px; border-radius: 8px; background: var(--blue); color: white; text-align: center; font-size: 19px; font-weight: 800; }
+
+    .deploy-note {
+      margin-top: 22px;
+      padding: 18px 20px;
+      border-left: 6px solid var(--blue);
+      background: var(--blue-soft);
+      color: #245f99;
+      font-size: 18px;
+      line-height: 1.5;
+      font-weight: 700;
+    }
+
+    .board-scene-title { margin-top: 66px; }
+    .board-scene-title h2 { margin-top: 14px; }
+
+    .boards {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      margin-top: 42px;
+    }
+
+    .motion-board {
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-top: 7px solid var(--green);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .motion-board.terminal { border-top-color: var(--blue); }
+
+    .motion-board-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 18px;
+    }
+
+    .motion-board-head b { font-size: 25px; }
+    .motion-board-head span { color: var(--muted); font-size: 16px; font-weight: 700; }
+
+    .board-track { position: relative; height: 410px; }
+
+    .board-lane {
+      position: absolute;
+      left: 0;
+      right: 0;
+      height: 116px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-2);
+    }
+
+    .board-lane.playing { border-color: #94c5ff; background: var(--blue-soft); }
+    .board-lane:nth-child(1) { top: 0; }
+    .board-lane:nth-child(2) { top: 136px; }
+    .board-lane:nth-child(3) { top: 272px; }
+    .board-lane-label { position: absolute; top: 15px; left: 14px; color: var(--muted); font-size: 14px; font-weight: 750; }
+
+    .moving-pair {
+      position: absolute;
+      z-index: 4;
+      top: 42px;
+      left: 14px;
+      right: 14px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      height: 58px;
+      will-change: transform;
+    }
+
+    .moving-card {
+      display: grid;
+      place-items: center;
+      border: 1px solid #d6d7da;
+      border-radius: 6px;
+      background: white;
+      font-size: 18px;
+      font-weight: 800;
+      box-shadow: 0 3px 8px rgba(29, 29, 31, .08);
+    }
+
+    .board-action {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 22px;
+      padding: 20px 23px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    .board-action b { color: var(--blue); }
+
+    .board-proof {
+      display: grid;
+      grid-template-columns: 60px 1fr;
+      gap: 18px;
+      align-items: center;
+      margin-top: 20px;
+      padding: 22px 25px;
+      border: 1px solid #a9dfbf;
+      border-radius: 8px;
+      background: var(--green-soft);
+    }
+
+    .board-proof-mark {
+      display: grid;
+      width: 54px;
+      height: 54px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--green);
+      color: white;
+      font-size: 30px;
+      font-weight: 900;
+    }
+
+    .board-proof b { display: block; font-size: 25px; }
+    .board-proof span { display: block; margin-top: 5px; color: #376248; font-size: 18px; line-height: 1.5; }
+
+    .flow-heading { margin-top: 52px; }
+    .flow-heading h2 { margin-top: 14px; }
+
+    .flow-meta {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-top: 20px;
+      color: var(--muted);
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    .step-index {
+      display: grid;
+      min-width: 70px;
+      height: 36px;
+      place-items: center;
+      border-radius: 18px;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-size: 16px;
+      font-weight: 850;
+    }
+
+    .terminal-shell {
+      position: relative;
+      width: 944px;
+      height: 760px;
+      margin-top: 30px;
+      padding: 10px;
+      overflow: hidden;
+      border-radius: 18px;
+      background: #29292c;
+      box-shadow: 0 24px 58px rgba(29, 29, 31, .17);
+    }
+
+    .terminal-screen {
+      position: relative;
+      width: 924px;
+      height: 740px;
+      overflow: hidden;
+      border-radius: 10px;
+      background: var(--bg);
+    }
+
+    .app-page {
+      position: absolute;
+      inset: 0;
+      display: none;
+      padding: 34px 36px;
+      overflow: hidden;
+      background: var(--bg);
+      will-change: opacity, transform;
+    }
+
+    .app-page.visible { display: block; }
+    .app-top { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 15px; font-weight: 700; }
+    .app-back { color: var(--blue); font-size: 16px; }
+    .app-title { margin-top: 64px; font-size: 38px; font-weight: 850; }
+    .app-sub { margin-top: 8px; color: var(--muted); font-size: 17px; line-height: 1.5; }
+    .app-card-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 34px; }
+
+    .app-option {
+      min-height: 190px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: white;
+    }
+
+    .app-option.selected { border: 2px solid var(--blue); background: var(--blue-soft); }
+    .app-option h3 { font-size: 24px; }
+    .app-option p { margin-top: 12px; color: var(--muted); font-size: 15px; line-height: 1.5; }
+    .app-option .app-link { margin-top: 32px; color: var(--blue); font-size: 16px; font-weight: 700; }
+
+    .app-button {
+      display: grid;
+      height: 58px;
+      place-items: center;
+      border-radius: 8px;
+      background: var(--blue);
+      color: white;
+      font-size: 19px;
+      font-weight: 800;
+    }
+
+    .app-button.secondary { background: var(--blue-soft); color: var(--blue); }
+
+    .home-layout { display: grid; grid-template-columns: 1fr 250px; gap: 20px; margin-top: 26px; }
+    .home-machine { min-height: 470px; padding: 22px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+    .home-machine-head { display: flex; align-items: center; justify-content: space-between; }
+    .home-machine-head b { font-size: 23px; }
+    .home-machine-head span { color: var(--muted); font-size: 14px; }
+    .home-queue { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 24px; }
+    .home-position { min-height: 158px; padding: 15px; border: 1px solid #9ac9ff; border-radius: 8px; background: var(--blue-soft); }
+    .home-position b { display: block; color: var(--blue); font-size: 14px; }
+    .home-player { margin-top: 12px; padding: 12px; border-radius: 6px; background: white; font-size: 16px; font-weight: 800; }
+    .home-player small { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; font-weight: 650; }
+    .home-join { display: flex; min-height: 470px; padding: 22px; flex-direction: column; justify-content: center; border: 1px solid var(--line); border-radius: 8px; background: white; }
+    .home-join h3 { font-size: 26px; }
+    .home-join p { margin: 10px 0 28px; color: var(--muted); font-size: 15px; line-height: 1.5; }
+
+    .method-helper { display: flex; align-items: center; gap: 12px; margin-top: 18px; }
+    .small-action { display: grid; height: 42px; padding: 0 15px; place-items: center; border: 1px solid rgba(8,124,255,.14); border-radius: 7px; background: var(--blue-soft); color: var(--blue); font-size: 14px; font-weight: 750; }
+    .method-helper span { color: var(--muted); font-size: 13px; }
+
+    .search-box { margin-top: 24px; padding: 15px 18px; border: 1px solid var(--line); border-radius: 8px; background: white; color: var(--tertiary); font-size: 15px; }
+    .profile-list { display: grid; gap: 11px; margin-top: 16px; }
+    .profile-row { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: center; min-height: 92px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+    .profile-row b { display: block; font-size: 19px; }
+    .profile-row span { display: block; margin-top: 6px; color: var(--muted); font-size: 13px; }
+    .profile-row strong { color: var(--blue); font-size: 14px; }
+
+    .preference-actions { display: flex; align-items: center; gap: 12px; margin-top: 18px; }
+    .complete-button { margin-top: 20px; }
+
+    .new-registration {
+      border-color: #60b983;
+      background: var(--green-soft);
+      box-shadow: 0 0 0 0 rgba(21,136,68,.18);
+    }
+
+    .new-registration b { color: var(--green); }
+
+    .flow-caption {
+      display: grid;
+      grid-template-columns: 52px 1fr;
+      gap: 16px;
+      align-items: center;
+      margin-top: 26px;
+      padding: 20px 22px;
+      border-left: 6px solid var(--blue);
+      background: white;
+      color: var(--muted);
+      font-size: 21px;
+      line-height: 1.5;
+    }
+
+    .caption-mark { display: grid; width: 46px; height: 46px; place-items: center; border-radius: 50%; background: var(--blue); color: white; font-weight: 900; }
+
+    .pointer {
+      position: absolute;
+      z-index: 50;
+      display: none;
+      width: 50px;
+      height: 50px;
+      border: 4px solid white;
+      border-radius: 50%;
+      background: var(--blue);
+      box-shadow: 0 5px 14px rgba(29,29,31,.28);
+      transform: translate(-50%, -50%);
+      will-change: left, top, opacity, transform;
+    }
+
+    .pointer.visible { display: block; }
+
+    .pointer::after {
+      content: "";
+      position: absolute;
+      inset: -18px;
+      border: 4px solid var(--blue);
+      border-radius: 50%;
+      opacity: var(--tap-opacity, 0);
+      transform: scale(var(--tap-scale, .6));
+    }
+
+    .status-heading { margin-top: 54px; }
+    .status-heading h2 { margin-top: 14px; }
+
+    .status-demo {
+      display: grid;
+      grid-template-columns: 1.1fr .9fr;
+      gap: 20px;
+      margin-top: 34px;
+    }
+
+    .status-queue,
+    .status-panel { min-height: 620px; padding: 25px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+    .status-queue h3,
+    .status-panel h3 { font-size: 25px; }
+    .status-queue-sub { margin-top: 6px; color: var(--muted); font-size: 15px; }
+    .status-position { position: relative; margin-top: 22px; padding: 18px; border: 1px solid #9bc8ff; border-radius: 8px; background: var(--blue-soft); }
+    .status-position b { display: block; color: var(--blue); font-size: 15px; }
+    .status-person { position: relative; margin-top: 12px; padding: 17px; border-radius: 7px; background: white; font-size: 18px; font-weight: 800; }
+    .status-person small { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; }
+    .status-badge { display: inline-block; margin-top: 8px; padding: 5px 8px; border-radius: 5px; background: var(--orange-soft); color: var(--orange); font-size: 12px; font-weight: 800; }
+    .status-action-list { display: grid; gap: 10px; margin-top: 20px; }
+    .status-action { padding: 15px 16px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); font-size: 15px; }
+    .status-action b { color: var(--ink); }
+    .status-choice { margin-top: 20px; padding: 18px; border: 1px solid #efc182; border-radius: 8px; background: var(--orange-soft); }
+    .status-choice b { display: block; color: var(--orange); font-size: 18px; }
+    .status-choice span { display: block; margin-top: 8px; color: #79532c; font-size: 14px; line-height: 1.5; }
+    .status-explain { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 18px; }
+    .status-explain-card { padding: 18px; border-left: 5px solid var(--orange); background: white; }
+    .status-explain-card b { display: block; font-size: 18px; }
+    .status-explain-card span { display: block; margin-top: 7px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+
+    .online-heading { margin-top: 54px; }
+    .online-heading h2 { margin-top: 14px; }
+    .online-demo { display: grid; grid-template-columns: 390px 1fr; gap: 28px; align-items: center; margin-top: 36px; }
+
+    .phone-shell {
+      width: 390px;
+      height: 760px;
+      padding: 11px;
+      border-radius: 31px;
+      background: var(--dark);
+      box-shadow: 0 22px 50px rgba(29,29,31,.18);
+    }
+
+    .phone-content { height: 738px; padding: 34px 24px; overflow: hidden; border-radius: 22px; background: white; }
+    .phone-top { display: flex; justify-content: space-between; color: var(--muted); font-size: 13px; font-weight: 800; }
+    .phone-content h3 { margin-top: 30px; font-size: 28px; }
+    .phone-success { margin-top: 26px; padding: 20px; border: 1px solid #afd9c0; border-radius: 8px; background: var(--green-soft); }
+    .phone-success b { color: var(--green); font-size: 17px; }
+    .phone-success p { margin-top: 9px; color: #376248; font-size: 14px; line-height: 1.55; }
+    .phone-rule { margin-top: 20px; color: var(--muted); font-size: 14px; line-height: 1.6; }
+
+    .checkin-panel { position: relative; min-height: 600px; padding: 28px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+    .checkin-panel h3 { font-size: 26px; }
+    .checkin-registration { margin-top: 24px; padding: 20px; border: 1px solid #8ed0aa; border-radius: 8px; background: var(--green-soft); }
+    .checkin-registration b { display: block; font-size: 21px; }
+    .checkin-registration span { display: inline-block; margin-top: 10px; padding: 5px 9px; border-radius: 5px; background: var(--orange-soft); color: var(--orange); font-size: 13px; font-weight: 800; }
+    .checkin-button { margin-top: 22px; background: var(--green); }
+    .checkin-result { margin-top: 20px; padding: 16px; border-left: 5px solid var(--green); background: var(--green-soft); color: #376248; font-size: 16px; line-height: 1.5; font-weight: 700; }
+    .online-rule { margin-top: 24px; padding: 19px 22px; border: 1px solid #efc182; border-radius: 8px; background: var(--orange-soft); color: #79532c; font-size: 17px; line-height: 1.55; font-weight: 700; }
+
+    .help-heading { margin-top: 64px; }
+    .help-heading h2 { margin-top: 14px; }
+    .help-list { display: grid; gap: 16px; margin-top: 42px; }
+
+    .help-item {
+      display: grid;
+      grid-template-columns: 58px 290px 1fr;
+      gap: 20px;
+      align-items: center;
+      min-height: 150px;
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: white;
+    }
+
+    .help-mark { display: grid; width: 50px; height: 50px; place-items: center; border-radius: 50%; background: var(--blue-soft); color: var(--blue); font-size: 23px; font-weight: 900; }
+    .help-item h3 { font-size: 21px; }
+    .help-item p { color: var(--muted); font-size: 17px; line-height: 1.6; }
+    .help-item p b { color: var(--ink); }
+    .help-meter { margin-top: 34px; padding: 22px; border-left: 6px solid var(--blue); background: white; }
+    .help-meter-top { display: flex; justify-content: space-between; align-items: baseline; }
+    .help-meter-top b { font-size: 21px; }
+    .help-meter-top span { color: var(--blue); font-size: 20px; font-weight: 800; }
+    .meter-track { height: 10px; margin-top: 16px; overflow: hidden; border-radius: 5px; background: #dedfe3; }
+    .meter-value { width: 40%; height: 100%; border-radius: 5px; background: var(--blue); }
+
+    .outro-content { display: flex; height: 1510px; flex-direction: column; justify-content: center; }
+    .outro-content h1 { margin-top: 18px; font-size: 92px; }
+    .outro-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-top: 46px; }
+    .outro-card { min-height: 190px; padding: 23px; border-top: 6px solid var(--blue); background: white; }
+    .outro-card:nth-child(2) { border-top-color: var(--green); }
+    .outro-card:nth-child(3) { border-top-color: var(--orange); }
+    .outro-card b { display: block; font-size: 22px; }
+    .outro-card span { display: block; margin-top: 11px; color: var(--muted); font-size: 16px; line-height: 1.55; }
+    .outro-note { margin-top: 28px; color: var(--muted); font-size: 20px; line-height: 1.55; }
+  </style>
+</head>
+<body>
+  <div class="global-top"><div class="brand">maimai <b>Q</b></div><div class="chapter" id="chapter">PLAYER GUIDE</div></div>
+  <div class="global-footer"><span>玩家自制排队工具 · 与游戏官方无关</span><span id="scene-count">01 / 08</span></div>
+  <div class="progress-track"><div class="progress-value" id="progress"></div></div>
+
+  <section class="scene" id="scene-intro">
+    <div class="intro-content">
+      <div class="eyebrow intro-reveal">面向舞萌现场的玩家排队系统</div>
+      <h1 class="intro-reveal">队伍走到哪，<br>心里都有数。</h1>
+      <div class="accent-rule intro-reveal"></div>
+      <p class="lede intro-reveal">从现场登记到进入游玩位置，完整走一遍实际使用过程。</p>
+      <div class="intro-pills">
+        <span class="intro-pill">加入排队</span>
+        <span class="intro-pill">查看进度</span>
+        <span class="intro-pill">处理临时状态</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="scene" id="scene-deploy">
+    <div class="deploy-layout">
+      <div class="deploy-copy">
+        <div class="eyebrow deploy-reveal">线下部署很简单</div>
+        <h2 class="deploy-reveal">一台 Android 平板，<br>就能开始现场排队。</h2>
+        <p class="lede deploy-reveal">不需要额外购买成套排卡板、读卡器等外设。安装终端应用后，就能按实体排卡板的逻辑使用。</p>
+        <div class="deploy-list">
+          <div class="deploy-item"><span class="deploy-check">✓</span><span>终端可独立完成现场登记与轮换</span></div>
+          <div class="deploy-item"><span class="deploy-check">✓</span><span>网站和 QQ Bot 可以按需要再接入</span></div>
+          <div class="deploy-item"><span class="deploy-check">✓</span><span>网络暂时断开，也不影响本地排队操作</span></div>
+        </div>
+        <div class="deploy-note">准备兼容的 Android 平板和稳定摆放位置，即可投入现场使用。</div>
+      </div>
+      <div class="device" id="deploy-device">
+        <div class="device-camera"></div>
+        <div class="device-screen">
+          <div class="mini-app">
+            <div class="mini-app-title">排队登记</div>
+            <div class="mini-app-sub">现场队列由终端统一记录</div>
+            <div class="mini-queue"><h3>左侧 · 机台 A</h3><div class="mini-position"><b>游玩位置 A</b><span>青空　北川</span></div><div class="mini-position"><b>位置 A1</b><span>小雨　夏夜</span></div></div>
+            <div class="mini-start">加入排队</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="scene" id="scene-board">
+    <div class="board-scene-title">
+      <div class="eyebrow board-reveal">最核心的特点</div>
+      <h2 class="board-reveal">手动怎样挪，终端就怎样走。</h2>
+      <p class="lede board-reveal">相同登记状态、相同规则、相同操作，两边得到相同结果。</p>
+    </div>
+    <div class="boards">
+      <div class="motion-board physical">
+        <div class="motion-board-head"><b>实体排卡板</b><span>手动挪卡</span></div>
+        <div class="board-track">
+          <div class="board-lane playing"><span class="board-lane-label">游玩位置 A</span></div>
+          <div class="board-lane"><span class="board-lane-label">位置 A1</span></div>
+          <div class="board-lane"><span class="board-lane-label">位置 A2</span></div>
+          <div class="moving-pair pair-current"><div class="moving-card">青空</div><div class="moving-card">北川</div></div>
+          <div class="moving-pair pair-next"><div class="moving-card">小雨</div><div class="moving-card">夏夜</div></div>
+          <div class="moving-pair pair-third"><div class="moving-card">星河</div><div class="moving-card">羽毛</div></div>
+        </div>
+      </div>
+      <div class="motion-board terminal">
+        <div class="motion-board-head"><b>终端队列</b><span>规则轮换</span></div>
+        <div class="board-track">
+          <div class="board-lane playing"><span class="board-lane-label">游玩位置 A</span></div>
+          <div class="board-lane"><span class="board-lane-label">位置 A1</span></div>
+          <div class="board-lane"><span class="board-lane-label">位置 A2</span></div>
+          <div class="moving-pair pair-current"><div class="moving-card">青空</div><div class="moving-card">北川</div></div>
+          <div class="moving-pair pair-next"><div class="moving-card">小雨</div><div class="moving-card">夏夜</div></div>
+          <div class="moving-pair pair-third"><div class="moving-card">星河</div><div class="moving-card">羽毛</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="board-action" id="board-action"><span>执行同一次操作</span><b>结束本轮并开始下一轮</b></div>
+    <div class="board-proof" id="board-proof"><div class="board-proof-mark">=</div><div><b>下一组进入游玩位置，本轮玩家回到等待队列末端。</b><span>不是近似模拟，而是按同一套排卡逻辑计算。</span></div></div>
+  </section>
+
+  <section class="scene" id="scene-flow">
+    <div class="flow-heading">
+      <div class="eyebrow">完整操作演示</div>
+      <h2>从加入排队，到确认自己的位置</h2>
+      <div class="flow-meta"><span class="step-index" id="flow-step">1 / 6</span><span id="flow-title">从首页开始</span></div>
+    </div>
+    <div class="terminal-shell">
+      <div class="terminal-screen">
+        <div class="app-page" data-page="home">
+          <div class="app-top"><span>排队登记</span><span>已同步</span></div>
+          <div class="home-layout">
+            <div class="home-machine"><div class="home-machine-head"><b>左侧 · 机台 A</b><span>1 个等待位置</span></div><div class="home-queue"><div class="home-position"><b>游玩位置 A</b><div class="home-player">青空<small>允许他人加入</small></div></div><div class="home-position"><b>位置 A1</b><div class="home-player">小雨<small>允许他人加入</small></div></div></div></div>
+            <div class="home-join"><h3>加入排队</h3><p>创建登记并加入现场队列。</p><div class="app-button" data-target="start">开始</div></div>
+          </div>
+        </div>
+
+        <div class="app-page" data-page="machine">
+          <div class="app-top"><span class="app-back">‹ 返回</span><span>1 / 3</span></div>
+          <div class="app-title">选择机台</div><div class="app-sub">每台机台都有独立的登记顺序。</div>
+          <div class="app-card-row">
+            <div class="app-option" data-target="machine-a"><h3>左侧 · 机台 A</h3><p>现有 2 份有效登记。</p><div class="app-link">选择这台机台 →</div></div>
+            <div class="app-option"><h3>右侧 · 机台 B</h3><p>目前没有登记，可以直接开始。</p><div class="app-link">选择这台机台 →</div></div>
+          </div>
+        </div>
+
+        <div class="app-page" data-page="method">
+          <div class="app-top"><span class="app-back">‹ 返回</span><span>2 / 3</span></div>
+          <div class="app-title">创建你的排队登记</div><div class="app-sub">选择一种可以确认你身份的方式。</div>
+          <div class="app-card-row">
+            <div class="app-option" data-target="library"><h3>使用玩家资料库</h3><p>从本机保存的玩家资料中选择，并沿用常用设置。</p><div class="app-link">选择玩家资料 →</div></div>
+            <div class="app-option"><h3>使用移动设备登记</h3><p>扫码后，在移动设备上选择或新建玩家资料。</p><div class="app-link">生成登记二维码 →</div></div>
+          </div>
+          <div class="method-helper"><div class="small-action">创建临时登记</div><span>不保存玩家资料，只输入本次排队使用的昵称。</span></div>
+        </div>
+
+        <div class="app-page" data-page="library">
+          <div class="app-top"><span class="app-back">‹ 返回</span><span>玩家资料库</span></div>
+          <div class="app-title">选择玩家资料</div><div class="app-sub">找到自己的资料后，核对昵称与默认游玩偏好。</div>
+          <div class="search-box">搜索昵称或 QQ</div>
+          <div class="profile-list">
+            <div class="profile-row" data-target="profile"><div><b>羽毛</b><span>QQ：123456789 · 允许他人加入</span></div><strong>选择 →</strong></div>
+            <div class="profile-row"><div><b>青空</b><span>QQ：223456789 · 单人游玩</span></div><strong>选择 →</strong></div>
+            <div class="profile-row"><div><b>北川</b><span>QQ：323456789 · 允许他人加入</span></div><strong>选择 →</strong></div>
+          </div>
+        </div>
+
+        <div class="app-page" data-page="preference">
+          <div class="app-top"><span class="app-back">‹ 返回</span><span>3 / 3</span></div>
+          <div class="app-title">选择你的游玩偏好</div><div class="app-sub">本次选择会显示在登记中，并参与每一轮组合。</div>
+          <div class="app-card-row">
+            <div class="app-option"><h3>单人游玩</h3><p>这份登记单独占用一个等待位置。</p></div>
+            <div class="app-option" data-target="open"><h3>允许他人加入</h3><p>按有效顺序与后来的开放登记组成一组。</p></div>
+          </div>
+          <div class="preference-actions"><div class="small-action">与朋友共同游玩</div><span class="app-sub" style="margin:0">与指定玩家形成固定组合。</span></div>
+          <div class="app-button complete-button" data-target="complete">完成并加入排队</div>
+        </div>
+
+        <div class="app-page" data-page="complete">
+          <div class="app-top"><span>排队登记</span><span>已同步</span></div>
+          <div class="home-layout">
+            <div class="home-machine"><div class="home-machine-head"><b>左侧 · 机台 A</b><span>2 个等待位置</span></div><div class="home-queue"><div class="home-position"><b>游玩位置 A</b><div class="home-player">青空<small>允许他人加入</small></div></div><div class="home-position"><b>位置 A1</b><div class="home-player">小雨<small>允许他人加入</small></div></div><div class="home-position new-registration" id="new-registration"><b>位置 A2 · 刚刚加入</b><div class="home-player">羽毛<small>允许他人加入</small></div></div></div></div>
+            <div class="home-join"><h3>登记完成</h3><p>自己的登记已经加入等待顺序。</p><div class="app-button secondary">查看位置 A2</div></div>
+          </div>
+        </div>
+
+        <div class="pointer" id="flow-pointer"></div>
+      </div>
+    </div>
+    <div class="flow-caption"><div class="caption-mark" id="caption-mark">1</div><div id="flow-caption">点击“开始”，选择实际要游玩的机台。</div></div>
+  </section>
+
+  <section class="scene" id="scene-status">
+    <div class="status-heading"><div class="eyebrow">临时有事怎么办？</div><h2>点击自己的登记，选择对应状态</h2><p class="lede">只跳过一次和持续离开，是两种不同处理。</p></div>
+    <div class="status-demo">
+      <div class="status-queue"><h3>左侧 · 机台 A</h3><div class="status-queue-sub">点击位置 A1 中的“小雨”</div><div class="status-position"><b>位置 A1</b><div class="status-person" id="status-person">小雨<small>允许他人加入</small><span class="status-badge" id="status-badge">暂缓一轮</span></div><div class="status-person">夏夜<small>允许他人加入</small></div></div></div>
+      <div class="status-panel" id="status-panel"><h3>队列位置 A1 · 小雨</h3><div class="status-action-list"><div class="status-action"><b>暂缓或暂离</b><br>处理短暂无法游玩的情况</div><div class="status-action">切换机台</div><div class="status-action">修改游玩偏好</div><div class="status-action">退出排队</div></div><div class="status-choice" id="status-choice"><b>暂缓一轮</b><span>只跳过下一次机会，触发一次后自动解除，登记位置不变。</span></div></div>
+    </div>
+    <div class="status-explain"><div class="status-explain-card"><b>暂缓一轮</b><span>只跳过下一次机会，之后自动恢复。</span></div><div class="status-explain-card"><b>暂时离开</b><span>持续不参与队列计算，回来后需要手动取消。</span></div></div>
+    <div class="pointer" id="status-pointer"></div>
+  </section>
+
+  <section class="scene" id="scene-online">
+    <div class="online-heading"><div class="eyebrow">线上登记</div><h2>加入成功后，到现场完成签到</h2><p class="lede">线上登记不是线上预约；签到后才会转换为正常登记。</p></div>
+    <div class="online-demo">
+      <div class="phone-shell" id="online-phone"><div class="phone-content"><div class="phone-top"><span>移动设备登记</span><span>04:46</span></div><h3>登记已加入队列</h3><div class="phone-success"><b>左侧 · 机台 A · 位置 A2</b><p>羽毛 · 允许他人加入<br>当前状态：线上登记 · 待签到</p></div><div class="phone-rule">请在 30 分钟内到现场终端签到。轮到时仍未签到，登记也会退出队列。</div></div></div>
+      <div class="checkin-panel" id="checkin-panel"><h3>终端登记详情</h3><div class="checkin-registration"><b>羽毛</b><span id="checkin-badge">线上登记 · 待签到</span></div><div class="app-button checkin-button" id="checkin-button">已到场</div><div class="checkin-result" id="checkin-result">签到完成，登记已转换为正常登记。</div><div class="pointer" id="checkin-pointer"></div></div>
+    </div>
+    <div class="online-rule">请在 30 分钟内签到；如果更早轮到，则必须在进入游玩位置前完成签到。</div>
+  </section>
+
+  <section class="scene" id="scene-help">
+    <div class="help-heading"><div class="eyebrow">常见问题</div><h2>先看状态，再决定怎么处理</h2><p class="lede">不要因为暂时找不到自己，就立即创建重复登记。</p></div>
+    <div class="help-list">
+      <div class="help-item"><div class="help-mark">?</div><h3>预计等待时间<br>为什么会变化？</h3><p>它会跟随轮次、游玩偏好和临时状态重新计算，<b>是估算，不是保证时间。</b></p></div>
+      <div class="help-item"><div class="help-mark">?</div><h3>网页和现场<br>暂时不一致？</h3><p>网络同步可能稍有延迟，可以刷新页面；<b>现场安排以终端记录为准。</b></p></div>
+      <div class="help-item"><div class="help-mark">?</div><h3>暂时找不到<br>自己的登记？</h3><p>先检查机台、队列位置、未到场和签到状态。仍不一致时，再找现场管理者确认。</p></div>
+    </div>
+    <div class="help-meter"><div class="help-meter-top"><b>预计等待会随现场进度更新</b><span id="help-time">约 18 分钟后</span></div><div class="meter-track"><div class="meter-value" id="help-meter"></div></div></div>
+  </section>
+
+  <section class="scene" id="scene-outro">
+    <div class="outro-content">
+      <div class="eyebrow outro-reveal">完整流程到这里</div>
+      <h1 class="outro-reveal">规则照旧，<br>信息更清楚。</h1>
+      <div class="outro-grid">
+        <div class="outro-card"><b>排卡逻辑一致</b><span>手动挪卡与终端轮换，在相同条件下得到相同结果。</span></div>
+        <div class="outro-card"><b>一台平板即可部署</b><span>无需额外采购成套排卡外设，网络功能可以按需接入。</span></div>
+        <div class="outro-card"><b>状态有明确处理</b><span>暂缓、暂离、签到和游玩偏好分别按规则计算。</span></div>
+      </div>
+      <p class="outro-note outro-reveal">所有安排以现场终端记录和场地规则为准。</p>
+    </div>
+  </section>
+
+  <script>
+    const timeline = [
+      { id: "intro", duration: 4, chapter: "PLAYER GUIDE" },
+      { id: "deploy", duration: 7, chapter: "EASY DEPLOYMENT" },
+      { id: "board", duration: 12, chapter: "BOARD LOGIC" },
+      { id: "flow", duration: 28, chapter: "FULL JOIN FLOW" },
+      { id: "status", duration: 12, chapter: "QUEUE STATUS" },
+      { id: "online", duration: 10, chapter: "ONLINE CHECK-IN" },
+      { id: "help", duration: 9, chapter: "QUICK HELP" },
+      { id: "outro", duration: 5, chapter: "READY TO PLAY" }
+    ];
+
+    const totalDuration = timeline.reduce((sum, item) => sum + item.duration, 0);
+    const clamp = value => Math.max(0, Math.min(1, value));
+    const segment = (value, start, end) => clamp((value - start) / (end - start));
+    const ease = value => {
+      const t = clamp(value);
+      return t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    };
+    const out = value => 1 - Math.pow(1 - clamp(value), 3);
+    const lerp = (from, to, value) => from + (to - from) * value;
+
+    function reveal(element, value, offset = 34, scale = .98) {
+      const progress = out(value);
+      element.style.opacity = progress;
+      element.style.transform = `translateY(${(1 - progress) * offset}px) scale(${lerp(scale, 1, progress)})`;
+    }
+
+    function stagger(elements, progress, start = 0, gap = .08, span = .2) {
+      elements.forEach((element, index) => reveal(element, segment(progress, start + index * gap, start + index * gap + span)));
+    }
+
+    function setScene(id, progress, index) {
+      document.querySelectorAll(".scene").forEach(scene => scene.classList.remove("active"));
+      const scene = document.getElementById(`scene-${id}`);
+      scene.classList.add("active");
+      const fadeIn = segment(progress, 0, .035);
+      const fadeOut = 1 - segment(progress, .965, 1);
+      scene.style.opacity = Math.min(fadeIn, fadeOut);
+      document.getElementById("chapter").textContent = timeline[index].chapter;
+      document.getElementById("scene-count").textContent = `${String(index + 1).padStart(2, "0")} / ${String(timeline.length).padStart(2, "0")}`;
+      return scene;
+    }
+
+    function animateIntro(progress) {
+      stagger(document.querySelectorAll(".intro-reveal"), progress, .04, .08, .22);
+      stagger(document.querySelectorAll(".intro-pill"), progress, .42, .08, .2);
+    }
+
+    function animateDeploy(progress) {
+      stagger(document.querySelectorAll(".deploy-reveal"), progress, .03, .08, .22);
+      stagger(document.querySelectorAll(".deploy-item"), progress, .36, .09, .2);
+      reveal(document.querySelector(".deploy-note"), segment(progress, .66, .84), 20);
+      const deviceProgress = ease(segment(progress, .12, .58));
+      const device = document.getElementById("deploy-device");
+      device.style.opacity = deviceProgress;
+      device.style.transform = `translateY(${(1 - deviceProgress) * 90}px) rotate(${(1 - deviceProgress) * 3}deg) scale(${lerp(.9, 1, deviceProgress)})`;
+      const pulse = Math.sin(segment(progress, .62, .94) * Math.PI * 3) * 2;
+      device.style.boxShadow = `0 28px ${64 + pulse * 3}px rgba(29,29,31,.2)`;
+    }
+
+    function animateBoard(progress) {
+      stagger(document.querySelectorAll(".board-reveal"), progress, .02, .07, .18);
+      const boardIn = out(segment(progress, .17, .35));
+      const boards = document.querySelectorAll(".motion-board");
+      boards[0].style.opacity = boardIn;
+      boards[0].style.transform = `translateX(${(1 - boardIn) * -55}px)`;
+      boards[1].style.opacity = boardIn;
+      boards[1].style.transform = `translateX(${(1 - boardIn) * 55}px)`;
+      const movement = ease(segment(progress, .43, .75));
+      document.querySelectorAll(".pair-current").forEach(pair => pair.style.transform = `translateY(${movement * 272}px)`);
+      document.querySelectorAll(".pair-next").forEach(pair => pair.style.transform = `translateY(${136 - movement * 136}px)`);
+      document.querySelectorAll(".pair-third").forEach(pair => pair.style.transform = `translateY(${272 - movement * 136}px)`);
+      reveal(document.getElementById("board-action"), segment(progress, .32, .46), 20);
+      reveal(document.getElementById("board-proof"), segment(progress, .74, .9), 22);
+    }
+
+    const flowPages = [
+      { name: "home", start: 0, end: 3.5, step: "1 / 6", title: "从首页开始", caption: "点击“开始”，进入加入排队流程。", mark: "1" },
+      { name: "machine", start: 3.5, end: 7.5, step: "2 / 6", title: "选择机台", caption: "两台机台的队列彼此独立，先确认实际要游玩的机台。", mark: "2" },
+      { name: "method", start: 7.5, end: 12, step: "3 / 6", title: "选择登记方式", caption: "优先从玩家资料库选择；也可以使用移动设备完成登记。", mark: "3" },
+      { name: "library", start: 12, end: 17, step: "4 / 6", title: "选择自己的玩家资料", caption: "资料库支持按昵称或 QQ 搜索，选择前核对自己的信息。", mark: "4" },
+      { name: "preference", start: 17, end: 23, step: "5 / 6", title: "确认本次游玩偏好", caption: "偏好会参与实际分组；这里选择“允许他人加入”。", mark: "5" },
+      { name: "complete", start: 23, end: 28, step: "6 / 6", title: "确认队列位置", caption: "登记完成后，终端回到首页并高亮刚加入的位置。", mark: "✓" }
+    ];
+
+    const pointerFrames = [
+      { time: .5, x: 820, y: 390 }, { time: 2.7, x: 778, y: 330 },
+      { time: 4, x: 720, y: 360 }, { time: 6.7, x: 270, y: 350 },
+      { time: 8.1, x: 480, y: 350 }, { time: 10.9, x: 260, y: 340 },
+      { time: 12.5, x: 520, y: 300 }, { time: 15.7, x: 320, y: 330 },
+      { time: 17.5, x: 480, y: 350 }, { time: 20.1, x: 650, y: 340 },
+      { time: 21.1, x: 650, y: 340 }, { time: 22.4, x: 470, y: 535 },
+      { time: 23.2, x: 470, y: 535 }, { time: 24.2, x: 350, y: 430 }
+    ];
+    const tapTimes = [2.7, 6.7, 10.9, 15.7, 20.1, 22.4];
+
+    function pointerAt(time) {
+      let left = pointerFrames[0];
+      let right = pointerFrames[pointerFrames.length - 1];
+      for (let index = 0; index < pointerFrames.length - 1; index++) {
+        if (time >= pointerFrames[index].time && time <= pointerFrames[index + 1].time) {
+          left = pointerFrames[index];
+          right = pointerFrames[index + 1];
+          break;
+        }
+      }
+      const progress = ease(segment(time, left.time, right.time));
+      return { x: lerp(left.x, right.x, progress), y: lerp(left.y, right.y, progress) };
+    }
+
+    function tapStrength(time, taps) {
+      return taps.reduce((strongest, tap) => Math.max(strongest, 1 - Math.min(1, Math.abs(time - tap) / .34)), 0);
+    }
+
+    function animateFlow(progress) {
+      const time = progress * 28;
+      const activePage = flowPages.find(page => time >= page.start && time < page.end) || flowPages[flowPages.length - 1];
+      document.querySelectorAll(".app-page").forEach(pageElement => {
+        const page = flowPages.find(item => item.name === pageElement.dataset.page);
+        const enter = segment(time, page.start, page.start + .42);
+        const exit = 1 - segment(time, page.end - .42, page.end);
+        const opacity = Math.min(enter, exit);
+        pageElement.classList.toggle("visible", opacity > 0);
+        pageElement.style.opacity = opacity;
+        pageElement.style.transform = `translateX(${(1 - enter) * 30 - (1 - exit) * 24}px)`;
+      });
+      document.getElementById("flow-step").textContent = activePage.step;
+      document.getElementById("flow-title").textContent = activePage.title;
+      document.getElementById("flow-caption").textContent = activePage.caption;
+      document.getElementById("caption-mark").textContent = activePage.mark;
+
+      const pointer = document.getElementById("flow-pointer");
+      const position = pointerAt(time);
+      const visible = segment(time, .4, 1) * (1 - segment(time, 24, 24.5));
+      const tap = tapStrength(time, tapTimes);
+      pointer.classList.toggle("visible", visible > 0);
+      pointer.style.opacity = visible;
+      pointer.style.left = `${position.x}px`;
+      pointer.style.top = `${position.y}px`;
+      pointer.style.transform = `translate(-50%, -50%) scale(${1 - tap * .18})`;
+      pointer.style.setProperty("--tap-opacity", tap * .8);
+      pointer.style.setProperty("--tap-scale", .65 + tap * .7);
+
+      const pressedTargets = [
+        ["start", 2.7], ["machine-a", 6.7], ["library", 10.9],
+        ["profile", 15.7], ["open", 20.1], ["complete", 22.4]
+      ];
+      pressedTargets.forEach(([target, tapTime]) => {
+        const element = document.querySelector(`[data-target="${target}"]`);
+        if (!element) return;
+        const strength = tapStrength(time, [tapTime]);
+        element.style.transform = `scale(${1 - strength * .02})`;
+        element.style.boxShadow = strength > .1 ? "0 0 0 4px rgba(8,124,255,.18)" : "none";
+        if (["open", "library", "profile"].includes(target)) element.classList.toggle("selected", strength > .25);
+      });
+
+      const highlight = document.getElementById("new-registration");
+      const highlightProgress = segment(time, 23.4, 27.4);
+      highlight.style.boxShadow = `0 0 0 ${Math.max(0, Math.sin(highlightProgress * Math.PI * 3)) * 8}px rgba(21,136,68,.16)`;
+    }
+
+    function animateStatus(progress) {
+      const panelIn = out(segment(progress, .2, .36));
+      const choiceIn = out(segment(progress, .42, .57));
+      const badgeIn = out(segment(progress, .68, .82));
+      const panel = document.getElementById("status-panel");
+      panel.style.opacity = panelIn;
+      panel.style.transform = `translateX(${(1 - panelIn) * 45}px)`;
+      document.getElementById("status-choice").style.opacity = choiceIn;
+      document.getElementById("status-choice").style.transform = `translateY(${(1 - choiceIn) * 18}px)`;
+      const badge = document.getElementById("status-badge");
+      badge.style.opacity = badgeIn;
+      badge.style.transform = `scale(${lerp(.75, 1, badgeIn)})`;
+      stagger(document.querySelectorAll(".status-explain-card"), progress, .72, .09, .18);
+
+      const pointer = document.getElementById("status-pointer");
+      let x;
+      let y;
+      if (progress < .4) {
+        x = lerp(330, 280, ease(segment(progress, .04, .29)));
+        y = lerp(760, 650, ease(segment(progress, .04, .29)));
+      } else if (progress < .56) {
+        x = lerp(280, 800, ease(segment(progress, .4, .51)));
+        y = lerp(650, 560, ease(segment(progress, .4, .51)));
+      } else {
+        x = lerp(800, 800, ease(segment(progress, .56, .64)));
+        y = lerp(560, 820, ease(segment(progress, .56, .64)));
+      }
+      const tap = tapStrength(progress, [.29, .51, .64]);
+      pointer.classList.add("visible");
+      pointer.style.opacity = (1 - segment(progress, .7, .76));
+      pointer.style.left = `${x}px`;
+      pointer.style.top = `${y}px`;
+      pointer.style.setProperty("--tap-opacity", tap * .8);
+      pointer.style.setProperty("--tap-scale", .7 + tap * .65);
+    }
+
+    function animateOnline(progress) {
+      const phone = document.getElementById("online-phone");
+      const panel = document.getElementById("checkin-panel");
+      const phoneIn = out(segment(progress, .05, .28));
+      const panelIn = out(segment(progress, .2, .4));
+      phone.style.opacity = phoneIn;
+      phone.style.transform = `translateX(${(1 - phoneIn) * -55}px)`;
+      panel.style.opacity = panelIn;
+      panel.style.transform = `translateX(${(1 - panelIn) * 55}px)`;
+
+      const pointer = document.getElementById("checkin-pointer");
+      const pointerIn = segment(progress, .38, .48) * (1 - segment(progress, .69, .76));
+      const tap = tapStrength(progress, [.62]);
+      pointer.classList.toggle("visible", pointerIn > 0);
+      pointer.style.opacity = pointerIn;
+      pointer.style.left = `${lerp(470, 260, ease(segment(progress, .4, .6)))}px`;
+      pointer.style.top = `${lerp(390, 245, ease(segment(progress, .4, .6)))}px`;
+      pointer.style.setProperty("--tap-opacity", tap * .8);
+      pointer.style.setProperty("--tap-scale", .7 + tap * .65);
+
+      const result = out(segment(progress, .65, .8));
+      document.getElementById("checkin-result").style.opacity = result;
+      document.getElementById("checkin-result").style.transform = `translateY(${(1 - result) * 16}px)`;
+      document.getElementById("checkin-badge").textContent = progress > .7 ? "已完成现场签到" : "线上登记 · 待签到";
+      document.getElementById("checkin-badge").style.background = progress > .7 ? "var(--green-soft)" : "var(--orange-soft)";
+      document.getElementById("checkin-badge").style.color = progress > .7 ? "var(--green)" : "var(--orange)";
+      document.getElementById("checkin-button").style.opacity = 1 - segment(progress, .64, .76);
+    }
+
+    function animateHelp(progress) {
+      stagger(document.querySelectorAll(".help-item"), progress, .08, .13, .2);
+      reveal(document.querySelector(".help-meter"), segment(progress, .54, .72), 20);
+      const meterProgress = ease(segment(progress, .58, .95));
+      document.getElementById("help-meter").style.width = `${lerp(68, 38, meterProgress)}%`;
+      const minutes = Math.round(lerp(22, 14, meterProgress));
+      document.getElementById("help-time").textContent = `约 ${minutes} 分钟后`;
+    }
+
+    function animateOutro(progress) {
+      stagger(document.querySelectorAll(".outro-reveal"), progress, .03, .1, .2);
+      stagger(document.querySelectorAll(".outro-card"), progress, .2, .05, .16);
+    }
+
+    const animators = {
+      intro: animateIntro,
+      deploy: animateDeploy,
+      board: animateBoard,
+      flow: animateFlow,
+      status: animateStatus,
+      online: animateOnline,
+      help: animateHelp,
+      outro: animateOutro
+    };
+
+    window.renderFrame = seconds => {
+      const time = Math.max(0, Math.min(totalDuration - .001, Number(seconds) || 0));
+      let start = 0;
+      let index = timeline.length - 1;
+      for (let current = 0; current < timeline.length; current++) {
+        if (time < start + timeline[current].duration) {
+          index = current;
+          break;
+        }
+        start += timeline[current].duration;
+      }
+      const item = timeline[index];
+      const progress = clamp((time - start) / item.duration);
+      setScene(item.id, progress, index);
+      animators[item.id](progress);
+      document.getElementById("progress").style.width = `${time / totalDuration * 100}%`;
+      return { time, totalDuration, scene: item.id, progress };
+    };
+
+    window.videoDuration = totalDuration;
+    const previewTime = Number(new URLSearchParams(window.location.search).get("time"));
+    window.renderFrame(Number.isFinite(previewTime) ? previewTime : 0);
+  </script>
+</body>
+</html>
