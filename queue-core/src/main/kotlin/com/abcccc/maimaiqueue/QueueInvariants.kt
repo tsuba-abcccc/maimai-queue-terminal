@@ -7,7 +7,7 @@ import kotlin.math.abs
  * The engine tests use this after action sequences; later QueueEngine work can reuse it
  * at command boundaries without duplicating the rules.
  */
-internal fun MachineQueue.invariantViolations(): List<String> = buildList {
+fun MachineQueue.invariantViolations(): List<String> = buildList {
     val registrations = allRegistrations
     val registrationsByKey = registrations.associateBy(Registration::key)
 

@@ -8,12 +8,6 @@ private val chineseNicknameCollator: Collator = Collator.getInstance(Locale.CHIN
     strength = Collator.PRIMARY
 }
 
-enum class PlayerGender {
-    MALE,
-    FEMALE,
-    UNDISCLOSED
-}
-
 enum class ProfilePlayPreference {
     SOLO,
     OPEN_TO_JOIN,

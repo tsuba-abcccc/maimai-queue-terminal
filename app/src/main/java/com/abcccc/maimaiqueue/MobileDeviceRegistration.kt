@@ -221,11 +221,12 @@ internal fun decideMobileDeviceRegistration(
     if (stagedQueue.registrationCount != queue.registrationCount + 1) {
         return reject("终端未能建立登记，请重新扫码后再试。")
     }
-    val preview = stagedQueue.nextPlayingPositionPreview()
+    val roundPlan = RoundPlanner.enterPlayingPosition(stagedQueue)
+    val preview = roundPlan.preview
     val needsAvailabilityConfirmation = stagedQueue.playing.isEmpty() &&
         preview?.changedByAvailability == true
     val updatedQueue = if (stagedQueue.playing.isEmpty() && !needsAvailabilityConfirmation) {
-        stagedQueue.enterPlayingPosition()
+        roundPlan.execute()
     } else {
         stagedQueue
     }

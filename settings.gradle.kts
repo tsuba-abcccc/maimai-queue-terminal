@@ -24,3 +24,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "maimai Q"
 include(":app")
+include(":queue-core")

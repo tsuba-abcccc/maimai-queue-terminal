@@ -18,7 +18,7 @@ val terminalBuildEnabled = providers.gradleProperty("ENABLE_TERMINAL_BUILD")
     .orElse(false)
 val terminalQueueSyncUrl = if (terminalBuildEnabled.get()) queueSyncUrl.get() else ""
 val terminalQueueSyncToken = if (terminalBuildEnabled.get()) queueSyncToken.get() else ""
-val appVersionName = "0.6.0"
+val appVersionName = "0.6.1"
 
 android {
     namespace = "com.abcccc.maimaiqueue"
@@ -32,7 +32,7 @@ android {
         applicationId = "com.abcccc.maimaiqueue"
         minSdk = 29
         targetSdk = 36
-        versionCode = 38
+        versionCode = 39
         versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -96,6 +96,7 @@ tasks.register<Copy>("packageTerminalDebugApk") {
 }
 
 dependencies {
+    implementation(project(":queue-core"))
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)

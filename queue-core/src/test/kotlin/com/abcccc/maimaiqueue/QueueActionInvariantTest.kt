@@ -1,5 +1,6 @@
 package com.abcccc.maimaiqueue
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.random.Random
@@ -20,6 +21,52 @@ class QueueActionInvariantTest {
 
     private fun MachineQueue.assertConsistent(step: String): MachineQueue = apply {
         assertTrue("$step: ${invariantViolations().joinToString()} ", invariantViolations().isEmpty())
+        assertRoundPlansConsistent(step)
+    }
+
+    private fun MachineQueue.assertRoundPlansConsistent(step: String) {
+        val atMillis = 500_000L
+        val finishPlan = RoundPlanner.finishRound(this)
+        val finishResult = finishPlan.execute(atMillis)
+        val endOnlyResult = RoundPlanner.endRoundOnly(this).execute(atMillis)
+        val composedResult = RoundPlanner.enterPlayingPosition(endOnlyResult).execute(atMillis)
+
+        assertEquals(
+            "$step：结束本轮预览必须与实际进入游玩位置的登记一致",
+            finishPlan.preview?.nextRegistrations.orEmpty().map { it.key },
+            finishResult.playing.map { it.key }
+        )
+        assertEquals(
+            "$step：结束并开始下一轮必须等同于两步执行",
+            composedResult,
+            finishResult
+        )
+        assertTrue(
+            "$step：结束本轮计划不能破坏队列不变量",
+            finishResult.invariantViolations().isEmpty()
+        )
+
+        if (playing.isEmpty()) {
+            val enterPlan = RoundPlanner.enterPlayingPosition(this)
+            val enterResult = enterPlan.execute(atMillis)
+            assertEquals(
+                "$step：进入游玩位置预览必须与实际登记一致",
+                enterPlan.preview?.nextRegistrations.orEmpty().map { it.key },
+                enterResult.playing.map { it.key }
+            )
+        } else {
+            val removalPlan = RoundPlanner.removeCurrentRoundAndStartNext(this)
+            val removalResult = removalPlan.execute(atMillis)
+            assertEquals(
+                "$step：移除本轮预览必须与实际进入游玩位置的登记一致",
+                removalPlan.preview?.nextRegistrations.orEmpty().map { it.key },
+                removalResult.playing.map { it.key }
+            )
+            assertTrue(
+                "$step：移除本轮计划不能破坏队列不变量",
+                removalResult.invariantViolations().isEmpty()
+            )
+        }
     }
 
     @Test

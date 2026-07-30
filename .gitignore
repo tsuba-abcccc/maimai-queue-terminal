@@ -18,6 +18,7 @@
 /koishi-bot/package-lock.json
 .DS_Store
 /build
+/queue-core/build/
 /captures
 .externalNativeBuild
 .cxx

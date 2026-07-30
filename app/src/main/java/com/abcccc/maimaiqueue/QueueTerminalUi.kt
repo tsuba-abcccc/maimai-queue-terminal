@@ -732,12 +732,13 @@ internal fun RegistrationApp() {
         val beforeQueue = queueFor(machineId)
         val stagedQueue = transform(beforeQueue)
         if (stagedQueue == beforeQueue) return
-        val preview = stagedQueue.nextPlayingPositionPreview()
+        val roundPlan = RoundPlanner.enterPlayingPosition(stagedQueue)
+        val preview = roundPlan.preview
         val needsAvailabilityConfirmation = advanceWhenPlayingEmpty &&
             stagedQueue.playing.isEmpty() &&
             preview?.changedByAvailability == true
         val afterQueue = if (advanceWhenPlayingEmpty && !needsAvailabilityConfirmation) {
-            stagedQueue.enterPlayingPosition()
+            roundPlan.execute()
         } else {
             stagedQueue
         }
@@ -2449,16 +2450,18 @@ internal fun RegistrationApp() {
                             },
                             onEnterPlaying = { machineId ->
                                 if (reorderSession == null) {
-                                    val preview = queueFor(machineId).nextPlayingPositionPreview()
-                                    if (preview?.changedByAvailability == true) {
+                                    val roundPlan = RoundPlanner.enterPlayingPosition(
+                                        queueFor(machineId)
+                                    )
+                                    if (roundPlan.preview?.changedByAvailability == true) {
                                         enterPlayingConfirmation = machineId
                                     } else {
                                         updateQueue(
                                             machineId = machineId,
                                             soundCue = QueueSoundCue.QUEUE_CHANGE,
                                             classifyMissedOnlineRegistrations = true
-                                        ) {
-                                            it.enterPlayingPosition()
+                                        ) { currentQueue ->
+                                            roundPlan.applyTo(currentQueue) ?: currentQueue
                                         }
                                     }
                                 }
@@ -3134,12 +3137,17 @@ internal fun RegistrationApp() {
                 }
 
                 finishConfirmation?.let { machineId ->
-                    val playingRegistrations = queueFor(machineId).playing
-                    val nextPlayingNotice = nextPlayingChangeMessage(
-                        queueFor(machineId).nextPlayingPositionPreviewAfterRoundEnd()
-                    )
-                    val removalPreview =
-                        queueFor(machineId).nextPlayingPositionPreviewAfterCurrentRoundRemoved()
+                    val sourceQueue = queueFor(machineId)
+                    if (sourceQueue.playing.isEmpty()) {
+                        LaunchedEffect(machineId, sourceQueue) { finishConfirmation = null }
+                        return@let
+                    }
+                    val finishPlan = RoundPlanner.finishRound(sourceQueue)
+                    val endOnlyPlan = RoundPlanner.endRoundOnly(sourceQueue)
+                    val removalPlan = RoundPlanner.removeCurrentRoundAndStartNext(sourceQueue)
+                    val playingRegistrations = sourceQueue.playing
+                    val nextPlayingNotice = nextPlayingChangeMessage(finishPlan.preview)
+                    val removalPreview = removalPlan.preview
                     RoundEndConfirmation(
                         machineName = configuredMachineName(machineId),
                         playingPositionLabel = playingPositionName(machineId),
@@ -3150,18 +3158,28 @@ internal fun RegistrationApp() {
                         closingGracePeriod = activeClosingGracePeriod,
                         onDismiss = { finishConfirmation = null },
                         onConfirm = {
-                            updateQueueWithUndo(
-                                machineId,
-                                "${configuredMachineName(machineId)} 的本轮已结束"
-                            ) { it.finishRound() }
-                            finishConfirmation = null
+                            if (queueFor(machineId) == finishPlan.sourceQueue) {
+                                val atMillis = System.currentTimeMillis()
+                                updateQueueWithUndo(
+                                    machineId,
+                                    "${configuredMachineName(machineId)} 的本轮已结束"
+                                ) { currentQueue ->
+                                    finishPlan.applyTo(currentQueue, atMillis) ?: currentQueue
+                                }
+                                finishConfirmation = null
+                            }
                         },
                         onEndOnly = {
-                            updateQueueWithUndo(
-                                machineId,
-                                "${configuredMachineName(machineId)} 的本轮已结束"
-                            ) { it.endRoundWithoutStartingNext() }
-                            finishConfirmation = null
+                            if (queueFor(machineId) == endOnlyPlan.sourceQueue) {
+                                val atMillis = System.currentTimeMillis()
+                                updateQueueWithUndo(
+                                    machineId,
+                                    "${configuredMachineName(machineId)} 的本轮已结束"
+                                ) { currentQueue ->
+                                    endOnlyPlan.applyTo(currentQueue, atMillis) ?: currentQueue
+                                }
+                                finishConfirmation = null
+                            }
                         },
                         removalNextPlayingNames = removalPreview
                             ?.nextRegistrations
@@ -3170,14 +3188,17 @@ internal fun RegistrationApp() {
                             .takeIf { it.isNotEmpty() },
                         removalNextPlayingNotice = nextPlayingChangeMessage(removalPreview),
                         onRemoveAndStartNext = {
-                            updateQueue(
-                                machineId = machineId,
-                                soundCue = QueueSoundCue.CAUTION,
-                                classifyMissedOnlineRegistrations = true
-                            ) {
-                                it.removeCurrentRoundAndStartNext()
+                            if (queueFor(machineId) == removalPlan.sourceQueue) {
+                                val atMillis = System.currentTimeMillis()
+                                updateQueue(
+                                    machineId = machineId,
+                                    soundCue = QueueSoundCue.CAUTION,
+                                    classifyMissedOnlineRegistrations = true
+                                ) { currentQueue ->
+                                    removalPlan.applyTo(currentQueue, atMillis) ?: currentQueue
+                                }
+                                finishConfirmation = null
                             }
-                            finishConfirmation = null
                         }
                     )
                 }
@@ -3216,7 +3237,12 @@ internal fun RegistrationApp() {
 
                 enterPlayingConfirmation?.let { machineId ->
                     val queue = queueFor(machineId)
-                    val preview = queue.nextPlayingPositionPreview()
+                    if (queue.playing.isNotEmpty()) {
+                        LaunchedEffect(machineId, queue) { enterPlayingConfirmation = null }
+                        return@let
+                    }
+                    val roundPlan = RoundPlanner.enterPlayingPosition(queue)
+                    val preview = roundPlan.preview
                     val notice = nextPlayingChangeMessage(preview)
                     if (preview?.changedByAvailability == true && notice != null) {
                         EnterPlayingConfirmation(
@@ -3224,14 +3250,17 @@ internal fun RegistrationApp() {
                             notice = notice,
                             onDismiss = { enterPlayingConfirmation = null },
                             onConfirm = {
-                                updateQueue(
-                                    machineId = machineId,
-                                    soundCue = QueueSoundCue.QUEUE_CHANGE,
-                                    classifyMissedOnlineRegistrations = true
-                                ) {
-                                    it.enterPlayingPosition()
+                                if (queueFor(machineId) == roundPlan.sourceQueue) {
+                                    val atMillis = System.currentTimeMillis()
+                                    updateQueue(
+                                        machineId = machineId,
+                                        soundCue = QueueSoundCue.QUEUE_CHANGE,
+                                        classifyMissedOnlineRegistrations = true
+                                    ) { currentQueue ->
+                                        roundPlan.applyTo(currentQueue, atMillis) ?: currentQueue
+                                    }
+                                    enterPlayingConfirmation = null
                                 }
-                                enterPlayingConfirmation = null
                             }
                         )
                     } else {
@@ -3402,14 +3431,18 @@ internal fun RegistrationApp() {
                             selectedPosition = null
                         },
                         onEnterPlaying = {
-                            val preview = queueFor(selection.machineId).nextPlayingPositionPreview()
-                            if (preview?.changedByAvailability == true) {
+                            val roundPlan = RoundPlanner.enterPlayingPosition(
+                                queueFor(selection.machineId)
+                            )
+                            if (roundPlan.preview?.changedByAvailability == true) {
                                 enterPlayingConfirmation = selection.machineId
                             } else {
                                 updateQueue(
                                     machineId = selection.machineId,
                                     classifyMissedOnlineRegistrations = true
-                                ) { it.enterPlayingPosition() }
+                                ) { currentQueue ->
+                                    roundPlan.applyTo(currentQueue) ?: currentQueue
+                                }
                             }
                             selectedPosition = null
                         },
@@ -10679,6 +10712,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.6.1",
+            "本轮规划一致性",
+            "结束本轮、移除本轮玩家和进入游玩位置改用同一份队列计划，确认提示与实际安排保持一致；过期确认不会覆盖已经变化的队列。内部队列逻辑独立为轻量核心模块，既有规则、界面和数据保持兼容。"
+        ),
         Triple(
             "0.6.0",
             "队列可靠性与结构整理",
