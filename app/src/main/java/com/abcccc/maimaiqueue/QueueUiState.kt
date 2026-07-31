@@ -37,7 +37,7 @@ internal enum class MachineId { A, B }
 
 internal enum class RegistrationActionMode { ACTIONS, PREFERENCE, RENAME }
 internal enum class QueueAbsenceChoice { DEFER_ONE_ROUND, TEMPORARILY_AWAY }
-internal enum class PlayerProfileContext { JOIN_QUEUE, CLAIM_REGISTRATION }
+internal enum class PlayerProfileContext { JOIN_QUEUE, CLAIM_REGISTRATION, FRIEND_PAIR }
 internal enum class FriendPairStep { METHOD, SELECT_EXISTING, CONFIRM_EXISTING, CREATE_FRIEND }
 
 internal data class SelectedRegistration(

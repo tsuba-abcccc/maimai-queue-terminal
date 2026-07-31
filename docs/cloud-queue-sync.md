@@ -17,6 +17,8 @@
 ```text
 Authorization: Bearer <QUEUE_SYNC_TOKEN>
 X-Device-ID: <终端 UUID>
+X-Terminal-Instance-ID: <本次进程启动生成的 UUID>
+X-Terminal-Instance-Generation: <本机单调递增的正整数>
 X-Queue-Schema-Version: 5
 Content-Type: application/json; charset=utf-8
 ```
@@ -197,6 +199,8 @@ Koishi 在连接 OneBot 后上报实际登录 QQ，并定期刷新。终端拉�
 
 `GET /api/queue-terminal/commands`
 
+服务器只向当前队列快照对应的终端运行实例返回命令。命令领取后进入短期租约，同一实例在租约内重复请求不会再次取得该命令；租约结束后，尚未回执的命令可以由当前权威实例重新领取。旧版终端未发送实例请求头时，服务器会以稳定的 `X-Device-ID` 作为兼容实例。
+
 终端约每 `3` 秒读取待执行命令。资料命令同时校验：
 
 1. 资料 UUID 和 QQ 与本地一致。
@@ -231,6 +235,8 @@ Koishi 在连接 OneBot 后上报实际登录 QQ，并定期刷新。终端拉�
 ```
 
 终端写入本机后再返回 `APPLIED`，随后正常上传新的资料快照。服务器不能自行把待执行命令直接改成正式资料。
+
+线上加入成功时，终端还会提交 `result_registration_id`。网站据此在公开快照中精确确认新登记已经出现；在确认前只显示终端已保存、队列仍在同步，不会提前向玩家报告创建成功。
 
 ## 远程操作边界
 

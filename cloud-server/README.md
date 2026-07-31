@@ -23,6 +23,7 @@ QUEUE_PRIMARY_DEVICE_ID=
 QUEUE_DATABASE_PATH=/var/lib/maimai-queue-status/queue.db
 QUEUE_ONLINE_TIMEOUT_SECONDS=90
 QUEUE_COMMAND_TIMEOUT_SECONDS=600
+QUEUE_COMMAND_CLAIM_LEASE_SECONDS=15
 QUEUE_COMMAND_RETENTION_SECONDS=2592000
 QUEUE_EVENT_RECIPIENT_RETENTION_SECONDS=2592000
 QUEUE_CORS_ORIGIN=https://abcccc.top
@@ -36,6 +37,8 @@ QUEUE_MOBILE_SESSION_RETENTION_SECONDS=86400
 每份鉴权令牌在启用对应私有接口时都必须达到 32 个 UTF-8 字节；两份令牌都配置时不能相同。某份配置缺失或过短时，对应私有接口统一返回 `503`；两份配置相同时，终端与 Bot 私有接口都会返回 `503`。健康检查仍会响应，服务不会降级为未鉴权访问。可使用 `openssl rand -hex 32` 分别生成两份独立令牌。
 
 `QUEUE_COMMAND_TIMEOUT_SECONDS` 是资料或队列命令等待终端处理的最长时间，默认 10 分钟。超时命令会被拒绝，玩家可以重新提交；当前权威终端发生接管时，仍在有效期内的命令会自动转交给新终端。
+
+`QUEUE_COMMAND_CLAIM_LEASE_SECONDS` 是终端领取命令后的短期租约，默认 15 秒。同一运行实例不会在租约内重复取得同一命令；如果应用在处理期间异常退出，租约结束后当前权威实例可以重新领取，避免命令永久卡住。
 
 `QUEUE_COMMAND_RETENTION_SECONDS` 控制已完成命令的保留时间，默认 30 天。到期后会删除包含 QQ 的命令载荷，避免私有信息无限期留存。
 
@@ -69,7 +72,7 @@ POST /api/queue-mobile/sessions/<session_token>/submit
 GET  /api/queue-mobile/sessions/<session_token>/result
 ```
 
-终端接口，使用 `QUEUE_SYNC_TOKEN` 和 `X-Device-ID`：
+终端接口使用 `QUEUE_SYNC_TOKEN`、稳定的 `X-Device-ID`，以及每次进程启动生成的 `X-Terminal-Instance-ID` 和单调递增的 `X-Terminal-Instance-Generation`。服务器只允许当前权威运行实例上传快照、领取命令和提交回执；旧版终端缺少实例请求头时仍按稳定设备编号兼容：
 
 ```text
 POST /api/queue-status

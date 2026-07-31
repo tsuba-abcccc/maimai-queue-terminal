@@ -60,6 +60,8 @@ RESULT_SOURCE_BOT_DISABLED = "BOT_DISABLED"
 COMMAND_TIMEOUT_DETAIL = "终端未在有效时间内处理这次修改，请重新提交。"
 BOT_DISABLED_DETAIL = "QQ Bot 联动已关闭，这次修改没有执行。"
 TEST_SYNC_ENDED_DETAIL = "测试同步已经结束，这次修改没有执行，请重新提交。"
+TERMINAL_INSTANCE_CONFLICT_DETAIL = "另一份终端实例正在同步，请关闭重复打开的应用后重试。"
+APPLIED_JOIN_SYNC_GUARD_SECONDS = 30
 SYNC_MODES = {"test", "takeover"}
 MACHINE_NAMES = {"A": "左侧 · 机台 A", "B": "右侧 · 机台 B"}
 MAX_MACHINE_REMARK_CHARACTERS = 8
@@ -113,6 +115,9 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         PRIMARY_DEVICE_ID=os.getenv("QUEUE_PRIMARY_DEVICE_ID", ""),
         ONLINE_TIMEOUT_SECONDS=int(os.getenv("QUEUE_ONLINE_TIMEOUT_SECONDS", "90")),
         COMMAND_TIMEOUT_SECONDS=int(os.getenv("QUEUE_COMMAND_TIMEOUT_SECONDS", "600")),
+        COMMAND_CLAIM_LEASE_SECONDS=int(
+            os.getenv("QUEUE_COMMAND_CLAIM_LEASE_SECONDS", "15")
+        ),
         COMMAND_RETENTION_SECONDS=int(
             os.getenv("QUEUE_COMMAND_RETENTION_SECONDS", "2592000")
         ),
@@ -160,6 +165,9 @@ def initialize_database(database_path: str) -> None:
     try:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA secure_delete = ON")
+        # Gunicorn workers import the app concurrently. Serialize schema inspection and
+        # ALTER TABLE statements so two fresh workers cannot add the same column.
+        connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS queue_snapshot (
@@ -168,8 +176,28 @@ def initialize_database(database_path: str) -> None:
                 revision INTEGER NOT NULL,
                 payload TEXT NOT NULL,
                 device_id TEXT NOT NULL,
+                instance_id TEXT NOT NULL,
+                instance_generation INTEGER NOT NULL,
                 received_at INTEGER NOT NULL
             )
+            """
+        )
+        queue_snapshot_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(queue_snapshot)")
+        }
+        for column_name, declaration in (
+            ("instance_id", "TEXT NOT NULL DEFAULT ''"),
+            ("instance_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column_name not in queue_snapshot_columns:
+                connection.execute(
+                    f"ALTER TABLE queue_snapshot ADD COLUMN {column_name} {declaration}"
+                )
+        connection.execute(
+            """
+            UPDATE queue_snapshot
+            SET instance_id = device_id
+            WHERE instance_id = ''
             """
         )
         connection.execute(
@@ -183,8 +211,10 @@ def initialize_database(database_path: str) -> None:
                 created_at INTEGER NOT NULL,
                 completed_at INTEGER,
                 result_detail TEXT,
+                result_registration_id TEXT,
                 claimed_at INTEGER,
                 claimed_terminal TEXT,
+                claimed_instance TEXT,
                 result_source TEXT
             )
             """
@@ -195,6 +225,8 @@ def initialize_database(database_path: str) -> None:
         for column_name, declaration in (
             ("claimed_at", "INTEGER"),
             ("claimed_terminal", "TEXT"),
+            ("claimed_instance", "TEXT"),
+            ("result_registration_id", "TEXT"),
             ("result_source", "TEXT"),
         ):
             if column_name not in terminal_command_columns:
@@ -489,7 +521,8 @@ def register_routes(app: Flask) -> None:
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = (
             "Authorization, Content-Type, X-Device-ID, X-Queue-Schema-Version, "
-            "X-Queue-Sync-Mode"
+            "X-Queue-Sync-Mode, X-Terminal-Instance-ID, "
+            "X-Terminal-Instance-Generation"
         )
         response.headers["Cache-Control"] = "no-store, max-age=0"
         response.headers["Pragma"] = "no-cache"
@@ -628,6 +661,10 @@ def publish_snapshot():
     device_id = request.headers.get("X-Device-ID", "").strip()
     if not device_id or len(device_id) > 128:
         return jsonify({"ok": False, "error": "终端编号无效"}), 400
+    try:
+        instance_id, instance_generation = read_terminal_instance_identity(device_id)
+    except ValidationError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
 
     requested_sync_mode = request.headers.get("X-Queue-Sync-Mode", "").strip().lower()
     if requested_sync_mode and requested_sync_mode not in SYNC_MODES:
@@ -663,7 +700,8 @@ def publish_snapshot():
         cleanup_expired_event_recipients(connection, now)
         current = connection.execute(
             """
-            SELECT queue_id, revision, payload, device_id, received_at
+            SELECT queue_id, revision, payload, device_id, instance_id,
+                   instance_generation, received_at
             FROM queue_snapshot WHERE id = 1
             """
         ).fetchone()
@@ -677,12 +715,39 @@ def publish_snapshot():
             and now - current["received_at"]
             <= current_app.config["ONLINE_TIMEOUT_SECONDS"]
         )
+        current_instance_changed = bool(
+            current
+            and current["device_id"] == device_id
+            and current["instance_id"] != instance_id
+        )
 
         if current is None:
             # There is no existing queue to displace, so the first authenticated terminal can
             # establish the official snapshot without a takeover choice.
             incoming_is_test = requested_sync_mode == "test"
         elif current["device_id"] == device_id:
+            if instance_generation < current["instance_generation"]:
+                connection.rollback()
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "STALE_TERMINAL_INSTANCE",
+                        "error": TERMINAL_INSTANCE_CONFLICT_DETAIL,
+                    }
+                ), 409
+            if (
+                current_instance_changed
+                and instance_generation == current["instance_generation"]
+                and current_is_online
+            ):
+                connection.rollback()
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "TERMINAL_INSTANCE_CONFLICT",
+                        "error": TERMINAL_INSTANCE_CONFLICT_DETAIL,
+                    }
+                ), 409
             if not requested_sync_mode:
                 incoming_is_test = current_is_test
         elif incoming_is_primary:
@@ -741,18 +806,39 @@ def publish_snapshot():
         connection.execute(
             """
             INSERT INTO queue_snapshot
-                (id, queue_id, revision, payload, device_id, received_at)
+                (id, queue_id, revision, payload, device_id, instance_id,
+                 instance_generation, received_at)
             VALUES
-                (1, ?, ?, ?, ?, ?)
+                (1, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 queue_id = excluded.queue_id,
                 revision = excluded.revision,
                 payload = excluded.payload,
                 device_id = excluded.device_id,
+                instance_id = excluded.instance_id,
+                instance_generation = excluded.instance_generation,
                 received_at = excluded.received_at
             """,
-            (queue_id, revision, serialized, device_id, now),
+            (
+                queue_id,
+                revision,
+                serialized,
+                device_id,
+                instance_id,
+                instance_generation,
+                now,
+            ),
         )
+        if current_instance_changed:
+            connection.execute(
+                """
+                UPDATE terminal_command
+                SET claimed_at = NULL, claimed_terminal = NULL, claimed_instance = NULL
+                WHERE status = 'PENDING' AND device_id = ?
+                  AND claimed_instance IS NOT NULL AND claimed_instance != ?
+                """,
+                (device_id, instance_id),
+            )
         if current is None or current["queue_id"] != queue_id:
             connection.execute("DELETE FROM queue_private_contact")
         stored_contacts = {
@@ -978,7 +1064,8 @@ def publish_snapshot():
                 connection.execute(
                     """
                     UPDATE terminal_command
-                    SET device_id = ?, claimed_at = NULL, claimed_terminal = NULL
+                    SET device_id = ?, claimed_at = NULL, claimed_terminal = NULL,
+                        claimed_instance = NULL
                     WHERE status = 'PENDING'
                     """,
                     (device_id,),
@@ -1832,6 +1919,36 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
             snapshot,
             actor_qq,
         )
+        if operation == "JOIN_QUEUE" and not registration_contexts:
+            recently_applied_join = connection.execute(
+                """
+                SELECT 1 FROM terminal_command
+                WHERE command_type = ? AND status = 'APPLIED'
+                  AND completed_at IS NOT NULL AND completed_at > ?
+                  AND json_extract(payload, '$.queue_id') = ?
+                  AND json_extract(payload, '$.operation') = 'JOIN_QUEUE'
+                  AND (
+                      json_extract(payload, '$.actor_qq') = ?
+                      OR json_extract(payload, '$.profile_id') = ?
+                  )
+                LIMIT 1
+                """,
+                (
+                    QUEUE_OPERATION_COMMAND,
+                    now - APPLIED_JOIN_SYNC_GUARD_SECONDS,
+                    snapshot_row["queue_id"],
+                    actor_qq,
+                    profile["profile_id"],
+                ),
+            ).fetchone()
+            if recently_applied_join is not None:
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "PLAYER_OPERATION_SYNCING",
+                        "error": "上一份线上登记已由终端保存，正在同步最新队列，请稍后刷新。",
+                    }
+                ), 409
 
         desired, validation_error = build_queue_operation_payload(
             snapshot=snapshot,
@@ -3075,39 +3192,85 @@ def read_bot_command(command_id: str):
 
 def read_terminal_commands():
     device_id = request.headers.get("X-Device-ID", "").strip()
+    try:
+        instance_id, instance_generation = read_terminal_instance_identity(device_id)
+    except ValidationError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         now = int(time.time())
         expire_pending_commands(connection, now)
+        current_terminal = connection.execute(
+            """
+            SELECT device_id, instance_id, instance_generation
+            FROM queue_snapshot WHERE id = 1
+            """
+        ).fetchone()
+        if not terminal_instance_matches(
+            current_terminal,
+            device_id,
+            instance_id,
+            instance_generation,
+        ):
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "STALE_TERMINAL_INSTANCE",
+                    "error": TERMINAL_INSTANCE_CONFLICT_DETAIL,
+                }
+            ), 409
+        lease_seconds = max(1, current_app.config["COMMAND_CLAIM_LEASE_SECONDS"])
         command_ids = [
             row["command_id"]
             for row in connection.execute(
                 """
                 SELECT command_id FROM terminal_command
                 WHERE device_id = ? AND status = 'PENDING'
+                  AND (
+                      claimed_at IS NULL OR claimed_instance IS NULL
+                      OR claimed_at <= ?
+                  )
                 ORDER BY created_at, command_id
                 LIMIT 20
                 """,
-                (device_id,),
+                (device_id, now - lease_seconds),
             ).fetchall()
         ]
-        connection.executemany(
-            """
-            UPDATE terminal_command
-            SET claimed_at = COALESCE(claimed_at, ?), claimed_terminal = ?
-            WHERE command_id = ? AND device_id = ? AND status = 'PENDING'
-            """,
-            [(now, device_id, command_id, device_id) for command_id in command_ids],
-        )
-        rows = connection.execute(
-            """
-            SELECT * FROM terminal_command
-            WHERE device_id = ? AND status = 'PENDING' AND claimed_terminal = ?
-            ORDER BY created_at, command_id
-            LIMIT 20
-            """,
-            (device_id, device_id),
-        ).fetchall()
+        rows = []
+        if command_ids:
+            placeholders = ",".join("?" for _ in command_ids)
+            connection.execute(
+                f"""
+                UPDATE terminal_command
+                SET claimed_at = ?, claimed_terminal = ?, claimed_instance = ?
+                WHERE command_id IN ({placeholders})
+                  AND device_id = ? AND status = 'PENDING'
+                  AND (
+                      claimed_at IS NULL OR claimed_instance IS NULL
+                      OR claimed_at <= ?
+                  )
+                """,
+                (
+                    now,
+                    device_id,
+                    instance_id,
+                    *command_ids,
+                    device_id,
+                    now - lease_seconds,
+                ),
+            )
+            rows = connection.execute(
+                f"""
+                SELECT * FROM terminal_command
+                WHERE command_id IN ({placeholders})
+                  AND device_id = ? AND status = 'PENDING'
+                  AND claimed_terminal = ? AND claimed_instance = ?
+                  AND claimed_at = ?
+                ORDER BY created_at, command_id
+                """,
+                (*command_ids, device_id, device_id, instance_id, now),
+            ).fetchall()
         connection.commit()
     return jsonify({"commands": [serialize_command(row) for row in rows]})
 
@@ -3127,7 +3290,19 @@ def complete_terminal_command(command_id: str):
     if not isinstance(detail, str) or len(detail) > 500:
         return jsonify({"ok": False, "error": "命令结果说明无效"}), 400
     detail = detail.strip()
+    result_registration_id = source.get("result_registration_id")
+    if result_registration_id is not None:
+        if (
+            status != "APPLIED"
+            or not isinstance(result_registration_id, str)
+            or PUBLIC_ID_PATTERN.fullmatch(result_registration_id) is None
+        ):
+            return jsonify({"ok": False, "error": "命令结果中的登记编号无效"}), 400
     device_id = request.headers.get("X-Device-ID", "").strip()
+    try:
+        instance_id, instance_generation = read_terminal_instance_identity(device_id)
+    except ValidationError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
 
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -3138,29 +3313,58 @@ def complete_terminal_command(command_id: str):
         if row is None:
             return jsonify({"ok": False, "error": "没有找到这条命令"}), 404
         if row["device_id"] != device_id:
+            connection.rollback()
             return jsonify({"ok": False, "error": "此命令不属于当前终端"}), 403
         current_terminal = connection.execute(
-            "SELECT device_id FROM queue_snapshot WHERE id = 1"
+            """
+            SELECT device_id, instance_id, instance_generation
+            FROM queue_snapshot WHERE id = 1
+            """
         ).fetchone()
+        if not terminal_instance_matches(
+            current_terminal,
+            device_id,
+            instance_id,
+            instance_generation,
+        ):
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "STALE_TERMINAL_INSTANCE",
+                    "error": TERMINAL_INSTANCE_CONFLICT_DETAIL,
+                }
+            ), 409
         late_timeout_result = (
             row["status"] == "REJECTED"
             and row["result_source"] == RESULT_SOURCE_SERVER_TIMEOUT
             and row["claimed_at"] is not None
             and row["claimed_terminal"] == device_id
-            and current_terminal is not None
-            and current_terminal["device_id"] == device_id
+            and row["claimed_instance"] == instance_id
         )
-        if row["status"] == "PENDING" or late_timeout_result:
+        result_can_be_written = row["status"] == "PENDING" or late_timeout_result
+        if result_can_be_written and row["claimed_instance"] != instance_id:
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "COMMAND_NOT_CLAIMED",
+                    "error": "此命令未由当前终端实例领取，请等待终端重新获取。",
+                }
+            ), 409
+        if result_can_be_written:
             connection.execute(
                 """
                 UPDATE terminal_command
-                SET status = ?, completed_at = ?, result_detail = ?, result_source = ?
+                SET status = ?, completed_at = ?, result_detail = ?,
+                    result_registration_id = ?, result_source = ?
                 WHERE command_id = ? AND device_id = ?
                   AND (
                       status = 'PENDING'
                       OR (
                           status = 'REJECTED' AND result_source = ?
                           AND claimed_at IS NOT NULL AND claimed_terminal = ?
+                          AND claimed_instance = ?
                       )
                   )
                 """,
@@ -3168,11 +3372,13 @@ def complete_terminal_command(command_id: str):
                     status,
                     int(time.time()),
                     detail or None,
+                    result_registration_id,
                     RESULT_SOURCE_TERMINAL,
                     command_id,
                     device_id,
                     RESULT_SOURCE_SERVER_TIMEOUT,
                     device_id,
+                    instance_id,
                 ),
             )
             connection.commit()
@@ -3219,9 +3425,11 @@ def serialize_command(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": row["created_at"] * 1000,
         "claimed_at": row["claimed_at"] * 1000 if row["claimed_at"] else None,
         "claimed_terminal": row["claimed_terminal"],
+        "claimed_instance": row["claimed_instance"],
         "completed_at": row["completed_at"] * 1000 if row["completed_at"] else None,
         "result_source": row["result_source"],
         "result_detail": row["result_detail"],
+        "result_registration_id": row["result_registration_id"],
     }
 
 
@@ -3336,6 +3544,43 @@ def online_registration_allowed(snapshot: dict[str, Any]) -> bool:
     return not isinstance(queue_rules, dict) or queue_rules.get(
         "allow_online_registration", True
     ) is not False
+
+
+def read_terminal_instance_identity(device_id: str) -> tuple[str, int]:
+    instance_id = request.headers.get("X-Terminal-Instance-ID", "").strip()
+    generation_source = request.headers.get(
+        "X-Terminal-Instance-Generation", ""
+    ).strip()
+    if not instance_id and not generation_source:
+        # Terminals from before runtime-instance coordination use their stable device ID.
+        return device_id, 0
+    if not instance_id or not generation_source:
+        raise ValidationError("终端运行实例信息不完整")
+    try:
+        instance_id = str(UUID(instance_id))
+    except ValueError as error:
+        raise ValidationError("终端运行实例编号无效") from error
+    try:
+        instance_generation = int(generation_source)
+    except ValueError as error:
+        raise ValidationError("终端运行实例代次无效") from error
+    if instance_generation < 1 or instance_generation > 2**63 - 1:
+        raise ValidationError("终端运行实例代次无效")
+    return instance_id, instance_generation
+
+
+def terminal_instance_matches(
+    snapshot: sqlite3.Row | None,
+    device_id: str,
+    instance_id: str,
+    instance_generation: int,
+) -> bool:
+    return bool(
+        snapshot is not None
+        and snapshot["device_id"] == device_id
+        and snapshot["instance_id"] == instance_id
+        and snapshot["instance_generation"] == instance_generation
+    )
 
 
 def authorize_terminal():

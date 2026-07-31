@@ -9,7 +9,7 @@ from threading import Barrier
 from unittest.mock import patch
 from uuid import UUID
 
-from app import create_app
+from app import create_app, initialize_database
 
 
 class QueueStatusApiTest(unittest.TestCase):
@@ -235,6 +235,9 @@ class QueueStatusApiTest(unittest.TestCase):
             command_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(terminal_command)")
             }
+            snapshot_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(queue_snapshot)")
+            }
             recipient_columns = {
                 row[1]
                 for row in connection.execute("PRAGMA table_info(queue_event_recipient)")
@@ -254,12 +257,84 @@ class QueueStatusApiTest(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertTrue({"claimed_at", "claimed_terminal", "result_source"} <= command_columns)
+        self.assertTrue(
+            {
+                "claimed_at",
+                "claimed_terminal",
+                "claimed_instance",
+                "result_registration_id",
+                "result_source",
+            }
+            <= command_columns
+        )
+        self.assertTrue(
+            {"instance_id", "instance_generation"} <= snapshot_columns
+        )
         self.assertIn("stored_at", recipient_columns)
         self.assertIn("operation_source", event_columns)
         self.assertEqual("SERVER_TIMEOUT", result_source)
         self.assertEqual("ON_SITE_TERMINAL", operation_source)
         self.assertGreater(stored_at, 0)
+
+    def test_concurrent_workers_can_migrate_the_same_legacy_database(self):
+        legacy_database_path = str(
+            Path(self.temporary_directory.name) / "concurrent-legacy-queue.db"
+        )
+        connection = sqlite3.connect(legacy_database_path)
+        try:
+            connection.executescript(
+                """
+                PRAGMA journal_mode = WAL;
+                CREATE TABLE queue_snapshot (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    queue_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    received_at INTEGER NOT NULL
+                );
+                CREATE TABLE terminal_command (
+                    command_id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    command_type TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    result_detail TEXT
+                );
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        barrier = Barrier(2)
+
+        def migrate(_: int):
+            barrier.wait()
+            initialize_database(legacy_database_path)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(migrate, range(2)))
+
+        connection = sqlite3.connect(legacy_database_path)
+        try:
+            snapshot_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(queue_snapshot)")
+            }
+            command_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(terminal_command)")
+            }
+        finally:
+            connection.close()
+
+        self.assertTrue(
+            {"instance_id", "instance_generation"} <= snapshot_columns
+        )
+        self.assertTrue(
+            {"claimed_instance", "result_registration_id"} <= command_columns
+        )
 
     def test_publishes_public_snapshot_and_drops_unknown_private_fields(self):
         snapshot = self.snapshot()
@@ -893,6 +968,7 @@ class QueueStatusApiTest(unittest.TestCase):
             },
             headers=self.bot_headers,
         )
+        self.client.get("/api/queue-terminal/commands", headers=self.headers)
 
         first = self.client.post(
             f"/api/queue-terminal/commands/{command_id}/result",
@@ -908,6 +984,135 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("APPLIED", first.get_json()["status"])
         self.assertEqual("APPLIED", second.get_json()["status"])
         self.assertEqual("第一次回执", second.get_json()["result_detail"])
+
+    def test_terminal_instance_claim_lease_returns_a_command_only_once(self):
+        instance_headers = {
+            **self.headers,
+            "X-Terminal-Instance-ID": "00000000-0000-0000-0000-000000000811",
+            "X-Terminal-Instance-Generation": "1",
+        }
+        snapshot = self.snapshot(revision=4)
+        snapshot["schema_version"] = 3
+        snapshot["private_player_profiles"] = [self.player_profile()]
+        snapshot["private_player_contacts"] = []
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=instance_headers
+            ).status_code,
+        )
+        command_id = "00000000-0000-0000-0000-000000000812"
+        self.client.patch(
+            f"/api/queue-bot/profiles/{self.profile_id}",
+            json={
+                "request_id": command_id,
+                "actor_qq": "12345678",
+                "nickname": "租约测试",
+            },
+            headers=self.bot_headers,
+        )
+
+        first = self.client.get(
+            "/api/queue-terminal/commands", headers=instance_headers
+        ).get_json()["commands"]
+        repeated = self.client.get(
+            "/api/queue-terminal/commands", headers=instance_headers
+        ).get_json()["commands"]
+
+        self.assertEqual([command_id], [item["command_id"] for item in first])
+        self.assertEqual(instance_headers["X-Terminal-Instance-ID"], first[0]["claimed_instance"])
+        self.assertEqual([], repeated)
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE terminal_command SET claimed_at = ? WHERE command_id = ?",
+                (int(time.time()) - 20, command_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        reclaimed = self.client.get(
+            "/api/queue-terminal/commands", headers=instance_headers
+        ).get_json()["commands"]
+        self.assertEqual([command_id], [item["command_id"] for item in reclaimed])
+
+    def test_newer_runtime_instance_excludes_the_previous_instance(self):
+        old_headers = {
+            **self.headers,
+            "X-Terminal-Instance-ID": "00000000-0000-0000-0000-000000000821",
+            "X-Terminal-Instance-Generation": "1",
+        }
+        new_headers = {
+            **self.headers,
+            "X-Terminal-Instance-ID": "00000000-0000-0000-0000-000000000822",
+            "X-Terminal-Instance-Generation": "2",
+        }
+        snapshot = self.snapshot(revision=4)
+        snapshot["schema_version"] = 3
+        snapshot["private_player_profiles"] = [self.player_profile()]
+        snapshot["private_player_contacts"] = []
+        self.client.post("/api/queue-status", json=snapshot, headers=old_headers)
+        command_id = "00000000-0000-0000-0000-000000000823"
+        self.client.patch(
+            f"/api/queue-bot/profiles/{self.profile_id}",
+            json={
+                "request_id": command_id,
+                "actor_qq": "12345678",
+                "nickname": "实例接管",
+            },
+            headers=self.bot_headers,
+        )
+        self.assertEqual(
+            [command_id],
+            [
+                item["command_id"]
+                for item in self.client.get(
+                    "/api/queue-terminal/commands", headers=old_headers
+                ).get_json()["commands"]
+            ],
+        )
+
+        replacement_snapshot = copy.deepcopy(snapshot)
+        replacement_snapshot["revision"] = 5
+        replaced = self.client.post(
+            "/api/queue-status", json=replacement_snapshot, headers=new_headers
+        )
+        stale_publish = self.client.post(
+            "/api/queue-status",
+            json={**replacement_snapshot, "revision": 6},
+            headers=old_headers,
+        )
+        stale_fetch = self.client.get(
+            "/api/queue-terminal/commands", headers=old_headers
+        )
+        stale_result = self.client.post(
+            f"/api/queue-terminal/commands/{command_id}/result",
+            json={"status": "APPLIED", "detail": "旧实例不应成功"},
+            headers=old_headers,
+        )
+        new_commands = self.client.get(
+            "/api/queue-terminal/commands", headers=new_headers
+        ).get_json()["commands"]
+        completed = self.client.post(
+            f"/api/queue-terminal/commands/{command_id}/result",
+            json={
+                "status": "APPLIED",
+                "detail": "新实例已处理",
+                "result_registration_id": "c" * 24,
+            },
+            headers=new_headers,
+        )
+
+        self.assertEqual(204, replaced.status_code)
+        self.assertEqual(409, stale_publish.status_code)
+        self.assertEqual("STALE_TERMINAL_INSTANCE", stale_publish.get_json()["code"])
+        self.assertEqual(409, stale_fetch.status_code)
+        self.assertEqual(409, stale_result.status_code)
+        self.assertEqual([command_id], [item["command_id"] for item in new_commands])
+        self.assertEqual("APPLIED", completed.get_json()["status"])
+        self.assertEqual("c" * 24, completed.get_json()["result_registration_id"])
 
     def test_pending_command_expires_and_allows_a_new_request(self):
         self.app.config["COMMAND_TIMEOUT_SECONDS"] = 1
@@ -1091,10 +1296,12 @@ class QueueStatusApiTest(unittest.TestCase):
             f"/api/queue-terminal/commands/{command_id}/result",
             json={"status": "APPLIED", "detail": "旧终端迟到的回执"},
             headers=self.headers,
-        ).get_json()
+        )
 
-        self.assertEqual("REJECTED", old_terminal_result["status"])
-        self.assertEqual("SERVER_TIMEOUT", old_terminal_result["result_source"])
+        self.assertEqual(409, old_terminal_result.status_code)
+        self.assertEqual(
+            "STALE_TERMINAL_INSTANCE", old_terminal_result.get_json()["code"]
+        )
 
     def test_terminal_takeover_reassigns_pending_commands(self):
         self.app.config["ALLOWED_DEVICE_ID"] = ""
@@ -1128,13 +1335,14 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         old_commands = self.client.get(
             "/api/queue-terminal/commands", headers=self.headers
-        ).get_json()["commands"]
+        )
         new_commands = self.client.get(
             "/api/queue-terminal/commands", headers=terminal_two_headers
         ).get_json()["commands"]
 
         self.assertEqual(204, takeover.status_code)
-        self.assertEqual([], old_commands)
+        self.assertEqual(409, old_commands.status_code)
+        self.assertEqual("STALE_TERMINAL_INSTANCE", old_commands.get_json()["code"])
         self.assertEqual([command_id], [item["command_id"] for item in new_commands])
 
     def test_bot_cannot_update_another_qq_or_change_the_identity_field(self):
@@ -2146,6 +2354,42 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("QUEUE_OPERATION", commands[0]["type"])
         self.assertEqual("JOIN_QUEUE", commands[0]["payload"]["operation"])
         self.assertEqual("WEBSITE_REMOTE", commands[0]["payload"]["operation_source"])
+
+    def test_recently_applied_website_join_cannot_be_duplicated_before_snapshot_sync(self):
+        snapshot = self.remote_ready_snapshot(revision=30)
+        self.client.post("/api/queue-status", json=snapshot, headers=self.headers)
+        first_request_id = "00000000-0000-0000-0000-000000000431"
+        self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": first_request_id,
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+        self.client.get("/api/queue-terminal/commands", headers=self.headers)
+        completed = self.client.post(
+            f"/api/queue-terminal/commands/{first_request_id}/result",
+            json={
+                "status": "APPLIED",
+                "detail": "线上登记已保存。",
+                "result_registration_id": "d" * 24,
+            },
+            headers=self.headers,
+        )
+
+        repeated = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000432",
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+
+        self.assertEqual("APPLIED", completed.get_json()["status"])
+        self.assertEqual(409, repeated.status_code)
+        self.assertEqual("PLAYER_OPERATION_SYNCING", repeated.get_json()["code"])
 
     def test_legacy_profile_can_join_online_before_completing_setup(self):
         snapshot = self.remote_ready_snapshot(revision=22)

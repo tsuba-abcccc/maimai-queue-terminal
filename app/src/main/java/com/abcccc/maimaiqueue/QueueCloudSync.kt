@@ -10,6 +10,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.Dispatchers
@@ -177,7 +178,12 @@ internal interface QueueCommandClient {
         queueId: String,
         machineId: String
     ): MobileRegistrationSession?
-    suspend fun complete(commandId: String, applied: Boolean, detail: String): Boolean
+    suspend fun complete(
+        commandId: String,
+        applied: Boolean,
+        detail: String,
+        resultRegistrationId: String? = null
+    ): Boolean
 }
 
 internal data class PlayerProfileSyncPayload(
@@ -239,12 +245,14 @@ private data class QueueConnectionConfiguration(
             isValidQueueSyncToken(token)
 }
 
+internal val remoteTerminalCommandPollMutex = Mutex()
+
 internal class HttpQueueStatePublisher(
     context: Context,
     endpoint: String,
     token: String
 ) : QueueStatePublisher {
-    private val terminalId = LocalTerminalIdentity(context).getOrCreateId()
+    private val terminalIdentity = LocalTerminalIdentity(context).getOrCreateRuntimeIdentity()
 
     @Volatile
     private var configuration = QueueConnectionConfiguration(
@@ -273,7 +281,7 @@ internal class HttpQueueStatePublisher(
                 val requestConfiguration = configuration
                 val body = buildQueueSyncSnapshot(
                     state = state,
-                    terminalId = terminalId,
+                    terminalId = terminalIdentity.terminalId,
                     capturedAtMillis = System.currentTimeMillis(),
                     auditLogs = auditLogs,
                     displaySettings = displaySettings,
@@ -291,7 +299,7 @@ internal class HttpQueueStatePublisher(
                     setRequestProperty("Accept", "application/json")
                     setRequestProperty("Content-Type", "application/json; charset=utf-8")
                     setRequestProperty("Authorization", "Bearer ${requestConfiguration.token}")
-                    setRequestProperty("X-Device-ID", terminalId)
+                    setTerminalIdentityHeaders(terminalIdentity)
                     setRequestProperty("X-Queue-Schema-Version", SYNC_SCHEMA_VERSION.toString())
                     displaySettings.syncMode.headerValue?.let { mode ->
                         setRequestProperty("X-Queue-Sync-Mode", mode)
@@ -334,7 +342,7 @@ internal class HttpQueueCommandClient(
     queueStatusEndpoint: String,
     token: String
 ) : QueueCommandClient {
-    private val terminalId = LocalTerminalIdentity(context).getOrCreateId()
+    private val terminalIdentity = LocalTerminalIdentity(context).getOrCreateRuntimeIdentity()
 
     @Volatile
     private var configuration = QueueConnectionConfiguration(
@@ -489,13 +497,17 @@ internal class HttpQueueCommandClient(
     override suspend fun complete(
         commandId: String,
         applied: Boolean,
-        detail: String
+        detail: String,
+        resultRegistrationId: String?
     ): Boolean = withContext(Dispatchers.IO) {
         runCatching {
             val requestConfiguration = configuration
             val body = JSONObject().apply {
                 put("status", if (applied) "APPLIED" else "REJECTED")
                 put("detail", detail.take(MAX_COMMAND_DETAIL_LENGTH))
+                if (applied && resultRegistrationId != null) {
+                    put("result_registration_id", resultRegistrationId)
+                }
             }.toString().toByteArray(Charsets.UTF_8)
             val endpoint = "${terminalEndpoint(requestConfiguration, "/queue-terminal/commands")}/$commandId/result"
             val connection = openConnection(endpoint, "POST", requestConfiguration.token).apply {
@@ -535,7 +547,7 @@ internal class HttpQueueCommandClient(
             useCaches = false
             setRequestProperty("Accept", "application/json")
             setRequestProperty("Authorization", "Bearer $requestToken")
-            setRequestProperty("X-Device-ID", terminalId)
+            setTerminalIdentityHeaders(terminalIdentity)
             setRequestProperty("X-Queue-Schema-Version", SYNC_SCHEMA_VERSION.toString())
         }
 
@@ -1448,17 +1460,44 @@ private fun stablePublicId(value: String): String = MessageDigest.getInstance("S
     .take(12)
     .joinToString("") { byte -> "%02x".format(byte) }
 
+private data class TerminalRuntimeIdentity(
+    val terminalId: String,
+    val instanceId: String,
+    val instanceGeneration: Long
+)
+
+private fun HttpURLConnection.setTerminalIdentityHeaders(identity: TerminalRuntimeIdentity) {
+    setRequestProperty("X-Device-ID", identity.terminalId)
+    setRequestProperty("X-Terminal-Instance-ID", identity.instanceId)
+    setRequestProperty(
+        "X-Terminal-Instance-Generation",
+        identity.instanceGeneration.toString()
+    )
+}
+
 private class LocalTerminalIdentity(context: Context) {
     private val preferences = context.applicationContext.getSharedPreferences(
         "terminal_identity",
         Context.MODE_PRIVATE
     )
 
-    fun getOrCreateId(): String {
-        preferences.getString(KEY_TERMINAL_ID, null)?.takeIf(::isValidUuid)?.let { return it }
-        val created = UUID.randomUUID().toString()
-        preferences.edit().putString(KEY_TERMINAL_ID, created).commit()
-        return created
+    fun getOrCreateRuntimeIdentity(): TerminalRuntimeIdentity = synchronized(identityLock) {
+        activeRuntimeIdentity?.let { return@synchronized it }
+        val terminalId = preferences.getString(KEY_TERMINAL_ID, null)
+            ?.takeIf(::isValidUuid)
+            ?: UUID.randomUUID().toString()
+        val previousGeneration = preferences.getLong(KEY_INSTANCE_GENERATION, 0L)
+            .coerceIn(0L, Long.MAX_VALUE - 1L)
+        val instanceGeneration = previousGeneration + 1L
+        preferences.edit()
+            .putString(KEY_TERMINAL_ID, terminalId)
+            .putLong(KEY_INSTANCE_GENERATION, instanceGeneration)
+            .commit()
+        TerminalRuntimeIdentity(
+            terminalId = terminalId,
+            instanceId = UUID.randomUUID().toString(),
+            instanceGeneration = instanceGeneration
+        ).also { activeRuntimeIdentity = it }
     }
 
     private fun isValidUuid(value: String): Boolean = runCatching {
@@ -1467,6 +1506,11 @@ private class LocalTerminalIdentity(context: Context) {
 
     private companion object {
         const val KEY_TERMINAL_ID = "id"
+        const val KEY_INSTANCE_GENERATION = "instance_generation"
+        val identityLock = Any()
+
+        @Volatile
+        var activeRuntimeIdentity: TerminalRuntimeIdentity? = null
     }
 }
 

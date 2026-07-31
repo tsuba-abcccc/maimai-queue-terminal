@@ -146,6 +146,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 import kotlin.random.Random
@@ -332,6 +333,7 @@ internal fun RegistrationApp() {
     var removeGroupTarget by remember { mutableStateOf<PositionSelection?>(null) }
     var machineTransferTarget by remember { mutableStateOf<MachineTransferRequest?>(null) }
     var friendPairTarget by remember { mutableStateOf<SelectedRegistration?>(null) }
+    var friendPairProfileTarget by remember { mutableStateOf<SelectedRegistration?>(null) }
     var stagedFriendPairRegistration by remember { mutableStateOf<SelectedRegistration?>(null) }
     var releaseFixedPairTarget by remember { mutableStateOf<PositionSelection?>(null) }
     var queueUndoAction by remember { mutableStateOf<QueueUndoAction?>(null) }
@@ -392,6 +394,33 @@ internal fun RegistrationApp() {
         )
     }
 
+    fun currentPersistedQueueState(): PersistedQueueState = PersistedQueueState(
+        queueId = queueId,
+        revision = queueRevision.incrementAndGet(),
+        machineA = machineA,
+        machineB = machineB,
+        machineAStatus = machineAStatus,
+        machineBStatus = machineBStatus,
+        registrationOpen = registrationOpen,
+        nextRegistrationKey = nextKey,
+        savedAtMillis = System.currentTimeMillis()
+    )
+
+    suspend fun persistQueueStateBeforeRemoteAcknowledgement() {
+        val snapshot = currentPersistedQueueState()
+        var retryDelayMillis = 250L
+        while (true) {
+            when (withContext(NonCancellable) { queueStateRepository.saveState(snapshot) }) {
+                QueueStateSaveResult.SAVED,
+                QueueStateSaveResult.SUPERSEDED -> return
+                QueueStateSaveResult.FAILED -> {
+                    delay(retryDelayMillis)
+                    retryDelayMillis = (retryDelayMillis * 2).coerceAtMost(5_000L)
+                }
+            }
+        }
+    }
+
     LaunchedEffect(playerProfileRepository) {
         playerProfiles = playerProfileRepository.getProfiles()
         playerProfilesLoaded = true
@@ -445,17 +474,7 @@ internal fun RegistrationApp() {
         if (!queuePersistenceReady || !playerProfilesLoaded || pendingQueueRestore != null) {
             return@LaunchedEffect
         }
-        val snapshot = PersistedQueueState(
-            queueId = queueId,
-            revision = queueRevision.incrementAndGet(),
-            machineA = machineA,
-            machineB = machineB,
-            machineAStatus = machineAStatus,
-            machineBStatus = machineBStatus,
-            registrationOpen = registrationOpen,
-            nextRegistrationKey = nextKey,
-            savedAtMillis = System.currentTimeMillis()
-        )
+        val snapshot = currentPersistedQueueState()
         var retryDelayMillis = 250L
         while (true) {
             when (withContext(NonCancellable) { queueStateRepository.saveState(snapshot) }) {
@@ -1340,6 +1359,49 @@ internal fun RegistrationApp() {
         screen = Screen.PLAYER_LIBRARY
     }
 
+    fun removeStagedFriendPairRegistration(
+        selection: SelectedRegistration? = stagedFriendPairRegistration
+    ) {
+        if (selection == null || stagedFriendPairRegistration != selection) return
+        updateQueue(selection.machineId) { queue ->
+            if (queue.waiting.any { it.key == selection.registrationKey }) {
+                queue.remove(selection.registrationKey)
+            } else {
+                queue
+            }
+        }
+        stagedFriendPairRegistration = null
+    }
+
+    fun openFriendPairPlayerLibrary(selection: SelectedRegistration) {
+        val targetStillWaiting = queueFor(selection.machineId).waiting.any {
+            it.key == selection.registrationKey && !it.requiresOnSiteCheckIn
+        }
+        if (!targetStillWaiting) return
+        friendPairTarget = null
+        friendPairProfileTarget = selection
+        openPlayerLibrary(PlayerProfileContext.FRIEND_PAIR)
+    }
+
+    fun returnToFriendPairDialog() {
+        val selection = friendPairProfileTarget
+        friendPairProfileTarget = null
+        selectedPlayerProfileId = null
+        playerProfileContext = PlayerProfileContext.JOIN_QUEUE
+        if (
+            selection != null &&
+            queueFor(selection.machineId).waiting.any { it.key == selection.registrationKey }
+        ) {
+            friendPairTarget = selection
+            screen = Screen.HOME
+        } else {
+            if (stagedFriendPairRegistration == selection) {
+                stagedFriendPairRegistration = null
+            }
+            screen = Screen.HOME
+        }
+    }
+
     fun currentPlayerProfileDraft() = PlayerProfileDraftSnapshot(
         nickname = profileNicknameDraft,
         gender = profileGenderDraft,
@@ -1532,6 +1594,111 @@ internal fun RegistrationApp() {
             selectedPlayerProfileId = null
             rememberProfileJoinPreference = false
             if (registrationAdded) showNewRegistrationFeedback(machineId, registrationKey)
+            screen = Screen.HOME
+        }
+    }
+
+    fun completeFriendPairPlayerProfile() {
+        val selection = friendPairProfileTarget ?: return
+        val profile = selectedPlayerProfileId?.let { profileId ->
+            playerProfiles.firstOrNull { it.id == profileId }
+        } ?: return
+        val currentQueue = queueFor(selection.machineId)
+        val target = currentQueue.waiting.firstOrNull {
+            it.key == selection.registrationKey
+        } ?: return
+        if (
+            !acceptingNewRegistrations ||
+            !statusFor(selection.machineId).isOperational ||
+            currentQueue.registrationCount >= 20 ||
+            target.requiresOnSiteCheckIn ||
+            !profile.hasValidContact ||
+            !profile.hasCompleteRequiredDetails ||
+            playerProfileAlreadyRegistered(profile)
+        ) return
+
+        val usageAtMillis = System.currentTimeMillis()
+        val usedProfile = profile.recordUsage(atMillis = usageAtMillis)
+        persistPlayerProfileForUser(
+            profile = usedProfile,
+            latestProfileMutation = { latestProfile ->
+                latestProfile.recordUsage(
+                    atMillis = maxOf(
+                        usageAtMillis,
+                        latestProfile.updatedAtMillis + 1L
+                    )
+                )
+            },
+            failureDetail = "朋友的玩家资料使用记录未能保存，因此尚未创建登记。请稍后重试。"
+        ) persisted@{ persistedProfile ->
+            val latestQueue = queueFor(selection.machineId)
+            val latestTarget = latestQueue.waiting.firstOrNull {
+                it.key == selection.registrationKey
+            }
+            if (
+                latestTarget == null ||
+                latestTarget.requiresOnSiteCheckIn ||
+                !acceptingNewRegistrations ||
+                !statusFor(selection.machineId).isOperational ||
+                latestQueue.registrationCount >= 20 ||
+                playerProfileAlreadyRegistered(persistedProfile)
+            ) {
+                removeStagedFriendPairRegistration(selection)
+                friendPairProfileTarget = null
+                selectedPlayerProfileId = null
+                playerProfileContext = PlayerProfileContext.JOIN_QUEUE
+                screen = Screen.HOME
+                showHomeOperationFeedback(
+                    title = "固定组合尚未建立",
+                    detail = "队列状态已经变化，请重新选择朋友并确认。",
+                    contextLabel = configuredMachineName(selection.machineId),
+                    tone = HomeSidePanelFeedbackTone.WARNING
+                )
+                return@persisted
+            }
+
+            val friendKey = nextKey
+            val friend = Registration(
+                key = friendKey,
+                displayId = persistedProfile.nickname,
+                preference = PlayPreference.OPEN_TO_JOIN,
+                isTemporary = false,
+                createdAtMillis = usageAtMillis,
+                gender = persistedProfile.gender,
+                playerProfileId = persistedProfile.id
+            )
+            val shouldFinishCreation = stagedFriendPairRegistration == selection
+            val pairCreated = updateQueueAfterOnSiteRegistration(
+                selection.machineId,
+                if (shouldFinishCreation) QueueSoundCue.CONFIRM else QueueSoundCue.QUEUE_CHANGE,
+                advanceWhenPlayingEmpty = shouldFinishCreation
+            ) {
+                it.createFriendPair(latestTarget.key, friend)
+            }
+            if (pairCreated) {
+                nextKey++
+                if (shouldFinishCreation) {
+                    stagedFriendPairRegistration = null
+                    showNewRegistrationFeedback(selection.machineId, selection.registrationKey)
+                } else {
+                    showHomeOperationFeedback(
+                        title = "固定组合已建立",
+                        detail = "“${latestTarget.displayId}”与“${persistedProfile.nickname}”已组成固定组合。",
+                        contextLabel = configuredMachineName(selection.machineId)
+                    )
+                }
+            } else {
+                removeStagedFriendPairRegistration(selection)
+                showHomeOperationFeedback(
+                    title = "固定组合尚未建立",
+                    detail = "队列状态已经变化，请重新选择朋友并确认。",
+                    contextLabel = configuredMachineName(selection.machineId),
+                    tone = HomeSidePanelFeedbackTone.WARNING
+                )
+            }
+            friendPairProfileTarget = null
+            selectedPlayerProfileId = null
+            playerProfileContext = PlayerProfileContext.JOIN_QUEUE
             screen = Screen.HOME
         }
     }
@@ -2001,8 +2168,9 @@ internal fun RegistrationApp() {
                             CLOUD_PROFILE_REFRESH_INTERVAL_MILLIS
                     }
                 }
-                queueCommandClient.fetchPendingCommands()?.let { commands ->
-                    for (command in commands) {
+                remoteTerminalCommandPollMutex.withLock {
+                    queueCommandClient.fetchPendingCommands()?.let { commands ->
+                        for (command in commands) {
                         when (command) {
                             is PlayerProfileUpdateCommand -> {
                                 if (!queueRuleSettings.oneBotSyncEnabled) {
@@ -2026,6 +2194,7 @@ internal fun RegistrationApp() {
                                     }
                                 )) {
                                     is PlayerProfileCommandPersistenceResult.Applied -> {
+                                        persistQueueStateBeforeRemoteAcknowledgement()
                                         localWriteFailureDetail = null
                                         queueCommandClient.complete(
                                             command.commandId,
@@ -2187,20 +2356,50 @@ internal fun RegistrationApp() {
                                                 tone = HomeSidePanelFeedbackTone.INFO
                                             )
                                         }
+                                        persistQueueStateBeforeRemoteAcknowledgement()
                                         localWriteFailureDetail = null
+                                        val resultRegistrationId = if (
+                                            command.operation == RemoteQueueOperation.JOIN_QUEUE
+                                        ) {
+                                            result.state.queues.values.asSequence()
+                                                .flatMap { it.allRegistrations.asSequence() }
+                                                .firstOrNull {
+                                                    it.originatingCommandId == command.commandId
+                                                }
+                                                ?.key
+                                                ?.let { publicRegistrationId(queueId, it) }
+                                        } else {
+                                            null
+                                        }
                                         queueCommandClient.complete(
                                             command.commandId,
                                             applied = true,
-                                            detail = result.detail
+                                            detail = result.detail,
+                                            resultRegistrationId = resultRegistrationId
                                         )
                                     }
 
                                     is RemoteQueueOperationDecision.AlreadyApplied -> {
+                                        persistQueueStateBeforeRemoteAcknowledgement()
                                         localWriteFailureDetail = null
+                                        val resultRegistrationId = if (
+                                            command.operation == RemoteQueueOperation.JOIN_QUEUE
+                                        ) {
+                                            sequenceOf(machineA, machineB)
+                                                .flatMap { it.allRegistrations.asSequence() }
+                                                .firstOrNull {
+                                                    it.originatingCommandId == command.commandId
+                                                }
+                                                ?.key
+                                                ?.let { publicRegistrationId(queueId, it) }
+                                        } else {
+                                            null
+                                        }
                                         queueCommandClient.complete(
                                             command.commandId,
                                             applied = true,
-                                            detail = result.detail
+                                            detail = result.detail,
+                                            resultRegistrationId = resultRegistrationId
                                         )
                                     }
 
@@ -2275,6 +2474,7 @@ internal fun RegistrationApp() {
                                                 source = AuditLogSource.MOBILE_DEVICE
                                             )
                                         }
+                                        persistQueueStateBeforeRemoteAcknowledgement()
                                         if (!persistMobileRegistrationReceipt(command.commandId)) {
                                             localWriteFailureDetail =
                                                 "移动设备登记的执行记录暂时无法写入本机，应用将继续重试。"
@@ -2310,6 +2510,7 @@ internal fun RegistrationApp() {
                                     is MobileDeviceRegistrationDecision.AlreadyApplied -> {
                                         val receiptWasAlreadyRecorded =
                                             command.commandId in appliedMobileRegistrationCommandIds
+                                        persistQueueStateBeforeRemoteAcknowledgement()
                                         if (!persistMobileRegistrationReceipt(command.commandId)) {
                                             localWriteFailureDetail =
                                                 "移动设备登记的执行记录暂时无法写入本机，应用将继续重试。"
@@ -2361,6 +2562,7 @@ internal fun RegistrationApp() {
                                         )
                                     }
                                 }
+                            }
                             }
                         }
                     }
@@ -2417,6 +2619,7 @@ internal fun RegistrationApp() {
     }
 
     fun returnHomeAndClearTransientState(resetQueueScroll: Boolean) {
+        removeStagedFriendPairRegistration()
         inactivityWarningSeconds = null
         selectedMachine = null
         isBatchFlow = false
@@ -2427,6 +2630,7 @@ internal fun RegistrationApp() {
         mobileRegistrationSession = null
         mobileRegistrationFailureDetail = null
         selectedPlayerProfileId = null
+        playerProfileContext = PlayerProfileContext.JOIN_QUEUE
         editingPlayerProfileId = null
         profileJoinPreference = null
         rememberProfileJoinPreference = false
@@ -2459,7 +2663,7 @@ internal fun RegistrationApp() {
         removeGroupTarget = null
         machineTransferTarget = null
         friendPairTarget = null
-        stagedFriendPairRegistration = null
+        friendPairProfileTarget = null
         releaseFixedPairTarget = null
         botFriendPromptQq = null
         playerProfileWriteFailureDetail = null
@@ -2816,20 +3020,23 @@ internal fun RegistrationApp() {
                             searchQuery = playerProfileSearch,
                             sortMode = playerProfileSort,
                             listState = playerProfileListState,
-                            contextLabel = if (playerProfileContext == PlayerProfileContext.CLAIM_REGISTRATION) {
-                                "认领登记"
-                            } else {
-                                "本机玩家资料"
+                            contextLabel = when (playerProfileContext) {
+                                PlayerProfileContext.CLAIM_REGISTRATION -> "认领登记"
+                                PlayerProfileContext.FRIEND_PAIR -> "与朋友共同游玩"
+                                PlayerProfileContext.JOIN_QUEUE -> "本机玩家资料"
                             },
-                            title = if (playerProfileContext == PlayerProfileContext.CLAIM_REGISTRATION) {
-                                "选择玩家资料"
-                            } else {
-                                "玩家资料库"
+                            title = when (playerProfileContext) {
+                                PlayerProfileContext.CLAIM_REGISTRATION -> "选择玩家资料"
+                                PlayerProfileContext.FRIEND_PAIR -> "选择朋友的玩家资料"
+                                PlayerProfileContext.JOIN_QUEUE -> "玩家资料库"
                             },
-                            subtitle = if (playerProfileContext == PlayerProfileContext.CLAIM_REGISTRATION) {
-                                "选择用于认领这份临时登记的玩家资料。"
-                            } else {
-                                "选择玩家资料，确认后加入当前机台的排队。"
+                            subtitle = when (playerProfileContext) {
+                                PlayerProfileContext.CLAIM_REGISTRATION ->
+                                    "选择用于认领这份临时登记的玩家资料。"
+                                PlayerProfileContext.FRIEND_PAIR ->
+                                    "选择朋友的玩家资料，确认后创建登记并组成固定组合。"
+                                PlayerProfileContext.JOIN_QUEUE ->
+                                    "选择玩家资料，确认后加入当前机台的排队。"
                             },
                             onSearchQueryChange = {
                                 playerProfileSearch = it
@@ -2842,10 +3049,13 @@ internal fun RegistrationApp() {
                                 openEditPlayerProfile(it, Screen.PLAYER_LIBRARY)
                             },
                             onBack = {
-                                screen = if (playerProfileContext == PlayerProfileContext.CLAIM_REGISTRATION) {
-                                    Screen.CLAIM_REGISTRATION
-                                } else {
-                                    Screen.CREATE_REGISTRATION
+                                when (playerProfileContext) {
+                                    PlayerProfileContext.CLAIM_REGISTRATION ->
+                                        screen = Screen.CLAIM_REGISTRATION
+                                    PlayerProfileContext.FRIEND_PAIR ->
+                                        returnToFriendPairDialog()
+                                    PlayerProfileContext.JOIN_QUEUE ->
+                                        screen = Screen.CREATE_REGISTRATION
                                 }
                             }
                         )
@@ -2924,6 +3134,40 @@ internal fun RegistrationApp() {
                                             completePlayerProfileClaim()
                                         }
                                     },
+                                    onBack = { screen = Screen.PLAYER_LIBRARY }
+                                )
+                            } else if (playerProfileContext == PlayerProfileContext.FRIEND_PAIR) {
+                                val selection = friendPairProfileTarget
+                                val queue = selection?.let { queueFor(it.machineId) }
+                                val registration = selection?.let { selected ->
+                                    queue?.waiting?.firstOrNull {
+                                        it.key == selected.registrationKey
+                                    }
+                                }
+                                val currentPartner = registration?.fixedPartnerKey?.let { partnerKey ->
+                                    queue?.waiting?.firstOrNull { it.key == partnerKey }
+                                }
+                                FriendPairPlayerProfileDetailScreen(
+                                    profile = profile,
+                                    registration = registration,
+                                    currentPartner = currentPartner,
+                                    alreadyRegistered = profile?.let(::playerProfileAlreadyRegistered) == true,
+                                    machineLabel = selection?.machineId
+                                        ?.let(::configuredMachineName)
+                                        ?: "所选机台",
+                                    machineAvailable = selection?.let { selected ->
+                                        registration != null &&
+                                            !registration.requiresOnSiteCheckIn &&
+                                            acceptingNewRegistrations &&
+                                            statusFor(selected.machineId).isOperational &&
+                                            queueFor(selected.machineId).registrationCount < 20
+                                    } == true,
+                                    onEditProfile = {
+                                        profile?.let {
+                                            openEditPlayerProfile(it, Screen.PLAYER_PROFILE_DETAIL)
+                                        }
+                                    },
+                                    onComplete = ::completeFriendPairPlayerProfile,
                                     onBack = { screen = Screen.PLAYER_LIBRARY }
                                 )
                             } else {
@@ -3346,6 +3590,7 @@ internal fun RegistrationApp() {
                             registration = registration,
                             queue = queue,
                             allowCreateFriend = acceptingNewRegistrations,
+                            machineOperational = statusFor(selection.machineId).isOperational,
                             idAlreadyExists = ::idAlreadyExists,
                             onGenerateFriendId = ::randomUnusedId,
                             onDismiss = {
@@ -3357,6 +3602,9 @@ internal fun RegistrationApp() {
                                     screen = Screen.PREFERENCE
                                 }
                                 friendPairTarget = null
+                            },
+                            onPlayerLibrary = {
+                                openFriendPairPlayerLibrary(selection)
                             },
                             onPairExisting = onPairExisting@{ plan ->
                                 if (
@@ -3393,6 +3641,7 @@ internal fun RegistrationApp() {
                                 val normalizedId = displayId.trim()
                                 if (
                                     acceptingNewRegistrations &&
+                                    statusFor(selection.machineId).isOperational &&
                                     normalizedId.isNotBlank() &&
                                     !idAlreadyExists(normalizedId) &&
                                     queueFor(selection.machineId).waiting.any {
@@ -8295,6 +8544,127 @@ private fun PlayerProfileDetailScreen(
 }
 
 @Composable
+private fun FriendPairPlayerProfileDetailScreen(
+    profile: PlayerProfile?,
+    registration: Registration?,
+    currentPartner: Registration?,
+    alreadyRegistered: Boolean,
+    machineAvailable: Boolean,
+    machineLabel: String,
+    onEditProfile: () -> Unit,
+    onComplete: () -> Unit,
+    onBack: () -> Unit
+) {
+    if (profile == null || registration == null) {
+        WizardPage(
+            step = "与朋友共同游玩",
+            title = "无法继续创建登记",
+            subtitle = "玩家资料或队列状态可能已经发生变化，请返回后重新选择。",
+            onBack = onBack
+        ) {
+            SecondaryButton("返回玩家资料库", onBack, Modifier.fillMaxWidth())
+        }
+        return
+    }
+    if (!profile.hasValidContact || !profile.hasCompleteRequiredDetails) {
+        IncompletePlayerProfileScreen(
+            profile = profile,
+            continuation = "创建朋友登记并组成固定组合",
+            onEditProfile = onEditProfile,
+            onBack = onBack
+        )
+        return
+    }
+    var consentConfirmed by remember(profile.id, registration.key) { mutableStateOf(false) }
+    WizardPage(
+        step = "确认资料",
+        title = "与朋友组成固定组合",
+        subtitle = "请确认朋友的玩家资料。完成后，两份登记会在 $machineLabel 的登记顺序末端组成固定组合。",
+        onBack = onBack
+    ) {
+        Row(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
+                .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp)).padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            PlayerAvatar(profile, 64.dp)
+            Spacer(Modifier.width(16.dp))
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(profile.nickname, color = PrimaryText, fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.width(8.dp))
+                    PlayerGenderMark(profile.gender, hideUndisclosed = false, fontSize = 20.sp)
+                }
+                Spacer(Modifier.height(5.dp))
+                Text(
+                    "默认偏好：${profilePreferenceLabel(profile.defaultPreference)}",
+                    color = SecondaryText,
+                    fontSize = 12.sp
+                )
+                Spacer(Modifier.height(3.dp))
+                Text(profileContactSummary(profile), color = SecondaryText, fontSize = 11.sp)
+            }
+        }
+        Spacer(Modifier.height(13.dp))
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(PageBackground)
+                .padding(horizontal = 15.dp, vertical = 12.dp)
+        ) {
+            MetadataRow("现有登记", registration.displayId)
+            MetadataRow("朋友的登记", profile.nickname)
+            MetadataRow("本次安排", "固定组合")
+        }
+        Spacer(Modifier.height(11.dp))
+        Text(
+            "此次会使用固定组合安排共同游玩，不会修改朋友玩家资料中的默认游玩偏好。为避免延后其他玩家，两份登记都会移动到当前机台的登记顺序末端。",
+            color = SecondaryText,
+            fontSize = 12.sp,
+            lineHeight = 18.sp
+        )
+        if (currentPartner != null) {
+            Spacer(Modifier.height(9.dp))
+            Text(
+                "继续后，“${registration.displayId}”与“${currentPartner.displayId}”的原固定组合会解除；“${currentPartner.displayId}”会恢复为允许他人加入。",
+                color = Color(0xFF9A5B00),
+                fontSize = 12.sp,
+                lineHeight = 18.sp
+            )
+        }
+        if (alreadyRegistered || !machineAvailable) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                if (alreadyRegistered) {
+                    "这名玩家已经有一份有效登记，不能重复创建。"
+                } else {
+                    "$machineLabel 当前不能接收新的登记，固定组合尚未建立。"
+                },
+                color = Destructive,
+                fontSize = 12.sp,
+                lineHeight = 18.sp
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        FriendConsentConfirmation(
+            checked = consentConfirmed,
+            text = "双方已经明确同意使用这份玩家资料创建登记并组成固定组合。",
+            onToggle = { consentConfirmed = !consentConfirmed }
+        )
+        Spacer(Modifier.height(16.dp))
+        PrimaryButton(
+            "创建并组成固定组合",
+            onComplete,
+            Modifier.fillMaxWidth(),
+            enabled = !alreadyRegistered && machineAvailable && consentConfirmed,
+            disabledReason = when {
+                alreadyRegistered -> "这名玩家已经有一份有效登记，不能重复创建。"
+                !machineAvailable -> "$machineLabel 当前不能接收新的登记。"
+                else -> "请先确认两位玩家都同意组成固定组合。"
+            }
+        )
+    }
+}
+
+@Composable
 private fun ClaimPlayerProfileDetailScreen(
     profile: PlayerProfile?,
     registration: Registration?,
@@ -8849,9 +9219,11 @@ private fun FriendPairFlowDialog(
     registration: Registration,
     queue: MachineQueue,
     allowCreateFriend: Boolean,
+    machineOperational: Boolean,
     idAlreadyExists: (String) -> Boolean,
     onGenerateFriendId: () -> String,
     onDismiss: () -> Unit,
+    onPlayerLibrary: () -> Unit,
     onPairExisting: (FriendPairPlan) -> Unit,
     onCreateFriend: (String) -> Unit
 ) {
@@ -8914,15 +9286,17 @@ private fun FriendPairFlowDialog(
                         "为朋友创建登记",
                         when {
                             !isWaiting -> "${playingPositionName(machineId)} 中的登记暂时不能创建固定组合。"
-                            !allowCreateFriend -> "闭店收尾期间不再接收新的排队登记。"
+                            !machineOperational -> "当前机台已停止使用，暂时不能创建朋友登记。"
+                            !allowCreateFriend -> "当前不接收新的排队登记。"
                             queue.registrationCount >= 20 -> "当前机台已达到 20 人上限，无法继续创建登记。"
-                            else -> "创建一份临时登记，并让你们在登记顺序末端组成固定组合。"
+                            else -> "使用玩家资料或创建临时登记，并在登记顺序末端组成固定组合。"
                         },
                         {
                             friendConsentConfirmed = false
                             step = FriendPairStep.CREATE_FRIEND
                         },
-                        enabled = allowCreateFriend && isWaiting && queue.registrationCount < 20
+                        enabled = allowCreateFriend && machineOperational && isWaiting &&
+                            queue.registrationCount < 20
                     ),
                     Modifier.widthIn(max = 340.dp).fillMaxWidth().align(Alignment.CenterHorizontally)
                 )
@@ -9059,7 +9433,7 @@ private fun FriendPairFlowDialog(
                 Text("为朋友创建登记", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "朋友会取得一份新的临时登记。你们两份登记将一起移动到当前机台的登记顺序末端，并形成固定组合；其他玩家不会因此延后。",
+                    "可以使用朋友的玩家资料创建登记，也可以创建一份临时登记。你们两份登记将一起移动到当前机台的登记顺序末端，并形成固定组合；其他玩家不会因此延后。",
                     color = SecondaryText,
                     fontSize = 13.sp,
                     lineHeight = 20.sp
@@ -9074,6 +9448,31 @@ private fun FriendPairFlowDialog(
                     )
                 }
                 Spacer(Modifier.height(16.dp))
+                MenuActionButton(
+                    MenuAction(
+                        "使用玩家资料库",
+                        "从本机玩家资料库选择朋友，登记会保留其昵称、性别和资料关联。",
+                        onPlayerLibrary,
+                        enabled = allowCreateFriend && machineOperational &&
+                            isWaiting && queue.registrationCount < 20
+                    ),
+                    Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(15.dp))
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    HorizontalDivider(Modifier.weight(1f), color = Separator.copy(alpha = .72f))
+                    Text(
+                        "或创建临时登记",
+                        color = TertiaryText,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(horizontal = 12.dp)
+                    )
+                    HorizontalDivider(Modifier.weight(1f), color = Separator.copy(alpha = .72f))
+                }
+                Spacer(Modifier.height(11.dp))
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     RegistrationNicknameField(
                         friendIdDraft,
@@ -9109,12 +9508,14 @@ private fun FriendPairFlowDialog(
                     Modifier.fillMaxWidth(),
                     enabled = friendIdDraft.isNotBlank() &&
                         allowCreateFriend &&
+                        machineOperational &&
                         !friendIdAlreadyExists &&
                         queue.registrationCount < 20 &&
                         friendConsentConfirmed,
                     disabledReason = when {
                         friendIdDraft.isBlank() -> "请先填写朋友的登记昵称。"
-                        !allowCreateFriend -> "当前状态不能再创建朋友登记。"
+                        !machineOperational -> "当前机台已停止使用，暂时不能创建朋友登记。"
+                        !allowCreateFriend -> "当前不接收新的排队登记。"
                         friendIdAlreadyExists -> "当前队列中已经有相同昵称的登记。"
                         queue.registrationCount >= 20 -> "当前机台已有 20 份登记，不能继续新增。"
                         else -> "请先确认两位玩家都同意组成固定组合。"
@@ -11262,6 +11663,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.6.5",
+            "线上登记可靠性",
+            "终端运行实例、命令领取和成功回执现在能够一一对应，避免重复运行的旧队列覆盖新登记；网页会在真实登记同步到队列后再显示成功。与朋友共同游玩时也可以从玩家资料库为朋友创建登记。"
+        ),
         Triple(
             "0.6.4",
             "估时表达修正",

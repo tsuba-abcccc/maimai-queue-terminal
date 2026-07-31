@@ -1377,6 +1377,30 @@ class QueueModelsTest {
     }
 
     @Test
+    fun creatingFriendPairFromPlayerProfileKeepsProfileIdentityAndVisibleDetails() {
+        val queue = MachineQueue(
+            waiting = listOf(registration(1, PlayPreference.OPEN_TO_JOIN))
+        )
+        val profileRegistration = registration(2, PlayPreference.SOLO).copy(
+            displayId = "资料玩家",
+            isTemporary = false,
+            gender = PlayerGender.FEMALE,
+            playerProfileId = "profile-2",
+            createdAtMillis = 456_000L
+        )
+
+        val paired = queue.createFriendPair(1, profileRegistration)
+        val created = paired.waiting.single { it.key == 2 }
+
+        assertEquals("资料玩家", created.displayId)
+        assertFalse(created.isTemporary)
+        assertEquals(PlayerGender.FEMALE, created.gender)
+        assertEquals("profile-2", created.playerProfileId)
+        assertEquals(456_000L, created.createdAtMillis)
+        assertEquals(1, created.fixedPartnerKey)
+    }
+
+    @Test
     fun staleFriendPairPlanIsRejectedWhenQueueBehaviorChanged() {
         val original = MachineQueue(
             waiting = listOf(
