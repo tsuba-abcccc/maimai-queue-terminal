@@ -20,9 +20,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
@@ -70,6 +68,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.Button
@@ -338,6 +337,8 @@ internal fun RegistrationApp() {
     var releaseFixedPairTarget by remember { mutableStateOf<PositionSelection?>(null) }
     var queueUndoAction by remember { mutableStateOf<QueueUndoAction?>(null) }
     var nextQueueUndoId by remember { mutableLongStateOf(1L) }
+    var homeSidePanelFeedback by remember { mutableStateOf<HomeSidePanelFeedback?>(null) }
+    var nextHomeSidePanelFeedbackId by remember { mutableLongStateOf(1L) }
     var pendingQueueRestore by remember { mutableStateOf<PersistedQueueState?>(null) }
     var queuePersistenceReady by remember { mutableStateOf(false) }
     var inactivityWarningSeconds by remember { mutableStateOf<Int?>(null) }
@@ -358,7 +359,33 @@ internal fun RegistrationApp() {
     )
     val acceptingNewRegistrations = registrationOpen && !closingOccurrencePending
 
+    fun showHomeOperationFeedback(
+        title: String,
+        detail: String,
+        contextLabel: String? = null,
+        tone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS
+    ) {
+        if (queueUndoAction != null && tone != HomeSidePanelFeedbackTone.WARNING) return
+        if (tone == HomeSidePanelFeedbackTone.WARNING) queueUndoAction = null
+        newRegistrationHighlight = null
+        homeSidePanelFeedback = HomeSidePanelFeedback(
+            id = nextHomeSidePanelFeedbackId++,
+            title = title,
+            detail = detail,
+            contextLabel = contextLabel,
+            tone = tone
+        )
+    }
+
+    fun dismissHomeSidePanelContent() {
+        newRegistrationHighlight = null
+        homeSidePanelFeedback = null
+        queueUndoAction = null
+    }
+
     fun showNewRegistrationFeedback(machineId: MachineId, registrationKey: Int) {
+        homeSidePanelFeedback = null
+        queueUndoAction = null
         newRegistrationHighlight = NewRegistrationHighlight(
             machineId = machineId,
             registrationKey = registrationKey,
@@ -667,8 +694,8 @@ internal fun RegistrationApp() {
         publicEventTypeOverride: PublicQueueEventType? = null,
         affectedRegistrationKeysOverride: Collection<Int> = emptyList(),
         source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL
-    ) {
-        createQueueAuditLog(
+    ): AuditLogEntry? {
+        val entry = createQueueAuditLog(
             category = auditCategoryFor(machineId),
             machineLabel = configuredMachineName(machineId),
             before = beforeQueue,
@@ -677,7 +704,9 @@ internal fun RegistrationApp() {
             publicEventTypeOverride = publicEventTypeOverride,
             affectedRegistrationKeysOverride = affectedRegistrationKeysOverride,
             source = source
-        )?.let(::appendAuditLog)
+        ) ?: return null
+        appendAuditLog(entry)
+        return entry
     }
 
     fun removedPendingCheckInKeys(
@@ -697,19 +726,23 @@ internal fun RegistrationApp() {
         affectedRegistrationKeysOverride: Collection<Int> = emptyList(),
         classifyMissedOnlineRegistrations: Boolean = false,
         source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
+        surfaceHomeFeedback: Boolean = false,
+        homeFeedbackTone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS,
+        homeFeedbackTitle: String? = null,
         transform: (MachineQueue) -> MachineQueue
-    ) {
+    ): Boolean {
         val beforeQueue = queueFor(machineId)
         val afterQueue = transform(beforeQueue)
-        if (afterQueue == beforeQueue) return
+        if (afterQueue == beforeQueue) return false
         val missedOnlineRegistrationKeys = if (classifyMissedOnlineRegistrations) {
             removedPendingCheckInKeys(beforeQueue, afterQueue)
         } else {
             emptySet()
         }
         queueUndoAction = null
+        homeSidePanelFeedback = null
         setQueue(machineId, afterQueue)
-        appendQueueAuditLog(
+        val auditEntry = appendQueueAuditLog(
             machineId,
             beforeQueue,
             afterQueue,
@@ -720,7 +753,22 @@ internal fun RegistrationApp() {
                 affectedRegistrationKeysOverride + missedOnlineRegistrationKeys,
             source = source
         )
+        if (surfaceHomeFeedback && auditEntry != null) {
+            val machineLabel = configuredMachineName(machineId)
+            showHomeOperationFeedback(
+                title = homeFeedbackTitle
+                    ?: auditEntry.title.removePrefix("$machineLabel · "),
+                detail = auditEntry.detail,
+                contextLabel = machineLabel,
+                tone = if (missedOnlineRegistrationKeys.isNotEmpty()) {
+                    HomeSidePanelFeedbackTone.WARNING
+                } else {
+                    homeFeedbackTone
+                }
+            )
+        }
         soundCue?.let(queueSoundPlayer::play)
+        return true
     }
 
     fun updateQueueAfterOnSiteRegistration(
@@ -728,10 +776,10 @@ internal fun RegistrationApp() {
         soundCue: QueueSoundCue,
         advanceWhenPlayingEmpty: Boolean = true,
         transform: (MachineQueue) -> MachineQueue
-    ) {
+    ): Boolean {
         val beforeQueue = queueFor(machineId)
         val stagedQueue = transform(beforeQueue)
-        if (stagedQueue == beforeQueue) return
+        if (stagedQueue == beforeQueue) return false
         val roundPlan = RoundPlanner.enterPlayingPosition(stagedQueue)
         val preview = roundPlan.preview
         val needsAvailabilityConfirmation = advanceWhenPlayingEmpty &&
@@ -742,27 +790,33 @@ internal fun RegistrationApp() {
         } else {
             stagedQueue
         }
-        updateQueue(
+        val changed = updateQueue(
             machineId = machineId,
             soundCue = soundCue,
             classifyMissedOnlineRegistrations = true
         ) { currentQueue ->
             if (currentQueue == beforeQueue) afterQueue else currentQueue
         }
-        if (needsAvailabilityConfirmation && queueFor(machineId) == afterQueue) {
+        if (changed && needsAvailabilityConfirmation && queueFor(machineId) == afterQueue) {
             enterPlayingConfirmation = machineId
         }
+        return changed
     }
 
     fun updateQueueWithUndo(
         machineId: MachineId,
         message: String,
+        feedbackTitle: String = message.substringAfter(" 的 ", message),
+        feedbackDetail: String = "$message。",
         transform: (MachineQueue) -> MachineQueue
-    ) {
+    ): Boolean {
         val beforeQueue = queueFor(machineId)
         val afterQueue = transform(beforeQueue)
-        if (afterQueue == beforeQueue) return
-        val nonRestorableRegistrationKeys = removedPendingCheckInKeys(beforeQueue, afterQueue)
+        if (afterQueue == beforeQueue) return false
+        val feedbackOutcome = queueUndoFeedbackOutcome(beforeQueue, afterQueue)
+        val nonRestorableRegistrationKeys = feedbackOutcome.nonRestorableRegistrationKeys
+        homeSidePanelFeedback = null
+        newRegistrationHighlight = null
         setQueue(machineId, afterQueue)
         appendQueueAuditLog(
             machineId = machineId,
@@ -779,9 +833,18 @@ internal fun RegistrationApp() {
             beforeQueue = beforeQueue,
             afterQueue = afterQueue,
             message = message,
+            feedbackTitle = feedbackTitle,
+            feedbackDetail = if (feedbackOutcome.detailLines.isEmpty()) {
+                feedbackDetail
+            } else {
+                (listOf(feedbackDetail) + feedbackOutcome.detailLines).joinToString("\n")
+            },
+            contextLabel = configuredMachineName(machineId),
+            feedbackTone = feedbackOutcome.tone,
             nonRestorableRegistrationKeys = nonRestorableRegistrationKeys
         )
         queueSoundPlayer.play(QueueSoundCue.QUEUE_CHANGE)
+        return true
     }
 
     fun undoLatestQueueAction() {
@@ -801,7 +864,26 @@ internal fun RegistrationApp() {
             restored = restoredQueue != action.afterQueue
         }
         queueUndoAction = null
-        if (restored) queueSoundPlayer.play(QueueSoundCue.UNDO)
+        if (restored) {
+            queueSoundPlayer.play(QueueSoundCue.UNDO)
+            showHomeOperationFeedback(
+                title = "操作已撤销",
+                detail = if (action.nonRestorableRegistrationKeys.isEmpty()) {
+                    "${action.feedbackTitle}已撤销，队列已经恢复到操作前的状态。"
+                } else {
+                    "${action.feedbackTitle}已撤销；此前因未签到而退出的登记不会恢复。"
+                },
+                contextLabel = action.contextLabel,
+                tone = HomeSidePanelFeedbackTone.INFO
+            )
+        } else {
+            showHomeOperationFeedback(
+                title = "无法撤销这次操作",
+                detail = "队列已经发生新的变化，为避免覆盖后续操作，本次撤销没有执行。",
+                contextLabel = action.contextLabel,
+                tone = HomeSidePanelFeedbackTone.WARNING
+            )
+        }
     }
 
     fun updateStatus(machineId: MachineId, transform: (MachineStatus) -> MachineStatus) {
@@ -838,6 +920,17 @@ internal fun RegistrationApp() {
             )
         )
         if (queueUndoAction?.machineId == machineId) queueUndoAction = null
+        showHomeOperationFeedback(
+            title = "机台已停止使用",
+            detail = buildString {
+                append("停止原因：${machineStopReasonLabel(stoppedStatus.stopReason, stoppedStatus.stopReasonDetail)}。")
+                if (registrationCount > 0) {
+                    append("现有 $registrationCount 份登记及其顺序已保留。")
+                }
+            },
+            contextLabel = configuredMachineName(machineId),
+            tone = HomeSidePanelFeedbackTone.WARNING
+        )
         if (selectedMachine == machineId) selectedMachine = null
         screen = Screen.HOME
     }
@@ -863,9 +956,18 @@ internal fun RegistrationApp() {
                 affectedRegistrationKeys = restoredQueue.allRegistrations.map { it.key }
             )
         )
+        showHomeOperationFeedback(
+            title = "机台已恢复正常使用",
+            detail = if (restoredQueue.playing.isEmpty()) {
+                "现在可以继续接收和处理排队登记。"
+            } else {
+                "保留的登记顺序已经恢复，本轮计时已从头开始。"
+            },
+            contextLabel = configuredMachineName(machineId)
+        )
     }
 
-    fun transferRegistrations(request: MachineTransferRequest) {
+    fun transferRegistrations(request: MachineTransferRequest): Boolean {
         val destinationMachineId = otherMachine(request.sourceMachineId)
         val registrationKeys = request.registrationKeys.toSet()
         val sourceQueue = queueFor(request.sourceMachineId)
@@ -882,14 +984,14 @@ internal fun RegistrationApp() {
             registrations.size != registrationKeys.size ||
             sourceQueue.playing.any { it.key in registrationKeys } ||
             destinationQueue.registrationCount + registrations.size > 20
-        ) return
+        ) return false
 
         val updatedSource = sourceQueue.removeAll(registrationKeys)
         val updatedDestination = destinationQueue.receiveAtWaitingTail(registrations)
         if (
             updatedSource == sourceQueue ||
             updatedDestination.registrationCount != destinationQueue.registrationCount + registrations.size
-        ) return
+        ) return false
 
         queueUndoAction = null
         setQueue(request.sourceMachineId, updatedSource)
@@ -902,6 +1004,14 @@ internal fun RegistrationApp() {
             releasedPartnerRegistrations = releasedPartnerRegistrations
         )?.let(::appendAuditLog)
         queueSoundPlayer.play(QueueSoundCue.QUEUE_CHANGE)
+        val sourceMachineName = configuredMachineName(request.sourceMachineId)
+        val destinationMachineName = configuredMachineName(destinationMachineId)
+        showHomeOperationFeedback(
+            title = if (registrations.size == 1) "登记已切换机台" else "多份登记已切换机台",
+            detail = "${registrations.joinToString("、") { "“${it.displayId}”" }}已转至 $destinationMachineName 的等待顺序末端。",
+            contextLabel = "$sourceMachineName · 转至 $destinationMachineName"
+        )
+        return true
     }
 
     fun idAlreadyExists(displayId: String, exceptKey: Int? = null): Boolean =
@@ -1043,7 +1153,7 @@ internal fun RegistrationApp() {
             is CloudPlayerProfilePersistenceResult.Success -> {
                 cloudProfileRestoreFailureDetail = null
                 playerProfiles = result.profiles
-                machineA = result.profiles.fold(
+                val syncedMachineA = result.profiles.fold(
                     machineA.resolvePlayerProfileAliases(
                         result.appliedAliases,
                         result.profiles
@@ -1051,7 +1161,7 @@ internal fun RegistrationApp() {
                 ) { queue, profile ->
                     queue.syncPlayerProfileDetails(profile.id, profile.nickname, profile.gender)
                 }
-                machineB = result.profiles.fold(
+                val syncedMachineB = result.profiles.fold(
                     machineB.resolvePlayerProfileAliases(
                         result.appliedAliases,
                         result.profiles
@@ -1059,6 +1169,12 @@ internal fun RegistrationApp() {
                 ) { queue, profile ->
                     queue.syncPlayerProfileDetails(profile.id, profile.nickname, profile.gender)
                 }
+                if (syncedMachineA != machineA || syncedMachineB != machineB) {
+                    queueUndoAction = null
+                    homeSidePanelFeedback = null
+                }
+                machineA = syncedMachineA
+                machineB = syncedMachineB
                 if (result.profilesChanged) {
                     val details = buildList {
                         if (result.appliedProfiles.isNotEmpty()) {
@@ -1093,6 +1209,11 @@ internal fun RegistrationApp() {
                 publicEventType = PublicQueueEventType.REGISTRATION_OPENED
             )
         )
+        showHomeOperationFeedback(
+            title = "登记排队已启用",
+            detail = "现在可以继续创建新的排队登记。",
+            contextLabel = "现场终端"
+        )
     }
 
     fun closeRegistration(businessHoursTrigger: BusinessHoursCloseTrigger? = null) {
@@ -1106,28 +1227,29 @@ internal fun RegistrationApp() {
         machineB = MachineQueue()
         registrationOpen = false
         queueSoundPlayer.play(QueueSoundCue.CAUTION)
+        val detail = if (removedCount == 0) {
+            when (businessHoursTrigger) {
+                BusinessHoursCloseTrigger.QUEUE_EMPTY_DURING_GRACE ->
+                    "今日营业时间已结束，现有队列已经处理完毕，登记排队现已关闭。"
+                BusinessHoursCloseTrigger.GRACE_PERIOD_EXPIRED ->
+                    "今日营业时间结束已 20 分钟，登记排队现已关闭。"
+                null -> "新的排队登记已停止接收。"
+            }
+        } else {
+            when (businessHoursTrigger) {
+                BusinessHoursCloseTrigger.GRACE_PERIOD_EXPIRED ->
+                    "今日营业时间结束已 20 分钟，登记排队现已关闭，并清除了两台机台剩余的 $removedCount 份登记。"
+                BusinessHoursCloseTrigger.QUEUE_EMPTY_DURING_GRACE ->
+                    "今日营业时间已结束，登记排队现已关闭，并清除了两台机台的 $removedCount 份登记。"
+                null ->
+                    "新的排队登记已停止接收，并清除了两台机台的 $removedCount 份登记。"
+            }
+        }
         appendAuditLog(
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
                 title = if (automaticBusinessHours) "营业结束，关闭登记排队" else "关闭登记排队",
-                detail = if (removedCount == 0) {
-                    when (businessHoursTrigger) {
-                        BusinessHoursCloseTrigger.QUEUE_EMPTY_DURING_GRACE ->
-                            "今日营业时间已结束，现有队列已经处理完毕，登记排队现已关闭。"
-                        BusinessHoursCloseTrigger.GRACE_PERIOD_EXPIRED ->
-                            "今日营业时间结束已 20 分钟，登记排队现已关闭。"
-                        null -> "新的排队登记已停止接收。"
-                    }
-                } else {
-                    when (businessHoursTrigger) {
-                        BusinessHoursCloseTrigger.GRACE_PERIOD_EXPIRED ->
-                            "今日营业时间结束已 20 分钟，登记排队现已关闭，并清除了两台机台剩余的 $removedCount 份登记。"
-                        BusinessHoursCloseTrigger.QUEUE_EMPTY_DURING_GRACE ->
-                            "今日营业时间已结束，登记排队现已关闭，并清除了两台机台的 $removedCount 份登记。"
-                        null ->
-                            "新的排队登记已停止接收，并清除了两台机台的 $removedCount 份登记。"
-                    }
-                },
+                detail = detail,
                 source = if (automaticBusinessHours) {
                     AuditLogSource.SYSTEM_AUTOMATIC
                 } else {
@@ -1136,6 +1258,12 @@ internal fun RegistrationApp() {
                 publicEventType = PublicQueueEventType.REGISTRATION_CLOSED,
                 affectedRegistrationKeys = removedRegistrationKeys
             )
+        )
+        showHomeOperationFeedback(
+            title = if (automaticBusinessHours) "营业结束，登记排队已关闭" else "登记排队已关闭",
+            detail = detail,
+            contextLabel = if (automaticBusinessHours) "系统自动" else "现场终端",
+            tone = HomeSidePanelFeedbackTone.WARNING
         )
     }
 
@@ -1167,6 +1295,12 @@ internal fun RegistrationApp() {
                     ).map { it.key }
             )
         )
+        showHomeOperationFeedback(
+            title = "上次队列已恢复",
+            detail = "已恢复 ${configuredMachineName(MachineId.A)} 的 ${savedState.machineA.registrationCount} 份登记，以及 ${configuredMachineName(MachineId.B)} 的 ${savedState.machineB.registrationCount} 份登记。",
+            contextLabel = "本机队列恢复",
+            tone = HomeSidePanelFeedbackTone.INFO
+        )
     }
 
     fun startWithNewQueue(savedState: PersistedQueueState) {
@@ -1189,6 +1323,12 @@ internal fun RegistrationApp() {
                 detail = "未载入上次保存的 ${savedState.totalRegistrationCount} 个登记，已从空队列开始。",
                 publicEventType = PublicQueueEventType.QUEUE_RESET
             )
+        )
+        showHomeOperationFeedback(
+            title = "已开始新的队列",
+            detail = "上次保存的 ${savedState.totalRegistrationCount} 份登记没有载入，当前从空队列开始。",
+            contextLabel = "本机队列恢复",
+            tone = HomeSidePanelFeedbackTone.WARNING
         )
     }
 
@@ -1376,7 +1516,7 @@ internal fun RegistrationApp() {
                 return@persisted
             }
             val registrationKey = nextKey++
-            updateQueueAfterOnSiteRegistration(machineId, QueueSoundCue.CONFIRM) {
+            val registrationAdded = updateQueueAfterOnSiteRegistration(machineId, QueueSoundCue.CONFIRM) {
                 it.receiveAtWaitingTail(
                     listOf(
                     Registration(
@@ -1392,7 +1532,7 @@ internal fun RegistrationApp() {
             }
             selectedPlayerProfileId = null
             rememberProfileJoinPreference = false
-            showNewRegistrationFeedback(machineId, registrationKey)
+            if (registrationAdded) showNewRegistrationFeedback(machineId, registrationKey)
             screen = Screen.HOME
         }
     }
@@ -1425,7 +1565,11 @@ internal fun RegistrationApp() {
             },
             failureDetail = "玩家资料的本次使用记录未能保存，因此尚未认领登记。请稍后重试。"
         ) { persistedProfile ->
-            updateQueue(selection.machineId, QueueSoundCue.CONFIRM) {
+            updateQueue(
+                machineId = selection.machineId,
+                soundCue = QueueSoundCue.CONFIRM,
+                surfaceHomeFeedback = true
+            ) {
                 it.claimWithPlayerProfile(
                     registrationKey = registration.key,
                     playerProfileId = persistedProfile.id,
@@ -1610,12 +1754,12 @@ internal fun RegistrationApp() {
             queueFor(machineId).registrationCount >= 20
         ) return
         val registrationKey = nextKey++
-        updateQueueAfterOnSiteRegistration(machineId, QueueSoundCue.CONFIRM) {
+        val registrationAdded = updateQueueAfterOnSiteRegistration(machineId, QueueSoundCue.CONFIRM) {
             it.receiveAtWaitingTail(
                 listOf(Registration(registrationKey, normalizedId, preference))
             )
         }
-        showNewRegistrationFeedback(machineId, registrationKey)
+        if (registrationAdded) showNewRegistrationFeedback(machineId, registrationKey)
         screen = Screen.HOME
     }
 
@@ -1664,8 +1808,15 @@ internal fun RegistrationApp() {
                 )
             }
         }
-        updateQueueAfterOnSiteRegistration(machineId, QueueSoundCue.CONFIRM) { queue ->
+        val registrationsAdded = updateQueueAfterOnSiteRegistration(machineId, QueueSoundCue.CONFIRM) { queue ->
             queue.receiveAtWaitingTail(registrations)
+        }
+        if (registrationsAdded) {
+            showHomeOperationFeedback(
+                title = "批量登记已创建",
+                detail = "已在 ${configuredMachineName(machineId)} 创建 $amount 份登记，并按创建顺序加入队列。",
+                contextLabel = configuredMachineName(machineId)
+            )
         }
         screen = Screen.HOME
     }
@@ -1692,10 +1843,15 @@ internal fun RegistrationApp() {
         machineB.waiting
     ) {
         if (!queuePersistenceReady || pendingQueueRestore != null) return@LaunchedEffect
+        val removalNotices = mutableListOf<String>()
         MachineId.entries.forEach { machineId ->
-            val expiredKeys = queueFor(machineId).expiredOnlineRegistrationKeys(nowMillis)
+            val queueBeforeRemoval = queueFor(machineId)
+            val expiredKeys = queueBeforeRemoval.expiredOnlineRegistrationKeys(nowMillis)
             if (expiredKeys.isNotEmpty()) {
-                updateQueue(
+                val expiredNames = queueBeforeRemoval.allRegistrations
+                    .filter { it.key in expiredKeys }
+                    .joinToString("、") { "“${it.displayId}”" }
+                val removed = updateQueue(
                     machineId = machineId,
                     publicEventTypeOverride = PublicQueueEventType.ONLINE_CHECK_IN_TIMED_OUT,
                     affectedRegistrationKeysOverride = expiredKeys,
@@ -1703,7 +1859,19 @@ internal fun RegistrationApp() {
                 ) { queue ->
                     queue.removeExpiredOnlineRegistrations(nowMillis)
                 }
+                if (removed) {
+                    removalNotices += "${configuredMachineName(machineId)}：$expiredNames"
+                }
             }
+        }
+        if (removalNotices.isNotEmpty()) {
+            showHomeOperationFeedback(
+                title = "未签到登记已自动移除",
+                detail = removalNotices.joinToString("\n") +
+                    "\n以上线上登记未在创建后的 30 分钟内完成现场签到，现已退出排队。",
+                contextLabel = "系统自动",
+                tone = HomeSidePanelFeedbackTone.WARNING
+            )
         }
     }
 
@@ -1939,6 +2107,7 @@ internal fun RegistrationApp() {
                                             result.state.nextRegistrationKey
                                         )
                                         queueUndoAction = null
+                                        homeSidePanelFeedback = null
                                         result.changedMachineIds.forEach { machineName ->
                                             val machineId = MachineId.entries.firstOrNull {
                                                 it.name == machineName
@@ -1991,6 +2160,33 @@ internal fun RegistrationApp() {
                                                         )
                                                     )
                                             }
+                                        } else if (result.changedMachineIds.isNotEmpty()) {
+                                            val changedMachineLabels = result.changedMachineIds
+                                                .mapNotNull { machineName ->
+                                                    MachineId.entries.firstOrNull {
+                                                        it.name == machineName
+                                                    }?.let(::configuredMachineName)
+                                                }
+                                            val nickname = playerProfiles.firstOrNull {
+                                                it.id == command.profileId
+                                            }?.nickname
+                                            showHomeOperationFeedback(
+                                                title = remoteQueueOperationFeedbackTitle(
+                                                    command.operation
+                                                ),
+                                                detail = buildString {
+                                                    if (nickname != null) append("“$nickname”：")
+                                                    append(result.detail)
+                                                },
+                                                contextLabel = buildString {
+                                                    append(remoteQueueOperationSourceLabel(command.source))
+                                                    if (changedMachineLabels.isNotEmpty()) {
+                                                        append(" · ")
+                                                        append(changedMachineLabels.joinToString("、"))
+                                                    }
+                                                },
+                                                tone = HomeSidePanelFeedbackTone.INFO
+                                            )
                                         }
                                         localWriteFailureDetail = null
                                         queueCommandClient.complete(
@@ -2060,6 +2256,7 @@ internal fun RegistrationApp() {
                                             ?: machineB
                                         nextKey = maxOf(nextKey, result.state.nextRegistrationKey)
                                         queueUndoAction = null
+                                        homeSidePanelFeedback = null
                                         val machineId = MachineId.entries.firstOrNull {
                                             it.name == result.changedMachineId
                                         }
@@ -2274,11 +2471,67 @@ internal fun RegistrationApp() {
 
     fun returnHomeAfterInactivity() = returnHomeAndClearTransientState(resetQueueScroll = true)
 
-    LaunchedEffect(newRegistrationHighlight?.requestId) {
+    val homeSidePanelOccluded = screen != Screen.HOME ||
+        reorderSession?.explicitEditMode == true ||
+        inlineReorderProposal != null ||
+        positionReorderProposal != null ||
+        selectedRegistration != null ||
+        moveIntoPlayingTarget != null ||
+        absenceChoiceTarget != null ||
+        friendPairTarget != null ||
+        finishConfirmation != null ||
+        joinClosingWarningRequest != null ||
+        enterPlayingConfirmation != null ||
+        moreMenuVisible ||
+        appDetailsVisible ||
+        versionHistoryVisible ||
+        editMachineChoiceVisible ||
+        stopMachineChoiceVisible ||
+        stopReasonTarget != null ||
+        claimPreferenceMismatchProfileId != null ||
+        selectedPosition != null ||
+        returnPlayingTarget != null ||
+        returnPlayingRegistrationTarget != null ||
+        advanceToPlayingTarget != null ||
+        releaseFixedPairTarget != null ||
+        machineTransferTarget != null ||
+        noShowTarget != null ||
+        groupNoShowTarget != null ||
+        exitTarget != null ||
+        removeGroupTarget != null ||
+        closeQueueConfirmation ||
+        mobileRegistrationSession != null ||
+        mobileRegistrationFailureDetail != null ||
+        botFriendPromptQq != null ||
+        incompleteCheckInProfileId != null ||
+        playerProfileWriteInProgress ||
+        playerProfileWriteFailureDetail != null ||
+        discardPlayerProfileDraftConfirmationVisible ||
+        pendingQueueRestore != null ||
+        inactivityWarningSeconds != null
+
+    LaunchedEffect(newRegistrationHighlight?.requestId, homeSidePanelOccluded) {
+        if (homeSidePanelOccluded) return@LaunchedEffect
         val requestId = newRegistrationHighlight?.requestId ?: return@LaunchedEffect
         delay(NEW_REGISTRATION_FEEDBACK_MILLIS)
         if (newRegistrationHighlight?.requestId == requestId) {
             newRegistrationHighlight = null
+        }
+    }
+
+    LaunchedEffect(homeSidePanelFeedback?.id, homeSidePanelOccluded) {
+        if (homeSidePanelOccluded) return@LaunchedEffect
+        val feedback = homeSidePanelFeedback ?: return@LaunchedEffect
+        val feedbackId = feedback.id
+        delay(
+            if (feedback.tone == HomeSidePanelFeedbackTone.WARNING) {
+                HOME_WARNING_FEEDBACK_MILLIS
+            } else {
+                HOME_OPERATION_FEEDBACK_MILLIS
+            }
+        )
+        if (homeSidePanelFeedback?.id == feedbackId) {
+            homeSidePanelFeedback = null
         }
     }
 
@@ -2306,6 +2559,8 @@ internal fun RegistrationApp() {
         }
         hostActivity?.recordUserInteraction()
         returnHomeAndClearTransientState(resetQueueScroll = false)
+        homeSidePanelFeedback = null
+        queueUndoAction = null
         newRegistrationHighlight = request.highlight
         enterPlayingConfirmation = request.enterPlayingConfirmation
         pendingNewRegistrationHomeRequests = pendingNewRegistrationHomeRequests.drop(1)
@@ -2351,9 +2606,10 @@ internal fun RegistrationApp() {
         }
     }
 
-    LaunchedEffect(queueUndoAction?.id) {
+    LaunchedEffect(queueUndoAction?.id, homeSidePanelOccluded) {
+        if (homeSidePanelOccluded) return@LaunchedEffect
         val action = queueUndoAction ?: return@LaunchedEffect
-        delay(5_000L)
+        delay(HOME_UNDO_FEEDBACK_MILLIS)
         if (queueUndoAction?.id == action.id) queueUndoAction = null
     }
 
@@ -2381,7 +2637,9 @@ internal fun RegistrationApp() {
                         ) {
                             updateQueueWithUndo(
                                 activeReorder.machineId,
-                                "${configuredMachineName(activeReorder.machineId)} 的登记顺序已调整"
+                                "${configuredMachineName(activeReorder.machineId)} 的登记顺序已调整",
+                                feedbackTitle = "登记顺序已调整",
+                                feedbackDetail = "等待登记已经按照确认后的顺序重新排列。"
                             ) { it.replaceOrder(registrations) }
                         }
                         reorderSession = null
@@ -2408,6 +2666,9 @@ internal fun RegistrationApp() {
                             cloudSyncStatus = displayedCloudSyncStatus.takeIf { cloudSyncAvailable },
                             queueUndoAction = queueUndoAction,
                             onUndoQueueAction = ::undoLatestQueueAction,
+                            onDismissQueueUndo = { queueUndoAction = null },
+                            homeSidePanelFeedback = homeSidePanelFeedback,
+                            onDismissHomeFeedback = { homeSidePanelFeedback = null },
                             inlineReorderSession = activeReorder?.takeIf { !it.explicitEditMode },
                             inlineReorderResetToken = inlineReorderResetToken,
                             positionReorderResetToken = positionReorderResetToken,
@@ -2427,20 +2688,23 @@ internal fun RegistrationApp() {
                             },
                             onEnableRegistration = ::reopenRegistration,
                             onJoin = {
-                                newRegistrationHighlight = null
+                                dismissHomeSidePanelContent()
                                 beginRegistration(false)
                             },
                             onJoinMachine = { machineId ->
-                                newRegistrationHighlight = null
+                                dismissHomeSidePanelContent()
                                 beginRegistrationForMachine(machineId)
                             },
                             onBatch = {
-                                newRegistrationHighlight = null
+                                dismissHomeSidePanelContent()
                                 beginRegistration(true)
                             },
                             onCompletedRegistrationClick = { machineId, registrationKey ->
                                 newRegistrationHighlight = null
                                 openRegistration(machineId, registrationKey)
+                            },
+                            onDismissCompletedRegistration = {
+                                newRegistrationHighlight = null
                             },
                             onMore = {
                                 if (reorderSession == null) moreMenuVisible = true
@@ -2459,7 +2723,8 @@ internal fun RegistrationApp() {
                                         updateQueue(
                                             machineId = machineId,
                                             soundCue = QueueSoundCue.QUEUE_CHANGE,
-                                            classifyMissedOnlineRegistrations = true
+                                            classifyMissedOnlineRegistrations = true,
+                                            surfaceHomeFeedback = true
                                         ) { currentQueue ->
                                             roundPlan.applyTo(currentQueue) ?: currentQueue
                                         }
@@ -2745,7 +3010,9 @@ internal fun RegistrationApp() {
                             ) {
                                 updateQueueWithUndo(
                                     proposal.machineId,
-                                    "${configuredMachineName(proposal.machineId)} 的登记顺序已调整"
+                                    "${configuredMachineName(proposal.machineId)} 的登记顺序已调整",
+                                    feedbackTitle = "登记顺序已调整",
+                                    feedbackDetail = "等待登记已经按照确认后的顺序重新排列。"
                                 ) {
                                     it.replaceOrder(proposal.proposedOrder)
                                 }
@@ -2771,7 +3038,9 @@ internal fun RegistrationApp() {
                             ) {
                                 updateQueueWithUndo(
                                     proposal.machineId,
-                                    "${configuredMachineName(proposal.machineId)} 的队列位置已调整"
+                                    "${configuredMachineName(proposal.machineId)} 的队列位置已调整",
+                                    feedbackTitle = "队列位置已调整",
+                                    feedbackDetail = "组间位置已经交换，队列位置编号也已同步更新。"
                                 ) {
                                     it.replaceOrder(proposal.proposedOrder)
                                 }
@@ -2846,13 +3115,21 @@ internal fun RegistrationApp() {
                                 }
                             },
                             onCancelDeferOneRound = {
-                                updateQueue(selection.machineId) {
+                                updateQueue(
+                                    machineId = selection.machineId,
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTitle = "暂缓一轮已取消"
+                                ) {
                                     it.cancelDeferOneRound(registration.key)
                                 }
                                 selectedRegistration = null
                             },
                             onCancelTemporaryLeave = {
-                                updateQueue(selection.machineId) {
+                                updateQueue(
+                                    machineId = selection.machineId,
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTitle = "暂时离开已取消"
+                                ) {
                                     it.cancelTemporaryLeave(registration.key)
                                 }
                                 selectedRegistration = null
@@ -2861,7 +3138,10 @@ internal fun RegistrationApp() {
                                 registrationActionMode = RegistrationActionMode.PREFERENCE
                             },
                             onPreferenceSelected = { preference ->
-                                updateQueue(selection.machineId) {
+                                updateQueue(
+                                    machineId = selection.machineId,
+                                    surfaceHomeFeedback = true
+                                ) {
                                     it.changePreference(registration.key, preference)
                                 }
                                 selectedRegistration = null
@@ -2877,7 +3157,10 @@ internal fun RegistrationApp() {
                             onRenameConfirm = {
                                 val normalized = renameDraft.trim()
                                 if (normalized.isNotBlank() && !idAlreadyExists(normalized, registration.key)) {
-                                    updateQueue(selection.machineId) {
+                                    updateQueue(
+                                        machineId = selection.machineId,
+                                        surfaceHomeFeedback = true
+                                    ) {
                                         it.rename(registration.key, normalized)
                                     }
                                     selectedRegistration = null
@@ -2946,7 +3229,9 @@ internal fun RegistrationApp() {
                                         publicEventTypeOverride =
                                             PublicQueueEventType.ONLINE_CHECK_IN_COMPLETED,
                                         affectedRegistrationKeysOverride =
-                                            listOf(registration.key)
+                                            listOf(registration.key),
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTitle = "现场签到已完成"
                                     ) {
                                         it.checkIn(registration.key)
                                     }
@@ -2982,7 +3267,12 @@ internal fun RegistrationApp() {
                             },
                             onDismiss = { moveIntoPlayingTarget = null },
                             onConfirm = {
-                                updateQueue(selection.machineId, QueueSoundCue.QUEUE_CHANGE) {
+                                updateQueue(
+                                    machineId = selection.machineId,
+                                    soundCue = QueueSoundCue.QUEUE_CHANGE,
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTitle = "登记已加入本轮"
+                                ) {
                                     it.moveFirstWaitingRegistrationIntoCurrentRound(
                                         selection.registrationKey
                                     )
@@ -3018,7 +3308,9 @@ internal fun RegistrationApp() {
                                     updateQueue(
                                         machineId = selection.machineId,
                                         soundCue = QueueSoundCue.QUEUE_CHANGE,
-                                        classifyMissedOnlineRegistrations = true
+                                        classifyMissedOnlineRegistrations = true,
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTitle = "登记已暂缓一轮"
                                     ) {
                                         it.deferOneRound(registration.key)
                                     }
@@ -3030,7 +3322,9 @@ internal fun RegistrationApp() {
                                     updateQueue(
                                         machineId = selection.machineId,
                                         soundCue = QueueSoundCue.QUEUE_CHANGE,
-                                        classifyMissedOnlineRegistrations = true
+                                        classifyMissedOnlineRegistrations = true,
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTitle = "登记已设为暂时离开"
                                     ) {
                                         it.temporarilyLeave(registration.key)
                                     }
@@ -3074,18 +3368,24 @@ internal fun RegistrationApp() {
                                     )
                                 ) return@onPairExisting
                                 val shouldFinishCreation = stagedFriendPairRegistration == selection
-                                updateQueueAfterOnSiteRegistration(
+                                val pairCreated = updateQueueAfterOnSiteRegistration(
                                     selection.machineId,
                                     if (shouldFinishCreation) QueueSoundCue.CONFIRM else QueueSoundCue.QUEUE_CHANGE,
                                     advanceWhenPlayingEmpty = shouldFinishCreation
                                 ) {
                                     it.applyFriendPair(plan)
                                 }
-                                if (shouldFinishCreation) {
+                                if (shouldFinishCreation && pairCreated) {
                                     stagedFriendPairRegistration = null
                                     showNewRegistrationFeedback(
                                         selection.machineId,
                                         selection.registrationKey
+                                    )
+                                } else if (pairCreated) {
+                                    showHomeOperationFeedback(
+                                        title = "固定组合已建立",
+                                        detail = "“${plan.firstRegistration.displayId}”与“${plan.secondRegistration.displayId}”已组成固定组合。",
+                                        contextLabel = configuredMachineName(selection.machineId)
                                     )
                                 }
                                 friendPairTarget = null
@@ -3107,18 +3407,24 @@ internal fun RegistrationApp() {
                                         displayId = normalizedId,
                                         preference = PlayPreference.OPEN_TO_JOIN
                                     )
-                                    updateQueueAfterOnSiteRegistration(
+                                    val pairCreated = updateQueueAfterOnSiteRegistration(
                                         selection.machineId,
                                         if (shouldFinishCreation) QueueSoundCue.CONFIRM else QueueSoundCue.QUEUE_CHANGE,
                                         advanceWhenPlayingEmpty = shouldFinishCreation
                                     ) {
                                         it.createFriendPair(registration.key, friend)
                                     }
-                                    if (shouldFinishCreation) {
+                                    if (shouldFinishCreation && pairCreated) {
                                         stagedFriendPairRegistration = null
                                         showNewRegistrationFeedback(
                                             selection.machineId,
                                             selection.registrationKey
+                                        )
+                                    } else if (pairCreated) {
+                                        showHomeOperationFeedback(
+                                            title = "固定组合已建立",
+                                            detail = "“${registration.displayId}”与“${friend.displayId}”已组成固定组合。",
+                                            contextLabel = configuredMachineName(selection.machineId)
                                         )
                                     }
                                     friendPairTarget = null
@@ -3162,7 +3468,23 @@ internal fun RegistrationApp() {
                                 val atMillis = System.currentTimeMillis()
                                 updateQueueWithUndo(
                                     machineId,
-                                    "${configuredMachineName(machineId)} 的本轮已结束"
+                                    "${configuredMachineName(machineId)} 的本轮已结束",
+                                    feedbackTitle = if (
+                                        finishPlan.preview?.nextRegistrations.orEmpty().isEmpty()
+                                    ) {
+                                        "本轮已结束"
+                                    } else {
+                                        "本轮已结束，下一轮已开始"
+                                    },
+                                    feedbackDetail = finishPlan.preview?.nextRegistrations
+                                        .orEmpty()
+                                        .takeIf { it.isNotEmpty() }
+                                        ?.joinToString(
+                                            prefix = "现在由",
+                                            postfix = "进入${playingPositionName(machineId)}。",
+                                            separator = "、"
+                                        ) { "“${it.displayId}”" }
+                                        ?: "本轮已经结束，${playingPositionName(machineId)}目前为空。"
                                 ) { currentQueue ->
                                     finishPlan.applyTo(currentQueue, atMillis) ?: currentQueue
                                 }
@@ -3174,7 +3496,9 @@ internal fun RegistrationApp() {
                                 val atMillis = System.currentTimeMillis()
                                 updateQueueWithUndo(
                                     machineId,
-                                    "${configuredMachineName(machineId)} 的本轮已结束"
+                                    "${configuredMachineName(machineId)} 的本轮已结束",
+                                    feedbackTitle = "本轮已结束",
+                                    feedbackDetail = "${playingPositionName(machineId)}已经空出，等待顺序保持不变。"
                                 ) { currentQueue ->
                                     endOnlyPlan.applyTo(currentQueue, atMillis) ?: currentQueue
                                 }
@@ -3193,7 +3517,10 @@ internal fun RegistrationApp() {
                                 updateQueue(
                                     machineId = machineId,
                                     soundCue = QueueSoundCue.CAUTION,
-                                    classifyMissedOnlineRegistrations = true
+                                    classifyMissedOnlineRegistrations = true,
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                    homeFeedbackTitle = "本轮登记已移除"
                                 ) { currentQueue ->
                                     removalPlan.applyTo(currentQueue, atMillis) ?: currentQueue
                                 }
@@ -3255,7 +3582,8 @@ internal fun RegistrationApp() {
                                     updateQueue(
                                         machineId = machineId,
                                         soundCue = QueueSoundCue.QUEUE_CHANGE,
-                                        classifyMissedOnlineRegistrations = true
+                                        classifyMissedOnlineRegistrations = true,
+                                        surfaceHomeFeedback = true
                                     ) { currentQueue ->
                                         roundPlan.applyTo(currentQueue, atMillis) ?: currentQueue
                                     }
@@ -3439,7 +3767,8 @@ internal fun RegistrationApp() {
                             } else {
                                 updateQueue(
                                     machineId = selection.machineId,
-                                    classifyMissedOnlineRegistrations = true
+                                    classifyMissedOnlineRegistrations = true,
+                                    surfaceHomeFeedback = true
                                 ) { currentQueue ->
                                     roundPlan.applyTo(currentQueue) ?: currentQueue
                                 }
@@ -3497,7 +3826,11 @@ internal fun RegistrationApp() {
                         playingPositionLabel = playingPositionName(selection.machineId),
                         onDismiss = { returnPlayingTarget = null },
                         onConfirm = {
-                            updateQueue(selection.machineId) {
+                            updateQueue(
+                                machineId = selection.machineId,
+                                surfaceHomeFeedback = true,
+                                homeFeedbackTitle = "已撤回等待顺序前端"
+                            ) {
                                 it.returnPlayingRegistrationsToWaitingFront(
                                     selection.registrationKeys.toSet()
                                 )
@@ -3524,7 +3857,11 @@ internal fun RegistrationApp() {
                             playingPositionLabel = playingPositionName(selection.machineId),
                             onDismiss = { returnPlayingRegistrationTarget = null },
                             onConfirm = {
-                                updateQueue(selection.machineId) {
+                                updateQueue(
+                                    machineId = selection.machineId,
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTitle = "已撤回等待顺序前端"
+                                ) {
                                     it.returnPlayingRegistrationsToWaitingFront(
                                         setOf(selection.registrationKey)
                                     )
@@ -3561,7 +3898,9 @@ internal fun RegistrationApp() {
                         onConfirm = {
                             updateQueueWithUndo(
                                 selection.machineId,
-                                "${playingPositionName(selection.machineId)} 已校正"
+                                "${playingPositionName(selection.machineId)} 已校正",
+                                feedbackTitle = "游玩位置已校正",
+                                feedbackDetail = "已将${selection.label.substringBefore(" · ")}及其之前的队列位置按实际进度完成处理。"
                             ) {
                                 it.advanceToWaitingPosition(targetKeys)
                             }
@@ -3579,7 +3918,11 @@ internal fun RegistrationApp() {
                         onConfirm = {
                             val firstKey = registrations.firstOrNull()?.key
                             if (firstKey != null) {
-                                updateQueue(selection.machineId) {
+                                updateQueue(
+                                    machineId = selection.machineId,
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTitle = "固定组合已解除"
+                                ) {
                                     it.changePreference(firstKey, PlayPreference.OPEN_TO_JOIN)
                                 }
                             }
@@ -3643,7 +3986,9 @@ internal fun RegistrationApp() {
                                         selection.machineId,
                                         QueueSoundCue.CAUTION,
                                         PublicQueueEventType.NO_SHOW_DEFERRED,
-                                        setOf(registration.key)
+                                        setOf(registration.key),
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
                                     ) {
                                         it.markNoShowDeferOneRound(
                                             registration.key,
@@ -3658,7 +4003,9 @@ internal fun RegistrationApp() {
                                     selection.machineId,
                                     QueueSoundCue.CAUTION,
                                     PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
-                                    setOf(registration.key)
+                                    setOf(registration.key),
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
                                 ) {
                                     it.markNoShowMoveToEnd(
                                         setOf(registration.key),
@@ -3672,7 +4019,9 @@ internal fun RegistrationApp() {
                                     selection.machineId,
                                     QueueSoundCue.CAUTION,
                                     PublicQueueEventType.NO_SHOW_REMOVED,
-                                    setOf(registration.key)
+                                    setOf(registration.key),
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
                                 ) {
                                     it.markNoShowAndRemove(
                                         setOf(registration.key),
@@ -3706,7 +4055,9 @@ internal fun RegistrationApp() {
                                         selection.machineId,
                                         QueueSoundCue.CAUTION,
                                         PublicQueueEventType.NO_SHOW_DEFERRED,
-                                        targetKeys
+                                        targetKeys,
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
                                     ) {
                                         it.markNoShowGroupDeferOneRound(
                                             targetKeys,
@@ -3721,7 +4072,9 @@ internal fun RegistrationApp() {
                                     selection.machineId,
                                     QueueSoundCue.CAUTION,
                                     PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
-                                    targetKeys
+                                    targetKeys,
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
                                 ) {
                                     it.markNoShowMoveToEnd(
                                         targetKeys,
@@ -3735,7 +4088,9 @@ internal fun RegistrationApp() {
                                     selection.machineId,
                                     QueueSoundCue.CAUTION,
                                     PublicQueueEventType.NO_SHOW_REMOVED,
-                                    targetKeys
+                                    targetKeys,
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
                                 ) {
                                     it.markNoShowAndRemove(
                                         targetKeys,
@@ -3770,7 +4125,12 @@ internal fun RegistrationApp() {
                             confirmText = "确认退出",
                             onDismiss = { exitTarget = null },
                             onConfirm = {
-                                updateQueue(selection.machineId) {
+                                updateQueue(
+                                    machineId = selection.machineId,
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                    homeFeedbackTitle = "登记已退出排队"
+                                ) {
                                     it.remove(selection.registrationKey)
                                 }
                                 exitTarget = null
@@ -3793,7 +4153,12 @@ internal fun RegistrationApp() {
                             confirmText = "移除这组登记",
                             onDismiss = { removeGroupTarget = null },
                             onConfirm = {
-                                updateQueue(selection.machineId) { it.removeAll(targetKeys) }
+                                updateQueue(
+                                    machineId = selection.machineId,
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                    homeFeedbackTitle = "这组登记已移除"
+                                ) { it.removeAll(targetKeys) }
                                 removeGroupTarget = null
                             }
                         )
@@ -4881,6 +5246,24 @@ private fun auditLogSourceLabel(source: AuditLogSource): String = when (source) 
     AuditLogSource.MOBILE_DEVICE -> "移动设备"
 }
 
+private fun remoteQueueOperationFeedbackTitle(operation: RemoteQueueOperation): String =
+    when (operation) {
+        RemoteQueueOperation.JOIN_QUEUE -> "线上登记已加入"
+        RemoteQueueOperation.DEFER_ONE_ROUND -> "登记已暂缓一轮"
+        RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND -> "暂缓一轮已取消"
+        RemoteQueueOperation.TEMPORARILY_LEAVE -> "登记已设为暂时离开"
+        RemoteQueueOperation.CANCEL_TEMPORARY_LEAVE -> "暂时离开已取消"
+        RemoteQueueOperation.TRANSFER_MACHINE -> "登记已切换机台"
+        RemoteQueueOperation.CHANGE_PLAY_PREFERENCE -> "游玩偏好已修改"
+        RemoteQueueOperation.LEAVE_QUEUE -> "登记已退出排队"
+    }
+
+private fun remoteQueueOperationSourceLabel(source: RemoteQueueOperationSource): String =
+    when (source) {
+        RemoteQueueOperationSource.QQ_BOT -> "QQ Bot"
+        RemoteQueueOperationSource.WEBSITE_REMOTE -> "网站远程"
+    }
+
 private fun formatAuditLogTimestamp(timestampMillis: Long): String =
     SimpleDateFormat("yyyy 年 M 月 d 日 HH:mm:ss", Locale.CHINA).format(Date(timestampMillis))
 
@@ -4899,6 +5282,9 @@ private fun HomeScreen(
     cloudSyncStatus: QueueCloudSyncStatus?,
     queueUndoAction: QueueUndoAction?,
     onUndoQueueAction: () -> Unit,
+    onDismissQueueUndo: () -> Unit,
+    homeSidePanelFeedback: HomeSidePanelFeedback?,
+    onDismissHomeFeedback: () -> Unit,
     inlineReorderSession: ReorderSession?,
     inlineReorderResetToken: Int,
     positionReorderResetToken: Int,
@@ -4911,6 +5297,7 @@ private fun HomeScreen(
     onJoinMachine: (MachineId) -> Unit,
     onBatch: () -> Unit,
     onCompletedRegistrationClick: (MachineId, Int) -> Unit,
+    onDismissCompletedRegistration: () -> Unit,
     onMore: () -> Unit,
     onFinishRequest: (MachineId) -> Unit,
     onEnterPlaying: (MachineId) -> Unit,
@@ -4950,6 +5337,8 @@ private fun HomeScreen(
         }
     }
     var cloudSyncInfoVisible by remember { mutableStateOf(false) }
+    val hasTransientSidePanelContent = completedRegistration != null ||
+        homeSidePanelFeedback != null || queueUndoAction != null
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().padding(horizontal = 32.dp, vertical = 20.dp)) {
             AppHeader(
@@ -4964,7 +5353,7 @@ private fun HomeScreen(
             Spacer(Modifier.height(11.dp))
             HorizontalDivider(color = Separator.copy(alpha = .72f))
             Spacer(Modifier.height(12.dp))
-            if (!registrationOpen && !hasStoppedMachine) {
+            if (!registrationOpen && !hasStoppedMachine && !hasTransientSidePanelContent) {
                 ClosedHome(
                     outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
                     onEnableRegistration = onEnableRegistration
@@ -4972,7 +5361,8 @@ private fun HomeScreen(
             } else if (
                 isEmpty &&
                 !hasStoppedMachine &&
-                !businessHoursStatus.closingSoon
+                !businessHoursStatus.closingSoon &&
+                !hasTransientSidePanelContent
             ) {
                 EmptyHome(
                     outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
@@ -5066,7 +5456,13 @@ private fun HomeScreen(
                         acceptingNewRegistrations = acceptingNewRegistrations,
                         closingGracePeriod = closingGracePeriod,
                         completedRegistration = completedRegistration,
+                        operationFeedback = homeSidePanelFeedback,
+                        queueUndoAction = queueUndoAction,
                         onCompletedRegistrationClick = onCompletedRegistrationClick,
+                        onDismissCompletedRegistration = onDismissCompletedRegistration,
+                        onDismissOperationFeedback = onDismissHomeFeedback,
+                        onUndoQueueAction = onUndoQueueAction,
+                        onDismissQueueUndo = onDismissQueueUndo,
                         onJoin = onJoin,
                         onBatch = onBatch,
                         modifier = Modifier.weight(.72f).fillMaxHeight()
@@ -5074,62 +5470,11 @@ private fun HomeScreen(
                 }
             }
         }
-        AnimatedContent(
-            targetState = queueUndoAction,
-            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 18.dp),
-            transitionSpec = {
-                (fadeIn(tween(180)) + slideInVertically(tween(220)) { height -> height / 2 })
-                    .togetherWith(
-                        fadeOut(tween(140)) + slideOutVertically(tween(180)) { height -> height / 2 }
-                    )
-            },
-            label = "队列操作撤销提示"
-        ) { action ->
-            if (action == null) {
-                Spacer(Modifier.size(0.dp))
-            } else {
-                QueueUndoBar(action.message, onUndoQueueAction)
-            }
-        }
         if (cloudSyncInfoVisible && cloudSyncStatus != null) {
             CloudSyncInfoDialog(
                 status = cloudSyncStatus,
                 onDismiss = { cloudSyncInfoVisible = false }
             )
-        }
-    }
-}
-
-@Composable
-private fun QueueUndoBar(message: String, onUndo: () -> Unit) {
-    Surface(
-        color = Color(0xFF2C2C2E),
-        shape = RoundedCornerShape(8.dp),
-        shadowElevation = 8.dp
-    ) {
-        Row(
-            Modifier.height(48.dp).widthIn(min = 330.dp, max = 520.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                message,
-                color = Color.White,
-                fontSize = 13.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Clip,
-                modifier = Modifier.weight(1f).padding(start = 18.dp, end = 14.dp)
-            )
-            Box(
-                Modifier.fillMaxHeight().clickable(onClick = onUndo).padding(horizontal = 18.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    "撤销",
-                    color = Color(0xFF75B7FF),
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
         }
     }
 }
@@ -6471,6 +6816,13 @@ private fun QueueJoinPosition(
     }
 }
 
+private sealed interface HomeSidePanelContent {
+    data object Join : HomeSidePanelContent
+    data class Registration(val value: HomeSidePanelRegistration) : HomeSidePanelContent
+    data class Operation(val value: HomeSidePanelFeedback) : HomeSidePanelContent
+    data class Undo(val value: QueueUndoAction) : HomeSidePanelContent
+}
+
 @Composable
 private fun HomeSidePanel(
     machineA: MachineQueue,
@@ -6484,7 +6836,13 @@ private fun HomeSidePanel(
     acceptingNewRegistrations: Boolean,
     closingGracePeriod: Boolean,
     completedRegistration: HomeSidePanelRegistration?,
+    operationFeedback: HomeSidePanelFeedback?,
+    queueUndoAction: QueueUndoAction?,
     onCompletedRegistrationClick: (MachineId, Int) -> Unit,
+    onDismissCompletedRegistration: () -> Unit,
+    onDismissOperationFeedback: () -> Unit,
+    onUndoQueueAction: () -> Unit,
+    onDismissQueueUndo: () -> Unit,
     onJoin: () -> Unit,
     onBatch: () -> Unit,
     modifier: Modifier = Modifier
@@ -6499,12 +6857,18 @@ private fun HomeSidePanel(
         !machineAJoinable && !machineBJoinable -> "两台机台的登记均已达到上限。"
         else -> "当前暂不接收新的排队登记。"
     }
+    val panelContent = when {
+        queueUndoAction != null -> HomeSidePanelContent.Undo(queueUndoAction)
+        completedRegistration != null -> HomeSidePanelContent.Registration(completedRegistration)
+        operationFeedback != null -> HomeSidePanelContent.Operation(operationFeedback)
+        else -> HomeSidePanelContent.Join
+    }
     AnimatedContent(
-        targetState = completedRegistration,
+        targetState = panelContent,
         modifier.clip(RoundedCornerShape(CardRadius)).background(CardBackground)
             .border(1.dp, Separator.copy(alpha = .68f), RoundedCornerShape(CardRadius)),
         transitionSpec = {
-            if (targetState != null) {
+            if (targetState !is HomeSidePanelContent.Join) {
                 (fadeIn(tween(220)) + slideInHorizontally(tween(280)) { width -> width / 5 })
                     .togetherWith(
                         fadeOut(tween(150)) + slideOutHorizontally(tween(220)) { width -> -width / 5 }
@@ -6517,24 +6881,45 @@ private fun HomeSidePanel(
             }
         },
         contentAlignment = Alignment.Center,
-        contentKey = { it?.requestId ?: "join" },
+        contentKey = { content ->
+            when (content) {
+                HomeSidePanelContent.Join -> "join"
+                is HomeSidePanelContent.Registration -> "registration-${content.value.requestId}"
+                is HomeSidePanelContent.Operation -> "operation-${content.value.id}"
+                is HomeSidePanelContent.Undo -> "undo-${content.value.id}"
+            }
+        },
         label = "首页右侧动态区域"
-    ) { completion ->
-        if (completion != null) {
-            RegistrationCompletedPanel(
-                completion = completion,
+    ) { content ->
+        when (content) {
+            is HomeSidePanelContent.Registration -> RegistrationCompletedPanel(
+                completion = content.value,
                 joiningEnabled = joiningEnabled,
                 onViewRegistration = {
                     onCompletedRegistrationClick(
-                        completion.machineId,
-                        completion.registrationKey
+                        content.value.machineId,
+                        content.value.registrationKey
                     )
                 },
                 onContinueJoining = onJoin,
+                onDismiss = onDismissCompletedRegistration,
                 modifier = Modifier.fillMaxSize()
             )
-        } else {
-            JoinPanelContent(
+
+            is HomeSidePanelContent.Operation -> HomeOperationFeedbackPanel(
+                feedback = content.value,
+                onDismiss = onDismissOperationFeedback,
+                modifier = Modifier.fillMaxSize()
+            )
+
+            is HomeSidePanelContent.Undo -> HomeUndoFeedbackPanel(
+                action = content.value,
+                onUndo = onUndoQueueAction,
+                onDismiss = onDismissQueueUndo,
+                modifier = Modifier.fillMaxSize()
+            )
+
+            HomeSidePanelContent.Join -> JoinPanelContent(
                 machineA = machineA,
                 machineB = machineB,
                 machineAStatus = machineAStatus,
@@ -6561,6 +6946,7 @@ private fun RegistrationCompletedPanel(
     joiningEnabled: Boolean,
     onViewRegistration: () -> Unit,
     onContinueJoining: () -> Unit,
+    onDismiss: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val visibleDisplayId = queueDisplayId(completion.displayId)
@@ -6577,67 +6963,221 @@ private fun RegistrationCompletedPanel(
         else ->
             "“$visibleDisplayId”已加入${completion.machineName}的等待顺序。"
     }
-    Column(
-        modifier.padding(horizontal = 22.dp, vertical = 24.dp),
-        verticalArrangement = Arrangement.Center
-    ) {
-        Box(
-            Modifier.size(42.dp).clip(CircleShape).background(Color(0xFF248A4B)),
-            contentAlignment = Alignment.Center
+    Box(modifier) {
+        Column(
+            Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 24.dp),
+            verticalArrangement = Arrangement.Center
         ) {
-            StraightCheckMark(Modifier.size(19.dp))
-        }
-        Spacer(Modifier.height(14.dp))
-        Text(
-            if (completion.requiresOnSiteCheckIn) "线上登记已加入" else "登记完成",
-            color = PrimaryText,
-            fontSize = 22.sp,
-            fontWeight = FontWeight.SemiBold
-        )
-        Spacer(Modifier.height(8.dp))
-        Text(summary, color = SecondaryText, fontSize = 13.sp, lineHeight = 19.sp)
-        Spacer(Modifier.height(20.dp))
-        Text(
-            completion.machineName,
-            color = TertiaryText,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Medium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(
-            completion.positionLabel,
-            color = PrimaryText,
-            fontSize = 20.sp,
-            fontWeight = FontWeight.SemiBold
-        )
-        Spacer(Modifier.height(5.dp))
-        Text(
-            statusText,
-            color = Color(0xFF248A4B),
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Medium
-        )
-        Spacer(Modifier.height(22.dp))
-        SecondaryButton(
-            "查看${completion.positionLabel}",
-            onViewRegistration,
-            Modifier.fillMaxWidth()
-        )
-        if (joiningEnabled) {
-            Spacer(Modifier.height(2.dp))
-            CancelAction("继续添加登记", onContinueJoining)
-        }
-        if (completion.requiresOnSiteCheckIn) {
-            Spacer(Modifier.height(10.dp))
+            Box(
+                Modifier.size(42.dp).clip(CircleShape).background(Color(0xFF248A4B)),
+                contentAlignment = Alignment.Center
+            ) {
+                StraightCheckMark(Modifier.size(19.dp))
+            }
+            Spacer(Modifier.height(14.dp))
             Text(
-                "请在 30 分钟内使用现场终端签到；如果更早轮到，也必须在进入游玩位置前完成签到。",
+                if (completion.requiresOnSiteCheckIn) "线上登记已加入" else "登记完成",
+                color = PrimaryText,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(summary, color = SecondaryText, fontSize = 13.sp, lineHeight = 19.sp)
+            Spacer(Modifier.height(20.dp))
+            Text(
+                completion.machineName,
                 color = TertiaryText,
-                fontSize = 10.sp,
-                lineHeight = 15.sp
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                completion.positionLabel,
+                color = PrimaryText,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(5.dp))
+            Text(
+                statusText,
+                color = Color(0xFF248A4B),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Spacer(Modifier.height(22.dp))
+            SecondaryButton(
+                "查看${completion.positionLabel}",
+                onViewRegistration,
+                Modifier.fillMaxWidth()
+            )
+            if (joiningEnabled) {
+                Spacer(Modifier.height(2.dp))
+                CancelAction("继续添加登记", onContinueJoining)
+            }
+            if (completion.requiresOnSiteCheckIn) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    "请在 30 分钟内使用现场终端签到；如果更早轮到，也必须在进入游玩位置前完成签到。",
+                    color = TertiaryText,
+                    fontSize = 10.sp,
+                    lineHeight = 15.sp
+                )
+            }
+        }
+        HomeSidePanelCloseButton(onDismiss, Modifier.align(Alignment.TopEnd))
+    }
+}
+
+@Composable
+private fun HomeOperationFeedbackPanel(
+    feedback: HomeSidePanelFeedback,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val accentColor = when (feedback.tone) {
+        HomeSidePanelFeedbackTone.SUCCESS -> Color(0xFF248A4B)
+        HomeSidePanelFeedbackTone.INFO -> SystemBlue
+        HomeSidePanelFeedbackTone.WARNING -> NoShowStatusColor
+    }
+    Box(modifier) {
+        Column(
+            Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 24.dp),
+            verticalArrangement = Arrangement.Center
+        ) {
+            HomeFeedbackStatusIcon(feedback.tone, accentColor)
+            Spacer(Modifier.height(14.dp))
+            Text(
+                feedback.title,
+                color = PrimaryText,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.SemiBold,
+                lineHeight = 28.sp
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                feedback.detail,
+                color = SecondaryText,
+                fontSize = 13.sp,
+                lineHeight = 19.sp
+            )
+            feedback.contextLabel?.let { contextLabel ->
+                Spacer(Modifier.height(18.dp))
+                Text(
+                    contextLabel,
+                    color = accentColor,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    lineHeight = 16.sp
+                )
+            }
+        }
+        HomeSidePanelCloseButton(onDismiss, Modifier.align(Alignment.TopEnd))
+    }
+}
+
+@Composable
+private fun HomeUndoFeedbackPanel(
+    action: QueueUndoAction,
+    onUndo: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val tone = action.feedbackTone
+    val accentColor = if (tone == HomeSidePanelFeedbackTone.SUCCESS) {
+        Color(0xFF248A4B)
+    } else {
+        NoShowStatusColor
+    }
+    Box(modifier) {
+        Column(
+            Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 24.dp),
+            verticalArrangement = Arrangement.Center
+        ) {
+            HomeFeedbackStatusIcon(tone, accentColor)
+            Spacer(Modifier.height(14.dp))
+            Text(
+                action.feedbackTitle,
+                color = PrimaryText,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.SemiBold,
+                lineHeight = 28.sp
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                action.feedbackDetail,
+                color = SecondaryText,
+                fontSize = 13.sp,
+                lineHeight = 19.sp
+            )
+            Spacer(Modifier.height(18.dp))
+            Text(
+                action.contextLabel,
+                color = TertiaryText,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Spacer(Modifier.height(5.dp))
+            Text(
+                "可在 10 秒内撤销；关闭提示后将无法撤销",
+                color = SystemBlue,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Spacer(Modifier.height(22.dp))
+            SecondaryButton(
+                "撤销本次操作",
+                onUndo,
+                Modifier.fillMaxWidth()
             )
         }
+        HomeSidePanelCloseButton(onDismiss, Modifier.align(Alignment.TopEnd))
+    }
+}
+
+@Composable
+private fun HomeFeedbackStatusIcon(
+    tone: HomeSidePanelFeedbackTone,
+    accentColor: Color
+) {
+    Box(
+        Modifier.size(42.dp).clip(CircleShape).background(accentColor),
+        contentAlignment = Alignment.Center
+    ) {
+        when (tone) {
+            HomeSidePanelFeedbackTone.SUCCESS -> StraightCheckMark(Modifier.size(19.dp))
+            HomeSidePanelFeedbackTone.INFO -> Text(
+                "i",
+                color = Color.White,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            HomeSidePanelFeedbackTone.WARNING -> Text(
+                "!",
+                color = Color.White,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+@Composable
+private fun HomeSidePanelCloseButton(
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    IconButton(
+        onClick = onDismiss,
+        modifier = modifier.padding(6.dp).size(48.dp)
+    ) {
+        Icon(
+            imageVector = Icons.Default.Close,
+            contentDescription = "关闭提示",
+            tint = TertiaryText,
+            modifier = Modifier.size(20.dp)
+        )
     }
 }
 
@@ -10712,6 +11252,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.6.2",
+            "首页操作反馈",
+            "首页右侧动态区域现在会反馈签到、暂缓与暂离、偏好修改、切换机台、本轮处理、机台状态和远程操作等结果；可撤销的重要操作也迁入右侧，并将撤销时间延长至 10 秒。"
+        ),
         Triple(
             "0.6.1",
             "本轮规划一致性",

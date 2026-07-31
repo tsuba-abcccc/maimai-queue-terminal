@@ -1,0 +1,105 @@
+package com.abcccc.maimaiqueue
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class QueueHomeFeedbackTest {
+    private fun registration(
+        key: Int,
+        name: String,
+        absenceStatus: QueueAbsenceStatus = QueueAbsenceStatus.NONE,
+        skippedTurns: Int = 0,
+        pendingCheckIn: Boolean = false
+    ) = Registration(
+        key = key,
+        displayId = name,
+        preference = PlayPreference.OPEN_TO_JOIN,
+        absenceStatus = absenceStatus,
+        temporaryAwaySkippedTurns = skippedTurns,
+        requiresOnSiteCheckIn = pendingCheckIn
+    )
+
+    @Test
+    fun pendingCheckInRemovalIsWarnedAndCannotBeRestored() {
+        val pending = registration(1, "青空", pendingCheckIn = true)
+        val remaining = registration(2, "北川")
+
+        val outcome = queueUndoFeedbackOutcome(
+            beforeQueue = MachineQueue(waiting = listOf(pending, remaining)),
+            afterQueue = MachineQueue(waiting = listOf(remaining))
+        )
+
+        assertEquals(HomeSidePanelFeedbackTone.WARNING, outcome.tone)
+        assertEquals(setOf(1), outcome.nonRestorableRegistrationKeys)
+        assertTrue(outcome.detailLines.single().contains("撤销本轮操作时不会恢复"))
+    }
+
+    @Test
+    fun deferredRegistrationExplainsAutomaticCancellation() {
+        val deferred = registration(
+            1,
+            "青空",
+            absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+        )
+
+        val outcome = queueUndoFeedbackOutcome(
+            beforeQueue = MachineQueue(waiting = listOf(deferred)),
+            afterQueue = MachineQueue(waiting = listOf(deferred.copy(absenceStatus = QueueAbsenceStatus.NONE)))
+        )
+
+        assertEquals(HomeSidePanelFeedbackTone.SUCCESS, outcome.tone)
+        assertTrue(outcome.detailLines.single().contains("暂缓一轮状态已自动解除"))
+        assertTrue(outcome.detailLines.single().contains("登记位置保持不变"))
+    }
+
+    @Test
+    fun temporaryAwayAdvancesAreGroupedBySkippedCount() {
+        val first = registration(
+            1,
+            "青空",
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            skippedTurns = 1
+        )
+        val second = registration(
+            2,
+            "北川",
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            skippedTurns = 1
+        )
+
+        val outcome = queueUndoFeedbackOutcome(
+            beforeQueue = MachineQueue(waiting = listOf(first, second)),
+            afterQueue = MachineQueue(
+                waiting = listOf(
+                    first.copy(temporaryAwaySkippedTurns = 2),
+                    second.copy(temporaryAwaySkippedTurns = 2)
+                )
+            )
+        )
+
+        assertEquals(1, outcome.detailLines.size)
+        assertTrue(outcome.detailLines.single().contains("“青空”、“北川”"))
+        assertTrue(outcome.detailLines.single().contains("累计已轮空 2 次"))
+    }
+
+    @Test
+    fun fourthTemporaryAwayTurnWarnsButRemainsUndoable() {
+        val expired = registration(
+            1,
+            "青空",
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            skippedTurns = 3
+        )
+
+        val outcome = queueUndoFeedbackOutcome(
+            beforeQueue = MachineQueue(waiting = listOf(expired)),
+            afterQueue = MachineQueue()
+        )
+
+        assertEquals(HomeSidePanelFeedbackTone.WARNING, outcome.tone)
+        assertTrue(outcome.nonRestorableRegistrationKeys.isEmpty())
+        assertTrue(outcome.detailLines.single().contains("第四次轮到"))
+        assertTrue(outcome.detailLines.single().contains("撤销时会恢复"))
+    }
+}

@@ -72,6 +72,20 @@ internal data class HomeSidePanelRegistration(
     val requiresOnSiteCheckIn: Boolean
 )
 
+internal enum class HomeSidePanelFeedbackTone {
+    SUCCESS,
+    INFO,
+    WARNING
+}
+
+internal data class HomeSidePanelFeedback(
+    val id: Long,
+    val title: String,
+    val detail: String,
+    val contextLabel: String? = null,
+    val tone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS
+)
+
 internal data class NewRegistrationHomeRequest(
     val highlight: NewRegistrationHighlight,
     val enterPlayingConfirmation: MachineId? = null,
@@ -98,6 +112,10 @@ internal data class QueueUndoAction(
     val beforeQueue: MachineQueue,
     val afterQueue: MachineQueue,
     val message: String,
+    val feedbackTitle: String,
+    val feedbackDetail: String,
+    val contextLabel: String,
+    val feedbackTone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS,
     val nonRestorableRegistrationKeys: Set<Int> = emptySet()
 )
 
