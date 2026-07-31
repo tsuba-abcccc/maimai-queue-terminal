@@ -81,7 +81,6 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
@@ -1456,11 +1455,11 @@ internal fun RegistrationApp() {
         ) { persistedProfile ->
             Toast.makeText(
                 context,
-                if (existingProfile == null) {
+                panguSpacing(if (existingProfile == null) {
                     "“${persistedProfile.nickname}”的玩家资料已创建。"
                 } else {
                     "“${persistedProfile.nickname}”的玩家资料已保存。"
-                },
+                }),
                 Toast.LENGTH_SHORT
             ).show()
             if (existingProfile == null) openPlayerProfile(persistedProfile)
@@ -4871,7 +4870,11 @@ private fun QueueRuleSettingsScreen(
                 text = "保存设置",
                 onClick = {
                     onSettingsChange(settingsToSave)
-                    Toast.makeText(context, "应用设置已保存。", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        context,
+                        panguSpacing("应用设置已保存。"),
+                        Toast.LENGTH_SHORT
+                    ).show()
                     onBack()
                 },
                 modifier = Modifier.fillMaxWidth(),
@@ -6467,7 +6470,7 @@ private fun QueuePosition(
     val playingHeaderWidth = if (isPlaying && registrations.isNotEmpty()) {
         val labelWidth = with(density) {
             textMeasurer.measure(
-                text = AnnotatedString(label),
+                text = AnnotatedString(panguSpacing(label)),
                 style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Medium)
             ).size.width.toDp()
         }
@@ -6863,79 +6866,86 @@ private fun HomeSidePanel(
         operationFeedback != null -> HomeSidePanelContent.Operation(operationFeedback)
         else -> HomeSidePanelContent.Join
     }
-    AnimatedContent(
-        targetState = panelContent,
-        modifier.clip(RoundedCornerShape(CardRadius)).background(CardBackground)
-            .border(1.dp, Separator.copy(alpha = .68f), RoundedCornerShape(CardRadius)),
-        transitionSpec = {
-            if (targetState !is HomeSidePanelContent.Join) {
-                (fadeIn(tween(220)) + slideInHorizontally(tween(280)) { width -> width / 5 })
-                    .togetherWith(
-                        fadeOut(tween(150)) + slideOutHorizontally(tween(220)) { width -> -width / 5 }
-                    )
-            } else {
-                (fadeIn(tween(220)) + slideInHorizontally(tween(280)) { width -> -width / 5 })
-                    .togetherWith(
-                        fadeOut(tween(150)) + slideOutHorizontally(tween(220)) { width -> width / 5 }
-                    )
-            }
-        },
-        contentAlignment = Alignment.Center,
-        contentKey = { content ->
+    val panelShape = RoundedCornerShape(CardRadius)
+    Surface(
+        modifier = modifier,
+        shape = panelShape,
+        color = CardBackground,
+        border = BorderStroke(1.dp, Separator.copy(alpha = .92f))
+    ) {
+        AnimatedContent(
+            targetState = panelContent,
+            modifier = Modifier.fillMaxSize().clip(panelShape),
+            transitionSpec = {
+                if (targetState !is HomeSidePanelContent.Join) {
+                    (fadeIn(tween(220)) + slideInHorizontally(tween(280)) { width -> width / 5 })
+                        .togetherWith(
+                            fadeOut(tween(150)) + slideOutHorizontally(tween(220)) { width -> -width / 5 }
+                        )
+                } else {
+                    (fadeIn(tween(220)) + slideInHorizontally(tween(280)) { width -> -width / 5 })
+                        .togetherWith(
+                            fadeOut(tween(150)) + slideOutHorizontally(tween(220)) { width -> width / 5 }
+                        )
+                }
+            },
+            contentAlignment = Alignment.Center,
+            contentKey = { content ->
+                when (content) {
+                    HomeSidePanelContent.Join -> "join"
+                    is HomeSidePanelContent.Registration -> "registration-${content.value.requestId}"
+                    is HomeSidePanelContent.Operation -> "operation-${content.value.id}"
+                    is HomeSidePanelContent.Undo -> "undo-${content.value.id}"
+                }
+            },
+            label = "首页右侧动态区域"
+        ) { content ->
             when (content) {
-                HomeSidePanelContent.Join -> "join"
-                is HomeSidePanelContent.Registration -> "registration-${content.value.requestId}"
-                is HomeSidePanelContent.Operation -> "operation-${content.value.id}"
-                is HomeSidePanelContent.Undo -> "undo-${content.value.id}"
+                is HomeSidePanelContent.Registration -> RegistrationCompletedPanel(
+                    completion = content.value,
+                    joiningEnabled = joiningEnabled,
+                    onViewRegistration = {
+                        onCompletedRegistrationClick(
+                            content.value.machineId,
+                            content.value.registrationKey
+                        )
+                    },
+                    onContinueJoining = onJoin,
+                    onDismiss = onDismissCompletedRegistration,
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                is HomeSidePanelContent.Operation -> HomeOperationFeedbackPanel(
+                    feedback = content.value,
+                    onDismiss = onDismissOperationFeedback,
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                is HomeSidePanelContent.Undo -> HomeUndoFeedbackPanel(
+                    action = content.value,
+                    onUndo = onUndoQueueAction,
+                    onDismiss = onDismissQueueUndo,
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                HomeSidePanelContent.Join -> JoinPanelContent(
+                    machineA = machineA,
+                    machineB = machineB,
+                    machineAStatus = machineAStatus,
+                    machineBStatus = machineBStatus,
+                    machineAName = machineAName,
+                    machineBName = machineBName,
+                    nowMillis = nowMillis,
+                    registrationOpen = registrationOpen,
+                    acceptingNewRegistrations = acceptingNewRegistrations,
+                    closingGracePeriod = closingGracePeriod,
+                    joiningEnabled = joiningEnabled,
+                    joiningDisabledReason = joiningDisabledReason,
+                    onJoin = onJoin,
+                    onBatch = onBatch,
+                    modifier = Modifier.fillMaxSize()
+                )
             }
-        },
-        label = "首页右侧动态区域"
-    ) { content ->
-        when (content) {
-            is HomeSidePanelContent.Registration -> RegistrationCompletedPanel(
-                completion = content.value,
-                joiningEnabled = joiningEnabled,
-                onViewRegistration = {
-                    onCompletedRegistrationClick(
-                        content.value.machineId,
-                        content.value.registrationKey
-                    )
-                },
-                onContinueJoining = onJoin,
-                onDismiss = onDismissCompletedRegistration,
-                modifier = Modifier.fillMaxSize()
-            )
-
-            is HomeSidePanelContent.Operation -> HomeOperationFeedbackPanel(
-                feedback = content.value,
-                onDismiss = onDismissOperationFeedback,
-                modifier = Modifier.fillMaxSize()
-            )
-
-            is HomeSidePanelContent.Undo -> HomeUndoFeedbackPanel(
-                action = content.value,
-                onUndo = onUndoQueueAction,
-                onDismiss = onDismissQueueUndo,
-                modifier = Modifier.fillMaxSize()
-            )
-
-            HomeSidePanelContent.Join -> JoinPanelContent(
-                machineA = machineA,
-                machineB = machineB,
-                machineAStatus = machineAStatus,
-                machineBStatus = machineBStatus,
-                machineAName = machineAName,
-                machineBName = machineBName,
-                nowMillis = nowMillis,
-                registrationOpen = registrationOpen,
-                acceptingNewRegistrations = acceptingNewRegistrations,
-                closingGracePeriod = closingGracePeriod,
-                joiningEnabled = joiningEnabled,
-                joiningDisabledReason = joiningDisabledReason,
-                onJoin = onJoin,
-                onBatch = onBatch,
-                modifier = Modifier.fillMaxSize()
-            )
         }
     }
 }
@@ -7663,7 +7673,7 @@ private fun PlayerProfileCard(
         IconButton(onClick = onEdit, modifier = Modifier.size(48.dp)) {
             Icon(
                 imageVector = Icons.Default.Edit,
-                contentDescription = "编辑“${profile.nickname}”的玩家资料",
+                contentDescription = panguSpacing("编辑“${profile.nickname}”的玩家资料"),
                 tint = SystemBlue,
                 modifier = Modifier.size(18.dp)
             )
@@ -10971,7 +10981,7 @@ private fun QrCodeImage(content: String, contentDescription: String, size: Dp) {
         if (bitmap != null) {
             Image(
                 bitmap = bitmap.asImageBitmap(),
-                contentDescription = contentDescription,
+                contentDescription = panguSpacing(contentDescription),
                 modifier = Modifier.fillMaxSize()
             )
         } else {
@@ -11252,6 +11262,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.6.3",
+            "首页分区与文本排版",
+            "首页右侧恢复为始终可见的圆角矩形分区，动态反馈只在框内切换；App 文本统一补全中文与字母、数字之间的 Pangu 空格，同时保持玩家资料和其他原始数据不变。"
+        ),
         Triple(
             "0.6.2",
             "首页操作反馈",
@@ -12453,7 +12468,7 @@ private fun showDisabledActionReason(
 ) {
     val reason = description?.trim()?.takeIf { it.isNotEmpty() }
         ?: "当前状态下不能使用这项操作。"
-    Toast.makeText(context, "$title：$reason", Toast.LENGTH_LONG).show()
+    Toast.makeText(context, panguSpacing("$title：$reason"), Toast.LENGTH_LONG).show()
 }
 
 @Composable
@@ -12981,10 +12996,11 @@ internal fun calculateDragReorder(
 }
 
 internal fun queueDisplayId(displayId: String): String {
-    val characterCount = displayId.codePointCount(0, displayId.length)
-    if (characterCount <= 6) return displayId
-    val truncationEnd = displayId.offsetByCodePoints(0, 5)
-    return displayId.substring(0, truncationEnd) + "…"
+    val formattedDisplayId = panguSpacing(displayId)
+    val characterCount = formattedDisplayId.codePointCount(0, formattedDisplayId.length)
+    if (characterCount <= 6) return formattedDisplayId
+    val truncationEnd = formattedDisplayId.offsetByCodePoints(0, 5)
+    return formattedDisplayId.substring(0, truncationEnd).trimEnd() + "…"
 }
 
 internal fun limitCodePointLength(value: String, maxCodePoints: Int): String {
