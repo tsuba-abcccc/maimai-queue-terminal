@@ -1253,7 +1253,7 @@ export function formatMachineChoice(machine: QueueMachine): string {
   if (typeof machine.new_registration_estimated_wait_minutes === "number") {
     details.push(
       machine.new_registration_estimated_wait_minutes <= 0
-        ? "预计不足 1 分钟"
+        ? "预计很快可以游玩"
         : `约 ${machine.new_registration_estimated_wait_minutes} 分钟后`,
     );
   } else {
@@ -1932,7 +1932,7 @@ function formatMachine(machine: QueueMachine, terminalOnline = true): string {
         : position.estimated_wait_minutes === null
         ? "·暂时无法估算"
         : position.estimated_wait_minutes <= 0
-        ? "·不足 1 分钟后"
+        ? "·预计很快可以游玩"
         : `·约 ${position.estimated_wait_minutes} 分钟后`
       : "·机台恢复使用后重新估算";
     sections.push(
@@ -2005,7 +2005,7 @@ export function formatOwnQueue(
         : estimatedWaitMinutes === null
         ? "，暂时无法估算"
         : estimatedWaitMinutes <= 0
-        ? "，不足 1 分钟后可以游玩"
+        ? "，预计很快可以游玩"
         : `，约 ${estimatedWaitMinutes} 分钟后可以游玩`
       : "";
     const machineStopReason = machine
@@ -2166,7 +2166,7 @@ export function formatNotificationQueueStatus(players: BotPlayer[]): string {
       : estimatedWaitMinutes === null
       ? "暂时无法估算"
       : estimatedWaitMinutes <= 0
-      ? "不足 1 分钟后可以游玩"
+      ? "预计很快可以游玩"
       : `约 ${estimatedWaitMinutes} 分钟后可以游玩`;
     return `现在，${subject}位于${position}，${estimate}。`;
   }).join("\n");

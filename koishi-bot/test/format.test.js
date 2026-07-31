@@ -82,7 +82,7 @@ test('shows move-to-end as the latest no-show handling result', () => {
   assert.match(text, /上次处理：移至队尾/)
 })
 
-test('describes a zero-minute personal estimate as under one minute', () => {
+test('describes a zero-minute personal estimate as available soon', () => {
   const text = formatOwnQueue([{
     registration_id: 'registration-ready',
     profile_id: 'profile-ready',
@@ -99,7 +99,8 @@ test('describes a zero-minute personal estimate as under one minute', () => {
     last_no_show_action_was_defer: false,
   }])
 
-  assert.match(text, /不足 1 分钟后可以游玩/)
+  assert.match(text, /预计很快可以游玩/)
+  assert.doesNotMatch(text, /不足 1 分钟/)
   assert.doesNotMatch(text, /约 0 分钟后/)
 })
 
@@ -927,7 +928,7 @@ test('presents machine choices with the short letter first', () => {
     { id: 'B', name: '机台 B', new_registration_estimated_wait_minutes: 0 },
   ]
   assert.equal(formatMachineChoice(machines[0]), 'A（左侧日框，约 12 分钟后）')
-  assert.equal(formatMachineChoice(machines[1]), 'B（预计不足 1 分钟）')
+  assert.equal(formatMachineChoice(machines[1]), 'B（预计很快可以游玩）')
   assert.equal(
     formatMachineChoice({ id: 'C', name: '机台 C' }),
     'C（暂时无法估算）',

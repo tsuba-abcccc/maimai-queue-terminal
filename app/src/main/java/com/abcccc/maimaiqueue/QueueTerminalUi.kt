@@ -11263,6 +11263,11 @@ private fun AppDetailsDialog(
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
         Triple(
+            "0.6.4",
+            "估时表达修正",
+            "预计等待时间不足 1 分钟时恢复显示“预计很快可以游玩”，避免将队列估时表达成精确倒计时；App、网站和 QQ Bot 使用一致文案。"
+        ),
+        Triple(
             "0.6.3",
             "首页分区与文本排版",
             "首页右侧恢复为始终可见的圆角矩形分区，动态反馈只在框内切换；App 文本统一补全中文与字母、数字之间的 Pangu 空格，同时保持玩家资料和其他原始数据不变。"
@@ -13174,15 +13179,15 @@ internal fun estimatedWaitForNewOpenRegistration(queue: MachineQueue, nowMillis:
 private fun roundDurationMillis(registrations: List<Registration>): Long =
     if (registrations.size <= 1) SOLO_ROUND_DURATION_MILLIS else SHARED_ROUND_DURATION_MILLIS
 
-private fun formatJoinWaitEstimate(minutes: Long?): String = when {
+internal fun formatJoinWaitEstimate(minutes: Long?): String = when {
     minutes == null -> "暂时无法估算"
-    minutes <= 0L -> "不足 1 分钟"
+    minutes <= 0L -> "预计很快可以游玩"
     else -> "约 $minutes 分钟"
 }
 
-private fun formatPositionWaitEstimate(minutes: Long?): String = when {
+internal fun formatPositionWaitEstimate(minutes: Long?): String = when {
     minutes == null -> "暂时无法估算"
-    minutes <= 0L -> "不足 1 分钟后可以游玩"
+    minutes <= 0L -> "预计很快可以游玩"
     else -> "约 $minutes 分钟后可以游玩"
 }
 
