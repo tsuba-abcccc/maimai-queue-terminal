@@ -303,6 +303,18 @@ test('uses documented defaults and formats the cloud notification menu', () => {
   assert.equal(profileAllowsEventNotification(profile, 'ONLINE_CHECK_IN_COMPLETED'), true)
   assert.equal(profileAllowsEventNotification(profile, 'ABSENCE_CHANGED'), true)
   assert.equal(profileAllowsEventNotification(profile, 'MACHINE_STOPPED'), false)
+  const playingOnly = notificationProfile('12345678', {
+    notify_queue_changes: false,
+    notify_playing_position: true,
+    notify_online_check_in: false,
+    notify_absence: false,
+    notify_machine_status: false,
+  })
+  assert.equal(profileAllowsEventNotification(
+    playingOnly,
+    'ONLINE_CHECK_IN_MISSED',
+    ['ONLINE_CHECK_IN', 'PLAYING_POSITION', 'QUEUE_CHANGES'],
+  ), true)
 
   const menu = formatNotificationPreferenceMenu(profile, true, '123456789')
   assert.match(menu, /总开关：已开启/)

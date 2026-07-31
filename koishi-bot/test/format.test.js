@@ -388,6 +388,7 @@ test('does not show a stale personal estimate while the machine is stopped', () 
     position: 'WAITING',
     position_index: 1,
     estimated_wait_minutes: 8,
+    online_registration_pending_check_in: true,
     deferred_once: false,
     temporarily_away: false,
     temporary_away_skipped_turns: 0,
@@ -422,6 +423,8 @@ test('does not show a stale personal estimate while the machine is stopped', () 
   })
 
   assert.match(text, /机台状态：入口侧·机台 A 已停止使用·机台未开机，登记顺序已保留/)
+  assert.match(text, /机台停止使用期间，30 分钟签到计时暂停；恢复正常使用后会从头开始/)
+  assert.doesNotMatch(text, /超过 30 分钟/)
   assert.doesNotMatch(text, /约 8 分钟后/)
 })
 
@@ -574,6 +577,7 @@ test('stops the personal playing timer while the terminal is offline', () => {
   assert.doesNotMatch(text, /正在游玩位置 A/)
   assert.doesNotMatch(text, /已游玩 \d+ 分钟/)
   assert.match(text, /游玩偏好：单人游玩/)
+  assert.doesNotMatch(text, /\n\n - (修改游玩偏好|退出排队)/)
 })
 
 test('shows the computed business-hours state in the queue header', () => {
@@ -824,16 +828,26 @@ test('shows the pending check-in state and only allows leaving the queue', () =>
     no_show_count: 0,
     last_no_show_action_was_defer: false,
     online_registration_pending_check_in: true,
+    created_at: 1_000,
+    online_check_in_started_at: 1_000,
   }
 
   const text = formatOwnQueue([player])
 
   assert.match(text, /^你好，糍粑。/)
   assert.match(text, /你位于队列位置 A4，签到后可以估算等待时间。/)
+  assert.match(text, /请在创建登记后的 30 分钟内/)
   assert.match(text, /当前状态：线上登记·待签到。/)
   assert.match(text, /\n\n - 退出排队$/)
   assert.doesNotMatch(text, /暂缓一轮|暂时离开|切换机台|修改游玩偏好/)
   assert.deepEqual(formatOwnQueueActions(player), ['退出排队'])
+
+  const restartedText = formatOwnQueue([{
+    ...player,
+    online_check_in_started_at: 2_000,
+  }])
+  assert.match(restartedText, /机台恢复正常使用后，这份登记已重新获得 30 分钟签到时限/)
+  assert.doesNotMatch(restartedText, /请在创建登记后的 30 分钟内/)
 })
 
 test('formats pending check-in registrations in the public queue', () => {
@@ -899,6 +913,11 @@ test('changes the personal menu with absence state and queue rules', () => {
     allow_defer_one_round: false,
     allow_temporary_leave: false,
   }), ['切换机台', '修改游玩偏好', '退出排队'])
+  assert.deepEqual(formatOwnQueueActions(player, undefined, false), [])
+  assert.deepEqual(formatOwnQueueActions({
+    ...player,
+    machine_operational: false,
+  }), [])
 })
 
 test('cancels temporary leave for a fixed pair after the terminal snapshot confirms it', async () => {

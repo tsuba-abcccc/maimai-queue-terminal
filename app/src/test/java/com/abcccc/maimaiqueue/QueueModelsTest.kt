@@ -489,7 +489,7 @@ class QueueModelsTest {
     @Test
     fun overtimeCorrectionKeepsTemporaryLeaveAndCountsTheSkippedOpportunity() {
         val correctedAt = 9_000L
-        val queue = MachineQueue(
+        val original = MachineQueue(
             playing = listOf(registration(9, PlayPreference.SOLO)),
             waiting = listOf(
                 registration(1, PlayPreference.SOLO).copy(
@@ -499,11 +499,14 @@ class QueueModelsTest {
                 registration(2, PlayPreference.SOLO),
                 registration(3, PlayPreference.SOLO)
             )
-        ).advanceToWaitingPosition(setOf(3), correctedAt)
+        )
+        val queue = original.advanceToWaitingPosition(setOf(3), correctedAt)
+        val sequential = original.finishRound(correctedAt).finishRound(correctedAt)
 
         assertEquals(listOf(3), queue.playing.map { it.key })
-        assertEquals(listOf(9, 2, 1), queue.waiting.map { it.key })
-        val temporarilyAway = queue.waiting.last()
+        assertEquals(listOf(9, 1, 2), queue.waiting.map { it.key })
+        assertEquals(sequential, queue)
+        val temporarilyAway = queue.waiting.first { it.key == 1 }
         assertEquals(QueueAbsenceStatus.TEMPORARILY_AWAY, temporarilyAway.absenceStatus)
         assertEquals(2, temporarilyAway.temporaryAwaySkippedTurns)
         assertEquals(null, temporarilyAway.lastPlayedAtMillis)
@@ -512,8 +515,8 @@ class QueueModelsTest {
     @Test
     fun overtimeCorrectionRemovesOnlyPendingRegistrationFromAMixedPosition() {
         val correctedAt = 9_000L
-        val pending = registration(1).copy(requiresOnSiteCheckIn = true)
-        val availablePartner = registration(2)
+        val pending = registration(1, PlayPreference.SOLO).copy(requiresOnSiteCheckIn = true)
+        val availablePartner = registration(2, PlayPreference.SOLO)
         val corrected = MachineQueue(
             playing = listOf(registration(9, PlayPreference.SOLO)),
             waiting = listOf(
@@ -546,6 +549,25 @@ class QueueModelsTest {
         assertEquals(original, original.advanceToWaitingPosition(setOf(2), 9_000L))
         assertEquals(original, original.advanceToWaitingPosition(setOf(3), 9_000L))
         assertEquals(listOf(3, 4), original.advanceToWaitingPosition(setOf(3, 4), 9_000L).playing.map { it.key })
+    }
+
+    @Test
+    fun overtimeCorrectionDoesNotApplyWhenNormalRotationRegroupsTheSelectedPosition() {
+        val original = MachineQueue(
+            playing = listOf(registration(1)),
+            waiting = listOf(
+                registration(2, PlayPreference.SOLO),
+                registration(3)
+            ),
+            playingStartedAtMillis = 123L
+        )
+
+        // After registration 2 plays, registration 1 returns to the tail and
+        // shares the next position with registration 3.
+        assertEquals(
+            original,
+            original.advanceToWaitingPosition(setOf(3), 9_000L)
+        )
     }
 
     @Test
@@ -1117,19 +1139,33 @@ class QueueModelsTest {
 
     @Test
     fun restoringAfterMachineStopKeepsQueueAndRestartsRoundTimer() {
+        val pending = registration(3, PlayPreference.SOLO).copy(
+            createdAtMillis = 75L,
+            requiresOnSiteCheckIn = true
+        )
         val queue = MachineQueue(
             playing = listOf(registration(1, PlayPreference.SOLO)),
             waiting = listOf(
                 registration(2, PlayPreference.SOLO),
-                registration(3, PlayPreference.SOLO)
+                pending
             ),
             playingStartedAtMillis = 50L
         )
 
         val restored = queue.restartPlayingTimer(atMillis = 300L)
+            .restartPendingCheckInTimers(atMillis = 300L)
 
+        assertFalse(pending.hasRestartedOnSiteCheckInWindow)
         assertEquals(queue.playing, restored.playing)
-        assertEquals(queue.waiting, restored.waiting)
+        assertEquals(queue.waiting.first(), restored.waiting.first())
+        assertEquals(75L, restored.waiting.last().createdAtMillis)
+        assertEquals(300L, restored.waiting.last().onSiteCheckInStartedAtMillis)
+        assertTrue(restored.waiting.last().hasRestartedOnSiteCheckInWindow)
+        assertEquals(
+            300L + ONLINE_REGISTRATION_CHECK_IN_TIMEOUT_MILLIS,
+            restored.waiting.last().onSiteCheckInDeadlineMillis
+        )
+        assertTrue(restored.waiting.last().requiresOnSiteCheckIn)
         assertEquals(300L, restored.playingStartedAtMillis)
     }
 

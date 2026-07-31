@@ -76,6 +76,8 @@ interface QueueRegistration {
   fixed_pair: boolean;
   no_show_count: number;
   online_registration_pending_check_in?: boolean;
+  created_at?: number | null;
+  online_check_in_started_at?: number | null;
 }
 
 interface WaitingPosition {
@@ -134,6 +136,8 @@ interface BotPlayer {
   preference?: PlayPreference;
   fixed_pair?: boolean;
   registration_type?: "TEMPORARY" | "PLAYER_PROFILE";
+  created_at?: number | null;
+  online_check_in_started_at?: number | null;
   last_played_at?: number | null;
   deferred_once: boolean;
   temporarily_away: boolean;
@@ -196,6 +200,7 @@ interface QueueEvent {
   title: string;
   detail: string;
   operation_source?: string;
+  notification_categories?: string[];
   affected_players: AffectedPlayer[];
 }
 
@@ -267,7 +272,7 @@ const NOTIFICATION_OPTIONS: ReadonlyArray<{
     field: "notify_absence",
     title: "暂缓一轮、暂时离开和未到场",
     commandId: "absence",
-    commandLabel: "暂缓暂离",
+    commandLabel: "暂缓一轮与暂时离开",
   },
   {
     field: "notify_machine_status",
@@ -875,6 +880,9 @@ async function joinQueueFromBot(
   if (queue.queue_rules?.allow_online_registration === false) {
     throw new Error("现场规则暂不允许线上登记。请在现场终端加入排队。");
   }
+  if (queue.business_hours?.enabled && queue.business_hours.closing_grace) {
+    throw new Error("今日营业时间已结束，闭店收尾期间不再接收新的排队登记。");
+  }
   if (!queue.registration_open) {
     throw new Error("现场当前没有使用登记排队，请在现场自然排队。");
   }
@@ -956,6 +964,7 @@ export async function changeAbsenceState(
 ): Promise<string> {
   const current = await requireCurrentQueueRegistration(api, session);
   const { player, response } = current;
+  requireOperationalRegistration(player);
   requireSignedInWaitingRegistration(player);
 
   if (operation === "DEFER_ONE_ROUND") {
@@ -1064,6 +1073,7 @@ async function transferQueueMachine(
   session: Session | undefined,
 ): Promise<string> {
   const current = await requireCurrentQueueRegistration(api, session);
+  requireOperationalRegistration(current.player);
   requireSignedInWaitingRegistration(current.player);
   const queue = await api.getQueue();
   const candidates = sortedMachines(queue).filter((machine) =>
@@ -1096,6 +1106,19 @@ async function transferQueueMachine(
       `是否将“${current.player.display_id}”转至${compactMachineName(target.name)}？`,
       "",
       "确认后，这份登记会离开当前机台，并进入目标机台的等待顺序末端。",
+      ...(current.player.deferred_once
+        ? [current.player.fixed_pair
+          ? "转入登记的暂缓一轮状态会解除；留在原机台的登记仍保持暂缓一轮。"
+          : "暂缓一轮状态会在转入后解除。"]
+        : []),
+      ...(current.player.temporarily_away
+        ? [current.player.fixed_pair
+          ? `两份登记的暂时离开状态和已轮空 ${current.player.temporary_away_skipped_turns} 次都会保留；转入后仍需手动取消。`
+          : `暂时离开状态和已轮空 ${current.player.temporary_away_skipped_turns} 次会保留；转入后仍需手动取消。`]
+        : []),
+      ...(current.player.fixed_pair
+        ? ["原固定组合会解除；两份登记都会恢复为允许他人加入，另一份登记保留原位。"]
+        : []),
     ].join("\n"),
     "确认切换机台",
   );
@@ -1104,6 +1127,7 @@ async function transferQueueMachine(
       target_machine_id: target.id,
     }),
     `登记已转至${compactMachineName(target.name)} 的等待顺序末端。`,
+    true,
   );
 }
 
@@ -1113,9 +1137,18 @@ async function changeCurrentPreference(
   session: Session | undefined,
 ): Promise<string> {
   const current = await requireCurrentQueueRegistration(api, session);
+  requireOperationalRegistration(current.player);
   requireSignedInRegistration(current.player);
   const fixedPairNotice = current.player.fixed_pair
-    ? ["", "当前登记属于固定组合。修改本次游玩偏好会解除这个固定组合。"]
+    ? [
+      "",
+      "当前登记属于固定组合。修改本次游玩偏好会解除这个固定组合；另一份登记保留原位，并恢复为允许他人加入。",
+      ...(current.player.deferred_once
+        ? ["两份登记当前的暂缓一轮状态不会因解除组合而清除。"]
+        : current.player.temporarily_away
+        ? [`两份登记当前的暂时离开状态和已轮空 ${current.player.temporary_away_skipped_turns} 次不会因解除组合而清除。`]
+        : []),
+    ]
     : [];
   const input = await resolveQueueCommandInput(
     session,
@@ -1145,6 +1178,7 @@ async function changeCurrentPreference(
       { preference },
     ),
     `本次游玩偏好已改为“${queuePreferenceLabel(preference)}”。玩家资料中的默认偏好没有改变。`,
+    true,
   );
 }
 
@@ -1154,6 +1188,7 @@ async function leaveQueueFromBot(
   session: Session | undefined,
 ): Promise<string> {
   const current = await requireCurrentQueueRegistration(api, session);
+  requireOperationalRegistration(current.player);
   await requireQueueConfirmation(
     session,
     [
@@ -1162,12 +1197,24 @@ async function leaveQueueFromBot(
       current.player.online_registration_pending_check_in
         ? "确认后，这份尚未签到的线上登记会被移除。"
         : "确认后，这份登记会从当前队列中移除；继续游玩时需要重新加入排队。",
+      ...(current.player.fixed_pair
+        ? ["原固定组合会解除；另一份登记保留原位，并恢复为允许他人加入。"]
+        : []),
+      ...(current.player.fixed_pair && current.player.deferred_once
+        ? ["另一份登记仍保持暂缓一轮，并会在下一次轮到后自动解除。"]
+        : current.player.fixed_pair && current.player.temporarily_away
+        ? [`另一份登记仍保持暂时离开和已轮空 ${current.player.temporary_away_skipped_turns} 次，返回后需要手动取消。`]
+        : []),
+      ...(current.player.position === "PLAYING"
+        ? ["游玩位置中的空缺不会自动由等待登记补入。"]
+        : []),
     ].join("\n"),
     "确认退出排队",
   );
   return formatQueueCommandResult(
     await submitQueueCommand(api, config, current.qq, "LEAVE_QUEUE"),
     "登记已退出排队。",
+    true,
   );
 }
 
@@ -1189,6 +1236,12 @@ async function requireCurrentQueueRegistration(
 function requireSignedInRegistration(player: BotPlayer): void {
   if (player.online_registration_pending_check_in) {
     throw new Error("这份线上登记尚未在现场签到，目前只能退出排队。");
+  }
+}
+
+function requireOperationalRegistration(player: BotPlayer): void {
+  if (player.machine_operational === false) {
+    throw new Error("登记所在机台已停止使用，恢复正常使用后才能操作这份登记。");
   }
 }
 
@@ -1218,10 +1271,13 @@ async function submitQueueCommand(
 function formatQueueCommandResult(
   command: RemoteCommand,
   appliedMessage: string,
+  preferTerminalDetail = false,
 ): string {
   if (command.status === "APPLIED") {
     const resultDetail = command.result_detail?.trim();
-    return resultDetail?.includes("已经") ? resultDetail : appliedMessage;
+    return resultDetail && (preferTerminalDetail || resultDetail.includes("已经"))
+      ? resultDetail
+      : appliedMessage;
   }
   if (command.status === "REJECTED") {
     return command.result_detail || "现场终端拒绝了这次排队操作。";
@@ -1487,7 +1543,12 @@ async function processNotificationEvent(
   const isEnabled = (qqNumber: string) => {
     let check = preferenceChecks.get(qqNumber);
     if (!check) {
-      check = notificationEnabledForEvent(api, qqNumber, event.type);
+      check = notificationEnabledForEvent(
+        api,
+        qqNumber,
+        event.type,
+        event.notification_categories,
+      );
       preferenceChecks.set(qqNumber, check);
     }
     return check;
@@ -1746,23 +1807,46 @@ export function notificationFieldForEvent(
   return "notify_queue_changes";
 }
 
+function notificationFieldForCategory(
+  category: string,
+): Exclude<NotificationPreferenceField, "notification_enabled"> | null {
+  return {
+    QUEUE_CHANGES: "notify_queue_changes",
+    PLAYING_POSITION: "notify_playing_position",
+    ONLINE_CHECK_IN: "notify_online_check_in",
+    ABSENCE: "notify_absence",
+    MACHINE_STATUS: "notify_machine_status",
+  }[category] as Exclude<NotificationPreferenceField, "notification_enabled"> | undefined ?? null;
+}
+
 export function profileAllowsEventNotification(
   profile: PlayerProfile,
   eventType: string,
+  notificationCategories?: string[],
 ): boolean {
-  return notificationSetting(profile, "notification_enabled") &&
-    notificationSetting(profile, notificationFieldForEvent(eventType));
+  if (!notificationSetting(profile, "notification_enabled")) return false;
+  const fields = notificationCategories
+    ?.map(notificationFieldForCategory)
+    .filter((field): field is Exclude<NotificationPreferenceField, "notification_enabled"> =>
+      field !== null
+    );
+  return fields?.length
+    ? fields.some((field) => notificationSetting(profile, field))
+    : notificationSetting(profile, notificationFieldForEvent(eventType));
 }
 
 async function notificationEnabledForEvent(
   api: QueueApi,
   qqNumber: string,
   eventType: string,
+  notificationCategories?: string[],
 ): Promise<boolean> {
   const response = await api.getProfiles(qqNumber);
   const profile = response.profiles.find((item) => item.qq_number === qqNumber) ??
     response.profiles[0];
-  return profile ? profileAllowsEventNotification(profile, eventType) : false;
+  return profile
+    ? profileAllowsEventNotification(profile, eventType, notificationCategories)
+    : false;
 }
 
 export function formatNotificationPreferenceMenu(
@@ -2027,6 +2111,14 @@ export function formatOwnQueue(
       ]
         .find((item) => item.registration_id === player.registration_id)
       : undefined;
+    const checkInCreatedAt = registration?.created_at ?? player.created_at;
+    const checkInStartedAt = registration?.online_check_in_started_at ??
+      player.online_check_in_started_at;
+    const checkInWindowWasRestarted = typeof checkInCreatedAt === "number" &&
+      Number.isFinite(checkInCreatedAt) &&
+      typeof checkInStartedAt === "number" &&
+      Number.isFinite(checkInStartedAt) &&
+      checkInStartedAt !== checkInCreatedAt;
     const machineOperational = machine?.operational ??
       player.machine_operational;
     const machineName = compactMachineName(
@@ -2132,7 +2224,11 @@ export function formatOwnQueue(
     ];
     if (player.online_registration_pending_check_in) {
       lines.push(
-        "签到要求：请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。",
+        machineOperational === false
+          ? "签到要求：机台停止使用期间，30 分钟签到计时暂停；恢复正常使用后会从头开始。"
+          : checkInWindowWasRestarted
+          ? "签到要求：机台恢复正常使用后，这份登记已重新获得 30 分钟签到时限；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。"
+          : "签到要求：请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。",
       );
     }
     if (machineState) lines.push(`机台状态：${machineState}`);
@@ -2174,8 +2270,13 @@ export function formatOwnQueue(
   const blocks = [`你好，${players[0].display_id}。`];
   if (notices.length) blocks.push(notices.join("\n"));
   blocks.push(status);
-  if (players.length === 1) {
-    const actions = formatOwnQueueActions(players[0], queueRules);
+  if (players.length === 1 && terminalOnline !== false) {
+    const playerMachineOperational = queue?.machines[players[0].machine_id]?.operational;
+    const actions = formatOwnQueueActions(
+      players[0],
+      queueRules,
+      playerMachineOperational,
+    );
     if (actions.length) blocks.push(actions.map((action) => ` - ${action}`).join("\n"));
   }
   return blocks.join("\n\n");
@@ -2184,7 +2285,9 @@ export function formatOwnQueue(
 export function formatOwnQueueActions(
   player: BotPlayer,
   queueRules?: QueueRules,
+  machineOperational?: boolean,
 ): string[] {
+  if ((machineOperational ?? player.machine_operational) === false) return [];
   if (player.online_registration_pending_check_in) return ["退出排队"];
   const actions: string[] = [];
   if (player.position === "WAITING") {

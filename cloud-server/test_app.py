@@ -272,6 +272,7 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertIn("stored_at", recipient_columns)
         self.assertIn("operation_source", event_columns)
+        self.assertIn("notification_categories", event_columns)
         self.assertEqual("SERVER_TIMEOUT", result_source)
         self.assertEqual("ON_SITE_TERMINAL", operation_source)
         self.assertGreater(stored_at, 0)
@@ -354,7 +355,26 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertNotIn("13800138000", serialized)
         self.assertNotIn("private-id", serialized)
         self.assertEqual("公开昵称", read.get_json()["machines"]["A"]["playing"][0]["display_id"])
+        self.assertEqual(
+            800_000,
+            read.get_json()["machines"]["A"]["playing"][0]["online_check_in_started_at"],
+        )
         self.assertTrue(read.get_json()["terminal"]["online"])
+
+    def test_preserves_a_restarted_online_check_in_timer_without_changing_creation_time(self):
+        snapshot = self.snapshot(revision=5)
+        registration = snapshot["machines"]["A"]["playing"][0]
+        registration["online_check_in_started_at"] = 900_000
+
+        publish = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        stored = self.client.get("/api/queue-status").get_json()
+        stored_registration = stored["machines"]["A"]["playing"][0]
+
+        self.assertEqual(204, publish.status_code)
+        self.assertEqual(800_000, stored_registration["created_at"])
+        self.assertEqual(900_000, stored_registration["online_check_in_started_at"])
 
     def test_preserves_temporary_away_state_and_rejects_invalid_count(self):
         snapshot = self.snapshot()
@@ -532,6 +552,8 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("OPEN_TO_JOIN", player["preference"])
         self.assertTrue(player["fixed_pair"])
         self.assertEqual("PLAYER_PROFILE", player["registration_type"])
+        self.assertEqual(800_000, player["created_at"])
+        self.assertEqual(800_000, player["online_check_in_started_at"])
         self.assertIsNone(player["last_played_at"])
         profiles = self.client.post(
             "/api/queue-bot/profiles", json={"qq": "12345678"}, headers=self.bot_headers
@@ -1425,6 +1447,51 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("12345678", event["affected_players"][0]["qq_number"])
         self.assertEqual(event["cursor"], events_response["next_cursor"])
         self.assertEqual(event["cursor"], events_response["latest_cursor"])
+
+    def test_composite_event_uses_every_related_notification_category(self):
+        snapshot = self.snapshot(revision=4)
+        snapshot["schema_version"] = 5
+        registration = snapshot["machines"]["A"]["playing"][0]
+        profile = self.player_profile()
+        profile.update(
+            notify_queue_changes=False,
+            notify_playing_position=True,
+            notify_online_check_in=False,
+            notify_absence=False,
+            notify_machine_status=False,
+        )
+        event = self.event(
+            "00000000-0000-0000-0000-000000000196",
+            "ONLINE_CHECK_IN_MISSED",
+            1_000_100,
+        )
+        event["notification_categories"] = [
+            "ONLINE_CHECK_IN",
+            "PLAYING_POSITION",
+            "QUEUE_CHANGES",
+        ]
+        snapshot["private_player_profiles"] = [profile]
+        snapshot["private_player_contacts"] = [{
+            "registration_id": registration["registration_id"],
+            "profile_id": self.profile_id,
+            "qq_number": "12345678",
+        }]
+        snapshot["recent_events"] = [event]
+
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        events = self.client.post(
+            "/api/queue-bot/events",
+            json={"qq": "12345678", "after": 0},
+            headers=self.bot_headers,
+        ).get_json()["events"]
+
+        self.assertEqual(1, len(events))
+        self.assertEqual(event["notification_categories"], events[0]["notification_categories"])
 
     def test_new_queue_reset_event_notifies_players_from_previous_batch(self):
         first = self.snapshot(revision=4)
@@ -2391,6 +2458,29 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(409, repeated.status_code)
         self.assertEqual("PLAYER_OPERATION_SYNCING", repeated.get_json()["code"])
 
+        connection = sqlite3.connect(self.database_path)
+        try:
+            completed_at = connection.execute(
+                "SELECT completed_at FROM terminal_command WHERE command_id = ?",
+                (first_request_id,),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE queue_snapshot SET received_at = ? WHERE id = 1",
+                (completed_at + 1,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        rejoined_after_newer_snapshot = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000433",
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+        self.assertEqual(202, rejoined_after_newer_snapshot.status_code)
+
     def test_legacy_profile_can_join_online_before_completing_setup(self):
         snapshot = self.remote_ready_snapshot(revision=22)
         snapshot["private_player_profiles"][0]["setup_version"] = 0
@@ -2475,6 +2565,83 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(503, bot_join.status_code)
         self.assertEqual(200, bot_players.status_code)
         self.assertEqual(202, bot_leave.status_code)
+
+    def test_closing_grace_and_machine_stop_block_remote_queue_changes(self):
+        closing = self.remote_ready_snapshot(revision=25)
+        closing["business_hours"] = {
+            "enabled": True,
+            "outside": True,
+            "closing_soon": False,
+            "closing_grace": True,
+            "closes_at": None,
+            "registration_closes_at": 2_200_000,
+        }
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=closing, headers=self.headers
+            ).status_code,
+        )
+        website_join = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000424",
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+        bot_join = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000425",
+                "actor_qq": "12345678",
+                "operation": "JOIN_QUEUE",
+                "machine_id": "A",
+            },
+            headers=self.bot_headers,
+        )
+        mobile_session = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000426",
+                "queue_id": closing["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        )
+
+        self.assertEqual(409, website_join.status_code)
+        self.assertIn("闭店收尾", website_join.get_json()["error"])
+        self.assertEqual(409, bot_join.status_code)
+        self.assertIn("闭店收尾", bot_join.get_json()["error"])
+        self.assertEqual(409, mobile_session.status_code)
+        self.assertIn("闭店收尾", mobile_session.get_json()["error"])
+
+        stopped = self.remote_ready_snapshot(revision=26, with_registration=True)
+        stopped["machines"]["A"].update(
+            operational=False,
+            stop_reason="MAINTENANCE",
+            stopped_at=2_300_000,
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=stopped, headers=self.headers
+            ).status_code,
+        )
+        leave = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000427",
+                "actor_qq": "12345678",
+                "operation": "LEAVE_QUEUE",
+                "machine_id": "A",
+            },
+            headers=self.bot_headers,
+        )
+
+        self.assertEqual(409, leave.status_code)
+        self.assertIn("机台已停止使用", leave.get_json()["error"])
 
     def test_online_join_requires_a_current_preference_when_profile_asks_each_time(self):
         snapshot = self.remote_ready_snapshot(default_preference="ASK_EVERY_TIME")

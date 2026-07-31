@@ -143,6 +143,10 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                     put("playerProfileId", registration.playerProfileId ?: JSONObject.NULL)
                     put("requiresOnSiteCheckIn", registration.requiresOnSiteCheckIn)
                     put(
+                        "onSiteCheckInStartedAtMillis",
+                        registration.onSiteCheckInStartedAtMillis ?: JSONObject.NULL
+                    )
+                    put(
                         "originatingCommandId",
                         registration.originatingCommandId ?: JSONObject.NULL
                     )
@@ -252,6 +256,9 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                 },
                 playerProfileId = item.optNullableString("playerProfileId"),
                 requiresOnSiteCheckIn = item.optBoolean("requiresOnSiteCheckIn", false),
+                onSiteCheckInStartedAtMillis = item
+                    .optLongOrNull("onSiteCheckInStartedAtMillis")
+                    ?.takeIf { it > 0L },
                 originatingCommandId = (
                     item.optNullableString("originatingCommandId")
                         ?: item.optNullableString("onlineRegistrationCommandId")
@@ -347,6 +354,8 @@ private fun normalizeRestoredRegistrations(
             },
             absenceStatus = normalizedAbsenceStatus,
             createdAtMillis = registration.createdAtMillis.coerceAtLeast(1L),
+            onSiteCheckInStartedAtMillis = registration.onSiteCheckInStartedAtMillis
+                ?.coerceAtLeast(1L),
             lastPlayedAtMillis = registration.lastPlayedAtMillis?.takeIf { it > 0L },
             noShowCount = noShowCount,
             lastNoShowActionWasDefer = noShowCount > 0 &&

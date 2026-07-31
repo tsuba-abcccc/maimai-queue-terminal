@@ -34,11 +34,14 @@ fun MachineQueue.invariantViolations(): List<String> = buildList {
         if (registration.lastNoShowActionWasDefer && registration.noShowCount <= 0) {
             add("没有未到场记录时不能保留未到场处理方式")
         }
+        if (registration.onSiteCheckInStartedAtMillis?.let { it <= 0L } == true) {
+            add("线上登记签到计时起点必须为正数")
+        }
         if (
             registration.requiresOnSiteCheckIn &&
             registration.absenceStatus != QueueAbsenceStatus.NONE
         ) {
-            add("待签到线上登记不能同时暂缓或暂时离开")
+            add("待签到线上登记不能同时暂缓一轮或暂时离开")
         }
 
         val partnerKey = registration.fixedPartnerKey ?: return@forEach
@@ -64,7 +67,7 @@ fun MachineQueue.invariantViolations(): List<String> = buildList {
             registration.absenceStatus != partner.absenceStatus ||
             registration.temporaryAwaySkippedTurns != partner.temporaryAwaySkippedTurns
         ) {
-            add("固定组合的暂缓或暂离状态必须一致")
+            add("固定组合的暂缓一轮或暂时离开状态必须一致")
         }
         if (registration.requiresOnSiteCheckIn || partner.requiresOnSiteCheckIn) {
             add("待签到线上登记不能建立固定组合")

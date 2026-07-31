@@ -158,6 +158,7 @@ class QueueStatePersistenceTest {
 
         assertEquals(18, registration.displayId.codePointCount(0, registration.displayId.length))
         assertEquals(1L, registration.createdAtMillis)
+        assertEquals(null, registration.onSiteCheckInStartedAtMillis)
         assertEquals(null, registration.lastPlayedAtMillis)
         assertFalse(registration.lastNoShowActionWasDefer)
         assertEquals(null, restored.playingStartedAtMillis)
@@ -230,6 +231,32 @@ class QueueStatePersistenceTest {
 
         assertFalse(restored.playing.single().requiresOnSiteCheckIn)
         assertTrue(restored.waiting.single().requiresOnSiteCheckIn)
+    }
+
+    @Test
+    fun restoredQueueKeepsIndependentOnlineCheckInTimerStart() {
+        val restored = normalizeRestoredMachineQueue(
+            MachineQueue(
+                waiting = listOf(
+                    Registration(
+                        key = 2,
+                        displayId = "线上玩家",
+                        preference = PlayPreference.SOLO,
+                        requiresOnSiteCheckIn = true,
+                        createdAtMillis = 200L,
+                        onSiteCheckInStartedAtMillis = 500L
+                    )
+                )
+            )
+        )
+
+        val registration = restored.waiting.single()
+        assertEquals(200L, registration.createdAtMillis)
+        assertEquals(500L, registration.onSiteCheckInStartedAtMillis)
+        assertEquals(
+            500L + ONLINE_REGISTRATION_CHECK_IN_TIMEOUT_MILLIS,
+            registration.onSiteCheckInDeadlineMillis
+        )
     }
 
     @Test

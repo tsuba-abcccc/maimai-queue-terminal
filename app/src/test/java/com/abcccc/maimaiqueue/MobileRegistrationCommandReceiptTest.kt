@@ -18,4 +18,29 @@ class MobileRegistrationCommandReceiptTest {
 
         assertEquals(listOf(third, first), updated)
     }
+
+    @Test
+    fun recordingAResultKeepsTheOriginalOutcomeForReliableRedelivery() {
+        val first = TerminalCommandReceipt(
+            commandId = "00000000-0000-0000-0000-000000000001",
+            applied = true,
+            detail = "登记已切换机台。"
+        )
+        val rejected = TerminalCommandReceipt(
+            commandId = "00000000-0000-0000-0000-000000000002",
+            applied = false,
+            detail = "机台已停止使用。"
+        )
+        val replacement = first.copy(detail = "终端不会重复执行。")
+
+        val updated = appendRecentCommandReceipt(
+            existing = listOf(first, rejected),
+            receipt = replacement,
+            maximumSize = 2
+        )
+
+        assertEquals(listOf(rejected, replacement), updated)
+        assertEquals(false, updated.first().applied)
+        assertEquals("机台已停止使用。", updated.first().detail)
+    }
 }

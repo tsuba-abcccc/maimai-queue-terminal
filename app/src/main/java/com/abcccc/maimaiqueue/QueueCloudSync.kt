@@ -1233,7 +1233,10 @@ internal fun buildPublicQueueSnapshot(
     put("queue_id", state.queueId)
     put("revision", state.revision)
     put("captured_at", capturedAtMillis)
-    put("registration_open", state.registrationOpen)
+    put(
+        "registration_open",
+        state.registrationOpen && !displaySettings.businessHours.closingGracePeriod
+    )
     put("website_remote_enabled", displaySettings.websiteRemoteEnabled)
     put("onebot_sync_enabled", displaySettings.oneBotSyncEnabled)
     put(
@@ -1324,6 +1327,14 @@ private fun buildPublicQueueEvent(queueId: String, event: AuditLogEntry): JSONOb
         put("event_id", event.id)
         put("occurred_at", event.timestampMillis)
         put("type", event.publicEventType?.name ?: PublicQueueEventType.OTHER.name)
+        put(
+            "notification_categories",
+            JSONArray().apply {
+                event.notificationCategories
+                    .sortedBy(PublicQueueNotificationCategory::name)
+                    .forEach { put(it.name) }
+            }
+        )
         put(
             "machine_id",
             when (event.category) {
@@ -1446,6 +1457,10 @@ private fun buildPublicRegistration(queueId: String, registration: Registration)
         put("online_registration_pending_check_in", registration.requiresOnSiteCheckIn)
         put("registration_type", if (registration.isTemporary) "TEMPORARY" else "PLAYER_PROFILE")
         put("created_at", registration.createdAtMillis)
+        put(
+            "online_check_in_started_at",
+            registration.onSiteCheckInStartedAtMillis ?: registration.createdAtMillis
+        )
         put("last_played_at", registration.lastPlayedAtMillis ?: JSONObject.NULL)
     }
 

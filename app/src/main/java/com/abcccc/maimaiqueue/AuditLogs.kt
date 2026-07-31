@@ -41,6 +41,14 @@ enum class PublicQueueEventType {
     OTHER
 }
 
+enum class PublicQueueNotificationCategory {
+    QUEUE_CHANGES,
+    PLAYING_POSITION,
+    ONLINE_CHECK_IN,
+    ABSENCE,
+    MACHINE_STATUS
+}
+
 data class AuditLogEntry(
     val id: String,
     val timestampMillis: Long,
@@ -50,6 +58,7 @@ data class AuditLogEntry(
     val source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
     val queueId: String? = null,
     val publicEventType: PublicQueueEventType? = null,
+    val notificationCategories: Set<PublicQueueNotificationCategory> = emptySet(),
     val affectedRegistrationKeys: List<Int> = emptyList()
 )
 
@@ -60,6 +69,7 @@ fun createAuditLogEntry(
     source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
     timestampMillis: Long = System.currentTimeMillis(),
     publicEventType: PublicQueueEventType? = null,
+    notificationCategories: Set<PublicQueueNotificationCategory> = emptySet(),
     affectedRegistrationKeys: Collection<Int> = emptyList()
 ): AuditLogEntry = AuditLogEntry(
     id = UUID.randomUUID().toString(),
@@ -69,6 +79,9 @@ fun createAuditLogEntry(
     detail = detail,
     source = source,
     publicEventType = publicEventType,
+    notificationCategories = notificationCategories.ifEmpty {
+        publicEventType?.let(::notificationCategoryForEventType)?.let(::setOf).orEmpty()
+    },
     affectedRegistrationKeys = affectedRegistrationKeys.distinct()
 )
 
@@ -91,11 +104,23 @@ fun createQueueAuditLog(
     val added = after.allRegistrations.filter { it.key !in beforeByKey }
     val removed = before.allRegistrations.filter { it.key !in afterByKey }
     val removedPendingCheckIn = removed.filter { it.requiresOnSiteCheckIn }
-    val otherRemoved = removed.filterNot { it.requiresOnSiteCheckIn }
-    val temporaryAwayExpired = removed.filter {
-        it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
-            it.temporaryAwaySkippedTurns >= 3
+    val temporaryAwayExpired = if (
+        publicEventTypeOverride == null ||
+        publicEventTypeOverride == PublicQueueEventType.TEMPORARY_AWAY_EXPIRED ||
+        publicEventTypeOverride == PublicQueueEventType.ONLINE_CHECK_IN_MISSED
+    ) {
+        removed.filter {
+            it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
+                it.temporaryAwaySkippedTurns >= 3
+        }
+    } else {
+        emptyList()
     }
+    val temporaryAwayExpiredKeys = temporaryAwayExpired.mapTo(mutableSetOf()) { it.key }
+    val otherRemoved = removed.filter {
+        !it.requiresOnSiteCheckIn && it.key !in temporaryAwayExpiredKeys
+    }
+    val unclassifiedRemoved = removed.filter { it.key !in temporaryAwayExpiredKeys }
     val affectedRegistrationKeys = mutableSetOf<Int>().apply {
         addAll(added.map { it.key })
         addAll(removed.map { it.key })
@@ -113,7 +138,7 @@ fun createQueueAuditLog(
                 details += "${quotedNames(removed)}本次未到场，登记已移除"
             PublicQueueEventType.ONLINE_CHECK_IN_TIMED_OUT -> {
                 if (removedPendingCheckIn.isNotEmpty()) {
-                    details += "${quotedNames(removedPendingCheckIn)}未在创建线上登记后的 30 分钟内完成现场签到，登记已自动移除"
+                    details += "${quotedNames(removedPendingCheckIn)}未在本次 30 分钟签到时限内完成现场签到，登记已自动移除"
                 }
                 if (otherRemoved.isNotEmpty()) details += "移除 ${quotedNames(otherRemoved)}"
             }
@@ -123,7 +148,9 @@ fun createQueueAuditLog(
                 }
                 if (otherRemoved.isNotEmpty()) details += "移除 ${quotedNames(otherRemoved)}"
             }
-            else -> details += "移除 ${quotedNames(removed)}"
+            else -> if (unclassifiedRemoved.isNotEmpty()) {
+                details += "移除 ${quotedNames(unclassifiedRemoved)}"
+            }
         }
         if (temporaryAwayExpired.isNotEmpty()) {
             details += "${quotedNames(temporaryAwayExpired)}在暂时离开期间第四次轮到，已自动退出排队"
@@ -151,7 +178,23 @@ fun createQueueAuditLog(
         if (old.fixedPartnerKey != new.fixedPartnerKey) {
             affectedRegistrationKeys += key
             changeKinds += "pair"
-            details += "“${new.displayId}”的固定组合关系已变更"
+            details += when {
+                old.fixedPartnerKey == null && new.fixedPartnerKey != null -> {
+                    val partnerName = afterByKey[new.fixedPartnerKey]?.displayId
+                    if (partnerName == null) {
+                        "“${new.displayId}”已建立固定组合"
+                    } else {
+                        "“${new.displayId}”已与“$partnerName”建立固定组合"
+                    }
+                }
+                old.fixedPartnerKey != null && new.fixedPartnerKey == null ->
+                    "“${new.displayId}”的固定组合已解除，当前游玩偏好为${queuePreferenceLabel(new)}"
+                else -> {
+                    val oldPartnerName = old.fixedPartnerKey?.let(beforeByKey::get)?.displayId
+                    val newPartnerName = new.fixedPartnerKey?.let(afterByKey::get)?.displayId
+                    "“${new.displayId}”的固定组合已由“${oldPartnerName ?: "原搭档"}”改为“${newPartnerName ?: "新搭档"}”"
+                }
+            }
         }
         if (old.absenceStatus != new.absenceStatus) {
             affectedRegistrationKeys += key
@@ -162,7 +205,7 @@ fun createQueueAuditLog(
                 QueueAbsenceStatus.NONE -> when (old.absenceStatus) {
                     QueueAbsenceStatus.DEFER_ONE_ROUND -> "“${new.displayId}”的暂缓一轮已解除"
                     QueueAbsenceStatus.TEMPORARILY_AWAY -> "“${new.displayId}”已取消暂时离开"
-                    QueueAbsenceStatus.NONE -> "“${new.displayId}”的暂缓或暂离状态已恢复"
+                    QueueAbsenceStatus.NONE -> "“${new.displayId}”的暂缓一轮或暂时离开状态已恢复"
                 }
             }
         }
@@ -258,7 +301,7 @@ fun createQueueAuditLog(
             "profile" in changeKinds -> "登记资料已更新"
             "no_show" in changeKinds -> "未到场状态已更新"
             "check_in" in changeKinds -> "线上登记签到状态已更新"
-            "absence" in changeKinds -> "暂缓或暂离状态已修改"
+            "absence" in changeKinds -> "暂缓一轮或暂时离开状态已修改"
             "pair" in changeKinds -> "固定组合已修改"
             "preference" in changeKinds -> "游玩偏好已修改"
             "playing" in changeKinds -> "游玩位置已更新"
@@ -266,6 +309,33 @@ fun createQueueAuditLog(
             "timer" in changeKinds -> "本轮计时已重置"
             else -> "队列已更新"
         }
+    }
+    val notificationCategories = buildSet {
+        add(notificationCategoryForEventType(publicEventType))
+        if ("playing" in changeKinds) add(PublicQueueNotificationCategory.PLAYING_POSITION)
+        if (
+            "check_in" in changeKinds ||
+            removedPendingCheckIn.isNotEmpty()
+        ) add(PublicQueueNotificationCategory.ONLINE_CHECK_IN)
+        if (
+            "absence" in changeKinds ||
+            "no_show" in changeKinds ||
+            "no_show_cleared" in changeKinds ||
+            temporaryAwayExpired.isNotEmpty()
+        ) add(PublicQueueNotificationCategory.ABSENCE)
+        if (changeKinds.any {
+            it in setOf(
+                "added",
+                "removed",
+                "renamed",
+                "profile",
+                "preference",
+                "pair",
+                "claimed",
+                "order",
+                "timer"
+            )
+        }) add(PublicQueueNotificationCategory.QUEUE_CHANGES)
     }
     return createAuditLogEntry(
         category = category,
@@ -278,8 +348,29 @@ fun createQueueAuditLog(
         source = source,
         timestampMillis = timestampMillis,
         publicEventType = publicEventType,
+        notificationCategories = notificationCategories,
         affectedRegistrationKeys = affectedRegistrationKeys
     )
+}
+
+internal fun notificationCategoryForEventType(
+    eventType: PublicQueueEventType
+): PublicQueueNotificationCategory = when (eventType) {
+    PublicQueueEventType.PLAYING_CHANGED -> PublicQueueNotificationCategory.PLAYING_POSITION
+    PublicQueueEventType.ONLINE_REGISTRATION_ADDED,
+    PublicQueueEventType.ONLINE_CHECK_IN_COMPLETED,
+    PublicQueueEventType.ONLINE_CHECK_IN_TIMED_OUT,
+    PublicQueueEventType.ONLINE_CHECK_IN_MISSED -> PublicQueueNotificationCategory.ONLINE_CHECK_IN
+    PublicQueueEventType.NO_SHOW_DEFERRED,
+    PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
+    PublicQueueEventType.NO_SHOW_REMOVED,
+    PublicQueueEventType.TEMPORARY_AWAY_EXPIRED,
+    PublicQueueEventType.ABSENCE_CHANGED -> PublicQueueNotificationCategory.ABSENCE
+    PublicQueueEventType.MACHINE_STOPPED,
+    PublicQueueEventType.MACHINE_RESTORED,
+    PublicQueueEventType.REGISTRATION_OPENED,
+    PublicQueueEventType.REGISTRATION_CLOSED -> PublicQueueNotificationCategory.MACHINE_STATUS
+    else -> PublicQueueNotificationCategory.QUEUE_CHANGES
 }
 
 fun createPlayerProfileAuditLog(
@@ -335,7 +426,18 @@ fun createMachineTransferAuditLog(
                 "并加入目标机台的等待顺序末端"
         )
         if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
-            add("转入后，暂缓一轮状态已解除")
+            if (releasedPartnerRegistrations.any {
+                    it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
+                }) {
+                add("转入登记的暂缓一轮状态已解除，留在原机台的登记仍保持暂缓一轮")
+            } else {
+                add("转入后，暂缓一轮状态已解除")
+            }
+        }
+        registrations.filter {
+            it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
+        }.maxOfOrNull(Registration::temporaryAwaySkippedTurns)?.let { skippedTurns ->
+            add("暂时离开状态和已轮空 $skippedTurns 次会在转入后保留")
         }
         if (releasedPartnerRegistrations.isNotEmpty()) {
             add("原固定组合已解除，双方均恢复为允许他人加入")

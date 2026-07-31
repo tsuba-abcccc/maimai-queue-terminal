@@ -88,6 +88,13 @@ PUBLIC_EVENT_TYPES = {
     "QUEUE_RESET",
     "OTHER",
 }
+PUBLIC_NOTIFICATION_CATEGORIES = {
+    "QUEUE_CHANGES",
+    "PLAYING_POSITION",
+    "ONLINE_CHECK_IN",
+    "ABSENCE",
+    "MACHINE_STATUS",
+}
 OPERATION_SOURCES = {
     "ON_SITE_TERMINAL",
     "QQ_BOT",
@@ -424,6 +431,7 @@ def initialize_database(database_path: str) -> None:
                 title TEXT NOT NULL,
                 detail TEXT NOT NULL,
                 operation_source TEXT NOT NULL DEFAULT 'ON_SITE_TERMINAL',
+                notification_categories TEXT NOT NULL DEFAULT '[]',
                 registration_ids TEXT NOT NULL,
                 UNIQUE(queue_id, event_id)
             )
@@ -437,6 +445,13 @@ def initialize_database(database_path: str) -> None:
                 """
                 ALTER TABLE queue_event
                 ADD COLUMN operation_source TEXT NOT NULL DEFAULT 'ON_SITE_TERMINAL'
+                """
+            )
+        if "notification_categories" not in queue_event_columns:
+            connection.execute(
+                """
+                ALTER TABLE queue_event
+                ADD COLUMN notification_categories TEXT NOT NULL DEFAULT '[]'
                 """
             )
         connection.execute(
@@ -960,8 +975,9 @@ def publish_snapshot():
                 """
                 INSERT OR IGNORE INTO queue_event
                     (queue_id, event_id, occurred_at, machine_id, event_type,
-                     title, detail, operation_source, registration_ids)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     title, detail, operation_source, notification_categories,
+                     registration_ids)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     queue_id,
@@ -972,6 +988,7 @@ def publish_snapshot():
                     event["title"],
                     event["detail"],
                     event["operation_source"],
+                    json.dumps(event["notification_categories"], separators=(",", ":")),
                     json.dumps(event_registration_ids, separators=(",", ":")),
                 ),
             )
@@ -990,6 +1007,7 @@ def publish_snapshot():
                     if profile_allows_event_notification(
                         notification_settings.get(contact["player_id"]),
                         event["type"],
+                        event["notification_categories"],
                     )
                 ]
                 connection.executemany(
@@ -1362,7 +1380,8 @@ def read_queue_logs():
 
         query = """
             SELECT id, event_id, occurred_at, machine_id, event_type,
-                   title, detail, operation_source, registration_ids
+                   title, detail, operation_source, notification_categories,
+                   registration_ids
             FROM queue_event
             WHERE queue_id = ?
         """
@@ -1386,6 +1405,7 @@ def read_queue_logs():
             "title": row["title"],
             "detail": row["detail"],
             "operation_source": row["operation_source"],
+            "notification_categories": stored_event_notification_categories(row),
             "registration_ids": json.loads(row["registration_ids"]),
         }
         for row in visible_rows
@@ -1456,6 +1476,10 @@ def read_bot_players():
                 "preference": context["registration"]["preference"],
                 "fixed_pair": context["registration"]["fixed_pair"],
                 "registration_type": context["registration"]["registration_type"],
+                "created_at": context["registration"]["created_at"],
+                "online_check_in_started_at": context["registration"][
+                    "online_check_in_started_at"
+                ],
                 "last_played_at": context["registration"]["last_played_at"],
                 "deferred_once": context["registration"]["deferred_once"],
                 "temporarily_away": context["registration"]["temporarily_away"],
@@ -1537,7 +1561,8 @@ def read_bot_events():
         event_rows = connection.execute(
             """
             SELECT id, event_id, occurred_at, machine_id, event_type,
-                   title, detail, operation_source, registration_ids
+                   title, detail, operation_source, notification_categories,
+                   registration_ids
             FROM queue_event
             WHERE queue_id = ? AND id > ?
             ORDER BY id ASC
@@ -1580,6 +1605,7 @@ def read_bot_events():
                 "title": row["title"],
                 "detail": row["detail"],
                 "operation_source": row["operation_source"],
+                "notification_categories": stored_event_notification_categories(row),
                 "affected_players": affected_players,
             }
         )
@@ -1922,7 +1948,7 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
         if operation == "JOIN_QUEUE" and not registration_contexts:
             recently_applied_join = connection.execute(
                 """
-                SELECT 1 FROM terminal_command
+                SELECT completed_at FROM terminal_command
                 WHERE command_type = ? AND status = 'APPLIED'
                   AND completed_at IS NOT NULL AND completed_at > ?
                   AND json_extract(payload, '$.queue_id') = ?
@@ -1941,7 +1967,10 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
                     profile["profile_id"],
                 ),
             ).fetchone()
-            if recently_applied_join is not None:
+            if (
+                recently_applied_join is not None
+                and snapshot_row["received_at"] <= recently_applied_join["completed_at"]
+            ):
                 return jsonify(
                     {
                         "ok": False,
@@ -2027,6 +2056,8 @@ def build_queue_operation_payload(
     if operation == "JOIN_QUEUE":
         if not online_registration_allowed(snapshot):
             return None, ("现场规则暂不允许线上登记", 409)
+        if snapshot_in_closing_grace(snapshot):
+            return None, ("今日营业时间已结束，闭店收尾期间不再接收新的排队登记", 409)
         if registration_contexts:
             return None, ("你已经有一份正在排队的登记，不能重复加入", 409)
         if not snapshot.get("registration_open", True):
@@ -2059,6 +2090,9 @@ def build_queue_operation_payload(
         return None, ("当前没有可以执行此操作的排队登记", 409)
     context = registration_contexts[0]
     registration = context["registration"]
+    source_machine = snapshot.get("machines", {}).get(context["machine_id"])
+    if source_machine is None or not source_machine.get("operational", False):
+        return None, ("登记所在机台已停止使用，恢复正常使用后才能操作", 409)
     pending_check_in = registration.get("online_registration_pending_check_in", False)
     if pending_check_in and operation != "LEAVE_QUEUE":
         return None, ("线上登记完成现场签到后，才能进行这项操作", 409)
@@ -2185,6 +2219,8 @@ def create_mobile_registration_session():
         snapshot = json.loads(snapshot_row["payload"])
         if not snapshot.get("website_remote_enabled", False):
             return jsonify({"ok": False, "error": "网站同步已关闭，暂不能使用移动设备登记"}), 409
+        if snapshot_in_closing_grace(snapshot):
+            return jsonify({"ok": False, "error": "闭店收尾期间不再接收新的排队登记"}), 409
         if not snapshot.get("registration_open", True):
             return jsonify({"ok": False, "error": "现场当前没有使用登记排队"}), 409
         machine = snapshot.get("machines", {}).get(machine_id)
@@ -2271,6 +2307,8 @@ def validate_open_mobile_session(
     snapshot = json.loads(snapshot_row["payload"])
     if not snapshot.get("website_remote_enabled", False):
         return "网站同步已关闭，暂不能使用移动设备登记", 503, "WEBSITE_SYNC_DISABLED"
+    if snapshot_in_closing_grace(snapshot):
+        return "闭店收尾期间不再接收新的排队登记", 409, "REGISTRATION_CLOSED"
     if not snapshot.get("registration_open", True):
         return "现场当前没有使用登记排队", 409, "REGISTRATION_CLOSED"
     machine = snapshot.get("machines", {}).get(session["machine_id"])
@@ -3430,39 +3468,66 @@ def serialize_command(row: sqlite3.Row) -> dict[str, Any]:
 def profile_allows_event_notification(
     settings: sqlite3.Row | None,
     event_type: str,
+    notification_categories: list[str] | None = None,
 ) -> bool:
     if (
         settings is None
         or not settings["notification_enabled"]
     ):
         return False
+    categories = notification_categories or [notification_category_for_event_type(event_type)]
+    return any(bool(settings[notification_field_for_category(category)]) for category in categories)
+
+
+def notification_category_for_event_type(event_type: str) -> str:
     if event_type == "PLAYING_CHANGED":
-        field = "notify_playing_position"
-    elif event_type in {
+        return "PLAYING_POSITION"
+    if event_type in {
         "ONLINE_REGISTRATION_ADDED",
         "ONLINE_CHECK_IN_COMPLETED",
         "ONLINE_CHECK_IN_TIMED_OUT",
         "ONLINE_CHECK_IN_MISSED",
     }:
-        field = "notify_online_check_in"
-    elif event_type in {
+        return "ONLINE_CHECK_IN"
+    if event_type in {
         "NO_SHOW_DEFERRED",
         "NO_SHOW_MOVED_TO_TAIL",
         "NO_SHOW_REMOVED",
         "TEMPORARY_AWAY_EXPIRED",
         "ABSENCE_CHANGED",
     }:
-        field = "notify_absence"
-    elif event_type in {
+        return "ABSENCE"
+    if event_type in {
         "MACHINE_STOPPED",
         "MACHINE_RESTORED",
         "REGISTRATION_OPENED",
         "REGISTRATION_CLOSED",
     }:
-        field = "notify_machine_status"
-    else:
-        field = "notify_queue_changes"
-    return bool(settings[field])
+        return "MACHINE_STATUS"
+    return "QUEUE_CHANGES"
+
+
+def notification_field_for_category(category: str) -> str:
+    return {
+        "QUEUE_CHANGES": "notify_queue_changes",
+        "PLAYING_POSITION": "notify_playing_position",
+        "ONLINE_CHECK_IN": "notify_online_check_in",
+        "ABSENCE": "notify_absence",
+        "MACHINE_STATUS": "notify_machine_status",
+    }[category]
+
+
+def stored_event_notification_categories(row: sqlite3.Row) -> list[str]:
+    try:
+        categories = json.loads(row["notification_categories"])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        categories = []
+    valid = [
+        category
+        for category in categories
+        if category in PUBLIC_NOTIFICATION_CATEGORIES
+    ] if isinstance(categories, list) else []
+    return valid or [notification_category_for_event_type(row["event_type"])]
 
 
 def cleanup_expired_event_recipients(
@@ -3538,6 +3603,13 @@ def online_registration_allowed(snapshot: dict[str, Any]) -> bool:
     return not isinstance(queue_rules, dict) or queue_rules.get(
         "allow_online_registration", True
     ) is not False
+
+
+def snapshot_in_closing_grace(snapshot: dict[str, Any]) -> bool:
+    business_hours = snapshot.get("business_hours")
+    return isinstance(business_hours, dict) and business_hours.get(
+        "closing_grace", False
+    ) is True
 
 
 def read_terminal_instance_identity(device_id: str) -> tuple[str, int]:
@@ -3978,14 +4050,31 @@ def normalize_public_event(source: Any) -> dict[str, Any]:
     operation_source = source.get("operation_source", "ON_SITE_TERMINAL")
     if not isinstance(operation_source, str) or operation_source not in OPERATION_SOURCES:
         raise ValidationError("公开事件操作来源无效")
+    event_type = read_choice(source, "type", PUBLIC_EVENT_TYPES)
+    categories_source = source.get("notification_categories")
+    if categories_source is None:
+        notification_categories = [notification_category_for_event_type(event_type)]
+    else:
+        if not isinstance(categories_source, list) or not 1 <= len(categories_source) <= 5:
+            raise ValidationError("公开事件通知类别无效")
+        if any(
+            not isinstance(category, str)
+            or category not in PUBLIC_NOTIFICATION_CATEGORIES
+            for category in categories_source
+        ):
+            raise ValidationError("公开事件通知类别无效")
+        if len(categories_source) != len(set(categories_source)):
+            raise ValidationError("公开事件通知类别不能重复")
+        notification_categories = categories_source
     return {
         "event_id": read_uuid(source, "event_id"),
         "occurred_at": read_integer(source, "occurred_at", minimum=1),
         "machine_id": machine_id,
-        "type": read_choice(source, "type", PUBLIC_EVENT_TYPES),
+        "type": event_type,
         "title": read_string(source, "title", maximum_length=120),
         "detail": read_string(source, "detail", maximum_length=2_000),
         "operation_source": operation_source,
+        "notification_categories": notification_categories,
         "registration_ids": normalized_registration_ids,
     }
 
@@ -4155,7 +4244,11 @@ def normalize_registration(source: Any, label: str) -> dict[str, Any]:
     if online_registration_pending_check_in and registration_type != "PLAYER_PROFILE":
         raise ValidationError("待签到的线上登记必须关联玩家资料")
     if online_registration_pending_check_in and (deferred_once or temporarily_away):
-        raise ValidationError("待签到的线上登记不能同时暂缓或暂时离开")
+        raise ValidationError("待签到的线上登记不能同时暂缓一轮或暂时离开")
+    created_at = read_integer(source, "created_at", minimum=1)
+    online_check_in_started_at = source.get("online_check_in_started_at", created_at)
+    if type(online_check_in_started_at) is not int or online_check_in_started_at < 1:
+        raise ValidationError("online_check_in_started_at 数值无效")
 
     return {
         "registration_id": read_public_id(source, "registration_id"),
@@ -4170,7 +4263,8 @@ def normalize_registration(source: Any, label: str) -> dict[str, Any]:
         "last_no_show_action_was_defer": last_no_show_action_was_defer,
         "online_registration_pending_check_in": online_registration_pending_check_in,
         "registration_type": registration_type,
-        "created_at": read_integer(source, "created_at", minimum=1),
+        "created_at": created_at,
+        "online_check_in_started_at": online_check_in_started_at,
         "last_played_at": read_optional_integer(source, "last_played_at", minimum=1),
     }
 

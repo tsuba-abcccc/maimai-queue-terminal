@@ -70,6 +70,7 @@ class QueueCloudSnapshotTest {
         assertEquals("入口侧 · 机台 A", machines.getJSONObject("A").getString("name"))
         assertEquals("墙侧 · 机台 B", machines.getJSONObject("B").getString("name"))
         assertFalse(snapshot.getBoolean("onebot_sync_enabled"))
+        assertFalse(snapshot.getBoolean("registration_open"))
         assertFalse(
             snapshot.getJSONObject("queue_rules").getBoolean("allow_online_registration")
         )
@@ -191,6 +192,31 @@ class QueueCloudSnapshotTest {
     }
 
     @Test
+    fun publicSnapshotKeepsCreationTimeSeparateFromRestartedCheckInTimer() {
+        val registration = Registration(
+            key = 3,
+            displayId = "线上玩家",
+            preference = PlayPreference.SOLO,
+            isTemporary = false,
+            createdAtMillis = 100L,
+            playerProfileId = "profile-3",
+            requiresOnSiteCheckIn = true,
+            onSiteCheckInStartedAtMillis = 500L
+        )
+
+        val publicRegistration = buildPublicQueueSnapshot(
+            state(machineA = MachineQueue(waiting = listOf(registration))),
+            terminalId = "terminal-1",
+            capturedAtMillis = 1_000L
+        ).getJSONObject("machines").getJSONObject("A")
+            .getJSONArray("waiting_positions").getJSONObject(0)
+            .getJSONArray("registrations").getJSONObject(0)
+
+        assertEquals(100L, publicRegistration.getLong("created_at"))
+        assertEquals(500L, publicRegistration.getLong("online_check_in_started_at"))
+    }
+
+    @Test
     fun publicSnapshotIncludesOnlyQueueScopedPublicEvents() {
         val state = state(machineA = MachineQueue(waiting = listOf(
             Registration(
@@ -234,6 +260,10 @@ class QueueCloudSnapshotTest {
         assertEquals(5, snapshot.getInt("schema_version"))
         assertEquals(1, events.length())
         assertEquals("NO_SHOW_MOVED_TO_TAIL", events.getJSONObject(0).getString("type"))
+        assertEquals(
+            "ABSENCE",
+            events.getJSONObject(0).getJSONArray("notification_categories").getString(0)
+        )
         assertEquals("QQ_BOT", events.getJSONObject(0).getString("operation_source"))
         assertEquals(
             publicRegistrationId(queueId, 8),

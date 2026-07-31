@@ -65,13 +65,33 @@ internal sealed interface RemoteQueueOperationDecision {
 internal fun decideRemoteQueueOperation(
     command: RemoteQueueOperationCommand,
     state: RemoteQueueExecutionState,
-    appliedAtMillis: Long = System.currentTimeMillis()
+    appliedAtMillis: Long = System.currentTimeMillis(),
+    appliedRegistrationCommandIds: Set<String> = emptySet()
 ): RemoteQueueOperationDecision {
     fun reject(detail: String) = RemoteQueueOperationDecision.Reject(detail)
     fun already(detail: String) = RemoteQueueOperationDecision.AlreadyApplied(detail)
 
     if (command.queueId != state.queueId) {
         return reject("排队批次已经变化，请重新查询后再操作。")
+    }
+    if (command.operation == RemoteQueueOperation.JOIN_QUEUE) {
+        val exactRegistration = state.queues.values.asSequence()
+            .flatMap { it.allRegistrations.asSequence() }
+            .firstOrNull { it.originatingCommandId == command.commandId }
+        if (exactRegistration != null) {
+            return already(
+                "线上登记已经加入等待顺序。请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。"
+            )
+        }
+    }
+    if (command.commandId in appliedRegistrationCommandIds) {
+        return already(
+            if (command.operation == RemoteQueueOperation.JOIN_QUEUE) {
+                "这条线上登记命令已经执行过，相关登记当前已不在队列中。"
+            } else {
+                "这项排队操作已经由现场终端执行，不会重复处理。"
+            }
+        )
     }
     when (command.source) {
         RemoteQueueOperationSource.WEBSITE_REMOTE -> if (!state.websiteRemoteEnabled) {
@@ -89,14 +109,6 @@ internal fun decideRemoteQueueOperation(
     }
 
     if (command.operation == RemoteQueueOperation.JOIN_QUEUE) {
-        val exactRegistration = state.queues.values.asSequence()
-            .flatMap { it.allRegistrations.asSequence() }
-            .firstOrNull { it.originatingCommandId == command.commandId }
-        if (exactRegistration != null) {
-            return already(
-                "线上登记已经加入等待顺序。请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。"
-            )
-        }
         if (!state.allowOnlineRegistration) {
             return reject("现场规则暂不允许线上登记。")
         }
@@ -183,10 +195,60 @@ internal fun decideRemoteQueueOperation(
     }
     val (actualMachineId, queue, registration) = located
     val affectsFixedGroup = registration.fixedPartnerKey != null
+    val fixedPartner = registration.fixedPartnerKey?.let { partnerKey ->
+        queue.allRegistrations.firstOrNull { it.key == partnerKey }
+    }
     fun registrationSubject(single: String, fixedGroup: String): String =
         if (affectsFixedGroup) fixedGroup else single
     if (registration.playerProfileId != profile.id) {
         return reject("这份登记已不再关联当前玩家资料。")
+    }
+    val alreadyAppliedDetail = when (command.operation) {
+        RemoteQueueOperation.DEFER_ONE_ROUND ->
+            if (registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND) {
+                registrationSubject(
+                    "这份登记已经暂缓一轮。",
+                    "固定组合的两份登记已经暂缓一轮。"
+                )
+            } else null
+        RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND ->
+            if (registration.absenceStatus == QueueAbsenceStatus.NONE) {
+                registrationSubject(
+                    "这份登记已经取消暂缓一轮。",
+                    "固定组合的两份登记已经取消暂缓一轮。"
+                )
+            } else null
+        RemoteQueueOperation.TEMPORARILY_LEAVE ->
+            if (registration.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY) {
+                registrationSubject(
+                    "这份登记已经处于暂时离开状态。",
+                    "固定组合的两份登记已经处于暂时离开状态。"
+                )
+            } else null
+        RemoteQueueOperation.CANCEL_TEMPORARY_LEAVE ->
+            if (registration.absenceStatus == QueueAbsenceStatus.NONE) {
+                registrationSubject(
+                    "这份登记已经取消暂时离开。",
+                    "固定组合的两份登记已经取消暂时离开。"
+                )
+            } else null
+        RemoteQueueOperation.TRANSFER_MACHINE ->
+            if (command.targetMachineId == actualMachineId) {
+                "登记已经位于机台 $actualMachineId。"
+            } else null
+        RemoteQueueOperation.CHANGE_PLAY_PREFERENCE ->
+            if (
+                registration.preference == command.preference &&
+                registration.fixedPartnerKey == null
+            ) {
+                "这份登记已经使用所选游玩偏好。"
+            } else null
+        RemoteQueueOperation.JOIN_QUEUE,
+        RemoteQueueOperation.LEAVE_QUEUE -> null
+    }
+    if (alreadyAppliedDetail != null) return already(alreadyAppliedDetail)
+    if (state.machineStatuses[actualMachineId]?.isOperational != true) {
+        return reject("机台 $actualMachineId 已停止使用，恢复正常使用后才能操作这份登记。")
     }
     if (registration.requiresOnSiteCheckIn && command.operation != RemoteQueueOperation.LEAVE_QUEUE) {
         return reject("线上登记完成现场签到后，才能进行这项操作。")
@@ -229,7 +291,28 @@ internal fun decideRemoteQueueOperation(
                     (actualMachineId to updatedSource) +
                     (targetMachineId to updatedTarget)
             ),
-            detail = "登记已转至机台 $targetMachineId 的等待顺序末端。",
+            detail = buildString {
+                append("登记已转至机台 $targetMachineId 的等待顺序末端。")
+                if (registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND) {
+                    if (fixedPartner != null) {
+                        append("转入登记的暂缓一轮状态已解除；留在原机台的登记仍保持暂缓一轮。")
+                    } else {
+                        append("暂缓一轮状态已解除。")
+                    }
+                }
+                if (registration.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY) {
+                    append(
+                        if (fixedPartner != null) {
+                            "两份登记的暂时离开状态和已轮空 ${registration.temporaryAwaySkippedTurns} 次均会保留，返回后仍需手动取消。"
+                        } else {
+                            "暂时离开状态和已轮空 ${registration.temporaryAwaySkippedTurns} 次会保留，返回后仍需手动取消。"
+                        }
+                    )
+                }
+                if (fixedPartner != null) {
+                    append("与“${fixedPartner.displayId}”的固定组合已解除；两份登记均恢复为允许他人加入，对方保留原位。")
+                }
+            },
             changedMachineIds = setOf(actualMachineId, targetMachineId)
         )
     }
@@ -250,7 +333,7 @@ internal fun decideRemoteQueueOperation(
                         )
                     )
                 registration.absenceStatus != QueueAbsenceStatus.NONE ->
-                    return reject("请先取消当前的暂缓或暂时离开状态。")
+                    return reject("请先取消当前的暂缓一轮或暂时离开状态。")
             }
             queue.deferOneRound(registration.key)
         }
@@ -283,7 +366,7 @@ internal fun decideRemoteQueueOperation(
                         )
                     )
                 registration.absenceStatus != QueueAbsenceStatus.NONE ->
-                    return reject("请先取消当前的暂缓或暂时离开状态。")
+                    return reject("请先取消当前的暂缓一轮或暂时离开状态。")
             }
             queue.temporarilyLeave(registration.key)
         }
@@ -336,8 +419,24 @@ internal fun decideRemoteQueueOperation(
             "登记已取消暂时离开。",
             "固定组合的两份登记已同时取消暂时离开。"
         )
-        RemoteQueueOperation.CHANGE_PLAY_PREFERENCE -> "本次游玩偏好已更新。"
-        RemoteQueueOperation.LEAVE_QUEUE -> "登记已退出排队。"
+        RemoteQueueOperation.CHANGE_PLAY_PREFERENCE -> buildString {
+            val preference = command.preference ?: registration.preference
+            append("本次游玩偏好已改为“${remotePreferenceLabel(preference)}”。玩家资料中的默认偏好没有改变。")
+            if (fixedPartner != null) {
+                append("与“${fixedPartner.displayId}”的固定组合已解除；对方保留原位，并恢复为允许他人加入。")
+                append(fixedPairAbsenceRetentionDetail(registration))
+            }
+        }
+        RemoteQueueOperation.LEAVE_QUEUE -> buildString {
+            append("登记已退出排队。")
+            if (fixedPartner != null) {
+                append("与“${fixedPartner.displayId}”的固定组合已解除；对方保留原位，并恢复为允许他人加入。")
+                append(remainingPartnerAbsenceDetail(fixedPartner))
+            }
+            if (queue.playing.any { it.key == registration.key }) {
+                append("游玩位置中的空缺不会自动由等待登记补入。")
+            }
+        }
         else -> "队列操作已完成。"
     }
     return RemoteQueueOperationDecision.Apply(
@@ -346,5 +445,28 @@ internal fun decideRemoteQueueOperation(
         changedMachineIds = setOf(actualMachineId)
     )
 }
+
+private fun remotePreferenceLabel(preference: PlayPreference): String = when (preference) {
+    PlayPreference.SOLO -> "单人游玩"
+    PlayPreference.OPEN_TO_JOIN -> "允许他人加入"
+}
+
+private fun fixedPairAbsenceRetentionDetail(registration: Registration): String =
+    when (registration.absenceStatus) {
+        QueueAbsenceStatus.DEFER_ONE_ROUND ->
+            "两份登记当前的暂缓一轮状态不会因解除组合而清除。"
+        QueueAbsenceStatus.TEMPORARILY_AWAY ->
+            "两份登记当前的暂时离开状态和已轮空 ${registration.temporaryAwaySkippedTurns} 次不会因解除组合而清除。"
+        QueueAbsenceStatus.NONE -> ""
+    }
+
+private fun remainingPartnerAbsenceDetail(partner: Registration): String =
+    when (partner.absenceStatus) {
+        QueueAbsenceStatus.DEFER_ONE_ROUND ->
+            "对方仍保持暂缓一轮，并会在下一次轮到后自动解除。"
+        QueueAbsenceStatus.TEMPORARILY_AWAY ->
+            "对方仍保持暂时离开和已轮空 ${partner.temporaryAwaySkippedTurns} 次，返回后需要手动取消。"
+        QueueAbsenceStatus.NONE -> ""
+    }
 
 private const val MAX_REGISTRATIONS_PER_MACHINE = 20

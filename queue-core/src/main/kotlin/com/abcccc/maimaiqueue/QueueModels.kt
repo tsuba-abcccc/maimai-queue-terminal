@@ -85,6 +85,7 @@ data class Registration(
     val gender: PlayerGender? = null,
     val playerProfileId: String? = null,
     val requiresOnSiteCheckIn: Boolean = false,
+    val onSiteCheckInStartedAtMillis: Long? = null,
     val originatingCommandId: String? = null
 ) {
     val canEnterPlayingPosition: Boolean
@@ -92,10 +93,15 @@ data class Registration(
 
     val onSiteCheckInDeadlineMillis: Long?
         get() = if (requiresOnSiteCheckIn) {
-            createdAtMillis + ONLINE_REGISTRATION_CHECK_IN_TIMEOUT_MILLIS
+            (onSiteCheckInStartedAtMillis ?: createdAtMillis) +
+                ONLINE_REGISTRATION_CHECK_IN_TIMEOUT_MILLIS
         } else {
             null
         }
+
+    val hasRestartedOnSiteCheckInWindow: Boolean
+        get() = requiresOnSiteCheckIn &&
+            onSiteCheckInStartedAtMillis?.let { it != createdAtMillis } == true
 
     fun hasExpiredOnSiteCheckIn(atMillis: Long): Boolean =
         onSiteCheckInDeadlineMillis?.let { atMillis >= it } == true
@@ -241,6 +247,18 @@ data class MachineQueue(
     fun restartPlayingTimer(atMillis: Long = System.currentTimeMillis()): MachineQueue =
         if (playing.isEmpty()) this else copy(playingStartedAtMillis = atMillis)
 
+    /** Gives pending online registrations a fresh check-in window after a machine stop. */
+    fun restartPendingCheckInTimers(atMillis: Long = System.currentTimeMillis()): MachineQueue =
+        copy(
+            waiting = waiting.map { registration ->
+                if (registration.requiresOnSiteCheckIn) {
+                    registration.copy(onSiteCheckInStartedAtMillis = atMillis)
+                } else {
+                    registration
+                }
+            }
+        )
+
     /**
      * Corrects an erroneous placement in the playing position. The registrations
      * return to the front of the waiting order and the next group is not advanced.
@@ -283,11 +301,7 @@ data class MachineQueue(
         )
     }
 
-    /**
-     * Replays several missed round-end operations at once. The selected waiting
-     * position becomes the current round, while every earlier completed position
-     * returns to the waiting tail in the same order in which it played.
-     */
+    /** Replays normal round-end operations until the selected position is playing. */
     fun advanceToWaitingPosition(
         registrationKeys: Set<Int>,
         atMillis: Long = System.currentTimeMillis()
@@ -301,105 +315,20 @@ data class MachineQueue(
         if (targetIndex <= 0) return this
         if (positions[targetIndex].any { !it.canEnterPlayingPosition }) return this
 
-        val targetPosition = positions[targetIndex].map {
-            it.copy(
-                absenceStatus = QueueAbsenceStatus.NONE,
-                temporaryAwaySkippedTurns = 0
-            )
+        var corrected = this
+        repeat(allRegistrations.size + 1) {
+            val previous = corrected
+            corrected = RoundPlanner.finishRound(corrected).execute(atMillis)
+            val playingKeys = corrected.playing.mapTo(mutableSetOf()) { it.key }
+            if (playingKeys == registrationKeys) return corrected
+            if (
+                corrected == previous ||
+                registrationKeys.any { targetKey ->
+                    corrected.allRegistrations.none { it.key == targetKey }
+                }
+            ) return this
         }
-        val completedRegistrations = playing.map { registration ->
-            registration.copy(
-                absenceStatus = QueueAbsenceStatus.NONE,
-                temporaryAwaySkippedTurns = 0,
-                noShowCount = 0,
-                lastNoShowActionWasDefer = false,
-                lastPlayedAtMillis = atMillis
-            )
-        }.toMutableList()
-        val retainedUnavailableRegistrations = mutableListOf<Registration>()
-        val temporarilyAwayRegistrations = mutableListOf<Registration>()
-
-        positions.take(targetIndex).forEach { position ->
-            // Reaching a later position means every earlier pending online
-            // registration has already missed its opportunity and must leave.
-            val remainingPosition = position.filterNot { it.requiresOnSiteCheckIn }
-            if (remainingPosition.isEmpty()) return@forEach
-
-            val hasTemporarilyAway = remainingPosition.any {
-                it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
-            }
-            val hasOneRoundDeferral = remainingPosition.any {
-                it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
-            }
-            when {
-                hasTemporarilyAway -> {
-                    val isFixedPair = remainingPosition.size == 2 &&
-                        remainingPosition[0].fixedPartnerKey == remainingPosition[1].key &&
-                        remainingPosition[1].fixedPartnerKey == remainingPosition[0].key
-                    if (isFixedPair) {
-                        val skippedTurns = remainingPosition.maxOf { it.temporaryAwaySkippedTurns }
-                        if (skippedTurns < 3) {
-                            temporarilyAwayRegistrations += remainingPosition.map {
-                                it.copy(
-                                    absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
-                                    temporaryAwaySkippedTurns = skippedTurns + 1
-                                )
-                            }
-                        }
-                    } else {
-                        remainingPosition.forEach { registration ->
-                            when (registration.absenceStatus) {
-                                QueueAbsenceStatus.TEMPORARILY_AWAY -> {
-                                    if (registration.temporaryAwaySkippedTurns < 3) {
-                                        temporarilyAwayRegistrations += registration.copy(
-                                            temporaryAwaySkippedTurns =
-                                                registration.temporaryAwaySkippedTurns + 1
-                                        )
-                                    }
-                                }
-                                QueueAbsenceStatus.DEFER_ONE_ROUND -> {
-                                    temporarilyAwayRegistrations += registration.copy(
-                                        absenceStatus = QueueAbsenceStatus.NONE,
-                                        temporaryAwaySkippedTurns = 0
-                                    )
-                                }
-                                QueueAbsenceStatus.NONE -> temporarilyAwayRegistrations += registration
-                            }
-                        }
-                    }
-                }
-                hasOneRoundDeferral -> {
-                    retainedUnavailableRegistrations += remainingPosition.map { registration ->
-                        if (registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND) {
-                            registration.copy(absenceStatus = QueueAbsenceStatus.NONE)
-                        } else {
-                            registration
-                        }
-                    }
-                }
-                else -> completedRegistrations += remainingPosition.map { registration ->
-                    registration.copy(
-                        absenceStatus = QueueAbsenceStatus.NONE,
-                        temporaryAwaySkippedTurns = 0,
-                        noShowCount = 0,
-                        lastNoShowActionWasDefer = false,
-                        lastPlayedAtMillis = atMillis
-                    )
-                }
-            }
-        }
-        val positionsStillWaiting = positions.drop(targetIndex + 1).flatten()
-
-        return copy(
-            playing = targetPosition,
-            waiting = sanitizeFriendPairs(
-                retainedUnavailableRegistrations +
-                    positionsStillWaiting +
-                    completedRegistrations +
-                    temporarilyAwayRegistrations
-            ),
-            playingStartedAtMillis = atMillis
-        )
+        return this
     }
 
     /** Skips exactly one opportunity while preserving the registration's physical order. */
@@ -1127,7 +1056,8 @@ fun registrationsHaveSameQueueState(
         left.noShowCount == right.noShowCount &&
         left.lastNoShowActionWasDefer == right.lastNoShowActionWasDefer &&
         left.fixedPartnerKey == right.fixedPartnerKey &&
-        left.requiresOnSiteCheckIn == right.requiresOnSiteCheckIn
+        left.requiresOnSiteCheckIn == right.requiresOnSiteCheckIn &&
+        left.onSiteCheckInStartedAtMillis == right.onSiteCheckInStartedAtMillis
 }
 
 fun groupIntoPositions(registrations: List<Registration>): List<List<Registration>> {

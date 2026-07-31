@@ -166,8 +166,8 @@ internal fun RegistrationApp() {
     val playerProfilePersistence = remember(playerProfileRepository) {
         PlayerProfilePersistenceCoordinator(playerProfileRepository)
     }
-    val mobileRegistrationReceiptRepository = remember(context) {
-        LocalMobileRegistrationCommandReceiptRepository(context)
+    val terminalCommandReceiptRepository = remember(context) {
+        LocalTerminalCommandReceiptRepository(context)
     }
     val auditLogRepository = remember(context) { LocalAuditLogRepository(context) }
     val queueStateRepository = remember(context) { LocalQueueStateRepository(context) }
@@ -250,10 +250,10 @@ internal fun RegistrationApp() {
     val queueRevision = remember { AtomicLong(0L) }
     var playerProfiles by remember { mutableStateOf<List<PlayerProfile>>(emptyList()) }
     var playerProfilesLoaded by remember { mutableStateOf(false) }
-    var appliedMobileRegistrationCommandIds by remember {
-        mutableStateOf<Set<String>>(emptySet())
+    var terminalCommandReceipts by remember {
+        mutableStateOf<Map<String, TerminalCommandReceipt>>(emptyMap())
     }
-    var mobileRegistrationReceiptsLoaded by remember { mutableStateOf(false) }
+    var terminalCommandReceiptsLoaded by remember { mutableStateOf(false) }
     var auditLogs by remember { mutableStateOf<List<AuditLogEntry>>(emptyList()) }
     var queueRuleSettings by remember { mutableStateOf(initialQueueRuleSettings) }
     fun configuredMachineName(machineId: MachineId): String = machineName(
@@ -426,10 +426,9 @@ internal fun RegistrationApp() {
         playerProfilesLoaded = true
     }
 
-    LaunchedEffect(mobileRegistrationReceiptRepository) {
-        appliedMobileRegistrationCommandIds =
-            mobileRegistrationReceiptRepository.getAppliedCommandIds()
-        mobileRegistrationReceiptsLoaded = true
+    LaunchedEffect(terminalCommandReceiptRepository) {
+        terminalCommandReceipts = terminalCommandReceiptRepository.getReceipts()
+        terminalCommandReceiptsLoaded = true
     }
 
     LaunchedEffect(auditLogRepository) {
@@ -919,8 +918,21 @@ internal fun RegistrationApp() {
         if (stoppedStatus == currentStatus) return
         updateStatus(machineId) { stoppedStatus }
         queueSoundPlayer.play(QueueSoundCue.CAUTION)
-        val registrations = queueFor(machineId).allRegistrations
+        val stoppedQueue = queueFor(machineId)
+        val registrations = stoppedQueue.allRegistrations
         val registrationCount = registrations.size
+        val pendingCheckInCount = registrations.count { it.requiresOnSiteCheckIn }
+        val stoppedQueueDetail = buildString {
+            if (registrationCount > 0) {
+                append("现有 $registrationCount 份登记及其顺序已保留，停止期间不会推进队列。")
+            }
+            if (stoppedQueue.playing.isNotEmpty()) {
+                append("本轮游玩计时已暂停，恢复正常使用后会从头开始。")
+            }
+            if (pendingCheckInCount > 0) {
+                append("其中 $pendingCheckInCount 份待签到线上登记的 30 分钟签到计时已暂停，恢复正常使用后会从头开始。")
+            }
+        }
         appendAuditLog(
             createAuditLogEntry(
                 category = auditCategoryFor(machineId),
@@ -929,9 +941,7 @@ internal fun RegistrationApp() {
                     append(
                         "原因：${machineStopReasonLabel(stoppedStatus.stopReason, stoppedStatus.stopReasonDetail)}。"
                     )
-                    if (registrationCount > 0) {
-                        append("现有 $registrationCount 份登记及其顺序已保留；恢复正常使用后，本轮计时会从头开始。")
-                    }
+                    append(stoppedQueueDetail)
                 },
                 publicEventType = PublicQueueEventType.MACHINE_STOPPED,
                 affectedRegistrationKeys = registrations.map { it.key }
@@ -942,9 +952,7 @@ internal fun RegistrationApp() {
             title = "机台已停止使用",
             detail = buildString {
                 append("停止原因：${machineStopReasonLabel(stoppedStatus.stopReason, stoppedStatus.stopReasonDetail)}。")
-                if (registrationCount > 0) {
-                    append("现有 $registrationCount 份登记及其顺序已保留。")
-                }
+                append(stoppedQueueDetail)
             },
             contextLabel = configuredMachineName(machineId),
             tone = HomeSidePanelFeedbackTone.WARNING
@@ -957,7 +965,22 @@ internal fun RegistrationApp() {
         val stoppedStatus = statusFor(machineId)
         if (stoppedStatus.isOperational) return
         val restoredAtMillis = System.currentTimeMillis()
-        val restoredQueue = queueFor(machineId).restartPlayingTimer(restoredAtMillis)
+        val restoredQueue = queueFor(machineId)
+            .restartPlayingTimer(restoredAtMillis)
+            .restartPendingCheckInTimers(restoredAtMillis)
+        val pendingCheckInCount = restoredQueue.allRegistrations.count {
+            it.requiresOnSiteCheckIn
+        }
+        val restoredQueueDetail = buildString {
+            if (restoredQueue.playing.isNotEmpty()) {
+                append("保留的登记顺序已经恢复，本轮游玩计时已从头开始。")
+            } else {
+                append("这台机台现在可以继续接收和处理排队登记。")
+            }
+            if (pendingCheckInCount > 0) {
+                append("$pendingCheckInCount 份待签到线上登记的 30 分钟签到计时也已从头开始。")
+            }
+        }
         setQueue(machineId, restoredQueue)
         updateStatus(machineId) { it.restore() }
         queueSoundPlayer.play(QueueSoundCue.CONFIRM)
@@ -965,22 +988,14 @@ internal fun RegistrationApp() {
             createAuditLogEntry(
                 category = auditCategoryFor(machineId),
                 title = "${configuredMachineName(machineId)} 已恢复正常使用",
-                detail = if (queueFor(machineId).playing.isEmpty()) {
-                    "这台机台现在可以继续接收和处理排队登记。"
-                } else {
-                    "保留的登记顺序已经恢复，本轮计时已从头开始。"
-                },
+                detail = restoredQueueDetail,
                 publicEventType = PublicQueueEventType.MACHINE_RESTORED,
                 affectedRegistrationKeys = restoredQueue.allRegistrations.map { it.key }
             )
         )
         showHomeOperationFeedback(
             title = "机台已恢复正常使用",
-            detail = if (restoredQueue.playing.isEmpty()) {
-                "现在可以继续接收和处理排队登记。"
-            } else {
-                "保留的登记顺序已经恢复，本轮计时已从头开始。"
-            },
+            detail = restoredQueueDetail,
             contextLabel = configuredMachineName(machineId)
         )
     }
@@ -1014,19 +1029,21 @@ internal fun RegistrationApp() {
         queueUndoAction = null
         setQueue(request.sourceMachineId, updatedSource)
         setQueue(destinationMachineId, updatedDestination)
-        createMachineTransferAuditLog(
+        val transferAuditLog = createMachineTransferAuditLog(
             category = auditCategoryFor(request.sourceMachineId),
             sourceMachineLabel = configuredMachineName(request.sourceMachineId),
             destinationMachineLabel = configuredMachineName(destinationMachineId),
             registrations = registrations,
             releasedPartnerRegistrations = releasedPartnerRegistrations
-        )?.let(::appendAuditLog)
+        )
+        transferAuditLog?.let(::appendAuditLog)
         queueSoundPlayer.play(QueueSoundCue.QUEUE_CHANGE)
         val sourceMachineName = configuredMachineName(request.sourceMachineId)
         val destinationMachineName = configuredMachineName(destinationMachineId)
         showHomeOperationFeedback(
             title = if (registrations.size == 1) "登记已切换机台" else "多份登记已切换机台",
-            detail = "${registrations.joinToString("、") { "“${it.displayId}”" }}已转至 $destinationMachineName 的等待顺序末端。",
+            detail = transferAuditLog?.detail
+                ?: "${registrations.joinToString("、") { "“${it.displayId}”" }}已转至 $destinationMachineName 的等待顺序末端。",
             contextLabel = "$sourceMachineName · 转至 $destinationMachineName"
         )
         return true
@@ -1683,7 +1700,10 @@ internal fun RegistrationApp() {
                 } else {
                     showHomeOperationFeedback(
                         title = "固定组合已建立",
-                        detail = "“${latestTarget.displayId}”与“${persistedProfile.nickname}”已组成固定组合。",
+                        detail = buildString {
+                            append("“${latestTarget.displayId}”与“${persistedProfile.nickname}”已组成固定组合。")
+                            fixedPairCreatedStatusDetail(listOf(latestTarget))?.let { append(it) }
+                        },
                         contextLabel = configuredMachineName(selection.machineId)
                     )
                 }
@@ -2011,6 +2031,7 @@ internal fun RegistrationApp() {
         if (!queuePersistenceReady || pendingQueueRestore != null) return@LaunchedEffect
         val removalNotices = mutableListOf<String>()
         MachineId.entries.forEach { machineId ->
+            if (!statusFor(machineId).isOperational) return@forEach
             val queueBeforeRemoval = queueFor(machineId)
             val expiredKeys = queueBeforeRemoval.expiredOnlineRegistrationKeys(nowMillis)
             if (expiredKeys.isNotEmpty()) {
@@ -2034,7 +2055,7 @@ internal fun RegistrationApp() {
             showHomeOperationFeedback(
                 title = "未签到登记已自动移除",
                 detail = removalNotices.joinToString("\n") +
-                    "\n以上线上登记未在创建后的 30 分钟内完成现场签到，现已退出排队。",
+                    "\n以上线上登记未在本次 30 分钟签到时限内完成现场签到，现已退出排队。",
                 contextLabel = "系统自动",
                 tone = HomeSidePanelFeedbackTone.WARNING
             )
@@ -2133,26 +2154,30 @@ internal fun RegistrationApp() {
         queueRuleSettings.websiteSyncEnabled,
         queueRuleSettings.oneBotSyncEnabled,
         playerProfilesLoaded,
-        mobileRegistrationReceiptsLoaded,
+        terminalCommandReceiptsLoaded,
         queuePersistenceReady,
         pendingQueueRestore
     ) {
         var nextCloudProfileRefreshAtMillis = 0L
         var localWriteFailureDetail: String? = null
         var localWriteFailureAtMillis: Long? = null
-        suspend fun persistMobileRegistrationReceipt(commandId: String): Boolean {
-            if (commandId in appliedMobileRegistrationCommandIds) return true
-            if (!mobileRegistrationReceiptRepository.recordApplied(commandId)) return false
-            appliedMobileRegistrationCommandIds = appendRecentCommandId(
-                appliedMobileRegistrationCommandIds.toList(),
-                commandId
-            ).toSet()
+        fun appliedTerminalCommandIds(): Set<String> = terminalCommandReceipts.values
+            .asSequence()
+            .filter(TerminalCommandReceipt::applied)
+            .mapTo(mutableSetOf(), TerminalCommandReceipt::commandId)
+        suspend fun persistTerminalCommandReceipt(receipt: TerminalCommandReceipt): Boolean {
+            if (receipt.commandId in terminalCommandReceipts) return true
+            if (!terminalCommandReceiptRepository.record(receipt)) return false
+            terminalCommandReceipts = appendRecentCommandReceipt(
+                terminalCommandReceipts.values.toList(),
+                receipt
+            ).associateBy(TerminalCommandReceipt::commandId)
             return true
         }
         while (true) {
             if (
                 playerProfilesLoaded &&
-                mobileRegistrationReceiptsLoaded &&
+                terminalCommandReceiptsLoaded &&
                 queuePersistenceReady &&
                 pendingQueueRestore == null &&
                 cloudSyncAvailable &&
@@ -2171,13 +2196,38 @@ internal fun RegistrationApp() {
                 remoteTerminalCommandPollMutex.withLock {
                     queueCommandClient.fetchPendingCommands()?.let { commands ->
                         for (command in commands) {
+                        val existingReceipt = terminalCommandReceipts[command.commandId]
+                        if (existingReceipt != null) {
+                            localWriteFailureDetail = null
+                            queueCommandClient.complete(
+                                commandId = existingReceipt.commandId,
+                                applied = existingReceipt.applied,
+                                detail = existingReceipt.detail,
+                                resultRegistrationId = existingReceipt.resultRegistrationId
+                            )
+                            continue
+                        }
                         when (command) {
                             is PlayerProfileUpdateCommand -> {
                                 if (!queueRuleSettings.oneBotSyncEnabled) {
+                                    val detail = "现场终端已关闭 QQ Bot 联动。"
+                                    if (!persistTerminalCommandReceipt(
+                                            TerminalCommandReceipt(
+                                                commandId = command.commandId,
+                                                applied = false,
+                                                detail = detail
+                                            )
+                                        )
+                                    ) {
+                                        localWriteFailureDetail =
+                                            "远程命令结果暂时无法写入本机，应用将继续重试。"
+                                        localWriteFailureAtMillis = System.currentTimeMillis()
+                                        continue
+                                    }
                                     queueCommandClient.complete(
                                         command.commandId,
                                         applied = false,
-                                        detail = "现场终端已关闭 QQ Bot 联动。"
+                                        detail = detail
                                     )
                                     continue
                                 }
@@ -2194,25 +2244,67 @@ internal fun RegistrationApp() {
                                     }
                                 )) {
                                     is PlayerProfileCommandPersistenceResult.Applied -> {
+                                        val detail = "玩家资料已由终端更新。"
                                         persistQueueStateBeforeRemoteAcknowledgement()
+                                        if (!persistTerminalCommandReceipt(
+                                                TerminalCommandReceipt(
+                                                    commandId = command.commandId,
+                                                    applied = true,
+                                                    detail = detail
+                                                )
+                                            )
+                                        ) {
+                                            localWriteFailureDetail =
+                                                "玩家资料命令的执行结果暂时无法写入本机，应用将继续重试。"
+                                            localWriteFailureAtMillis = System.currentTimeMillis()
+                                            continue
+                                        }
                                         localWriteFailureDetail = null
                                         queueCommandClient.complete(
                                             command.commandId,
                                             applied = true,
-                                            detail = "玩家资料已由终端更新。"
+                                            detail = detail
                                         )
                                     }
 
                                     PlayerProfileCommandPersistenceResult.AlreadyApplied -> {
+                                        val detail = "玩家资料已经是请求的内容。"
+                                        if (!persistTerminalCommandReceipt(
+                                                TerminalCommandReceipt(
+                                                    commandId = command.commandId,
+                                                    applied = true,
+                                                    detail = detail
+                                                )
+                                            )
+                                        ) {
+                                            localWriteFailureDetail =
+                                                "玩家资料命令的执行结果暂时无法写入本机，应用将继续重试。"
+                                            localWriteFailureAtMillis = System.currentTimeMillis()
+                                            continue
+                                        }
                                         localWriteFailureDetail = null
                                         queueCommandClient.complete(
                                             command.commandId,
                                             applied = true,
-                                            detail = "玩家资料已经是请求的内容。"
+                                            detail = detail
                                         )
                                     }
 
                                     is PlayerProfileCommandPersistenceResult.Rejected -> {
+                                        if (!persistTerminalCommandReceipt(
+                                                TerminalCommandReceipt(
+                                                    commandId = command.commandId,
+                                                    applied = false,
+                                                    detail = result.detail
+                                                )
+                                            )
+                                        ) {
+                                            localWriteFailureDetail =
+                                                "玩家资料命令的处理结果暂时无法写入本机，应用将继续重试。"
+                                            localWriteFailureAtMillis = System.currentTimeMillis()
+                                            continue
+                                        }
+                                        localWriteFailureDetail = null
                                         queueCommandClient.complete(
                                             command.commandId,
                                             applied = false,
@@ -2233,7 +2325,8 @@ internal fun RegistrationApp() {
                                 var decision = decideRemoteQueueOperation(
                                     command,
                                     currentRemoteQueueExecutionState(),
-                                    commandAppliedAtMillis
+                                    commandAppliedAtMillis,
+                                    appliedTerminalCommandIds()
                                 )
                                 val profileToPersist =
                                     (decision as? RemoteQueueOperationDecision.Apply)
@@ -2257,7 +2350,8 @@ internal fun RegistrationApp() {
                                     decision = decideRemoteQueueOperation(
                                         command,
                                         currentRemoteQueueExecutionState(),
-                                        commandAppliedAtMillis
+                                        commandAppliedAtMillis,
+                                        appliedTerminalCommandIds()
                                     )
                                 }
                                 when (val result = decision) {
@@ -2276,22 +2370,58 @@ internal fun RegistrationApp() {
                                         )
                                         queueUndoAction = null
                                         homeSidePanelFeedback = null
-                                        result.changedMachineIds.forEach { machineName ->
-                                            val machineId = MachineId.entries.firstOrNull {
-                                                it.name == machineName
-                                            } ?: return@forEach
-                                            appendQueueAuditLog(
-                                                machineId = machineId,
-                                                beforeQueue = beforeQueues.getValue(machineName),
-                                                afterQueue = result.state.queues.getValue(machineName),
-                                                publicEventTypeOverride =
-                                                    PublicQueueEventType.ONLINE_REGISTRATION_ADDED
-                                                        .takeIf {
-                                                            command.operation ==
-                                                                RemoteQueueOperation.JOIN_QUEUE
-                                                        },
-                                                source = command.source.auditLogSource
-                                            )
+                                        if (command.operation == RemoteQueueOperation.TRANSFER_MACHINE) {
+                                            val sourceMachineId = MachineId.entries.firstOrNull {
+                                                it.name == command.machineId
+                                            }
+                                            val destinationMachineId = MachineId.entries.firstOrNull {
+                                                it.name == command.targetMachineId
+                                            }
+                                            if (sourceMachineId != null && destinationMachineId != null) {
+                                                val beforeSource = beforeQueues.getValue(sourceMachineId.name)
+                                                val afterSource = result.state.queues.getValue(sourceMachineId.name)
+                                                val remainingSourceKeys = afterSource.allRegistrations
+                                                    .mapTo(mutableSetOf()) { it.key }
+                                                val transferred = beforeSource.allRegistrations.filter {
+                                                    it.key !in remainingSourceKeys
+                                                }
+                                                val transferredKeys = transferred
+                                                    .mapTo(mutableSetOf()) { it.key }
+                                                val releasedPartners = afterSource.allRegistrations.filter { after ->
+                                                    val before = beforeSource.allRegistrations.firstOrNull {
+                                                        it.key == after.key
+                                                    }
+                                                    before?.fixedPartnerKey in transferredKeys &&
+                                                        after.fixedPartnerKey == null
+                                                }
+                                                createMachineTransferAuditLog(
+                                                    category = auditCategoryFor(sourceMachineId),
+                                                    sourceMachineLabel = configuredMachineName(sourceMachineId),
+                                                    destinationMachineLabel = configuredMachineName(destinationMachineId),
+                                                    registrations = transferred,
+                                                    releasedPartnerRegistrations = releasedPartners,
+                                                    source = command.source.auditLogSource
+                                                )?.let(::appendAuditLog)
+                                            }
+                                        } else {
+                                            result.changedMachineIds.forEach { machineName ->
+                                                val machineId = MachineId.entries.firstOrNull {
+                                                    it.name == machineName
+                                                } ?: return@forEach
+                                                appendQueueAuditLog(
+                                                    machineId = machineId,
+                                                    beforeQueue = beforeQueues.getValue(machineName),
+                                                    afterQueue = result.state.queues.getValue(machineName),
+                                                    publicEventTypeOverride = when (command.operation) {
+                                                        RemoteQueueOperation.JOIN_QUEUE ->
+                                                            PublicQueueEventType.ONLINE_REGISTRATION_ADDED
+                                                        RemoteQueueOperation.LEAVE_QUEUE ->
+                                                            PublicQueueEventType.REGISTRATION_REMOVED
+                                                        else -> null
+                                                    },
+                                                    source = command.source.auditLogSource
+                                                )
+                                            }
                                         }
                                         if (result.changedMachineIds.isNotEmpty()) {
                                             queueSoundPlayer.play(
@@ -2357,7 +2487,6 @@ internal fun RegistrationApp() {
                                             )
                                         }
                                         persistQueueStateBeforeRemoteAcknowledgement()
-                                        localWriteFailureDetail = null
                                         val resultRegistrationId = if (
                                             command.operation == RemoteQueueOperation.JOIN_QUEUE
                                         ) {
@@ -2371,6 +2500,21 @@ internal fun RegistrationApp() {
                                         } else {
                                             null
                                         }
+                                        if (!persistTerminalCommandReceipt(
+                                                TerminalCommandReceipt(
+                                                    commandId = command.commandId,
+                                                    applied = true,
+                                                    detail = result.detail,
+                                                    resultRegistrationId = resultRegistrationId
+                                                )
+                                            )
+                                        ) {
+                                            localWriteFailureDetail =
+                                                "远程排队操作的执行结果暂时无法写入本机，应用将继续重试。"
+                                            localWriteFailureAtMillis = System.currentTimeMillis()
+                                            continue
+                                        }
+                                        localWriteFailureDetail = null
                                         queueCommandClient.complete(
                                             command.commandId,
                                             applied = true,
@@ -2381,7 +2525,6 @@ internal fun RegistrationApp() {
 
                                     is RemoteQueueOperationDecision.AlreadyApplied -> {
                                         persistQueueStateBeforeRemoteAcknowledgement()
-                                        localWriteFailureDetail = null
                                         val resultRegistrationId = if (
                                             command.operation == RemoteQueueOperation.JOIN_QUEUE
                                         ) {
@@ -2395,6 +2538,21 @@ internal fun RegistrationApp() {
                                         } else {
                                             null
                                         }
+                                        if (!persistTerminalCommandReceipt(
+                                                TerminalCommandReceipt(
+                                                    commandId = command.commandId,
+                                                    applied = true,
+                                                    detail = result.detail,
+                                                    resultRegistrationId = resultRegistrationId
+                                                )
+                                            )
+                                        ) {
+                                            localWriteFailureDetail =
+                                                "远程排队操作的执行结果暂时无法写入本机，应用将继续重试。"
+                                            localWriteFailureAtMillis = System.currentTimeMillis()
+                                            continue
+                                        }
+                                        localWriteFailureDetail = null
                                         queueCommandClient.complete(
                                             command.commandId,
                                             applied = true,
@@ -2404,6 +2562,20 @@ internal fun RegistrationApp() {
                                     }
 
                                     is RemoteQueueOperationDecision.Reject -> {
+                                        if (!persistTerminalCommandReceipt(
+                                                TerminalCommandReceipt(
+                                                    commandId = command.commandId,
+                                                    applied = false,
+                                                    detail = result.detail
+                                                )
+                                            )
+                                        ) {
+                                            localWriteFailureDetail =
+                                                "远程排队操作的处理结果暂时无法写入本机，应用将继续重试。"
+                                            localWriteFailureAtMillis = System.currentTimeMillis()
+                                            continue
+                                        }
+                                        localWriteFailureDetail = null
                                         queueCommandClient.complete(
                                             command.commandId,
                                             applied = false,
@@ -2417,7 +2589,7 @@ internal fun RegistrationApp() {
                                 var decision = decideMobileDeviceRegistration(
                                     command,
                                     currentRemoteQueueExecutionState(),
-                                    appliedMobileRegistrationCommandIds
+                                    appliedTerminalCommandIds()
                                 )
                                 val profileToPersist =
                                     (decision as? MobileDeviceRegistrationDecision.Apply)
@@ -2440,7 +2612,7 @@ internal fun RegistrationApp() {
                                     decision = decideMobileDeviceRegistration(
                                         command,
                                         currentRemoteQueueExecutionState(),
-                                        appliedMobileRegistrationCommandIds
+                                        appliedTerminalCommandIds()
                                     )
                                 }
                                 when (val result = decision) {
@@ -2475,9 +2647,16 @@ internal fun RegistrationApp() {
                                             )
                                         }
                                         persistQueueStateBeforeRemoteAcknowledgement()
-                                        if (!persistMobileRegistrationReceipt(command.commandId)) {
+                                        if (!persistTerminalCommandReceipt(
+                                                TerminalCommandReceipt(
+                                                    commandId = command.commandId,
+                                                    applied = true,
+                                                    detail = result.detail
+                                                )
+                                            )
+                                        ) {
                                             localWriteFailureDetail =
-                                                "移动设备登记的执行记录暂时无法写入本机，应用将继续重试。"
+                                                "移动设备登记的执行结果暂时无法写入本机，应用将继续重试。"
                                             localWriteFailureAtMillis = System.currentTimeMillis()
                                             continue
                                         }
@@ -2508,40 +2687,43 @@ internal fun RegistrationApp() {
                                     }
 
                                     is MobileDeviceRegistrationDecision.AlreadyApplied -> {
-                                        val receiptWasAlreadyRecorded =
-                                            command.commandId in appliedMobileRegistrationCommandIds
                                         persistQueueStateBeforeRemoteAcknowledgement()
-                                        if (!persistMobileRegistrationReceipt(command.commandId)) {
+                                        if (!persistTerminalCommandReceipt(
+                                                TerminalCommandReceipt(
+                                                    commandId = command.commandId,
+                                                    applied = true,
+                                                    detail = result.detail
+                                                )
+                                            )
+                                        ) {
                                             localWriteFailureDetail =
-                                                "移动设备登记的执行记录暂时无法写入本机，应用将继续重试。"
+                                                "移动设备登记的执行结果暂时无法写入本机，应用将继续重试。"
                                             localWriteFailureAtMillis = System.currentTimeMillis()
                                             continue
                                         }
                                         localWriteFailureDetail = null
-                                        if (!receiptWasAlreadyRecorded) {
-                                            val machineId = MachineId.entries.firstOrNull {
-                                                it.name == command.machineId
-                                            }
-                                            val registrationKey = machineId?.let(::queueFor)
-                                                ?.allRegistrations
-                                                ?.firstOrNull {
-                                                    it.originatingCommandId == command.commandId
-                                                }?.key
-                                            if (machineId != null && registrationKey != null) {
-                                                queueSoundPlayer.play(QueueSoundCue.CONFIRM)
-                                                pendingNewRegistrationHomeRequests =
-                                                    pendingNewRegistrationHomeRequests +
-                                                    NewRegistrationHomeRequest(
-                                                        NewRegistrationHighlight(
-                                                            machineId = machineId,
-                                                            registrationKey = registrationKey,
-                                                            requestId = command.commandId
-                                                        ),
-                                                        forceImmediateHome = command.matchesSession(
-                                                            mobileRegistrationSession
-                                                        )
+                                        val machineId = MachineId.entries.firstOrNull {
+                                            it.name == command.machineId
+                                        }
+                                        val registrationKey = machineId?.let(::queueFor)
+                                            ?.allRegistrations
+                                            ?.firstOrNull {
+                                                it.originatingCommandId == command.commandId
+                                            }?.key
+                                        if (machineId != null && registrationKey != null) {
+                                            queueSoundPlayer.play(QueueSoundCue.CONFIRM)
+                                            pendingNewRegistrationHomeRequests =
+                                                pendingNewRegistrationHomeRequests +
+                                                NewRegistrationHomeRequest(
+                                                    NewRegistrationHighlight(
+                                                        machineId = machineId,
+                                                        registrationKey = registrationKey,
+                                                        requestId = command.commandId
+                                                    ),
+                                                    forceImmediateHome = command.matchesSession(
+                                                        mobileRegistrationSession
                                                     )
-                                            }
+                                                )
                                         }
                                         queueCommandClient.complete(
                                             command.commandId,
@@ -2551,6 +2733,20 @@ internal fun RegistrationApp() {
                                     }
 
                                     is MobileDeviceRegistrationDecision.Reject -> {
+                                        if (!persistTerminalCommandReceipt(
+                                                TerminalCommandReceipt(
+                                                    commandId = command.commandId,
+                                                    applied = false,
+                                                    detail = result.detail
+                                                )
+                                            )
+                                        ) {
+                                            localWriteFailureDetail =
+                                                "移动设备登记的处理结果暂时无法写入本机，应用将继续重试。"
+                                            localWriteFailureAtMillis = System.currentTimeMillis()
+                                            continue
+                                        }
+                                        localWriteFailureDetail = null
                                         if (command.matchesSession(mobileRegistrationSession)) {
                                             mobileRegistrationSession = null
                                             mobileRegistrationFailureDetail = result.detail
@@ -3647,7 +3843,12 @@ internal fun RegistrationApp() {
                                 } else if (pairCreated) {
                                     showHomeOperationFeedback(
                                         title = "固定组合已建立",
-                                        detail = "“${plan.firstRegistration.displayId}”与“${plan.secondRegistration.displayId}”已组成固定组合。",
+                                        detail = buildString {
+                                            append("“${plan.firstRegistration.displayId}”与“${plan.secondRegistration.displayId}”已组成固定组合。")
+                                            fixedPairCreatedStatusDetail(
+                                                listOf(plan.firstRegistration, plan.secondRegistration)
+                                            )?.let { append(it) }
+                                        },
                                         contextLabel = configuredMachineName(selection.machineId)
                                     )
                                 }
@@ -3687,7 +3888,11 @@ internal fun RegistrationApp() {
                                     } else if (pairCreated) {
                                         showHomeOperationFeedback(
                                             title = "固定组合已建立",
-                                            detail = "“${registration.displayId}”与“${friend.displayId}”已组成固定组合。",
+                                            detail = buildString {
+                                                append("“${registration.displayId}”与“${friend.displayId}”已组成固定组合。")
+                                                fixedPairCreatedStatusDetail(listOf(registration))
+                                                    ?.let { append(it) }
+                                            },
                                             contextLabel = configuredMachineName(selection.machineId)
                                         )
                                     }
@@ -3969,16 +4174,18 @@ internal fun RegistrationApp() {
                     }
                     val profilePreference = profile?.defaultPreference?.toPlayPreferenceOrNull()
                     if (profile != null && registration != null && profilePreference != null) {
+                        val fixedPartner = registration.fixedPartnerKey?.let { partnerKey ->
+                            queueFor(selection.machineId).allRegistrations
+                                .firstOrNull { it.key == partnerKey }
+                                ?.takeIf { it.fixedPartnerKey == registration.key }
+                        }
                         ClaimPreferenceMismatchDialog(
                             profileNickname = profile.nickname,
                             currentPreferenceLabel = playPreferenceLabel(registration),
                             profilePreference = profilePreference,
-                            fixedPartnerDisplayId = registration.fixedPartnerKey?.let { partnerKey ->
-                                queueFor(selection.machineId).allRegistrations
-                                    .firstOrNull { it.key == partnerKey }
-                                    ?.takeIf { it.fixedPartnerKey == registration.key }
-                                    ?.displayId
-                            },
+                            fixedPartnerDisplayId = fixedPartner?.displayId,
+                            fixedPartnerAbsenceNotice =
+                                fixedPartner?.let(::remainingPartnerAbsenceNotice),
                             onDismiss = { claimPreferenceMismatchProfileId = null },
                             onKeepCurrent = { completePlayerProfileClaim() },
                             onUseProfileDefault = {
@@ -4003,6 +4210,7 @@ internal fun RegistrationApp() {
                     PositionActions(
                         selection = selection,
                         queue = queueFor(selection.machineId),
+                        machineOperational = statusFor(selection.machineId).isOperational,
                         transferMachineName = configuredMachineName(transferTargetMachineId),
                         transferUnavailableReason = transferUnavailableReason,
                         onDismiss = { selectedPosition = null },
@@ -4151,13 +4359,30 @@ internal fun RegistrationApp() {
                             .filterNot { it.canEnterPlayingPosition },
                         nextRegistrations = positions.getOrNull(targetIndex).orEmpty()
                     )
+                    val correctionPreview = if (queue.playing.isNotEmpty() && targetIndex > 0) {
+                        queue.advanceToWaitingPosition(targetKeys, atMillis = 1L)
+                    } else {
+                        queue
+                    }
+                    val correctionCanApply = correctionPreview != queue &&
+                        correctionPreview.playing.mapTo(mutableSetOf()) { it.key } == targetKeys
+                    val correctionDisabledReason = when {
+                        queue.playing.isEmpty() || targetIndex <= 0 ->
+                            "队列状态已经发生变化，请关闭后重新选择目标位置。"
+                        positions.getOrNull(targetIndex).orEmpty().any {
+                            !it.canEnterPlayingPosition
+                        } -> "所选位置包含当前不能进入游玩位置的登记，无法执行校正。"
+                        else ->
+                            "按照正常轮换推进时，所选登记会先与其他登记重新组合，不能直接校正为当前所选位置。请按现场实际情况逐轮结束。"
+                    }
                     AdvanceToPlayingConfirmation(
                         selectionLabel = selection.label.substringBefore(" · "),
                         playingPositionLabel = playingPositionName(selection.machineId),
                         registrations = positions.getOrNull(targetIndex).orEmpty(),
                         completedWaitingPositionCount = targetIndex.coerceAtLeast(0),
                         availabilityNotice = correctionNotice,
-                        enabled = queue.playing.isNotEmpty() && targetIndex > 0,
+                        enabled = correctionCanApply,
+                        disabledReason = correctionDisabledReason,
                         onDismiss = { advanceToPlayingTarget = null },
                         onConfirm = {
                             updateQueueWithUndo(
@@ -4374,15 +4599,18 @@ internal fun RegistrationApp() {
                     val exitRegistration = exitQueue.allRegistrations
                         .firstOrNull { it.key == selection.registrationKey }
                     if (exitRegistration != null) {
-                        val fixedPartnerDisplayId = exitRegistration.fixedPartnerKey?.let { partnerKey ->
+                        val fixedPartner = exitRegistration.fixedPartnerKey?.let { partnerKey ->
                             exitQueue.allRegistrations.firstOrNull { it.key == partnerKey }
                                 ?.takeIf { it.fixedPartnerKey == exitRegistration.key }
-                                ?.displayId
                         }
                         RemoveRegistrationConfirmation(
                             title = "退出排队？",
-                            message = if (fixedPartnerDisplayId != null) {
-                                "“${exitRegistration.displayId}”退出后，这份登记将立即失效。与“$fixedPartnerDisplayId”的固定组合也会解除；对方会保留在原位置，并恢复为允许他人加入。若仍想游玩，需要重新加入队尾。"
+                            message = if (fixedPartner != null) {
+                                buildString {
+                                    append("“${exitRegistration.displayId}”退出后，这份登记将立即失效。与“${fixedPartner.displayId}”的固定组合也会解除；对方会保留在原位置，并恢复为允许他人加入。")
+                                    remainingPartnerAbsenceNotice(fixedPartner)?.let { append(it) }
+                                    append("若仍想游玩，需要重新加入队尾。")
+                                }
                             } else {
                                 "“${exitRegistration.displayId}”退出后，这份登记将立即失效。若仍想游玩，需要重新加入队尾。"
                             },
@@ -4391,6 +4619,8 @@ internal fun RegistrationApp() {
                             onConfirm = {
                                 updateQueue(
                                     machineId = selection.machineId,
+                                    publicEventTypeOverride =
+                                        PublicQueueEventType.REGISTRATION_REMOVED,
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
                                     homeFeedbackTitle = "登记已退出排队"
@@ -4419,6 +4649,8 @@ internal fun RegistrationApp() {
                             onConfirm = {
                                 updateQueue(
                                     machineId = selection.machineId,
+                                    publicEventTypeOverride =
+                                        PublicQueueEventType.REGISTRATION_REMOVED,
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
                                     homeFeedbackTitle = "这组登记已移除"
@@ -6090,7 +6322,7 @@ private fun MachineLane(
                 Spacer(Modifier.height(4.dp))
                 Text(
                     if (queue.registrationCount > 0) {
-                        "停止期间不能操作该队列；恢复后将按原顺序继续，本轮计时会从头开始。"
+                        "停止期间不能操作该队列，也不会继续游玩或签到计时；恢复后将按原顺序继续，相关计时会从头开始。"
                     } else {
                         "恢复正常使用后，可以继续创建登记。"
                     },
@@ -8637,10 +8869,22 @@ private fun FriendPairPlayerProfileDetailScreen(
             fontSize = 12.sp,
             lineHeight = 18.sp
         )
+        fixedPairFormationAbsenceNotice(listOf(registration))?.let { notice ->
+            Spacer(Modifier.height(9.dp))
+            Text(
+                notice,
+                color = Color(0xFF9A5B00),
+                fontSize = 12.sp,
+                lineHeight = 18.sp
+            )
+        }
         if (currentPartner != null) {
             Spacer(Modifier.height(9.dp))
             Text(
-                "继续后，“${registration.displayId}”与“${currentPartner.displayId}”的原固定组合会解除；“${currentPartner.displayId}”会恢复为允许他人加入。",
+                buildString {
+                    append("继续后，“${registration.displayId}”与“${currentPartner.displayId}”的原固定组合会解除；“${currentPartner.displayId}”会恢复为允许他人加入。")
+                    remainingPartnerAbsenceNotice(currentPartner)?.let { append(it) }
+                },
                 color = Color(0xFF9A5B00),
                 fontSize = 12.sp,
                 lineHeight = 18.sp
@@ -8839,6 +9083,7 @@ private fun ClaimPreferenceMismatchDialog(
     currentPreferenceLabel: String,
     profilePreference: PlayPreference,
     fixedPartnerDisplayId: String?,
+    fixedPartnerAbsenceNotice: String?,
     onDismiss: () -> Unit,
     onKeepCurrent: () -> Unit,
     onUseProfileDefault: () -> Unit
@@ -8855,7 +9100,10 @@ private fun ClaimPreferenceMismatchDialog(
         if (fixedPartnerDisplayId != null) {
             Spacer(Modifier.height(10.dp))
             Text(
-                "使用资料默认偏好会解除与“$fixedPartnerDisplayId”的固定组合；对方会保留在原位置，并恢复为允许他人加入。",
+                buildString {
+                    append("使用资料默认偏好会解除与“$fixedPartnerDisplayId”的固定组合；对方会保留在原位置，并恢复为允许他人加入。")
+                    fixedPartnerAbsenceNotice?.let { append(it) }
+                },
                 color = Destructive,
                 fontSize = 12.sp,
                 lineHeight = 18.sp
@@ -9403,6 +9651,17 @@ private fun FriendPairFlowDialog(
                     )
                 }
                 if (plan != null && planIsCurrent && delayedOthers.isEmpty()) {
+                    fixedPairFormationAbsenceNotice(
+                        listOf(plan.firstRegistration, plan.secondRegistration)
+                    )?.let { notice ->
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            notice,
+                            color = Color(0xFF9A5B00),
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp
+                        )
+                    }
                     val selectedPartnerKey = if (plan.firstRegistration.key == registration.key) {
                         plan.secondRegistration.key
                     } else {
@@ -9411,7 +9670,10 @@ private fun FriendPairFlowDialog(
                     if (currentPartner != null && currentPartner.key != selectedPartnerKey) {
                         Spacer(Modifier.height(10.dp))
                         Text(
-                            "确认后，与“${currentPartner.displayId}”的原固定组合会解除；该登记会恢复为允许他人加入。",
+                            buildString {
+                                append("确认后，与“${currentPartner.displayId}”的原固定组合会解除；该登记会恢复为允许他人加入。")
+                                remainingPartnerAbsenceNotice(currentPartner)?.let { append(it) }
+                            },
                             color = SecondaryText,
                             fontSize = 12.sp,
                             lineHeight = 18.sp
@@ -9454,10 +9716,22 @@ private fun FriendPairFlowDialog(
                     fontSize = 13.sp,
                     lineHeight = 20.sp
                 )
+                fixedPairFormationAbsenceNotice(listOf(registration))?.let { notice ->
+                    Spacer(Modifier.height(9.dp))
+                    Text(
+                        notice,
+                        color = Color(0xFF9A5B00),
+                        fontSize = 12.sp,
+                        lineHeight = 18.sp
+                    )
+                }
                 if (currentPartner != null) {
                     Spacer(Modifier.height(9.dp))
                     Text(
-                        "这也会解除当前与“${currentPartner.displayId}”的固定组合；该登记会恢复为允许他人加入。",
+                        buildString {
+                            append("这也会解除当前与“${currentPartner.displayId}”的固定组合；该登记会恢复为允许他人加入。")
+                            remainingPartnerAbsenceNotice(currentPartner)?.let { append(it) }
+                        },
                         color = SecondaryText,
                         fontSize = 12.sp,
                         lineHeight = 18.sp
@@ -9632,7 +9906,10 @@ private fun RegistrationActions(
                 if (fixedPartnerDisplayId != null) {
                     Spacer(Modifier.height(9.dp))
                     Text(
-                        "当前与“$fixedPartnerDisplayId”组成固定组合。改为单人游玩或允许他人加入时，双方的固定组合会同时解除。",
+                        buildString {
+                            append("当前与“$fixedPartnerDisplayId”组成固定组合。改为单人游玩或允许他人加入时，双方的固定组合会同时解除。")
+                            fixedPairAbsenceRetentionNotice(registration)?.let { append(it) }
+                        },
                         color = SecondaryText,
                         fontSize = 12.sp,
                         lineHeight = 18.sp
@@ -9772,7 +10049,14 @@ private fun RegistrationActions(
                     registration.lastPlayedAtMillis?.let(::formatRegistrationTime) ?: "尚未游玩"
                 )
                 if (registration.requiresOnSiteCheckIn) {
-                    MetadataRow("签到时限", "创建线上登记后 30 分钟内")
+                    MetadataRow(
+                        "签到时限",
+                        if (registration.hasRestartedOnSiteCheckInWindow) {
+                            "机台恢复正常使用后重新获得的 30 分钟内"
+                        } else {
+                            "创建线上登记后 30 分钟内"
+                        }
+                    )
                 }
                 if (registration.noShowCount > 0) {
                     MetadataRow("未到场记录", "${registration.noShowCount} 次")
@@ -9784,7 +10068,11 @@ private fun RegistrationActions(
                 Spacer(Modifier.height(16.dp))
                 if (registration.requiresOnSiteCheckIn) {
                     Text(
-                        "请在创建线上登记后的 30 分钟内完成现场签到。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。",
+                        if (registration.hasRestartedOnSiteCheckInWindow) {
+                            "机台恢复正常使用后，这份登记已重新获得 30 分钟签到时限。请在本次时限内完成现场签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。"
+                        } else {
+                            "请在创建线上登记后的 30 分钟内完成现场签到。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。"
+                        },
                         color = OnlineRegistrationStatusColor,
                         fontSize = 11.sp,
                         lineHeight = 17.sp,
@@ -9801,7 +10089,11 @@ private fun RegistrationActions(
                         MenuActionButton(
                             MenuAction(
                                 "已到场",
-                                "完成签到后，这份登记会保持当前顺序，并开始参与后续游玩位置分配。请在创建登记后的 30 分钟内操作。",
+                                if (registration.hasRestartedOnSiteCheckInWindow) {
+                                    "完成签到后，这份登记会保持当前顺序，并开始参与后续游玩位置分配。请在机台恢复正常使用后重新获得的 30 分钟内操作。"
+                                } else {
+                                    "完成签到后，这份登记会保持当前顺序，并开始参与后续游玩位置分配。请在创建登记后的 30 分钟内操作。"
+                                },
                                 onCheckIn,
                                 accented = true,
                                 accentColor = OnlineRegistrationStatusColor,
@@ -9850,7 +10142,7 @@ private fun RegistrationActions(
                         )
                         QueueAbsenceStatus.NONE -> add(
                             MenuAction(
-                                "暂缓或暂离",
+                                "暂缓一轮或暂时离开",
                                 if (allowDeferOneRound || allowTemporaryLeave) {
                                     "选择只跳过下一轮，或在返回前持续轮空。"
                                 } else {
@@ -10338,7 +10630,16 @@ private fun MachineTransferConfirmation(
         if (breaksFixedPair) {
             Spacer(Modifier.height(10.dp))
             Text(
-                "这份登记属于固定组合。只转移其中一份会同时解除双方的固定组合；留在原机台的登记会恢复为允许他人加入。",
+                "这份登记属于固定组合。只转移其中一份会同时解除双方的固定组合；转入目标机台和留在原机台的两份登记都会恢复为允许他人加入。",
+                color = SecondaryText,
+                fontSize = 12.sp,
+                lineHeight = 18.sp
+            )
+        }
+        machineTransferAbsenceNotice(registrations, breaksFixedPair)?.let { notice ->
+            Spacer(Modifier.height(10.dp))
+            Text(
+                notice,
                 color = SecondaryText,
                 fontSize = 12.sp,
                 lineHeight = 18.sp
@@ -10370,6 +10671,7 @@ private fun MachineTransferConfirmation(
 private fun PositionActions(
     selection: PositionSelection,
     queue: MachineQueue,
+    machineOperational: Boolean,
     transferMachineName: String,
     transferUnavailableReason: String?,
     onDismiss: () -> Unit,
@@ -10480,10 +10782,18 @@ private fun PositionActions(
             if (!selection.isPlayingPosition && registrations.isNotEmpty()) {
                 Spacer(Modifier.width(12.dp))
                 Text(
-                    positionWaitEstimateLabel(
-                        registrations,
-                        estimatedMinutesUntilPlaying(queue, selection.registrationKeys.toSet(), nowMillis)
-                    ),
+                    if (machineOperational) {
+                        positionWaitEstimateLabel(
+                            registrations,
+                            estimatedMinutesUntilPlaying(
+                                queue,
+                                selection.registrationKeys.toSet(),
+                                nowMillis
+                            )
+                        )
+                    } else {
+                        "机台恢复使用后重新估算"
+                    },
                     color = SecondaryText,
                     fontSize = 12.sp
                 )
@@ -10719,11 +11029,11 @@ private fun AdvanceToPlayingConfirmation(
     completedWaitingPositionCount: Int,
     availabilityNotice: String?,
     enabled: Boolean,
+    disabledReason: String,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
 ) {
     val names = registrations.joinToString("和") { "“${it.displayId}”" }
-    val completedRoundCount = completedWaitingPositionCount + 1
     ModalSurface(onDismiss, width = 500.dp) {
         Text("调整为$playingPositionLabel？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
@@ -10740,7 +11050,7 @@ private fun AdvanceToPlayingConfirmation(
         if (registrations.isNotEmpty()) {
             Spacer(Modifier.height(10.dp))
             Text(
-                "确认后，系统会补记队列已经推进 $completedRoundCount 轮：$playingPositionLabel，以及此位置之前的 $completedWaitingPositionCount 个等待位置。能够正常进入游玩位置的登记会按已经完成游玩处理；处于特殊状态的登记会按各自规则处理。",
+                "确认后，系统会从当前${playingPositionLabel}开始，按正常轮换规则连续处理，直到这个位置进入$playingPositionLabel。此位置之前共有 $completedWaitingPositionCount 个等待位置；能够正常进入游玩位置的登记会按已经完成游玩处理，处于特殊状态的登记会按各自规则处理，不会被误记为已经游玩。",
                 color = PrimaryText,
                 fontSize = 12.sp,
                 lineHeight = 19.sp,
@@ -10773,7 +11083,7 @@ private fun AdvanceToPlayingConfirmation(
             onConfirm,
             Modifier.fillMaxWidth(),
             enabled = enabled,
-            disabledReason = "队列状态已经发生变化，请关闭后重新选择目标位置。"
+            disabledReason = disabledReason
         )
         Spacer(Modifier.height(8.dp))
         CancelAction(onDismiss)
@@ -10792,7 +11102,11 @@ private fun ReleaseFixedPairConfirmation(
         Spacer(Modifier.height(8.dp))
         Text(
             if (registrations.size == 2) {
-                "$names 将不再固定共同游玩。两份登记的游玩偏好都会改为允许他人加入，系统会按照登记顺序重新组成等待位置。"
+                buildString {
+                    append("$names 将不再固定共同游玩。两份登记的游玩偏好都会改为允许他人加入，系统会按照登记顺序重新组成等待位置。")
+                    registrations.firstOrNull()?.let(::fixedPairAbsenceRetentionNotice)
+                        ?.let { append(it) }
+                }
             } else {
                 "这个固定组合已经发生变化，无法继续执行释放操作。"
             },
@@ -10989,11 +11303,16 @@ private fun QueueAbsenceDialog(
     }
     val subject = fixedPartnerDisplayId?.let { "“$displayId”和“$it”" } ?: "“$displayId”"
     ModalSurface(onDismiss, width = 500.dp) {
-        AnimatedContent(targetState = choice, label = "暂缓或暂离选项") { selectedChoice ->
+        AnimatedContent(targetState = choice, label = "暂缓一轮或暂时离开选项") { selectedChoice ->
             Column(Modifier.fillMaxWidth()) {
                 when (selectedChoice) {
                     null -> {
-                        Text("暂缓或暂离", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "暂缓一轮或暂时离开",
+                            color = PrimaryText,
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
                         Spacer(Modifier.height(8.dp))
                         Text(
                             if (fixedPartnerDisplayId == null) {
@@ -11025,7 +11344,7 @@ private fun QueueAbsenceDialog(
                             MenuAction(
                                 "暂时离开",
                                 if (allowTemporaryLeave) {
-                                    "暂离期间不参与游玩组合；每次轮到时移至队尾，返回后需要手动解除。"
+                                    "暂时离开期间不参与游玩组合；每次轮到时移至队尾，返回后需要手动解除。"
                                 } else {
                                     "系统规则不允许。"
                                 },
@@ -11368,7 +11687,7 @@ private fun IncompleteCheckInProfileDialog(
             if (profile == null) {
                 "这份线上登记关联的玩家资料暂时不可用，因此不能完成签到。请等待资料同步后重试，或联系现场工作人员。"
             } else {
-                "“${profile.nickname}”还需要确认 QQ 显示范围和排队通知设置。线上登记会继续保留；保存资料后，请再次点击登记并选择“已到场”完成签到。"
+                "“${profile.nickname}”还需要确认 QQ 显示范围和排队通知设置。补全资料期间，本次 30 分钟签到时限以及轮到进入游玩位置时仍未签到即退出排队的规则不会暂停。保存资料后，请再次点击登记并选择“已到场”完成签到。"
             },
             color = SecondaryText,
             fontSize = 13.sp,
@@ -11680,6 +11999,16 @@ private fun AppDetailsDialog(
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
         Triple(
+            "0.6.7",
+            "跨端队列动作一致性",
+            "机台停止使用期间会暂停本轮和线上签到计时，恢复后重新计时；终端、网站和 QQ Bot 统一固定组合、特殊状态、估时和通知说明。远程命令会保存首次处理结果，断网重投不再重复执行；后方位置校正也会先按正常轮换模拟，避免无效调整。"
+        ),
+        Triple(
+            "0.6.6",
+            "固定组合远程操作一致性",
+            "固定组合的暂缓一轮、取消暂缓一轮、暂时离开和取消暂时离开继续沿用现场终端规则，并同时作用于两份登记；后端和 QQ Bot 改由终端最终确认状态，避免旧快照阻止取消操作。"
+        ),
+        Triple(
             "0.6.5",
             "线上登记可靠性",
             "终端运行实例、命令领取和成功回执现在能够一一对应，避免重复运行的旧队列覆盖新登记；网页会在真实登记同步到队列后再显示成功。与朋友共同游玩时也可以从玩家资料库为朋友创建登记。"
@@ -11697,7 +12026,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.6.2",
             "首页操作反馈",
-            "首页右侧动态区域现在会反馈签到、暂缓与暂离、偏好修改、切换机台、本轮处理、机台状态和远程操作等结果；可撤销的重要操作也迁入右侧，并将撤销时间延长至 10 秒。"
+            "首页右侧动态区域现在会反馈签到、暂缓一轮与暂时离开、偏好修改、切换机台、本轮处理、机台状态和远程操作等结果；可撤销的重要操作也迁入右侧，并将撤销时间延长至 10 秒。"
         ),
         Triple(
             "0.6.1",
@@ -11707,7 +12036,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.6.0",
             "队列可靠性与结构整理",
-            "终端内部职责完成第一阶段拆分；队列和玩家资料增加本机有效快照保护，并通过连续组合动作测试核对轮换、暂缓、暂离、签到、未到场、固定组合和顺序调整的一致性。"
+            "终端内部职责完成第一阶段拆分；队列和玩家资料增加本机有效快照保护，并通过连续组合动作测试核对轮换、暂缓一轮、暂时离开、签到、未到场、固定组合和顺序调整的一致性。"
         ),
         Triple(
             "0.5.5",
@@ -11742,7 +12071,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.4.1",
             "线上签到规则与入口控制",
-            "线上登记在创建后 30 分钟未签到或轮到时仍未签到会自动退出；设置中可以单独关闭新线上登记，而不影响查询和已有登记管理。"
+            "线上登记在本次 30 分钟签到时限内未签到或轮到时仍未签到会自动退出；机台停止使用期间计时暂停，恢复正常使用后会重新获得 30 分钟。设置中可以单独关闭新线上登记，而不影响查询和已有登记管理。"
         ),
         Triple(
             "0.4.0",
@@ -13756,6 +14085,81 @@ private fun registrationAbsenceStatusLabel(
     }
 }
 
+private fun fixedPairFormationAbsenceNotice(
+    registrations: List<Registration>
+): String? {
+    val temporarilyAway = registrations.filter {
+        it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
+    }
+    if (temporarilyAway.isNotEmpty()) {
+        val skippedTurns = temporarilyAway.maxOf(Registration::temporaryAwaySkippedTurns)
+        return "其中至少一份登记当前处于暂时离开状态。固定组合建立后，两份登记都会暂时离开，已轮空次数统一为 $skippedTurns 次；返回后可通过其中任一份登记取消。" +
+            if (skippedTurns >= 3) "下一次轮到时，整组会自动退出排队。" else ""
+    }
+    if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
+        return "其中至少一份登记当前已暂缓一轮。固定组合建立后，两份登记都会暂缓一轮；下一次轮到整组时会跳过，随后同时自动解除。"
+    }
+    return null
+}
+
+private fun fixedPairCreatedStatusDetail(registrations: List<Registration>): String? {
+    val temporarilyAway = registrations.filter {
+        it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
+    }
+    if (temporarilyAway.isNotEmpty()) {
+        val skippedTurns = temporarilyAway.maxOf(Registration::temporaryAwaySkippedTurns)
+        return "两份登记现均为暂时离开，已轮空次数统一为 $skippedTurns 次。"
+    }
+    return if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
+        "两份登记现均已暂缓一轮。"
+    } else {
+        null
+    }
+}
+
+private fun fixedPairAbsenceRetentionNotice(registration: Registration): String? =
+    when (registration.absenceStatus) {
+        QueueAbsenceStatus.DEFER_ONE_ROUND ->
+            "两份登记当前的暂缓一轮状态不会因解除组合而清除。"
+        QueueAbsenceStatus.TEMPORARILY_AWAY ->
+            "两份登记当前的暂时离开状态和已轮空 ${registration.temporaryAwaySkippedTurns} 次不会因解除组合而清除。"
+        QueueAbsenceStatus.NONE -> null
+    }
+
+private fun remainingPartnerAbsenceNotice(registration: Registration): String? =
+    when (registration.absenceStatus) {
+        QueueAbsenceStatus.DEFER_ONE_ROUND ->
+            "对方仍保持暂缓一轮，并会在下一次轮到后自动解除。"
+        QueueAbsenceStatus.TEMPORARILY_AWAY ->
+            "对方仍保持暂时离开和已轮空 ${registration.temporaryAwaySkippedTurns} 次，返回后需要手动取消。"
+        QueueAbsenceStatus.NONE -> null
+    }
+
+private fun machineTransferAbsenceNotice(
+    registrations: List<Registration>,
+    breaksFixedPair: Boolean
+): String? {
+    val temporarilyAway = registrations.filter {
+        it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
+    }
+    if (temporarilyAway.isNotEmpty()) {
+        val skippedTurns = temporarilyAway.maxOf(Registration::temporaryAwaySkippedTurns)
+        return if (breaksFixedPair) {
+            "两份登记的暂时离开状态和已轮空 $skippedTurns 次都会保留；转入后仍需手动取消，才能参与游玩位置分配。"
+        } else {
+            "暂时离开状态和已轮空 $skippedTurns 次会保留；转入后仍需手动取消，才能参与游玩位置分配。"
+        }
+    }
+    if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
+        return if (breaksFixedPair) {
+            "转入登记的暂缓一轮状态会解除；留在原机台的登记仍保持暂缓一轮。"
+        } else {
+            "这些登记转入后，暂缓一轮状态会解除。"
+        }
+    }
+    return null
+}
+
 private fun unavailableNoShowExplanation(registrations: List<Registration>): String {
     val hasPendingCheckIn = registrations.any { it.requiresOnSiteCheckIn }
     val hasTemporaryLeave = registrations.any {
@@ -13769,7 +14173,7 @@ private fun unavailableNoShowExplanation(registrations: List<Registration>): Str
         hasPendingCheckIn ->
             "$subject 尚未完成现场签到，不会进入游玩位置，不能标记为未到场。"
         hasTemporaryLeave && hasOneRoundDeferral ->
-            "$subject 包含暂缓或暂时离开的登记，本次不会进入游玩位置，不能标记为未到场。"
+            "$subject 包含暂缓一轮或暂时离开的登记，本次不会进入游玩位置，不能标记为未到场。"
         hasTemporaryLeave ->
             "$subject 处于暂时离开状态，本次不会进入游玩位置，不能标记为未到场。"
         else ->

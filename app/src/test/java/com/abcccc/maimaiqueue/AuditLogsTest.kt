@@ -171,6 +171,14 @@ class AuditLogsTest {
 
         assertEquals("机台 A · 游玩位置已更新", log.title)
         assertEquals(PublicQueueEventType.PLAYING_CHANGED, log.publicEventType)
+        assertEquals(
+            setOf(
+                PublicQueueNotificationCategory.PLAYING_POSITION,
+                PublicQueueNotificationCategory.ABSENCE,
+                PublicQueueNotificationCategory.QUEUE_CHANGES
+            ),
+            log.notificationCategories
+        )
         assertTrue(log.detail.contains("“曾未到场玩家”正常完成游玩，未到场记录已清除"))
         assertTrue(1 in log.affectedRegistrationKeys)
     }
@@ -212,7 +220,10 @@ class AuditLogsTest {
             absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND,
             fixedPartnerKey = 2
         )
-        val releasedPartner = registration(2, "青空").copy(fixedPartnerKey = 1)
+        val releasedPartner = registration(2, "青空").copy(
+            absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND,
+            fixedPartnerKey = 1
+        )
 
         val log = requireNotNull(
             createMachineTransferAuditLog(
@@ -228,8 +239,24 @@ class AuditLogsTest {
         assertEquals(PublicQueueEventType.REGISTRATION_UPDATED, log.publicEventType)
         assertEquals(listOf(1, 2), log.affectedRegistrationKeys)
         assertTrue(log.detail.contains("从左侧 · 机台 A 转至右侧 · 机台 B"))
-        assertTrue(log.detail.contains("暂缓一轮状态已解除"))
+        assertTrue(log.detail.contains("转入登记的暂缓一轮状态已解除"))
+        assertTrue(log.detail.contains("留在原机台的登记仍保持暂缓一轮"))
         assertTrue(log.detail.contains("原固定组合已解除"))
+
+        val temporarilyAwayLog = requireNotNull(
+            createMachineTransferAuditLog(
+                category = AuditLogCategory.MACHINE_A,
+                sourceMachineLabel = "左侧 · 机台 A",
+                destinationMachineLabel = "右侧 · 机台 B",
+                registrations = listOf(
+                    transferred.copy(
+                        absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+                        temporaryAwaySkippedTurns = 2
+                    )
+                )
+            )
+        )
+        assertTrue(temporarilyAwayLog.detail.contains("暂时离开状态和已轮空 2 次会在转入后保留"))
     }
 
     @Test
@@ -255,6 +282,25 @@ class AuditLogsTest {
     }
 
     @Test
+    fun manualExitAtTheTemporaryAwayLimitIsNotReportedAsAutomaticExpiry() {
+        val away = registration(1, "主动退出玩家").copy(
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            temporaryAwaySkippedTurns = 3
+        )
+        val log = queueLog(
+            before = MachineQueue(waiting = listOf(away)),
+            after = MachineQueue(),
+            publicEventTypeOverride = PublicQueueEventType.REGISTRATION_REMOVED
+        )!!
+
+        assertEquals(PublicQueueEventType.REGISTRATION_REMOVED, log.publicEventType)
+        assertEquals("机台 A · 移除登记", log.title)
+        assertTrue(log.detail.contains("移除 “主动退出玩家”"))
+        assertFalse(log.detail.contains("第四次轮到"))
+        assertFalse(log.detail.contains("自动退出"))
+    }
+
+    @Test
     fun onlineCheckInRemovalLogsDistinguishTimeoutFromMissedOpportunity() {
         val pending = registration(1, "线上玩家").copy(requiresOnSiteCheckIn = true)
         val currentPlayer = registration(2, "本轮玩家", PlayPreference.SOLO)
@@ -273,11 +319,51 @@ class AuditLogsTest {
         )!!
 
         assertEquals("机台 A · 线上登记签到超时", timeoutLog.title)
-        assertTrue(timeoutLog.detail.contains("30 分钟内完成现场签到"))
+        assertTrue(timeoutLog.detail.contains("本次 30 分钟签到时限内完成现场签到"))
+        assertFalse(timeoutLog.detail.contains("创建线上登记后"))
         assertEquals("机台 A · 未签到登记已自动移除", missedLog.title)
         assertTrue(missedLog.detail.contains("“线上玩家”轮到进入游玩位置时"))
         assertTrue(missedLog.detail.contains("移除 “本轮玩家”"))
         assertFalse(missedLog.detail.contains("“本轮玩家”轮到进入游玩位置时"))
+        assertEquals(
+            setOf(
+                PublicQueueNotificationCategory.ONLINE_CHECK_IN,
+                PublicQueueNotificationCategory.PLAYING_POSITION,
+                PublicQueueNotificationCategory.QUEUE_CHANGES
+            ),
+            missedLog.notificationCategories
+        )
+    }
+
+    @Test
+    fun missedOnlineCheckInAndTemporaryAwayExpiryAreBothExplained() {
+        val pending = registration(1, "线上玩家").copy(requiresOnSiteCheckIn = true)
+        val away = registration(2, "暂离玩家").copy(
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            temporaryAwaySkippedTurns = 3
+        )
+        val next = registration(3, "下一位", PlayPreference.SOLO)
+        val before = MachineQueue(waiting = listOf(pending, away, next))
+        val after = MachineQueue(playing = listOf(next), playingStartedAtMillis = 900L)
+
+        val log = queueLog(
+            before = before,
+            after = after,
+            publicEventTypeOverride = PublicQueueEventType.ONLINE_CHECK_IN_MISSED
+        )!!
+
+        assertTrue(log.detail.contains("“线上玩家”轮到进入游玩位置时尚未完成现场签到"))
+        assertTrue(log.detail.contains("“暂离玩家”在暂时离开期间第四次轮到"))
+        assertFalse(log.detail.contains("移除 “暂离玩家”"))
+        assertEquals(
+            setOf(
+                PublicQueueNotificationCategory.ONLINE_CHECK_IN,
+                PublicQueueNotificationCategory.PLAYING_POSITION,
+                PublicQueueNotificationCategory.ABSENCE,
+                PublicQueueNotificationCategory.QUEUE_CHANGES
+            ),
+            log.notificationCategories
+        )
     }
 
     @Test
@@ -315,6 +401,24 @@ class AuditLogsTest {
 
         assertEquals("机台 A · 登记资料已更新", log.title)
         assertTrue(log.detail.contains("性别标识已更新"))
+    }
+
+    @Test
+    fun fixedPairChangesNameTheRelationshipAndEachResultingPreference() {
+        val first = registration(1, "小雨")
+        val second = registration(2, "青空")
+        val paired = MachineQueue(waiting = listOf(first, second)).let { queue ->
+            queue.applyFriendPair(requireNotNull(queue.planFriendPair(first.key, second.key)))
+        }
+        val released = paired.changePreference(first.key, PlayPreference.SOLO)
+
+        val establishedLog = requireNotNull(queueLog(MachineQueue(waiting = listOf(first, second)), paired))
+        val releasedLog = requireNotNull(queueLog(paired, released))
+
+        assertTrue(establishedLog.detail.contains("“小雨”已与“青空”建立固定组合"))
+        assertTrue(releasedLog.detail.contains("“小雨”的固定组合已解除，当前游玩偏好为单人游玩"))
+        assertTrue(releasedLog.detail.contains("“青空”的固定组合已解除，当前游玩偏好为允许他人加入"))
+        assertFalse(releasedLog.detail.contains("关系已变更"))
     }
 
     @Test
