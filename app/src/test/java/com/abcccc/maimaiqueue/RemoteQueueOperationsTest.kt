@@ -139,6 +139,86 @@ class RemoteQueueOperationsTest {
         assertFalse(checkedIn.waiting.single().requiresOnSiteCheckIn)
     }
 
+    @Test
+    fun fixedPairAbsenceOperationsAlwaysApplyToBothRegistrations() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id
+        )
+        val partner = registration(3, "固定搭档")
+        val pairedQueue = MachineQueue(waiting = listOf(player, partner)).let { queue ->
+            queue.applyFriendPair(requireNotNull(queue.planFriendPair(player.key, partner.key)))
+        }
+        var current = state(machineA = pairedQueue, nextKey = 4)
+
+        val deferred = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.DEFER_ONE_ROUND, player),
+            current
+        ) as RemoteQueueOperationDecision.Apply
+        assertEquals(
+            setOf(QueueAbsenceStatus.DEFER_ONE_ROUND),
+            deferred.state.queues.getValue("A").waiting.map { it.absenceStatus }.toSet()
+        )
+        assertEquals("固定组合的两份登记已同时暂缓一轮。", deferred.detail)
+        current = deferred.state
+
+        val deferCancelled = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND, player),
+            current
+        ) as RemoteQueueOperationDecision.Apply
+        assertEquals(
+            setOf(QueueAbsenceStatus.NONE),
+            deferCancelled.state.queues.getValue("A").waiting.map { it.absenceStatus }.toSet()
+        )
+        assertEquals("固定组合的两份登记已同时取消暂缓一轮。", deferCancelled.detail)
+        current = deferCancelled.state
+
+        val temporarilyAway = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.TEMPORARILY_LEAVE, player),
+            current
+        ) as RemoteQueueOperationDecision.Apply
+        val awayRegistrations = temporarilyAway.state.queues.getValue("A").waiting
+        assertEquals(
+            setOf(QueueAbsenceStatus.TEMPORARILY_AWAY),
+            awayRegistrations.map { it.absenceStatus }.toSet()
+        )
+        assertEquals(setOf(0), awayRegistrations.map { it.temporaryAwaySkippedTurns }.toSet())
+        assertEquals("固定组合的两份登记已同时设为暂时离开。", temporarilyAway.detail)
+        current = temporarilyAway.state
+
+        val leaveCancelled = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.CANCEL_TEMPORARY_LEAVE, player),
+            current
+        ) as RemoteQueueOperationDecision.Apply
+        val restoredRegistrations = leaveCancelled.state.queues.getValue("A").waiting
+        assertEquals(
+            setOf(QueueAbsenceStatus.NONE),
+            restoredRegistrations.map { it.absenceStatus }.toSet()
+        )
+        assertEquals(setOf(0), restoredRegistrations.map { it.temporaryAwaySkippedTurns }.toSet())
+        assertEquals("固定组合的两份登记已同时取消暂时离开。", leaveCancelled.detail)
+    }
+
+    @Test
+    fun repeatedFixedPairAbsenceOperationReportsTheWholeGroup() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id
+        )
+        val partner = registration(3, "固定搭档")
+        val pairedQueue = MachineQueue(waiting = listOf(player, partner)).let { queue ->
+            queue.applyFriendPair(requireNotNull(queue.planFriendPair(player.key, partner.key)))
+        }
+        val current = state(machineA = pairedQueue, nextKey = 4)
+
+        val result = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.CANCEL_TEMPORARY_LEAVE, player),
+            current
+        ) as RemoteQueueOperationDecision.AlreadyApplied
+
+        assertEquals("固定组合的两份登记已经取消暂时离开。", result.detail)
+    }
+
     private fun state(
         machineA: MachineQueue = MachineQueue(),
         machineB: MachineQueue = MachineQueue(),

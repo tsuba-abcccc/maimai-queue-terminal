@@ -2529,6 +2529,56 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertIn("完成现场签到后", deferred.get_json()["error"])
         self.assertEqual(202, left.status_code)
 
+    def test_fixed_pair_cancel_temporary_leave_is_forwarded_for_terminal_validation(self):
+        snapshot = self.remote_ready_snapshot()
+        first = self.registration("a" * 24, "公开昵称")
+        second = self.registration("c" * 24, "固定搭档")
+        for registration in (first, second):
+            registration.update(
+                preference="OPEN_TO_JOIN",
+                fixed_pair=True,
+                fixed_pair_id="f" * 24,
+            )
+        snapshot["machines"]["A"]["waiting_positions"] = [
+            {
+                "index": 1,
+                "position_id": "b" * 24,
+                "fixed_pair": True,
+                "estimated_wait_minutes": 0,
+                "registrations": [first, second],
+            }
+        ]
+        snapshot["machines"]["A"]["registration_count"] = 2
+        snapshot["machines"]["A"]["waiting_position_count"] = 1
+        snapshot["private_player_contacts"] = [
+            {
+                "registration_id": first["registration_id"],
+                "profile_id": self.profile_id,
+                "qq_number": "12345678",
+            }
+        ]
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+
+        response = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000424",
+                "actor_qq": "12345678",
+                "operation": "CANCEL_TEMPORARY_LEAVE",
+            },
+            headers=self.bot_headers,
+        )
+
+        self.assertEqual(202, response.status_code)
+        command = response.get_json()
+        self.assertEqual("CANCEL_TEMPORARY_LEAVE", command["payload"]["operation"])
+        self.assertEqual(first["registration_id"], command["payload"]["registration_id"])
+
     def test_disabling_onebot_does_not_reject_a_pending_website_join(self):
         enabled = self.remote_ready_snapshot(revision=4)
         self.client.post("/api/queue-status", json=enabled, headers=self.headers)

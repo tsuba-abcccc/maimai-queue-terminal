@@ -3,6 +3,8 @@ const assert = require('node:assert/strict')
 
 const {
   HELP_TEXT,
+  absenceOperationSuccessMessage,
+  changeAbsenceState,
   formatMachineChoice,
   formatMachineReplyHint,
   formatOwnQueue,
@@ -897,6 +899,107 @@ test('changes the personal menu with absence state and queue rules', () => {
     allow_defer_one_round: false,
     allow_temporary_leave: false,
   }), ['切换机台', '修改游玩偏好', '退出排队'])
+})
+
+test('cancels temporary leave for a fixed pair after the terminal snapshot confirms it', async () => {
+  const player = {
+    registration_id: 'registration-fixed-player',
+    profile_id: 'profile-fixed-player',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'A',
+    position: 'WAITING',
+    position_index: 1,
+    estimated_wait_minutes: null,
+    fixed_pair: true,
+    deferred_once: false,
+    temporarily_away: true,
+    temporary_away_skipped_turns: 2,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+    online_registration_pending_check_in: false,
+  }
+  const responses = [
+    {
+      queue_id: 'queue-fixed',
+      queue_rules: {
+        allow_defer_one_round: true,
+        allow_temporary_leave: true,
+      },
+      players: [player],
+    },
+    {
+      queue_id: 'queue-fixed',
+      players: [{
+        ...player,
+        temporarily_away: false,
+        temporary_away_skipped_turns: 0,
+      }],
+    },
+  ]
+  const submitted = []
+  const api = {
+    getPlayers: async () => responses.shift() || responses[responses.length - 1],
+    createQueueCommand: async (_qq, operation) => {
+      submitted.push(operation)
+      return {
+        command_id: 'command-fixed',
+        status: 'APPLIED',
+        result_detail: '固定组合的两份登记已同时取消暂时离开。',
+      }
+    },
+  }
+
+  const text = await changeAbsenceState(
+    api,
+    { commandWaitSeconds: 3 },
+    { platform: 'onebot', userId: '12345678', isDirect: true },
+    'CANCEL_TEMPORARY_LEAVE',
+  )
+
+  assert.deepEqual(submitted, ['CANCEL_TEMPORARY_LEAVE'])
+  assert.match(text, /固定组合的两份登记已同时取消暂时离开/)
+  assert.match(text, /轮空次数均已清零/)
+})
+
+test('fixed-pair personal menu exposes the matching cancel action', () => {
+  const actions = formatOwnQueueActions({
+    position: 'WAITING',
+    fixed_pair: true,
+    deferred_once: false,
+    temporarily_away: true,
+    online_registration_pending_check_in: false,
+  })
+
+  assert.deepEqual(actions, [
+    '取消暂时离开',
+    '切换机台',
+    '修改游玩偏好',
+    '退出排队',
+  ])
+})
+
+test('explains all fixed-pair absence operations as whole-group changes', () => {
+  assert.match(
+    absenceOperationSuccessMessage('DEFER_ONE_ROUND', true),
+    /两份登记已同时暂缓一轮.*跳过整组/,
+  )
+  assert.match(
+    absenceOperationSuccessMessage('CANCEL_DEFER_ONE_ROUND', true),
+    /两份登记已同时取消暂缓一轮/,
+  )
+  assert.match(
+    absenceOperationSuccessMessage('TEMPORARILY_LEAVE', true),
+    /两份登记已同时设为暂时离开.*忽略整组.*整组将退出排队/s,
+  )
+  assert.match(
+    absenceOperationSuccessMessage('CANCEL_TEMPORARY_LEAVE', true),
+    /两份登记已同时取消暂时离开.*轮空次数均已清零/,
+  )
+  assert.doesNotMatch(
+    absenceOperationSuccessMessage('CANCEL_TEMPORARY_LEAVE', false),
+    /固定组合|两份登记|整组/,
+  )
 })
 
 test('accepts concise machine letters, full names, and unique remarks', () => {

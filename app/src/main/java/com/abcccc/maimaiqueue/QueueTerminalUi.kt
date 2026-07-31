@@ -3361,7 +3361,11 @@ internal fun RegistrationApp() {
                                 updateQueue(
                                     machineId = selection.machineId,
                                     surfaceHomeFeedback = true,
-                                    homeFeedbackTitle = "暂缓一轮已取消"
+                                    homeFeedbackTitle = if (registration.fixedPartnerKey == null) {
+                                        "暂缓一轮已取消"
+                                    } else {
+                                        "固定组合已取消暂缓一轮"
+                                    }
                                 ) {
                                     it.cancelDeferOneRound(registration.key)
                                 }
@@ -3371,7 +3375,11 @@ internal fun RegistrationApp() {
                                 updateQueue(
                                     machineId = selection.machineId,
                                     surfaceHomeFeedback = true,
-                                    homeFeedbackTitle = "暂时离开已取消"
+                                    homeFeedbackTitle = if (registration.fixedPartnerKey == null) {
+                                        "暂时离开已取消"
+                                    } else {
+                                        "固定组合已取消暂时离开"
+                                    }
                                 ) {
                                     it.cancelTemporaryLeave(registration.key)
                                 }
@@ -3553,7 +3561,11 @@ internal fun RegistrationApp() {
                                         soundCue = QueueSoundCue.QUEUE_CHANGE,
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
-                                        homeFeedbackTitle = "登记已暂缓一轮"
+                                        homeFeedbackTitle = if (registration.fixedPartnerKey == null) {
+                                            "登记已暂缓一轮"
+                                        } else {
+                                            "固定组合已暂缓一轮"
+                                        }
                                     ) {
                                         it.deferOneRound(registration.key)
                                     }
@@ -3567,7 +3579,11 @@ internal fun RegistrationApp() {
                                         soundCue = QueueSoundCue.QUEUE_CHANGE,
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
-                                        homeFeedbackTitle = "登记已设为暂时离开"
+                                        homeFeedbackTitle = if (registration.fixedPartnerKey == null) {
+                                            "登记已设为暂时离开"
+                                        } else {
+                                            "固定组合已设为暂时离开"
+                                        }
                                     ) {
                                         it.temporarilyLeave(registration.key)
                                     }

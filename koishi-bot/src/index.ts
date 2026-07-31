@@ -54,6 +54,11 @@ type QueueOperation =
   | "TRANSFER_MACHINE"
   | "CHANGE_PLAY_PREFERENCE"
   | "LEAVE_QUEUE";
+type AbsenceQueueOperation =
+  | "DEFER_ONE_ROUND"
+  | "CANCEL_DEFER_ONE_ROUND"
+  | "TEMPORARILY_LEAVE"
+  | "CANCEL_TEMPORARY_LEAVE";
 
 interface QueueRules {
   allow_defer_one_round: boolean;
@@ -229,6 +234,8 @@ export const NOTIFICATION_RETRY_DELAYS_MS = [
 export const NOTIFICATION_MAX_ATTEMPTS = NOTIFICATION_RETRY_DELAYS_MS.length +
   1;
 const COMMAND_INPUT_TIMEOUT_MS = 60_000;
+const ABSENCE_STATE_CONFIRMATION_TIMEOUT_MS = 5_000;
+const ABSENCE_STATE_CONFIRMATION_INTERVAL_MS = 500;
 const BOT_IDENTITY_RETRY_INTERVAL_MS = 30_000;
 const BOT_IDENTITY_REFRESH_INTERVAL_MS = 60 * 60 * 1_000;
 
@@ -941,15 +948,11 @@ async function joinQueueFromBot(
   ].join("\n");
 }
 
-async function changeAbsenceState(
+export async function changeAbsenceState(
   api: QueueApi,
   config: Config,
   session: Session | undefined,
-  operation:
-    | "DEFER_ONE_ROUND"
-    | "CANCEL_DEFER_ONE_ROUND"
-    | "TEMPORARILY_LEAVE"
-    | "CANCEL_TEMPORARY_LEAVE",
+  operation: AbsenceQueueOperation,
 ): Promise<string> {
   const current = await requireCurrentQueueRegistration(api, session);
   const { player, response } = current;
@@ -959,47 +962,100 @@ async function changeAbsenceState(
     if (response.queue_rules?.allow_defer_one_round === false) {
       throw new Error("系统规则不允许暂缓一轮。");
     }
-    if (player.deferred_once) {
-      throw new Error("这份登记已经暂缓一轮；如需恢复，请发送“取消暂缓一轮”。");
-    }
-    if (player.temporarily_away) {
-      throw new Error("请先发送“取消暂时离开”，再设置暂缓一轮。");
-    }
-  } else if (operation === "CANCEL_DEFER_ONE_ROUND") {
-    if (!player.deferred_once) {
-      throw new Error("这份登记当前没有暂缓一轮。");
-    }
   } else if (operation === "TEMPORARILY_LEAVE") {
     if (response.queue_rules?.allow_temporary_leave === false) {
       throw new Error("系统规则不允许暂时离开。");
     }
-    if (player.temporarily_away) {
-      throw new Error("这份登记已经暂时离开；返回后请发送“取消暂时离开”。");
-    }
-    if (player.deferred_once) {
-      throw new Error("请先发送“取消暂缓一轮”，再设置暂时离开。");
-    }
-  } else if (!player.temporarily_away) {
-    throw new Error("这份登记当前没有处于暂时离开状态。");
   }
 
-  const messages: Record<typeof operation, string> = {
-    DEFER_ONE_ROUND:
-      "登记已暂缓一轮。下一次轮到时会跳过这份登记，之后自动恢复；等待顺序保持不变。",
-    CANCEL_DEFER_ONE_ROUND:
-      "登记已取消暂缓一轮，将按照当前等待顺序正常参与游玩位置分配。",
-    TEMPORARILY_LEAVE: [
-      "登记已设为暂时离开。",
+  const stateWasAlreadyApplied = absenceStateMatchesOperation(player, operation);
+  const command = await submitQueueCommand(
+    api,
+    config,
+    current.qq,
+    operation,
+  );
+  if (
+    command.status === "APPLIED" &&
+    !stateWasAlreadyApplied &&
+    !await waitForAbsenceStateConfirmation(api, current, operation)
+  ) {
+    return [
+      command.result_detail?.trim() || "现场终端已完成这次操作。",
       "",
-      "返回后需要手动发送“取消暂时离开”。在此之前，排队分组会忽略这份登记；连续轮空三次后，第四次仍未返回将退出排队。",
+      "最新队列状态仍在同步。稍后发送“我的排队”确认结果。",
+    ].join("\n");
+  }
+  return formatQueueCommandResult(
+    command,
+    absenceOperationSuccessMessage(operation, player.fixed_pair === true),
+  );
+}
+
+export function absenceOperationSuccessMessage(
+  operation: AbsenceQueueOperation,
+  fixedPair: boolean,
+): string {
+  if (!fixedPair) {
+    return {
+      DEFER_ONE_ROUND:
+        "登记已暂缓一轮。下一次轮到时会跳过这份登记，之后自动恢复；等待顺序保持不变。",
+      CANCEL_DEFER_ONE_ROUND:
+        "登记已取消暂缓一轮，将按照当前等待顺序正常参与游玩位置分配。",
+      TEMPORARILY_LEAVE: [
+        "登记已设为暂时离开。",
+        "",
+        "返回后需要手动发送“取消暂时离开”。在此之前，排队分组会忽略这份登记；连续轮空 3 次后，第四次仍未返回将退出排队。",
+      ].join("\n"),
+      CANCEL_TEMPORARY_LEAVE:
+        "登记已取消暂时离开，轮空次数已经清零，并将按照当前等待顺序正常参与游玩位置分配。",
+    }[operation];
+  }
+  return {
+    DEFER_ONE_ROUND:
+      "固定组合的两份登记已同时暂缓一轮。下一次轮到时会跳过整组，之后两份登记自动恢复；等待顺序保持不变。",
+    CANCEL_DEFER_ONE_ROUND:
+      "固定组合的两份登记已同时取消暂缓一轮，将按照当前等待顺序正常参与游玩位置分配。",
+    TEMPORARILY_LEAVE: [
+      "固定组合的两份登记已同时设为暂时离开。",
+      "",
+      "返回后，可以通过其中任一份登记发送“取消暂时离开”。在此之前，排队分组会忽略整组；连续轮空 3 次后，第四次仍未返回时，整组将退出排队。",
     ].join("\n"),
     CANCEL_TEMPORARY_LEAVE:
-      "登记已取消暂时离开，轮空次数已经清零，并将按照当前等待顺序正常参与游玩位置分配。",
-  };
-  return formatQueueCommandResult(
-    await submitQueueCommand(api, config, current.qq, operation),
-    messages[operation],
-  );
+      "固定组合的两份登记已同时取消暂时离开，轮空次数均已清零，并将按照当前等待顺序正常参与游玩位置分配。",
+  }[operation];
+}
+
+export function absenceStateMatchesOperation(
+  player: Pick<BotPlayer, "deferred_once" | "temporarily_away">,
+  operation: AbsenceQueueOperation,
+): boolean {
+  return operation === "DEFER_ONE_ROUND"
+    ? player.deferred_once && !player.temporarily_away
+    : operation === "CANCEL_DEFER_ONE_ROUND"
+    ? !player.deferred_once
+    : operation === "TEMPORARILY_LEAVE"
+    ? player.temporarily_away && !player.deferred_once
+    : !player.temporarily_away;
+}
+
+async function waitForAbsenceStateConfirmation(
+  api: QueueApi,
+  current: CurrentQueueRegistration,
+  operation: AbsenceQueueOperation,
+): Promise<boolean> {
+  const deadline = Date.now() + ABSENCE_STATE_CONFIRMATION_TIMEOUT_MS;
+  while (true) {
+    const response = await api.getPlayers(current.qq).catch(() => undefined);
+    const player = response?.queue_id === current.response.queue_id
+      ? response.players.find((candidate) =>
+        candidate.registration_id === current.player.registration_id
+      )
+      : undefined;
+    if (player && absenceStateMatchesOperation(player, operation)) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(ABSENCE_STATE_CONFIRMATION_INTERVAL_MS);
+  }
 }
 
 async function transferQueueMachine(
@@ -1163,7 +1219,10 @@ function formatQueueCommandResult(
   command: RemoteCommand,
   appliedMessage: string,
 ): string {
-  if (command.status === "APPLIED") return appliedMessage;
+  if (command.status === "APPLIED") {
+    const resultDetail = command.result_detail?.trim();
+    return resultDetail?.includes("已经") ? resultDetail : appliedMessage;
+  }
   if (command.status === "REJECTED") {
     return command.result_detail || "现场终端拒绝了这次排队操作。";
   }

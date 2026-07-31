@@ -182,6 +182,9 @@ internal fun decideRemoteQueueOperation(
         }
     }
     val (actualMachineId, queue, registration) = located
+    val affectsFixedGroup = registration.fixedPartnerKey != null
+    fun registrationSubject(single: String, fixedGroup: String): String =
+        if (affectsFixedGroup) fixedGroup else single
     if (registration.playerProfileId != profile.id) {
         return reject("这份登记已不再关联当前玩家资料。")
     }
@@ -240,7 +243,12 @@ internal fun decideRemoteQueueOperation(
             when {
                 !state.allowDeferOneRound -> return reject("系统规则不允许暂缓一轮。")
                 registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND ->
-                    return already("这份登记已经暂缓一轮。")
+                    return already(
+                        registrationSubject(
+                            "这份登记已经暂缓一轮。",
+                            "固定组合的两份登记已经暂缓一轮。"
+                        )
+                    )
                 registration.absenceStatus != QueueAbsenceStatus.NONE ->
                     return reject("请先取消当前的暂缓或暂时离开状态。")
             }
@@ -249,16 +257,31 @@ internal fun decideRemoteQueueOperation(
         RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND -> {
             when (registration.absenceStatus) {
                 QueueAbsenceStatus.DEFER_ONE_ROUND -> queue.cancelDeferOneRound(registration.key)
-                QueueAbsenceStatus.NONE -> return already("这份登记已经取消暂缓一轮。")
+                QueueAbsenceStatus.NONE -> return already(
+                    registrationSubject(
+                        "这份登记已经取消暂缓一轮。",
+                        "固定组合的两份登记已经取消暂缓一轮。"
+                    )
+                )
                 QueueAbsenceStatus.TEMPORARILY_AWAY ->
-                    return reject("这份登记当前处于暂时离开状态。")
+                    return reject(
+                        registrationSubject(
+                            "这份登记当前处于暂时离开状态。",
+                            "固定组合的两份登记当前处于暂时离开状态。"
+                        )
+                    )
             }
         }
         RemoteQueueOperation.TEMPORARILY_LEAVE -> {
             when {
                 !state.allowTemporaryLeave -> return reject("系统规则不允许暂时离开。")
                 registration.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY ->
-                    return already("这份登记已经处于暂时离开状态。")
+                    return already(
+                        registrationSubject(
+                            "这份登记已经处于暂时离开状态。",
+                            "固定组合的两份登记已经处于暂时离开状态。"
+                        )
+                    )
                 registration.absenceStatus != QueueAbsenceStatus.NONE ->
                     return reject("请先取消当前的暂缓或暂时离开状态。")
             }
@@ -267,9 +290,19 @@ internal fun decideRemoteQueueOperation(
         RemoteQueueOperation.CANCEL_TEMPORARY_LEAVE -> {
             when (registration.absenceStatus) {
                 QueueAbsenceStatus.TEMPORARILY_AWAY -> queue.cancelTemporaryLeave(registration.key)
-                QueueAbsenceStatus.NONE -> return already("这份登记已经取消暂时离开。")
+                QueueAbsenceStatus.NONE -> return already(
+                    registrationSubject(
+                        "这份登记已经取消暂时离开。",
+                        "固定组合的两份登记已经取消暂时离开。"
+                    )
+                )
                 QueueAbsenceStatus.DEFER_ONE_ROUND ->
-                    return reject("这份登记当前处于暂缓一轮状态。")
+                    return reject(
+                        registrationSubject(
+                            "这份登记当前处于暂缓一轮状态。",
+                            "固定组合的两份登记当前处于暂缓一轮状态。"
+                        )
+                    )
             }
         }
         RemoteQueueOperation.CHANGE_PLAY_PREFERENCE -> {
@@ -287,10 +320,22 @@ internal fun decideRemoteQueueOperation(
         return reject("队列状态已经变化，这项操作没有执行。")
     }
     val detail = when (command.operation) {
-        RemoteQueueOperation.DEFER_ONE_ROUND -> "登记已暂缓一轮。"
-        RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND -> "登记已取消暂缓一轮。"
-        RemoteQueueOperation.TEMPORARILY_LEAVE -> "登记已设为暂时离开。"
-        RemoteQueueOperation.CANCEL_TEMPORARY_LEAVE -> "登记已取消暂时离开。"
+        RemoteQueueOperation.DEFER_ONE_ROUND -> registrationSubject(
+            "登记已暂缓一轮。",
+            "固定组合的两份登记已同时暂缓一轮。"
+        )
+        RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND -> registrationSubject(
+            "登记已取消暂缓一轮。",
+            "固定组合的两份登记已同时取消暂缓一轮。"
+        )
+        RemoteQueueOperation.TEMPORARILY_LEAVE -> registrationSubject(
+            "登记已设为暂时离开。",
+            "固定组合的两份登记已同时设为暂时离开。"
+        )
+        RemoteQueueOperation.CANCEL_TEMPORARY_LEAVE -> registrationSubject(
+            "登记已取消暂时离开。",
+            "固定组合的两份登记已同时取消暂时离开。"
+        )
         RemoteQueueOperation.CHANGE_PLAY_PREFERENCE -> "本次游玩偏好已更新。"
         RemoteQueueOperation.LEAVE_QUEUE -> "登记已退出排队。"
         else -> "队列操作已完成。"

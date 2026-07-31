@@ -2067,19 +2067,13 @@ def build_queue_operation_payload(
     if operation == "DEFER_ONE_ROUND":
         if not queue_rules["allow_defer_one_round"]:
             return None, ("系统规则不允许暂缓一轮", 409)
-        if registration.get("deferred_once") or registration.get("temporarily_away"):
-            return None, ("请先取消当前的暂缓或暂时离开状态", 409)
-    elif operation == "CANCEL_DEFER_ONE_ROUND":
-        if not registration.get("deferred_once"):
-            return None, ("这份登记当前没有暂缓一轮", 409)
     elif operation == "TEMPORARILY_LEAVE":
         if not queue_rules["allow_temporary_leave"]:
             return None, ("系统规则不允许暂时离开", 409)
-        if registration.get("deferred_once") or registration.get("temporarily_away"):
-            return None, ("请先取消当前的暂缓或暂时离开状态", 409)
-    elif operation == "CANCEL_TEMPORARY_LEAVE":
-        if not registration.get("temporarily_away"):
-            return None, ("这份登记当前没有处于暂时离开状态", 409)
+    elif operation in {"CANCEL_DEFER_ONE_ROUND", "CANCEL_TEMPORARY_LEAVE"}:
+        # The public snapshot may lag behind the terminal by one publish cycle.
+        # The terminal owns the current absence state and performs the final check.
+        pass
     elif operation == "TRANSFER_MACHINE":
         if context["position"] == "PLAYING":
             return None, ("处于游玩位置的登记暂不能切换机台", 409)
