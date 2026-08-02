@@ -237,6 +237,22 @@ class MobileDeviceRegistrationTest {
     }
 
     @Test
+    fun delayedCommandUsesTerminalProcessingTimeForThePlayingTimer() {
+        val requested = command()
+        val processedAtMillis = 95_000L
+
+        val result = decideMobileDeviceRegistration(
+            requested,
+            state(),
+            appliedAtMillis = processedAtMillis
+        ) as MobileDeviceRegistrationDecision.Apply
+        val queue = result.state.queues.getValue("A")
+
+        assertEquals(processedAtMillis, queue.playingStartedAtMillis)
+        assertEquals(requested.createdAtMillis, queue.playing.single().createdAtMillis)
+    }
+
+    @Test
     fun commandMatchesOnlyItsOriginatingMobileSession() {
         val command = command()
         val originatingSession = MobileRegistrationSession(
@@ -251,6 +267,46 @@ class MobileDeviceRegistrationTest {
         assertTrue(command.matchesSession(originatingSession))
         assertTrue(!command.matchesSession(newerSession))
         assertTrue(!command.copy(sessionId = null).matchesSession(originatingSession))
+    }
+
+    @Test
+    fun mobileRegistrationProducesExactlyTheDirectEngineQueue() {
+        val initial = state()
+        val requested = command()
+        val appliedAtMillis = 75_000L
+        val mobile = decideMobileDeviceRegistration(
+            requested,
+            initial,
+            appliedAtMillis = appliedAtMillis
+        )
+            as MobileDeviceRegistrationDecision.Apply
+        val selectedProfile = initial.playerProfiles.single()
+        val expectedRegistration = Registration(
+            key = initial.nextRegistrationKey,
+            displayId = selectedProfile.nickname,
+            preference = requested.preference,
+            isTemporary = false,
+            createdAtMillis = requested.createdAtMillis,
+            gender = selectedProfile.gender,
+            playerProfileId = selectedProfile.id,
+            requiresOnSiteCheckIn = false,
+            originatingCommandId = requested.commandId
+        )
+        val direct = initial.executeQueueAction(
+            action = QueueAction.AddRegistrations(
+                machineId = requested.machineId,
+                registrations = listOf(expectedRegistration),
+                placement = RegistrationPlacement.ADVANCE_IF_UNAMBIGUOUS
+            ),
+            origin = QueueActionOrigin.MOBILE_DEVICE,
+            atMillis = appliedAtMillis
+        ) as QueueActionExecution.Applied
+
+        assertEquals(direct.state.queues, mobile.state.queues)
+        assertEquals(
+            direct.impact.requiresAvailabilityConfirmation,
+            mobile.needsAvailabilityConfirmation
+        )
     }
 
     private fun command() = MobileDeviceRegistrationCommand(

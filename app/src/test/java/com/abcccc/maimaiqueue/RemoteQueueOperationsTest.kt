@@ -399,6 +399,89 @@ class RemoteQueueOperationsTest {
         )
     }
 
+    @Test
+    fun remoteMutationsProduceExactlyTheSameQueueAsDirectEngineActions() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id
+        )
+        val scenarios = listOf(
+            RemoteQueueOperation.DEFER_ONE_ROUND to
+                QueueAction.DeferOneRound("A", player.key),
+            RemoteQueueOperation.TEMPORARILY_LEAVE to
+                QueueAction.TemporarilyLeave("A", player.key),
+            RemoteQueueOperation.CHANGE_PLAY_PREFERENCE to
+                QueueAction.ChangePreference("A", player.key, PlayPreference.SOLO),
+            RemoteQueueOperation.LEAVE_QUEUE to
+                QueueAction.RemoveRegistrations("A", setOf(player.key))
+        )
+
+        scenarios.forEach { (operation, action) ->
+            val initial = state(
+                machineA = MachineQueue(waiting = listOf(player)),
+                nextKey = 3
+            )
+            val command = operationCommand(
+                operation = operation,
+                registration = player,
+                preference = PlayPreference.SOLO.takeIf {
+                    operation == RemoteQueueOperation.CHANGE_PLAY_PREFERENCE
+                }
+            )
+            val remote = decideRemoteQueueOperation(
+                command = command,
+                state = initial,
+                appliedAtMillis = 8_000L
+            ) as RemoteQueueOperationDecision.Apply
+            val direct = initial.executeQueueAction(
+                action = action,
+                origin = QueueActionOrigin.QQ_BOT,
+                atMillis = 8_000L
+            ) as QueueActionExecution.Applied
+
+            assertEquals(operation.name, direct.state.queues, remote.state.queues)
+        }
+    }
+
+    @Test
+    fun remoteCancellationActionsProduceExactlyTheDirectEngineState() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id
+        )
+        val scenarios = listOf(
+            Triple(
+                RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND,
+                player.copy(absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND),
+                QueueAction.CancelDeferOneRound("A", player.key)
+            ),
+            Triple(
+                RemoteQueueOperation.CANCEL_TEMPORARY_LEAVE,
+                player.copy(absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY),
+                QueueAction.CancelTemporaryLeave("A", player.key)
+            )
+        )
+
+        scenarios.forEach { (operation, registration, action) ->
+            val initial = state(
+                machineA = MachineQueue(waiting = listOf(registration)),
+                nextKey = 3
+            )
+            val remote = decideRemoteQueueOperation(
+                operationCommand(operation, registration),
+                initial,
+                appliedAtMillis = 8_000L
+            ) as RemoteQueueOperationDecision.Apply
+            val direct = initial.executeQueueAction(
+                action = action,
+                origin = QueueActionOrigin.QQ_BOT,
+                atMillis = 8_000L
+            ) as QueueActionExecution.Applied
+
+            assertEquals(operation.name, direct.state.queues, remote.state.queues)
+        }
+    }
+
     private fun state(
         machineA: MachineQueue = MachineQueue(),
         machineB: MachineQueue = MachineQueue(),

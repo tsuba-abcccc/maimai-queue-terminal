@@ -524,6 +524,40 @@ internal fun RegistrationApp() {
         if (machineId == MachineId.A) machineA = queue else machineB = queue
     }
 
+    fun currentQueueEngineState(): QueueEngineState = QueueEngineState(
+        linkedMapOf(
+            MachineId.A.name to machineA,
+            MachineId.B.name to machineB
+        )
+    )
+
+    fun currentQueueEnginePolicy(): QueueEnginePolicy = QueueEnginePolicy(
+        registrationOpen = acceptingNewRegistrations,
+        allowOnlineRegistration = queueRuleSettings.allowOnlineRegistration,
+        allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
+        allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
+        machineStatuses = mapOf(
+            MachineId.A.name to machineAStatus,
+            MachineId.B.name to machineBStatus
+        ),
+        maxRegistrationsPerMachine = 20,
+        requireOperationalForPlayerActions = true
+    )
+
+    fun planQueueAction(
+        action: QueueAction,
+        origin: QueueActionOrigin = QueueActionOrigin.ON_SITE_TERMINAL,
+        atMillis: Long = System.currentTimeMillis()
+    ): QueueActionPlan = QueueEngine.plan(
+        state = currentQueueEngineState(),
+        action = action,
+        context = QueueActionContext(
+            atMillis = atMillis,
+            origin = origin,
+            policy = currentQueueEnginePolicy()
+        )
+    )
+
     fun appendAuditLog(entry: AuditLogEntry) {
         val queueScopedEntry = if (entry.queueId == null) entry.copy(queueId = queueId) else entry
         auditLogs = (listOf(queueScopedEntry) + auditLogs.filterNot {
@@ -788,33 +822,98 @@ internal fun RegistrationApp() {
         return true
     }
 
+    fun updateQueueByPlan(
+        plan: QueueActionPlan,
+        soundCue: QueueSoundCue? = null,
+        publicEventTypeOverride: PublicQueueEventType? = null,
+        affectedRegistrationKeysOverride: Collection<Int> = emptyList(),
+        classifyMissedOnlineRegistrations: Boolean = false,
+        source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
+        surfaceHomeFeedback: Boolean = false,
+        homeFeedbackTone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS,
+        homeFeedbackTitle: String? = null,
+        executionAtMillis: Long = plan.context.atMillis
+    ): Boolean {
+        val machineId = MachineId.entries.firstOrNull { it.name == plan.action.machineId }
+            ?: return false
+        return updateQueue(
+            machineId = machineId,
+            soundCue = soundCue,
+            publicEventTypeOverride = publicEventTypeOverride,
+            affectedRegistrationKeysOverride = affectedRegistrationKeysOverride,
+            classifyMissedOnlineRegistrations = classifyMissedOnlineRegistrations,
+            source = source,
+            surfaceHomeFeedback = surfaceHomeFeedback,
+            homeFeedbackTone = homeFeedbackTone,
+            homeFeedbackTitle = homeFeedbackTitle
+        ) { currentQueue ->
+            val currentState = currentQueueEngineState().replace(machineId.name, currentQueue)
+            when (val execution = plan.applyTo(
+                currentState,
+                currentQueueEnginePolicy(),
+                executionAtMillis
+            )) {
+                is QueueActionExecution.Applied ->
+                    execution.state.queue(machineId.name) ?: currentQueue
+                is QueueActionExecution.Rejected -> currentQueue
+            }
+        }
+    }
+
+    fun updateQueueByAction(
+        action: QueueAction,
+        soundCue: QueueSoundCue? = null,
+        publicEventTypeOverride: PublicQueueEventType? = null,
+        affectedRegistrationKeysOverride: Collection<Int> = emptyList(),
+        classifyMissedOnlineRegistrations: Boolean = false,
+        source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
+        surfaceHomeFeedback: Boolean = false,
+        homeFeedbackTone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS,
+        homeFeedbackTitle: String? = null,
+        origin: QueueActionOrigin = QueueActionOrigin.ON_SITE_TERMINAL,
+        atMillis: Long = System.currentTimeMillis()
+    ): Boolean = updateQueueByPlan(
+        plan = planQueueAction(action, origin, atMillis),
+        soundCue = soundCue,
+        publicEventTypeOverride = publicEventTypeOverride,
+        affectedRegistrationKeysOverride = affectedRegistrationKeysOverride,
+        classifyMissedOnlineRegistrations = classifyMissedOnlineRegistrations,
+        source = source,
+        surfaceHomeFeedback = surfaceHomeFeedback,
+        homeFeedbackTone = homeFeedbackTone,
+        homeFeedbackTitle = homeFeedbackTitle
+    )
+
     fun updateQueueAfterOnSiteRegistration(
         machineId: MachineId,
         soundCue: QueueSoundCue,
         advanceWhenPlayingEmpty: Boolean = true,
-        transform: (MachineQueue) -> MachineQueue
+        action: QueueAction
     ): Boolean {
-        val beforeQueue = queueFor(machineId)
-        val stagedQueue = transform(beforeQueue)
-        if (stagedQueue == beforeQueue) return false
-        val roundPlan = RoundPlanner.enterPlayingPosition(stagedQueue)
-        val preview = roundPlan.preview
-        val needsAvailabilityConfirmation = advanceWhenPlayingEmpty &&
-            stagedQueue.playing.isEmpty() &&
-            preview?.changedByAvailability == true
-        val afterQueue = if (advanceWhenPlayingEmpty && !needsAvailabilityConfirmation) {
-            roundPlan.execute()
-        } else {
-            stagedQueue
+        if (action.machineId != machineId.name) return false
+        val normalizedAction = when (action) {
+            is QueueAction.AddRegistrations -> action.copy(
+                placement = if (advanceWhenPlayingEmpty) {
+                    RegistrationPlacement.ADVANCE_IF_UNAMBIGUOUS
+                } else {
+                    RegistrationPlacement.WAITING_TAIL
+                }
+            )
+            is QueueAction.CreateFixedPair -> action.copy(
+                advanceWhenPlayingEmpty = advanceWhenPlayingEmpty
+            )
+            is QueueAction.CreateFixedPairWithRegistration -> action.copy(
+                advanceWhenPlayingEmpty = advanceWhenPlayingEmpty
+            )
+            else -> return false
         }
-        val changed = updateQueue(
-            machineId = machineId,
+        val plan = planQueueAction(normalizedAction)
+        val changed = updateQueueByPlan(
+            plan = plan,
             soundCue = soundCue,
             classifyMissedOnlineRegistrations = true
-        ) { currentQueue ->
-            if (currentQueue == beforeQueue) afterQueue else currentQueue
-        }
-        if (changed && needsAvailabilityConfirmation && queueFor(machineId) == afterQueue) {
+        )
+        if (changed && plan.impact.requiresAvailabilityConfirmation) {
             enterPlayingConfirmation = machineId
         }
         return changed
@@ -864,13 +963,66 @@ internal fun RegistrationApp() {
         return true
     }
 
+    fun updateQueueWithUndoByPlan(
+        plan: QueueActionPlan,
+        message: String,
+        feedbackTitle: String = message.substringAfter(" 的 ", message),
+        feedbackDetail: String = "$message。",
+        executionAtMillis: Long = plan.context.atMillis
+    ): Boolean {
+        val machineId = MachineId.entries.firstOrNull { it.name == plan.action.machineId }
+            ?: return false
+        return updateQueueWithUndo(
+            machineId = machineId,
+            message = message,
+            feedbackTitle = feedbackTitle,
+            feedbackDetail = feedbackDetail
+        ) { currentQueue ->
+            val currentState = currentQueueEngineState().replace(machineId.name, currentQueue)
+            when (val execution = plan.applyTo(
+                currentState,
+                currentQueueEnginePolicy(),
+                executionAtMillis
+            )) {
+                is QueueActionExecution.Applied ->
+                    execution.state.queue(machineId.name) ?: currentQueue
+                is QueueActionExecution.Rejected -> currentQueue
+            }
+        }
+    }
+
+    fun updateQueueWithUndoByAction(
+        action: QueueAction,
+        message: String,
+        feedbackTitle: String = message.substringAfter(" 的 ", message),
+        feedbackDetail: String = "$message。",
+        atMillis: Long = System.currentTimeMillis()
+    ): Boolean = updateQueueWithUndoByPlan(
+        plan = planQueueAction(action, atMillis = atMillis),
+        message = message,
+        feedbackTitle = feedbackTitle,
+        feedbackDetail = feedbackDetail
+    )
+
     fun undoLatestQueueAction() {
         val action = queueUndoAction ?: return
         var restored = false
-        if (queueFor(action.machineId) == action.afterQueue) {
-            val restoredQueue = action.beforeQueue.removeAll(
-                action.nonRestorableRegistrationKeys
+        val restoreExecution = QueueEngine.execute(
+            state = currentQueueEngineState(),
+            action = QueueAction.RestoreSnapshot(
+                machineId = action.machineId.name,
+                expectedCurrentQueue = action.afterQueue,
+                restoredQueue = action.beforeQueue,
+                excludedRegistrationKeys = action.nonRestorableRegistrationKeys
+            ),
+            context = QueueActionContext(
+                origin = QueueActionOrigin.SYSTEM,
+                policy = currentQueueEnginePolicy()
             )
+        ) as? QueueActionExecution.Applied
+        if (restoreExecution != null) {
+            val restoredQueue = restoreExecution.state.queue(action.machineId.name)
+                ?: action.afterQueue
             setQueue(action.machineId, restoredQueue)
             appendQueueAuditLog(
                 action.machineId,
@@ -965,9 +1117,16 @@ internal fun RegistrationApp() {
         val stoppedStatus = statusFor(machineId)
         if (stoppedStatus.isOperational) return
         val restoredAtMillis = System.currentTimeMillis()
-        val restoredQueue = queueFor(machineId)
-            .restartPlayingTimer(restoredAtMillis)
-            .restartPendingCheckInTimers(restoredAtMillis)
+        val restartExecution = QueueEngine.execute(
+            state = currentQueueEngineState(),
+            action = QueueAction.RestartMachineTimers(machineId.name),
+            context = QueueActionContext(
+                atMillis = restoredAtMillis,
+                origin = QueueActionOrigin.SYSTEM,
+                policy = currentQueueEnginePolicy()
+            )
+        ) as? QueueActionExecution.Applied
+        val restoredQueue = restartExecution?.state?.queue(machineId.name) ?: queueFor(machineId)
         val pendingCheckInCount = restoredQueue.allRegistrations.count {
             it.requiresOnSiteCheckIn
         }
@@ -1004,27 +1163,23 @@ internal fun RegistrationApp() {
         val destinationMachineId = otherMachine(request.sourceMachineId)
         val registrationKeys = request.registrationKeys.toSet()
         val sourceQueue = queueFor(request.sourceMachineId)
-        val destinationQueue = queueFor(destinationMachineId)
         val registrations = sourceQueue.allRegistrations
             .filter { it.key in registrationKeys }
         val releasedPartnerRegistrations = sourceQueue.allRegistrations.filter { registration ->
             registration.key !in registrationKeys && registration.fixedPartnerKey in registrationKeys
         }
-        if (
-            !statusFor(request.sourceMachineId).isOperational ||
-            !statusFor(destinationMachineId).isOperational ||
-            registrationKeys.isEmpty() ||
-            registrations.size != registrationKeys.size ||
-            sourceQueue.playing.any { it.key in registrationKeys } ||
-            destinationQueue.registrationCount + registrations.size > 20
-        ) return false
-
-        val updatedSource = sourceQueue.removeAll(registrationKeys)
-        val updatedDestination = destinationQueue.receiveAtWaitingTail(registrations)
-        if (
-            updatedSource == sourceQueue ||
-            updatedDestination.registrationCount != destinationQueue.registrationCount + registrations.size
-        ) return false
+        val plan = planQueueAction(
+            QueueAction.TransferRegistrations(
+                sourceMachineId = request.sourceMachineId.name,
+                destinationMachineId = destinationMachineId.name,
+                registrationKeys = registrationKeys
+            )
+        )
+        val execution = plan.applyTo(currentQueueEngineState(), currentQueueEnginePolicy())
+            as? QueueActionExecution.Applied
+            ?: return false
+        val updatedSource = execution.state.queue(request.sourceMachineId.name) ?: return false
+        val updatedDestination = execution.state.queue(destinationMachineId.name) ?: return false
 
         queueUndoAction = null
         setQueue(request.sourceMachineId, updatedSource)
@@ -1104,12 +1259,26 @@ internal fun RegistrationApp() {
         } else {
             playerProfiles + profile
         }
-        updateQueue(MachineId.A, source = source) {
-            it.syncPlayerProfileDetails(profile.id, profile.nickname, profile.gender)
-        }
-        updateQueue(MachineId.B, source = source) {
-            it.syncPlayerProfileDetails(profile.id, profile.nickname, profile.gender)
-        }
+        updateQueueByAction(
+            action = QueueAction.SyncPlayerProfileDetails(
+                MachineId.A.name,
+                profile.id,
+                profile.nickname,
+                profile.gender
+            ),
+            source = source,
+            origin = QueueActionOrigin.SYSTEM
+        )
+        updateQueueByAction(
+            action = QueueAction.SyncPlayerProfileDetails(
+                MachineId.B.name,
+                profile.id,
+                profile.nickname,
+                profile.gender
+            ),
+            source = source,
+            origin = QueueActionOrigin.SYSTEM
+        )
         if (recordAudit && (
             existingProfile == null ||
             existingProfile.nickname != profile.nickname ||
@@ -1257,9 +1426,22 @@ internal fun RegistrationApp() {
         val removedCount = machineA.registrationCount + machineB.registrationCount
         val removedRegistrationKeys = (machineA.allRegistrations + machineB.allRegistrations)
             .map { it.key }
+        val clearExecution = QueueEngine.execute(
+            state = currentQueueEngineState(),
+            action = QueueAction.ClearRegistrations(MachineId.entries.mapTo(mutableSetOf()) { it.name }),
+            context = QueueActionContext(
+                origin = if (automaticBusinessHours) {
+                    QueueActionOrigin.SYSTEM
+                } else {
+                    QueueActionOrigin.ON_SITE_TERMINAL
+                },
+                policy = currentQueueEnginePolicy()
+            )
+        ) as? QueueActionExecution.Applied
+        if (removedCount > 0 && clearExecution == null) return
         queueUndoAction = null
-        machineA = MachineQueue()
-        machineB = MachineQueue()
+        machineA = clearExecution?.state?.queue(MachineId.A.name) ?: MachineQueue()
+        machineB = clearExecution?.state?.queue(MachineId.B.name) ?: MachineQueue()
         registrationOpen = false
         queueSoundPlayer.play(QueueSoundCue.CAUTION)
         val detail = if (removedCount == 0) {
@@ -1380,12 +1562,14 @@ internal fun RegistrationApp() {
         selection: SelectedRegistration? = stagedFriendPairRegistration
     ) {
         if (selection == null || stagedFriendPairRegistration != selection) return
-        updateQueue(selection.machineId) { queue ->
-            if (queue.waiting.any { it.key == selection.registrationKey }) {
-                queue.remove(selection.registrationKey)
-            } else {
-                queue
-            }
+        if (queueFor(selection.machineId).waiting.any { it.key == selection.registrationKey }) {
+            updateQueueByAction(
+                action = QueueAction.RemoveRegistrations(
+                    selection.machineId.name,
+                    setOf(selection.registrationKey)
+                ),
+                origin = QueueActionOrigin.SYSTEM
+            )
         }
         stagedFriendPairRegistration = null
     }
@@ -1594,20 +1778,23 @@ internal fun RegistrationApp() {
                 return@persisted
             }
             val registrationKey = nextKey++
-            val registrationAdded = updateQueueAfterOnSiteRegistration(machineId, QueueSoundCue.CONFIRM) {
-                it.receiveAtWaitingTail(
-                    listOf(
-                    Registration(
-                        key = registrationKey,
-                        displayId = persistedProfile.nickname,
-                        preference = preference,
-                        isTemporary = false,
-                        gender = persistedProfile.gender,
-                        playerProfileId = persistedProfile.id
-                    )
-                    )
+            val registration = Registration(
+                key = registrationKey,
+                displayId = persistedProfile.nickname,
+                preference = preference,
+                isTemporary = false,
+                gender = persistedProfile.gender,
+                playerProfileId = persistedProfile.id
+            )
+            val registrationAdded = updateQueueAfterOnSiteRegistration(
+                machineId = machineId,
+                soundCue = QueueSoundCue.CONFIRM,
+                action = QueueAction.AddRegistrations(
+                    machineId.name,
+                    listOf(registration),
+                    RegistrationPlacement.ADVANCE_IF_UNAMBIGUOUS
                 )
-            }
+            )
             selectedPlayerProfileId = null
             rememberProfileJoinPreference = false
             if (registrationAdded) showNewRegistrationFeedback(machineId, registrationKey)
@@ -1688,10 +1875,14 @@ internal fun RegistrationApp() {
             val pairCreated = updateQueueAfterOnSiteRegistration(
                 selection.machineId,
                 if (shouldFinishCreation) QueueSoundCue.CONFIRM else QueueSoundCue.QUEUE_CHANGE,
-                advanceWhenPlayingEmpty = shouldFinishCreation
-            ) {
-                it.createFriendPair(latestTarget.key, friend)
-            }
+                advanceWhenPlayingEmpty = shouldFinishCreation,
+                action = QueueAction.CreateFixedPairWithRegistration(
+                    machineId = selection.machineId.name,
+                    registrationKey = latestTarget.key,
+                    friend = friend,
+                    advanceWhenPlayingEmpty = shouldFinishCreation
+                )
+            )
             if (pairCreated) {
                 nextKey++
                 if (shouldFinishCreation) {
@@ -1751,19 +1942,18 @@ internal fun RegistrationApp() {
             },
             failureDetail = "玩家资料的本次使用记录未能保存，因此尚未认领登记。请稍后重试。"
         ) { persistedProfile ->
-            updateQueue(
-                machineId = selection.machineId,
-                soundCue = QueueSoundCue.CONFIRM,
-                surfaceHomeFeedback = true
-            ) {
-                it.claimWithPlayerProfile(
+            updateQueueByAction(
+                action = QueueAction.ClaimWithPlayerProfile(
+                    machineId = selection.machineId.name,
                     registrationKey = registration.key,
                     playerProfileId = persistedProfile.id,
-                    playerNickname = persistedProfile.nickname,
+                    nickname = persistedProfile.nickname,
                     gender = persistedProfile.gender,
                     preferenceOverride = preferenceOverride
-                )
-            }
+                ),
+                soundCue = QueueSoundCue.CONFIRM,
+                surfaceHomeFeedback = true
+            )
             claimPreferenceMismatchProfileId = null
             claimTarget = null
             selectedPlayerProfileId = null
@@ -1940,11 +2130,15 @@ internal fun RegistrationApp() {
             queueFor(machineId).registrationCount >= 20
         ) return
         val registrationKey = nextKey++
-        val registrationAdded = updateQueueAfterOnSiteRegistration(machineId, QueueSoundCue.CONFIRM) {
-            it.receiveAtWaitingTail(
-                listOf(Registration(registrationKey, normalizedId, preference))
+        val registrationAdded = updateQueueAfterOnSiteRegistration(
+            machineId = machineId,
+            soundCue = QueueSoundCue.CONFIRM,
+            action = QueueAction.AddRegistrations(
+                machineId.name,
+                listOf(Registration(registrationKey, normalizedId, preference)),
+                RegistrationPlacement.ADVANCE_IF_UNAMBIGUOUS
             )
-        }
+        )
         if (registrationAdded) showNewRegistrationFeedback(machineId, registrationKey)
         screen = Screen.HOME
     }
@@ -1964,7 +2158,13 @@ internal fun RegistrationApp() {
             displayId = normalizedId,
             preference = PlayPreference.OPEN_TO_JOIN
         )
-        updateQueue(machineId) { it.stageWaiting(registration) }
+        updateQueueByAction(
+            QueueAction.AddRegistrations(
+                machineId.name,
+                listOf(registration),
+                RegistrationPlacement.STAGED_WAITING
+            )
+        )
         val selection = SelectedRegistration(machineId, registration.key)
         stagedFriendPairRegistration = selection
         friendPairTarget = selection
@@ -1994,9 +2194,15 @@ internal fun RegistrationApp() {
                 )
             }
         }
-        val registrationsAdded = updateQueueAfterOnSiteRegistration(machineId, QueueSoundCue.CONFIRM) { queue ->
-            queue.receiveAtWaitingTail(registrations)
-        }
+        val registrationsAdded = updateQueueAfterOnSiteRegistration(
+            machineId = machineId,
+            soundCue = QueueSoundCue.CONFIRM,
+            action = QueueAction.AddRegistrations(
+                machineId.name,
+                registrations,
+                RegistrationPlacement.ADVANCE_IF_UNAMBIGUOUS
+            )
+        )
         if (registrationsAdded) {
             showHomeOperationFeedback(
                 title = "批量登记已创建",
@@ -2038,14 +2244,14 @@ internal fun RegistrationApp() {
                 val expiredNames = queueBeforeRemoval.allRegistrations
                     .filter { it.key in expiredKeys }
                     .joinToString("、") { "“${it.displayId}”" }
-                val removed = updateQueue(
-                    machineId = machineId,
+                val removed = updateQueueByAction(
+                    action = QueueAction.RemoveExpiredOnlineRegistrations(machineId.name),
                     publicEventTypeOverride = PublicQueueEventType.ONLINE_CHECK_IN_TIMED_OUT,
                     affectedRegistrationKeysOverride = expiredKeys,
-                    source = AuditLogSource.SYSTEM_AUTOMATIC
-                ) { queue ->
-                    queue.removeExpiredOnlineRegistrations(nowMillis)
-                }
+                    source = AuditLogSource.SYSTEM_AUTOMATIC,
+                    origin = QueueActionOrigin.SYSTEM,
+                    atMillis = nowMillis
+                )
                 if (removed) {
                     removalNotices += "${configuredMachineName(machineId)}：$expiredNames"
                 }
@@ -3034,12 +3240,15 @@ internal fun RegistrationApp() {
                             queueFor(activeReorder.machineId)
                                 .hasSameQueueOperationState(activeReorder.queueSnapshot)
                         ) {
-                            updateQueueWithUndo(
-                                activeReorder.machineId,
-                                "${configuredMachineName(activeReorder.machineId)} 的登记顺序已调整",
+                            updateQueueWithUndoByAction(
+                                action = QueueAction.ReplaceOrder(
+                                    activeReorder.machineId.name,
+                                    registrations
+                                ),
+                                message = "${configuredMachineName(activeReorder.machineId)} 的登记顺序已调整",
                                 feedbackTitle = "登记顺序已调整",
                                 feedbackDetail = "等待登记已经按照确认后的顺序重新排列。"
-                            ) { it.replaceOrder(registrations) }
+                            )
                         }
                         reorderSession = null
                     }
@@ -3113,20 +3322,18 @@ internal fun RegistrationApp() {
                             },
                             onEnterPlaying = { machineId ->
                                 if (reorderSession == null) {
-                                    val roundPlan = RoundPlanner.enterPlayingPosition(
-                                        queueFor(machineId)
+                                    val roundPlan = planQueueAction(
+                                        QueueAction.EnterPlayingPosition(machineId.name)
                                     )
-                                    if (roundPlan.preview?.changedByAvailability == true) {
+                                    if (roundPlan.impact.requiresConfirmation) {
                                         enterPlayingConfirmation = machineId
                                     } else {
-                                        updateQueue(
-                                            machineId = machineId,
+                                        updateQueueByPlan(
+                                            plan = roundPlan,
                                             soundCue = QueueSoundCue.QUEUE_CHANGE,
                                             classifyMissedOnlineRegistrations = true,
                                             surfaceHomeFeedback = true
-                                        ) { currentQueue ->
-                                            roundPlan.applyTo(currentQueue) ?: currentQueue
-                                        }
+                                        )
                                     }
                                 }
                             },
@@ -3447,14 +3654,15 @@ internal fun RegistrationApp() {
                                 queueFor(proposal.machineId)
                                     .hasSameQueueOperationState(proposal.originalQueue)
                             ) {
-                                updateQueueWithUndo(
-                                    proposal.machineId,
-                                    "${configuredMachineName(proposal.machineId)} 的登记顺序已调整",
+                                updateQueueWithUndoByAction(
+                                    action = QueueAction.ReplaceOrder(
+                                        proposal.machineId.name,
+                                        proposal.proposedOrder
+                                    ),
+                                    message = "${configuredMachineName(proposal.machineId)} 的登记顺序已调整",
                                     feedbackTitle = "登记顺序已调整",
                                     feedbackDetail = "等待登记已经按照确认后的顺序重新排列。"
-                                ) {
-                                    it.replaceOrder(proposal.proposedOrder)
-                                }
+                                )
                             }
                             inlineReorderProposal = null
                             reorderSession = null
@@ -3475,14 +3683,15 @@ internal fun RegistrationApp() {
                                 queueFor(proposal.machineId)
                                     .hasSameQueueOperationState(proposal.originalQueue)
                             ) {
-                                updateQueueWithUndo(
-                                    proposal.machineId,
-                                    "${configuredMachineName(proposal.machineId)} 的队列位置已调整",
+                                updateQueueWithUndoByAction(
+                                    action = QueueAction.ReplaceOrder(
+                                        proposal.machineId.name,
+                                        proposal.proposedOrder
+                                    ),
+                                    message = "${configuredMachineName(proposal.machineId)} 的队列位置已调整",
                                     feedbackTitle = "队列位置已调整",
                                     feedbackDetail = "组间位置已经交换，队列位置编号也已同步更新。"
-                                ) {
-                                    it.replaceOrder(proposal.proposedOrder)
-                                }
+                                )
                             }
                             positionReorderProposal = null
                         }
@@ -3554,43 +3763,47 @@ internal fun RegistrationApp() {
                                 }
                             },
                             onCancelDeferOneRound = {
-                                updateQueue(
-                                    machineId = selection.machineId,
+                                updateQueueByAction(
+                                    action = QueueAction.CancelDeferOneRound(
+                                        selection.machineId.name,
+                                        registration.key
+                                    ),
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTitle = if (registration.fixedPartnerKey == null) {
                                         "暂缓一轮已取消"
                                     } else {
                                         "固定组合已取消暂缓一轮"
                                     }
-                                ) {
-                                    it.cancelDeferOneRound(registration.key)
-                                }
+                                )
                                 selectedRegistration = null
                             },
                             onCancelTemporaryLeave = {
-                                updateQueue(
-                                    machineId = selection.machineId,
+                                updateQueueByAction(
+                                    action = QueueAction.CancelTemporaryLeave(
+                                        selection.machineId.name,
+                                        registration.key
+                                    ),
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTitle = if (registration.fixedPartnerKey == null) {
                                         "暂时离开已取消"
                                     } else {
                                         "固定组合已取消暂时离开"
                                     }
-                                ) {
-                                    it.cancelTemporaryLeave(registration.key)
-                                }
+                                )
                                 selectedRegistration = null
                             },
                             onChangePreference = {
                                 registrationActionMode = RegistrationActionMode.PREFERENCE
                             },
                             onPreferenceSelected = { preference ->
-                                updateQueue(
-                                    machineId = selection.machineId,
+                                updateQueueByAction(
+                                    action = QueueAction.ChangePreference(
+                                        selection.machineId.name,
+                                        registration.key,
+                                        preference
+                                    ),
                                     surfaceHomeFeedback = true
-                                ) {
-                                    it.changePreference(registration.key, preference)
-                                }
+                                )
                                 selectedRegistration = null
                             },
                             onFriendPair = {
@@ -3604,12 +3817,14 @@ internal fun RegistrationApp() {
                             onRenameConfirm = {
                                 val normalized = renameDraft.trim()
                                 if (normalized.isNotBlank() && !idAlreadyExists(normalized, registration.key)) {
-                                    updateQueue(
-                                        machineId = selection.machineId,
+                                    updateQueueByAction(
+                                        action = QueueAction.RenameRegistration(
+                                            selection.machineId.name,
+                                            registration.key,
+                                            normalized
+                                        ),
                                         surfaceHomeFeedback = true
-                                    ) {
-                                        it.rename(registration.key, normalized)
-                                    }
+                                    )
                                     selectedRegistration = null
                                 }
                             },
@@ -3670,8 +3885,11 @@ internal fun RegistrationApp() {
                                     linkedPlayerProfile?.hasValidContact == true &&
                                     linkedPlayerProfile.hasCompleteRequiredDetails
                                 ) {
-                                    updateQueue(
-                                        machineId = selection.machineId,
+                                    updateQueueByAction(
+                                        action = QueueAction.CheckIn(
+                                            selection.machineId.name,
+                                            registration.key
+                                        ),
                                         soundCue = QueueSoundCue.CONFIRM,
                                         publicEventTypeOverride =
                                             PublicQueueEventType.ONLINE_CHECK_IN_COMPLETED,
@@ -3679,9 +3897,7 @@ internal fun RegistrationApp() {
                                             listOf(registration.key),
                                         surfaceHomeFeedback = true,
                                         homeFeedbackTitle = "现场签到已完成"
-                                    ) {
-                                        it.checkIn(registration.key)
-                                    }
+                                    )
                                 } else {
                                     incompleteCheckInProfileId =
                                         registration.playerProfileId.orEmpty()
@@ -3714,16 +3930,15 @@ internal fun RegistrationApp() {
                             },
                             onDismiss = { moveIntoPlayingTarget = null },
                             onConfirm = {
-                                updateQueue(
-                                    machineId = selection.machineId,
+                                updateQueueByAction(
+                                    action = QueueAction.MoveWaitingRegistrationIntoCurrentRound(
+                                        selection.machineId.name,
+                                        selection.registrationKey
+                                    ),
                                     soundCue = QueueSoundCue.QUEUE_CHANGE,
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTitle = "登记已加入本轮"
-                                ) {
-                                    it.moveFirstWaitingRegistrationIntoCurrentRound(
-                                        selection.registrationKey
-                                    )
-                                }
+                                )
                                 moveIntoPlayingTarget = null
                             }
                         )
@@ -3752,8 +3967,11 @@ internal fun RegistrationApp() {
                             onDismiss = { absenceChoiceTarget = null },
                             onDeferOneRound = {
                                 if (queueRuleSettings.allowDeferOneRound) {
-                                    updateQueue(
-                                        machineId = selection.machineId,
+                                    updateQueueByAction(
+                                        action = QueueAction.DeferOneRound(
+                                            selection.machineId.name,
+                                            registration.key
+                                        ),
                                         soundCue = QueueSoundCue.QUEUE_CHANGE,
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
@@ -3762,16 +3980,17 @@ internal fun RegistrationApp() {
                                         } else {
                                             "固定组合已暂缓一轮"
                                         }
-                                    ) {
-                                        it.deferOneRound(registration.key)
-                                    }
+                                    )
                                     absenceChoiceTarget = null
                                 }
                             },
                             onTemporarilyLeave = {
                                 if (queueRuleSettings.allowTemporaryLeave) {
-                                    updateQueue(
-                                        machineId = selection.machineId,
+                                    updateQueueByAction(
+                                        action = QueueAction.TemporarilyLeave(
+                                            selection.machineId.name,
+                                            registration.key
+                                        ),
                                         soundCue = QueueSoundCue.QUEUE_CHANGE,
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
@@ -3780,9 +3999,7 @@ internal fun RegistrationApp() {
                                         } else {
                                             "固定组合已设为暂时离开"
                                         }
-                                    ) {
-                                        it.temporarilyLeave(registration.key)
-                                    }
+                                    )
                                     absenceChoiceTarget = null
                                 }
                             }
@@ -3807,10 +4024,7 @@ internal fun RegistrationApp() {
                             onGenerateFriendId = ::randomUnusedId,
                             onDismiss = {
                                 if (stagedFriendPairRegistration == selection) {
-                                    updateQueue(selection.machineId) {
-                                        it.remove(selection.registrationKey)
-                                    }
-                                    stagedFriendPairRegistration = null
+                                    removeStagedFriendPairRegistration(selection)
                                     screen = Screen.PREFERENCE
                                 }
                                 friendPairTarget = null
@@ -3830,10 +4044,15 @@ internal fun RegistrationApp() {
                                 val pairCreated = updateQueueAfterOnSiteRegistration(
                                     selection.machineId,
                                     if (shouldFinishCreation) QueueSoundCue.CONFIRM else QueueSoundCue.QUEUE_CHANGE,
-                                    advanceWhenPlayingEmpty = shouldFinishCreation
-                                ) {
-                                    it.applyFriendPair(plan)
-                                }
+                                    advanceWhenPlayingEmpty = shouldFinishCreation,
+                                    action = QueueAction.CreateFixedPair(
+                                        machineId = selection.machineId.name,
+                                        firstRegistrationKey = plan.firstRegistration.key,
+                                        secondRegistrationKey = plan.secondRegistration.key,
+                                        expectedPlan = plan,
+                                        advanceWhenPlayingEmpty = shouldFinishCreation
+                                    )
+                                )
                                 if (shouldFinishCreation && pairCreated) {
                                     stagedFriendPairRegistration = null
                                     showNewRegistrationFeedback(
@@ -3875,10 +4094,14 @@ internal fun RegistrationApp() {
                                     val pairCreated = updateQueueAfterOnSiteRegistration(
                                         selection.machineId,
                                         if (shouldFinishCreation) QueueSoundCue.CONFIRM else QueueSoundCue.QUEUE_CHANGE,
-                                        advanceWhenPlayingEmpty = shouldFinishCreation
-                                    ) {
-                                        it.createFriendPair(registration.key, friend)
-                                    }
+                                        advanceWhenPlayingEmpty = shouldFinishCreation,
+                                        action = QueueAction.CreateFixedPairWithRegistration(
+                                            machineId = selection.machineId.name,
+                                            registrationKey = registration.key,
+                                            friend = friend,
+                                            advanceWhenPlayingEmpty = shouldFinishCreation
+                                        )
+                                    )
                                     if (shouldFinishCreation && pairCreated) {
                                         stagedFriendPairRegistration = null
                                         showNewRegistrationFeedback(
@@ -3917,12 +4140,15 @@ internal fun RegistrationApp() {
                         LaunchedEffect(machineId, sourceQueue) { finishConfirmation = null }
                         return@let
                     }
-                    val finishPlan = RoundPlanner.finishRound(sourceQueue)
-                    val endOnlyPlan = RoundPlanner.endRoundOnly(sourceQueue)
-                    val removalPlan = RoundPlanner.removeCurrentRoundAndStartNext(sourceQueue)
+                    val finishPlan = planQueueAction(QueueAction.FinishRound(machineId.name))
+                    val endOnlyPlan = planQueueAction(QueueAction.EndRoundOnly(machineId.name))
+                    val removalPlan = planQueueAction(
+                        QueueAction.RemoveCurrentRoundAndStartNext(machineId.name)
+                    )
                     val playingRegistrations = sourceQueue.playing
-                    val nextPlayingNotice = nextPlayingChangeMessage(finishPlan.preview)
-                    val removalPreview = removalPlan.preview
+                    val finishPreview = finishPlan.impact.roundPreview
+                    val nextPlayingNotice = nextPlayingChangeMessage(finishPreview)
+                    val removalPreview = removalPlan.impact.roundPreview
                     RoundEndConfirmation(
                         machineName = configuredMachineName(machineId),
                         playingPositionLabel = playingPositionName(machineId),
@@ -3933,44 +4159,41 @@ internal fun RegistrationApp() {
                         closingGracePeriod = activeClosingGracePeriod,
                         onDismiss = { finishConfirmation = null },
                         onConfirm = {
-                            if (queueFor(machineId) == finishPlan.sourceQueue) {
-                                val atMillis = System.currentTimeMillis()
-                                updateQueueWithUndo(
-                                    machineId,
-                                    "${configuredMachineName(machineId)} 的本轮已结束",
-                                    feedbackTitle = if (
-                                        finishPlan.preview?.nextRegistrations.orEmpty().isEmpty()
-                                    ) {
-                                        "本轮已结束"
-                                    } else {
-                                        "本轮已结束，下一轮已开始"
-                                    },
-                                    feedbackDetail = finishPlan.preview?.nextRegistrations
-                                        .orEmpty()
-                                        .takeIf { it.isNotEmpty() }
-                                        ?.joinToString(
-                                            prefix = "现在由",
-                                            postfix = "进入${playingPositionName(machineId)}。",
-                                            separator = "、"
-                                        ) { "“${it.displayId}”" }
-                                        ?: "本轮已经结束，${playingPositionName(machineId)}目前为空。"
-                                ) { currentQueue ->
-                                    finishPlan.applyTo(currentQueue, atMillis) ?: currentQueue
-                                }
+                            val atMillis = System.currentTimeMillis()
+                            updateQueueWithUndoByPlan(
+                                plan = finishPlan,
+                                message = "${configuredMachineName(machineId)} 的本轮已结束",
+                                feedbackTitle = if (
+                                    finishPreview?.nextRegistrations.orEmpty().isEmpty()
+                                ) {
+                                    "本轮已结束"
+                                } else {
+                                    "本轮已结束，下一轮已开始"
+                                },
+                                feedbackDetail = finishPreview?.nextRegistrations
+                                    .orEmpty()
+                                    .takeIf { it.isNotEmpty() }
+                                    ?.joinToString(
+                                        prefix = "现在由",
+                                        postfix = "进入${playingPositionName(machineId)}。",
+                                        separator = "、"
+                                    ) { "“${it.displayId}”" }
+                                    ?: "本轮已经结束，${playingPositionName(machineId)}目前为空。",
+                                executionAtMillis = atMillis
+                            )
+                            if (queueFor(machineId) != sourceQueue) {
                                 finishConfirmation = null
                             }
                         },
                         onEndOnly = {
-                            if (queueFor(machineId) == endOnlyPlan.sourceQueue) {
-                                val atMillis = System.currentTimeMillis()
-                                updateQueueWithUndo(
-                                    machineId,
-                                    "${configuredMachineName(machineId)} 的本轮已结束",
-                                    feedbackTitle = "本轮已结束",
-                                    feedbackDetail = "${playingPositionName(machineId)}已经空出，等待顺序保持不变。"
-                                ) { currentQueue ->
-                                    endOnlyPlan.applyTo(currentQueue, atMillis) ?: currentQueue
-                                }
+                            val changed = updateQueueWithUndoByPlan(
+                                plan = endOnlyPlan,
+                                message = "${configuredMachineName(machineId)} 的本轮已结束",
+                                feedbackTitle = "本轮已结束",
+                                feedbackDetail = "${playingPositionName(machineId)}已经空出，等待顺序保持不变。",
+                                executionAtMillis = System.currentTimeMillis()
+                            )
+                            if (changed || queueFor(machineId) != sourceQueue) {
                                 finishConfirmation = null
                             }
                         },
@@ -3981,18 +4204,16 @@ internal fun RegistrationApp() {
                             .takeIf { it.isNotEmpty() },
                         removalNextPlayingNotice = nextPlayingChangeMessage(removalPreview),
                         onRemoveAndStartNext = {
-                            if (queueFor(machineId) == removalPlan.sourceQueue) {
-                                val atMillis = System.currentTimeMillis()
-                                updateQueue(
-                                    machineId = machineId,
-                                    soundCue = QueueSoundCue.CAUTION,
-                                    classifyMissedOnlineRegistrations = true,
-                                    surfaceHomeFeedback = true,
-                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
-                                    homeFeedbackTitle = "本轮登记已移除"
-                                ) { currentQueue ->
-                                    removalPlan.applyTo(currentQueue, atMillis) ?: currentQueue
-                                }
+                            val changed = updateQueueByPlan(
+                                plan = removalPlan,
+                                soundCue = QueueSoundCue.CAUTION,
+                                classifyMissedOnlineRegistrations = true,
+                                surfaceHomeFeedback = true,
+                                homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                homeFeedbackTitle = "本轮登记已移除",
+                                executionAtMillis = System.currentTimeMillis()
+                            )
+                            if (changed || queueFor(machineId) != sourceQueue) {
                                 finishConfirmation = null
                             }
                         }
@@ -4037,8 +4258,10 @@ internal fun RegistrationApp() {
                         LaunchedEffect(machineId, queue) { enterPlayingConfirmation = null }
                         return@let
                     }
-                    val roundPlan = RoundPlanner.enterPlayingPosition(queue)
-                    val preview = roundPlan.preview
+                    val roundPlan = planQueueAction(
+                        QueueAction.EnterPlayingPosition(machineId.name)
+                    )
+                    val preview = roundPlan.impact.roundPreview
                     val notice = nextPlayingChangeMessage(preview)
                     if (preview?.changedByAvailability == true && notice != null) {
                         EnterPlayingConfirmation(
@@ -4046,16 +4269,14 @@ internal fun RegistrationApp() {
                             notice = notice,
                             onDismiss = { enterPlayingConfirmation = null },
                             onConfirm = {
-                                if (queueFor(machineId) == roundPlan.sourceQueue) {
-                                    val atMillis = System.currentTimeMillis()
-                                    updateQueue(
-                                        machineId = machineId,
-                                        soundCue = QueueSoundCue.QUEUE_CHANGE,
-                                        classifyMissedOnlineRegistrations = true,
-                                        surfaceHomeFeedback = true
-                                    ) { currentQueue ->
-                                        roundPlan.applyTo(currentQueue, atMillis) ?: currentQueue
-                                    }
+                                val changed = updateQueueByPlan(
+                                    plan = roundPlan,
+                                    soundCue = QueueSoundCue.QUEUE_CHANGE,
+                                    classifyMissedOnlineRegistrations = true,
+                                    surfaceHomeFeedback = true,
+                                    executionAtMillis = System.currentTimeMillis()
+                                )
+                                if (changed || queueFor(machineId) != queue) {
                                     enterPlayingConfirmation = null
                                 }
                             }
@@ -4231,19 +4452,17 @@ internal fun RegistrationApp() {
                             selectedPosition = null
                         },
                         onEnterPlaying = {
-                            val roundPlan = RoundPlanner.enterPlayingPosition(
-                                queueFor(selection.machineId)
+                            val roundPlan = planQueueAction(
+                                QueueAction.EnterPlayingPosition(selection.machineId.name)
                             )
-                            if (roundPlan.preview?.changedByAvailability == true) {
+                            if (roundPlan.impact.requiresConfirmation) {
                                 enterPlayingConfirmation = selection.machineId
                             } else {
-                                updateQueue(
-                                    machineId = selection.machineId,
+                                updateQueueByPlan(
+                                    plan = roundPlan,
                                     classifyMissedOnlineRegistrations = true,
                                     surfaceHomeFeedback = true
-                                ) { currentQueue ->
-                                    roundPlan.applyTo(currentQueue) ?: currentQueue
-                                }
+                                )
                             }
                             selectedPosition = null
                         },
@@ -4298,15 +4517,14 @@ internal fun RegistrationApp() {
                         playingPositionLabel = playingPositionName(selection.machineId),
                         onDismiss = { returnPlayingTarget = null },
                         onConfirm = {
-                            updateQueue(
-                                machineId = selection.machineId,
+                            updateQueueByAction(
+                                action = QueueAction.ReturnPlayingToWaitingFront(
+                                    selection.machineId.name,
+                                    selection.registrationKeys.toSet()
+                                ),
                                 surfaceHomeFeedback = true,
                                 homeFeedbackTitle = "已撤回等待顺序前端"
-                            ) {
-                                it.returnPlayingRegistrationsToWaitingFront(
-                                    selection.registrationKeys.toSet()
-                                )
-                            }
+                            )
                             returnPlayingTarget = null
                         }
                     )
@@ -4329,15 +4547,14 @@ internal fun RegistrationApp() {
                             playingPositionLabel = playingPositionName(selection.machineId),
                             onDismiss = { returnPlayingRegistrationTarget = null },
                             onConfirm = {
-                                updateQueue(
-                                    machineId = selection.machineId,
+                                updateQueueByAction(
+                                    action = QueueAction.ReturnPlayingToWaitingFront(
+                                        selection.machineId.name,
+                                        setOf(selection.registrationKey)
+                                    ),
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTitle = "已撤回等待顺序前端"
-                                ) {
-                                    it.returnPlayingRegistrationsToWaitingFront(
-                                        setOf(selection.registrationKey)
-                                    )
-                                }
+                                )
                                 returnPlayingRegistrationTarget = null
                             }
                         )
@@ -4359,12 +4576,16 @@ internal fun RegistrationApp() {
                             .filterNot { it.canEnterPlayingPosition },
                         nextRegistrations = positions.getOrNull(targetIndex).orEmpty()
                     )
-                    val correctionPreview = if (queue.playing.isNotEmpty() && targetIndex > 0) {
-                        queue.advanceToWaitingPosition(targetKeys, atMillis = 1L)
-                    } else {
-                        queue
-                    }
-                    val correctionCanApply = correctionPreview != queue &&
+                    val correctionPlan = planQueueAction(
+                        action = QueueAction.AdvanceToWaitingPosition(
+                            selection.machineId.name,
+                            targetKeys
+                        ),
+                        atMillis = 1L
+                    )
+                    val correctionPreview = correctionPlan.resultState
+                        .queue(selection.machineId.name) ?: queue
+                    val correctionCanApply = correctionPlan.canApply &&
                         correctionPreview.playing.mapTo(mutableSetOf()) { it.key } == targetKeys
                     val correctionDisabledReason = when {
                         queue.playing.isEmpty() || targetIndex <= 0 ->
@@ -4385,14 +4606,15 @@ internal fun RegistrationApp() {
                         disabledReason = correctionDisabledReason,
                         onDismiss = { advanceToPlayingTarget = null },
                         onConfirm = {
-                            updateQueueWithUndo(
-                                selection.machineId,
-                                "${playingPositionName(selection.machineId)} 已校正",
+                            updateQueueWithUndoByAction(
+                                action = QueueAction.AdvanceToWaitingPosition(
+                                    selection.machineId.name,
+                                    targetKeys
+                                ),
+                                message = "${playingPositionName(selection.machineId)} 已校正",
                                 feedbackTitle = "游玩位置已校正",
                                 feedbackDetail = "已将${selection.label.substringBefore(" · ")}及其之前的队列位置按实际进度完成处理。"
-                            ) {
-                                it.advanceToWaitingPosition(targetKeys)
-                            }
+                            )
                             advanceToPlayingTarget = null
                         }
                     )
@@ -4407,13 +4629,15 @@ internal fun RegistrationApp() {
                         onConfirm = {
                             val firstKey = registrations.firstOrNull()?.key
                             if (firstKey != null) {
-                                updateQueue(
-                                    machineId = selection.machineId,
+                                updateQueueByAction(
+                                    action = QueueAction.ChangePreference(
+                                        selection.machineId.name,
+                                        firstKey,
+                                        PlayPreference.OPEN_TO_JOIN
+                                    ),
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTitle = "固定组合已解除"
-                                ) {
-                                    it.changePreference(firstKey, PlayPreference.OPEN_TO_JOIN)
-                                }
+                                )
                             }
                             releaseFixedPairTarget = null
                         }
@@ -4471,52 +4695,57 @@ internal fun RegistrationApp() {
                             onDismiss = { noShowTarget = null },
                             onDefer = {
                                 if (queueRuleSettings.allowDeferOneRound) {
-                                    updateQueue(
-                                        selection.machineId,
-                                        QueueSoundCue.CAUTION,
-                                        PublicQueueEventType.NO_SHOW_DEFERRED,
-                                        setOf(registration.key),
+                                    updateQueueByAction(
+                                        action = QueueAction.MarkNoShow(
+                                            selection.machineId.name,
+                                            setOf(registration.key),
+                                            NoShowResolution.DEFER_ONE_ROUND,
+                                            startNextWhenPlayingBecomesEmpty =
+                                                !selection.fromPlayingPosition
+                                        ),
+                                        soundCue = QueueSoundCue.CAUTION,
+                                        publicEventTypeOverride =
+                                            PublicQueueEventType.NO_SHOW_DEFERRED,
+                                        affectedRegistrationKeysOverride = setOf(registration.key),
                                         surfaceHomeFeedback = true,
                                         homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
-                                    ) {
-                                        it.markNoShowDeferOneRound(
-                                            registration.key,
-                                            startNextWhenPlayingBecomesEmpty = !selection.fromPlayingPosition
-                                        )
-                                    }
+                                    )
                                     noShowTarget = null
                                 }
                             },
                             onMoveToEnd = {
-                                updateQueue(
-                                    selection.machineId,
-                                    QueueSoundCue.CAUTION,
-                                    PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
-                                    setOf(registration.key),
+                                updateQueueByAction(
+                                    action = QueueAction.MarkNoShow(
+                                        selection.machineId.name,
+                                        setOf(registration.key),
+                                        NoShowResolution.MOVE_TO_TAIL,
+                                        startNextWhenPlayingBecomesEmpty =
+                                            !selection.fromPlayingPosition
+                                    ),
+                                    soundCue = QueueSoundCue.CAUTION,
+                                    publicEventTypeOverride =
+                                        PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
+                                    affectedRegistrationKeysOverride = setOf(registration.key),
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
-                                ) {
-                                    it.markNoShowMoveToEnd(
-                                        setOf(registration.key),
-                                        startNextWhenPlayingBecomesEmpty = !selection.fromPlayingPosition
-                                    )
-                                }
+                                )
                                 noShowTarget = null
                             },
                             onRemove = {
-                                updateQueue(
-                                    selection.machineId,
-                                    QueueSoundCue.CAUTION,
-                                    PublicQueueEventType.NO_SHOW_REMOVED,
-                                    setOf(registration.key),
+                                updateQueueByAction(
+                                    action = QueueAction.MarkNoShow(
+                                        selection.machineId.name,
+                                        setOf(registration.key),
+                                        NoShowResolution.REMOVE,
+                                        startNextWhenPlayingBecomesEmpty =
+                                            !selection.fromPlayingPosition
+                                    ),
+                                    soundCue = QueueSoundCue.CAUTION,
+                                    publicEventTypeOverride = PublicQueueEventType.NO_SHOW_REMOVED,
+                                    affectedRegistrationKeysOverride = setOf(registration.key),
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
-                                ) {
-                                    it.markNoShowAndRemove(
-                                        setOf(registration.key),
-                                        startNextWhenPlayingBecomesEmpty = !selection.fromPlayingPosition
-                                    )
-                                }
+                                )
                                 noShowTarget = null
                             }
                         )
@@ -4540,52 +4769,57 @@ internal fun RegistrationApp() {
                             onDismiss = { groupNoShowTarget = null },
                             onDefer = {
                                 if (queueRuleSettings.allowDeferOneRound) {
-                                    updateQueue(
-                                        selection.machineId,
-                                        QueueSoundCue.CAUTION,
-                                        PublicQueueEventType.NO_SHOW_DEFERRED,
-                                        targetKeys,
+                                    updateQueueByAction(
+                                        action = QueueAction.MarkNoShow(
+                                            selection.machineId.name,
+                                            targetKeys,
+                                            NoShowResolution.DEFER_GROUP_ONE_ROUND,
+                                            startNextWhenPlayingBecomesEmpty =
+                                                !selection.fromPlayingPosition
+                                        ),
+                                        soundCue = QueueSoundCue.CAUTION,
+                                        publicEventTypeOverride =
+                                            PublicQueueEventType.NO_SHOW_DEFERRED,
+                                        affectedRegistrationKeysOverride = targetKeys,
                                         surfaceHomeFeedback = true,
                                         homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
-                                    ) {
-                                        it.markNoShowGroupDeferOneRound(
-                                            targetKeys,
-                                            startNextWhenPlayingBecomesEmpty = !selection.fromPlayingPosition
-                                        )
-                                    }
+                                    )
                                     groupNoShowTarget = null
                                 }
                             },
                             onMoveToEnd = {
-                                updateQueue(
-                                    selection.machineId,
-                                    QueueSoundCue.CAUTION,
-                                    PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
-                                    targetKeys,
+                                updateQueueByAction(
+                                    action = QueueAction.MarkNoShow(
+                                        selection.machineId.name,
+                                        targetKeys,
+                                        NoShowResolution.MOVE_TO_TAIL,
+                                        startNextWhenPlayingBecomesEmpty =
+                                            !selection.fromPlayingPosition
+                                    ),
+                                    soundCue = QueueSoundCue.CAUTION,
+                                    publicEventTypeOverride =
+                                        PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
+                                    affectedRegistrationKeysOverride = targetKeys,
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
-                                ) {
-                                    it.markNoShowMoveToEnd(
-                                        targetKeys,
-                                        startNextWhenPlayingBecomesEmpty = !selection.fromPlayingPosition
-                                    )
-                                }
+                                )
                                 groupNoShowTarget = null
                             },
                             onRemove = {
-                                updateQueue(
-                                    selection.machineId,
-                                    QueueSoundCue.CAUTION,
-                                    PublicQueueEventType.NO_SHOW_REMOVED,
-                                    targetKeys,
+                                updateQueueByAction(
+                                    action = QueueAction.MarkNoShow(
+                                        selection.machineId.name,
+                                        targetKeys,
+                                        NoShowResolution.REMOVE,
+                                        startNextWhenPlayingBecomesEmpty =
+                                            !selection.fromPlayingPosition
+                                    ),
+                                    soundCue = QueueSoundCue.CAUTION,
+                                    publicEventTypeOverride = PublicQueueEventType.NO_SHOW_REMOVED,
+                                    affectedRegistrationKeysOverride = targetKeys,
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
-                                ) {
-                                    it.markNoShowAndRemove(
-                                        targetKeys,
-                                        startNextWhenPlayingBecomesEmpty = !selection.fromPlayingPosition
-                                    )
-                                }
+                                )
                                 groupNoShowTarget = null
                             }
                         )
@@ -4617,16 +4851,17 @@ internal fun RegistrationApp() {
                             confirmText = "确认退出",
                             onDismiss = { exitTarget = null },
                             onConfirm = {
-                                updateQueue(
-                                    machineId = selection.machineId,
+                                updateQueueByAction(
+                                    action = QueueAction.RemoveRegistrations(
+                                        selection.machineId.name,
+                                        setOf(selection.registrationKey)
+                                    ),
                                     publicEventTypeOverride =
                                         PublicQueueEventType.REGISTRATION_REMOVED,
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
                                     homeFeedbackTitle = "登记已退出排队"
-                                ) {
-                                    it.remove(selection.registrationKey)
-                                }
+                                )
                                 exitTarget = null
                             }
                         )
@@ -4647,14 +4882,17 @@ internal fun RegistrationApp() {
                             confirmText = "移除这组登记",
                             onDismiss = { removeGroupTarget = null },
                             onConfirm = {
-                                updateQueue(
-                                    machineId = selection.machineId,
+                                updateQueueByAction(
+                                    action = QueueAction.RemoveRegistrations(
+                                        selection.machineId.name,
+                                        targetKeys
+                                    ),
                                     publicEventTypeOverride =
                                         PublicQueueEventType.REGISTRATION_REMOVED,
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
                                     homeFeedbackTitle = "这组登记已移除"
-                                ) { it.removeAll(targetKeys) }
+                                )
                                 removeGroupTarget = null
                             }
                         )
@@ -11998,6 +12236,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.7.0",
+            "统一队列动作引擎",
+            "现场终端、移动设备、网站和 QQ Bot 的队列操作统一由终端动作引擎校验并执行；跨机台、撤销、本轮处理、固定组合和特殊状态继续沿用既有排队算法，同时增加原子提交、过期计划保护及连续行为对照测试。界面、同步协议和既有数据格式保持兼容。"
+        ),
         Triple(
             "0.6.7",
             "跨端队列动作一致性",

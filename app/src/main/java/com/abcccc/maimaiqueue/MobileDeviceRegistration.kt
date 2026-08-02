@@ -54,7 +54,8 @@ internal sealed interface MobileDeviceRegistrationDecision {
 internal fun decideMobileDeviceRegistration(
     command: MobileDeviceRegistrationCommand,
     state: RemoteQueueExecutionState,
-    appliedCommandIds: Set<String> = emptySet()
+    appliedCommandIds: Set<String> = emptySet(),
+    appliedAtMillis: Long = System.currentTimeMillis()
 ): MobileDeviceRegistrationDecision {
     fun reject(detail: String) = MobileDeviceRegistrationDecision.Reject(detail)
     if (command.commandId in appliedCommandIds) {
@@ -217,27 +218,30 @@ internal fun decideMobileDeviceRegistration(
         requiresOnSiteCheckIn = false,
         originatingCommandId = command.commandId
     )
-    val stagedQueue = queue.receiveAtWaitingTail(listOf(registration))
-    if (stagedQueue.registrationCount != queue.registrationCount + 1) {
+    val execution = state.executeQueueAction(
+        action = QueueAction.AddRegistrations(
+            machineId = command.machineId,
+            registrations = listOf(registration),
+            placement = RegistrationPlacement.ADVANCE_IF_UNAMBIGUOUS
+        ),
+        origin = QueueActionOrigin.MOBILE_DEVICE,
+        atMillis = appliedAtMillis
+    ) as? QueueActionExecution.Applied
+    val updatedQueue = execution?.state?.queue(command.machineId)
+    if (execution == null ||
+        updatedQueue == null ||
+        updatedQueue.registrationCount != queue.registrationCount + 1
+    ) {
         return reject("终端未能建立登记，请重新扫码后再试。")
-    }
-    val roundPlan = RoundPlanner.enterPlayingPosition(stagedQueue)
-    val preview = roundPlan.preview
-    val needsAvailabilityConfirmation = stagedQueue.playing.isEmpty() &&
-        preview?.changedByAvailability == true
-    val updatedQueue = if (stagedQueue.playing.isEmpty() && !needsAvailabilityConfirmation) {
-        roundPlan.execute()
-    } else {
-        stagedQueue
     }
     return MobileDeviceRegistrationDecision.Apply(
         state = state.copy(
-            queues = state.queues + (command.machineId to updatedQueue),
+            queues = execution.state.queues,
             nextRegistrationKey = state.nextRegistrationKey + 1
         ),
         profileToPersist = usedProfile.takeIf { it != existingProfile },
         changedMachineId = command.machineId,
-        needsAvailabilityConfirmation = needsAvailabilityConfirmation,
+        needsAvailabilityConfirmation = execution.impact.requiresAvailabilityConfirmation,
         detail = "已通过移动设备加入排队。"
     )
 }

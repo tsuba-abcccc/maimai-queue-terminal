@@ -50,6 +50,34 @@ internal data class RemoteQueueExecutionState(
     val allowTemporaryLeave: Boolean
 )
 
+internal fun RemoteQueueExecutionState.executeQueueAction(
+    action: QueueAction,
+    origin: QueueActionOrigin,
+    atMillis: Long
+): QueueActionExecution = QueueEngine.execute(
+    state = QueueEngineState(queues),
+    action = action,
+    context = QueueActionContext(
+        atMillis = atMillis,
+        origin = origin,
+        policy = QueueEnginePolicy(
+            registrationOpen = acceptingNewRegistrations,
+            allowOnlineRegistration = allowOnlineRegistration,
+            allowDeferOneRound = allowDeferOneRound,
+            allowTemporaryLeave = allowTemporaryLeave,
+            machineStatuses = machineStatuses,
+            maxRegistrationsPerMachine = MAX_REGISTRATIONS_PER_MACHINE,
+            requireOperationalForPlayerActions = true
+        )
+    )
+)
+
+private val RemoteQueueOperationSource.queueActionOrigin: QueueActionOrigin
+    get() = when (this) {
+        RemoteQueueOperationSource.QQ_BOT -> QueueActionOrigin.QQ_BOT
+        RemoteQueueOperationSource.WEBSITE_REMOTE -> QueueActionOrigin.WEBSITE
+    }
+
 internal sealed interface RemoteQueueOperationDecision {
     data class Apply(
         val state: RemoteQueueExecutionState,
@@ -157,8 +185,17 @@ internal fun decideRemoteQueueOperation(
         )
         // A remote join may arrive while the playing position was deliberately left empty.
         // It must only append the pending registration and never advance another group.
-        val updatedQueue = queue.receiveAtWaitingTail(listOf(registration))
-        if (updatedQueue.registrationCount != queue.registrationCount + 1) {
+        val execution = state.executeQueueAction(
+            action = QueueAction.AddRegistrations(
+                machineId = machineId,
+                registrations = listOf(registration),
+                placement = RegistrationPlacement.WAITING_TAIL
+            ),
+            origin = command.source.queueActionOrigin,
+            atMillis = appliedAtMillis
+        ) as? QueueActionExecution.Applied
+        val updatedQueue = execution?.state?.queue(machineId)
+        if (updatedQueue == null || updatedQueue.registrationCount != queue.registrationCount + 1) {
             return reject("终端未能建立线上登记，请重新查询后再试。")
         }
         val usedProfile = if ((profile.lastUsedAtMillis ?: Long.MIN_VALUE) < appliedAtMillis) {
@@ -170,7 +207,7 @@ internal fun decideRemoteQueueOperation(
         }
         return RemoteQueueOperationDecision.Apply(
             state = state.copy(
-                queues = state.queues + (machineId to updatedQueue),
+                queues = execution.state.queues,
                 nextRegistrationKey = state.nextRegistrationKey + 1
             ),
             detail = "线上登记已加入机台 $machineId 的等待顺序。请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。",
@@ -277,20 +314,24 @@ internal fun decideRemoteQueueOperation(
         if (targetQueue.registrationCount >= MAX_REGISTRATIONS_PER_MACHINE) {
             return reject("机台 $targetMachineId 的登记已满，暂不能转入。")
         }
-        val updatedSource = queue.remove(registration.key)
-        val updatedTarget = targetQueue.receiveAtWaitingTail(listOf(registration))
-        if (
-            updatedSource == queue ||
+        val execution = state.executeQueueAction(
+            action = QueueAction.TransferRegistrations(
+                sourceMachineId = actualMachineId,
+                destinationMachineId = targetMachineId,
+                registrationKeys = setOf(registration.key)
+            ),
+            origin = command.source.queueActionOrigin,
+            atMillis = appliedAtMillis
+        ) as? QueueActionExecution.Applied
+        val updatedTarget = execution?.state?.queue(targetMachineId)
+        if (execution == null ||
+            updatedTarget == null ||
             updatedTarget.registrationCount != targetQueue.registrationCount + 1
         ) {
             return reject("终端未能切换机台，请重新查询后再试。")
         }
         return RemoteQueueOperationDecision.Apply(
-            state = state.copy(
-                queues = state.queues +
-                    (actualMachineId to updatedSource) +
-                    (targetMachineId to updatedTarget)
-            ),
+            state = state.copy(queues = execution.state.queues),
             detail = buildString {
                 append("登记已转至机台 $targetMachineId 的等待顺序末端。")
                 if (registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND) {
@@ -321,7 +362,7 @@ internal fun decideRemoteQueueOperation(
         return reject("登记所在机台已经变化，请重新查询后再操作。")
     }
 
-    val updatedQueue = when (command.operation) {
+    val action = when (command.operation) {
         RemoteQueueOperation.DEFER_ONE_ROUND -> {
             when {
                 !state.allowDeferOneRound -> return reject("系统规则不允许暂缓一轮。")
@@ -335,11 +376,11 @@ internal fun decideRemoteQueueOperation(
                 registration.absenceStatus != QueueAbsenceStatus.NONE ->
                     return reject("请先取消当前的暂缓一轮或暂时离开状态。")
             }
-            queue.deferOneRound(registration.key)
+            QueueAction.DeferOneRound(actualMachineId, registration.key)
         }
         RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND -> {
             when (registration.absenceStatus) {
-                QueueAbsenceStatus.DEFER_ONE_ROUND -> queue.cancelDeferOneRound(registration.key)
+                QueueAbsenceStatus.DEFER_ONE_ROUND -> Unit
                 QueueAbsenceStatus.NONE -> return already(
                     registrationSubject(
                         "这份登记已经取消暂缓一轮。",
@@ -354,6 +395,7 @@ internal fun decideRemoteQueueOperation(
                         )
                     )
             }
+            QueueAction.CancelDeferOneRound(actualMachineId, registration.key)
         }
         RemoteQueueOperation.TEMPORARILY_LEAVE -> {
             when {
@@ -368,11 +410,11 @@ internal fun decideRemoteQueueOperation(
                 registration.absenceStatus != QueueAbsenceStatus.NONE ->
                     return reject("请先取消当前的暂缓一轮或暂时离开状态。")
             }
-            queue.temporarilyLeave(registration.key)
+            QueueAction.TemporarilyLeave(actualMachineId, registration.key)
         }
         RemoteQueueOperation.CANCEL_TEMPORARY_LEAVE -> {
             when (registration.absenceStatus) {
-                QueueAbsenceStatus.TEMPORARILY_AWAY -> queue.cancelTemporaryLeave(registration.key)
+                QueueAbsenceStatus.TEMPORARILY_AWAY -> Unit
                 QueueAbsenceStatus.NONE -> return already(
                     registrationSubject(
                         "这份登记已经取消暂时离开。",
@@ -387,19 +429,29 @@ internal fun decideRemoteQueueOperation(
                         )
                     )
             }
+            QueueAction.CancelTemporaryLeave(actualMachineId, registration.key)
         }
         RemoteQueueOperation.CHANGE_PLAY_PREFERENCE -> {
             val preference = command.preference ?: return reject("请选择本次游玩偏好。")
             if (registration.preference == preference && registration.fixedPartnerKey == null) {
                 return already("这份登记已经使用所选游玩偏好。")
             }
-            queue.changePreference(registration.key, preference)
+            QueueAction.ChangePreference(actualMachineId, registration.key, preference)
         }
-        RemoteQueueOperation.LEAVE_QUEUE -> queue.remove(registration.key)
+        RemoteQueueOperation.LEAVE_QUEUE -> QueueAction.RemoveRegistrations(
+            actualMachineId,
+            setOf(registration.key)
+        )
         RemoteQueueOperation.JOIN_QUEUE,
         RemoteQueueOperation.TRANSFER_MACHINE -> error("operation handled above")
     }
-    if (updatedQueue == queue) {
+    val execution = state.executeQueueAction(
+        action = action,
+        origin = command.source.queueActionOrigin,
+        atMillis = appliedAtMillis
+    ) as? QueueActionExecution.Applied
+    val updatedQueue = execution?.state?.queue(actualMachineId)
+    if (execution == null || updatedQueue == null || updatedQueue == queue) {
         return reject("队列状态已经变化，这项操作没有执行。")
     }
     val detail = when (command.operation) {
@@ -440,7 +492,7 @@ internal fun decideRemoteQueueOperation(
         else -> "队列操作已完成。"
     }
     return RemoteQueueOperationDecision.Apply(
-        state = state.copy(queues = state.queues + (actualMachineId to updatedQueue)),
+        state = state.copy(queues = execution.state.queues),
         detail = detail,
         changedMachineIds = setOf(actualMachineId)
     )

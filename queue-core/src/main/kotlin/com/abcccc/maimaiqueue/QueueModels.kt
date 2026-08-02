@@ -175,15 +175,21 @@ data class MachineQueue(
                 ?.any { it.key == registrationKey } == true
     }
 
-    fun join(registration: Registration): MachineQueue {
+    fun join(registration: Registration): MachineQueue =
+        join(registration, System.currentTimeMillis())
+
+    fun join(registration: Registration, atMillis: Long): MachineQueue {
         val accepted = acceptUniqueRegistrations(listOf(registration)).firstOrNull() ?: return this
-        return copy(waiting = waiting + accepted).advanceIfNeeded()
+        return copy(waiting = waiting + accepted).advanceIfNeeded(atMillis)
     }
 
-    fun joinAll(registrations: List<Registration>): MachineQueue {
+    fun joinAll(registrations: List<Registration>): MachineQueue =
+        joinAll(registrations, System.currentTimeMillis())
+
+    fun joinAll(registrations: List<Registration>, atMillis: Long): MachineQueue {
         val accepted = acceptUniqueRegistrations(registrations)
         if (accepted.isEmpty()) return this
-        return copy(waiting = waiting + accepted).advanceIfNeeded()
+        return copy(waiting = waiting + accepted).advanceIfNeeded(atMillis)
     }
 
     /** Adds a registration to the waiting order while a multi-step preference flow is unfinished. */
@@ -332,7 +338,10 @@ data class MachineQueue(
     }
 
     /** Skips exactly one opportunity while preserving the registration's physical order. */
-    fun deferOneRound(registrationKey: Int): MachineQueue {
+    fun deferOneRound(
+        registrationKey: Int,
+        atMillis: Long = System.currentTimeMillis()
+    ): MachineQueue {
         val affectedKeys = fixedGroupKeys(registrationKey)
         if (
             affectedKeys.isEmpty() ||
@@ -353,7 +362,7 @@ data class MachineQueue(
                 playingStartedAtMillis = if (remainingPlayers.isEmpty()) null else playingStartedAtMillis
             )
             return if (remainingPlayers.isEmpty()) {
-                updated.advanceIfNeeded()
+                updated.advanceIfNeeded(atMillis)
             } else {
                 updated
             }
@@ -385,7 +394,10 @@ data class MachineQueue(
     }
 
     /** Keeps skipping turns until manually cancelled, rotating to the tail after each skipped turn. */
-    fun temporarilyLeave(registrationKey: Int): MachineQueue {
+    fun temporarilyLeave(
+        registrationKey: Int,
+        atMillis: Long = System.currentTimeMillis()
+    ): MachineQueue {
         val affectedKeys = fixedGroupKeys(registrationKey)
         if (
             affectedKeys.isEmpty() ||
@@ -406,7 +418,10 @@ data class MachineQueue(
                 playingStartedAtMillis = if (remainingPlayers.isEmpty()) null else playingStartedAtMillis
             )
             return if (remainingPlayers.isEmpty()) {
-                updated.advanceIfNeeded(skippedThisOpportunity = affectedKeys)
+                updated.advanceIfNeeded(
+                    atMillis = atMillis,
+                    skippedThisOpportunity = affectedKeys
+                )
             } else {
                 updated
             }
@@ -789,7 +804,8 @@ data class MachineQueue(
 
     fun markNoShowDeferOneRound(
         registrationKey: Int,
-        startNextWhenPlayingBecomesEmpty: Boolean = true
+        startNextWhenPlayingBecomesEmpty: Boolean = true,
+        atMillis: Long = System.currentTimeMillis()
     ): MachineQueue {
         val affectedKeys = fixedGroupKeys(registrationKey)
         if (affectedKeys.isEmpty() || affectedKeys.any { !canMarkNoShow(it) }) return this
@@ -813,7 +829,7 @@ data class MachineQueue(
         )
         val deferred = updated.deferRegistrationsOneRound(affectedKeys)
         return if (startNextWhenPlayingBecomesEmpty && deferred.playing.isEmpty()) {
-            deferred.advanceIfNeeded()
+            deferred.advanceIfNeeded(atMillis)
         } else {
             deferred
         }
@@ -821,7 +837,8 @@ data class MachineQueue(
 
     fun markNoShowMoveToEnd(
         registrationKeys: Set<Int>,
-        startNextWhenPlayingBecomesEmpty: Boolean = true
+        startNextWhenPlayingBecomesEmpty: Boolean = true,
+        atMillis: Long = System.currentTimeMillis()
     ): MachineQueue {
         if (registrationKeys.isEmpty() || registrationKeys.any { !canMarkNoShow(it) }) {
             return this
@@ -854,7 +871,7 @@ data class MachineQueue(
             playingStartedAtMillis = if (sanitizedPlaying.isEmpty()) null else playingStartedAtMillis
         )
         return if (startNextWhenPlayingBecomesEmpty && updated.playing.isEmpty()) {
-            updated.advanceIfNeeded()
+            updated.advanceIfNeeded(atMillis)
         } else {
             updated
         }
@@ -862,7 +879,8 @@ data class MachineQueue(
 
     fun markNoShowGroupDeferOneRound(
         registrationKeys: Set<Int>,
-        startNextWhenPlayingBecomesEmpty: Boolean = true
+        startNextWhenPlayingBecomesEmpty: Boolean = true,
+        atMillis: Long = System.currentTimeMillis()
     ): MachineQueue {
         if (registrationKeys.isEmpty() || registrationKeys.any { !canMarkNoShow(it) }) {
             return this
@@ -878,7 +896,7 @@ data class MachineQueue(
         }
         val deferred = updated.deferRegistrationsOneRound(affectedKeys)
         return if (startNextWhenPlayingBecomesEmpty && deferred.playing.isEmpty()) {
-            deferred.advanceIfNeeded()
+            deferred.advanceIfNeeded(atMillis)
         } else {
             deferred
         }
@@ -886,14 +904,15 @@ data class MachineQueue(
 
     fun markNoShowAndRemove(
         registrationKeys: Set<Int>,
-        startNextWhenPlayingBecomesEmpty: Boolean = true
+        startNextWhenPlayingBecomesEmpty: Boolean = true,
+        atMillis: Long = System.currentTimeMillis()
     ): MachineQueue {
         if (registrationKeys.isEmpty() || registrationKeys.any { !canMarkNoShow(it) }) {
             return this
         }
         val updated = removeAll(registrationKeys)
         return if (startNextWhenPlayingBecomesEmpty && updated.playing.isEmpty()) {
-            updated.advanceIfNeeded()
+            updated.advanceIfNeeded(atMillis)
         } else {
             updated
         }
