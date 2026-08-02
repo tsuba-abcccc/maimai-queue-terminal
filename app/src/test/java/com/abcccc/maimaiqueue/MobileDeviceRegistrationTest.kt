@@ -7,6 +7,24 @@ import org.junit.Test
 
 class MobileDeviceRegistrationTest {
     @Test
+    fun registrationCanProceedImmediatelyAfterTheTerminalReopensTheQueue() {
+        val closed = decideMobileDeviceRegistration(
+            command(),
+            state().copy(acceptingNewRegistrations = false)
+        )
+        val reopened = decideMobileDeviceRegistration(
+            command(),
+            state().copy(acceptingNewRegistrations = true)
+        )
+
+        assertEquals(
+            "现场当前没有使用登记排队。",
+            (closed as MobileDeviceRegistrationDecision.Reject).detail
+        )
+        assertTrue(reopened is MobileDeviceRegistrationDecision.Apply)
+    }
+
+    @Test
     fun existingCompleteProfileCreatesANormalOnSiteRegistration() {
         val result = decideMobileDeviceRegistration(command(), state())
 

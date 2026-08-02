@@ -93,6 +93,7 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
@@ -359,6 +360,7 @@ internal fun RegistrationApp() {
         lastHandledClosingOccurrenceId
     )
     val acceptingNewRegistrations = registrationOpen && !closingOccurrencePending
+    val latestAcceptingNewRegistrations by rememberUpdatedState(acceptingNewRegistrations)
 
     fun showHomeOperationFeedback(
         title: String,
@@ -2346,7 +2348,7 @@ internal fun RegistrationApp() {
         ),
         playerProfiles = playerProfiles,
         nextRegistrationKey = nextKey,
-        acceptingNewRegistrations = acceptingNewRegistrations,
+        acceptingNewRegistrations = latestAcceptingNewRegistrations,
         websiteRemoteEnabled = queueRuleSettings.websiteSyncEnabled,
         oneBotSyncEnabled = queueRuleSettings.websiteSyncEnabled &&
             queueRuleSettings.oneBotSyncEnabled,
@@ -12236,6 +12238,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.7.1",
+            "线上登记开放状态修复",
+            "修复终端关闭登记后再次开放时，网站和 QQ Bot 仍可能被旧状态拒绝加入排队的问题。远程命令轮询现在会持续读取终端最新的登记开放状态，无需重启应用或重新切换同步开关。"
+        ),
         Triple(
             "0.7.0",
             "统一队列动作引擎",

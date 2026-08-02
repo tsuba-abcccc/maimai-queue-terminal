@@ -260,6 +260,14 @@ class RemoteQueueOperationsTest {
     fun joinRevalidatesCurrentCapacityAndFeatureSwitches() {
         val full = MachineQueue(waiting = (1..20).map { registration(it, "玩家$it") })
         val capacity = decideRemoteQueueOperation(joinCommand(), state(machineA = full, nextKey = 21))
+        val closed = decideRemoteQueueOperation(
+            joinCommand(),
+            state().copy(acceptingNewRegistrations = false)
+        )
+        val reopened = decideRemoteQueueOperation(
+            joinCommand(),
+            state().copy(acceptingNewRegistrations = true)
+        )
         val disabled = decideRemoteQueueOperation(
             joinCommand(),
             state().copy(websiteRemoteEnabled = false)
@@ -270,6 +278,11 @@ class RemoteQueueOperationsTest {
         )
 
         assertTrue(capacity is RemoteQueueOperationDecision.Reject)
+        assertEquals(
+            "现场当前没有使用登记排队，暂不能线上加入排队。",
+            (closed as RemoteQueueOperationDecision.Reject).detail
+        )
+        assertTrue(reopened is RemoteQueueOperationDecision.Apply)
         assertTrue(disabled is RemoteQueueOperationDecision.Reject)
         assertEquals(
             "现场规则暂不允许线上登记。",
