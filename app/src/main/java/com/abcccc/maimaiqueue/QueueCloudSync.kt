@@ -217,6 +217,7 @@ internal data class QueuePublicDisplaySettings(
     val allowDeferOneRound: Boolean = true,
     val allowTemporaryLeave: Boolean = true,
     val allowOnlineRegistration: Boolean = true,
+    val showCommonPlayPreview: Boolean = true,
     val businessHours: QueuePublicBusinessHours = QueuePublicBusinessHours()
 )
 
@@ -1285,6 +1286,7 @@ internal fun buildPublicQueueSnapshot(
                     ),
                     queue = state.machineA,
                     status = state.machineAStatus,
+                    showCommonPlayPreview = displaySettings.showCommonPlayPreview,
                     capturedAtMillis = capturedAtMillis
                 )
             )
@@ -1300,6 +1302,7 @@ internal fun buildPublicQueueSnapshot(
                     ),
                     queue = state.machineB,
                     status = state.machineBStatus,
+                    showCommonPlayPreview = displaySettings.showCommonPlayPreview,
                     capturedAtMillis = capturedAtMillis
                 )
             )
@@ -1362,73 +1365,92 @@ private fun buildPublicMachine(
     machineName: String,
     queue: MachineQueue,
     status: MachineStatus,
+    showCommonPlayPreview: Boolean,
     capturedAtMillis: Long
-): JSONObject = JSONObject().apply {
-    put("id", machineId)
-    put("name", machineName)
-    put("operational", status.isOperational)
-    put("stop_reason", status.stopReason?.name ?: JSONObject.NULL)
-    put("stop_reason_detail", status.stopReasonDetail ?: JSONObject.NULL)
-    put("stopped_at", status.stoppedAtMillis ?: JSONObject.NULL)
-    put(
-        "playing_started_at",
-        queue.playingStartedAtMillis.takeIf { status.isOperational } ?: JSONObject.NULL
-    )
-    put("registration_count", queue.registrationCount)
-    put("waiting_position_count", queue.waitingPositions().size)
-    put(
-        "new_registration_estimated_wait_minutes",
-        if (status.isOperational && queue.registrationCount < 20) {
-            estimatedWaitForNewOpenRegistration(queue, capturedAtMillis) ?: JSONObject.NULL
-        } else {
-            JSONObject.NULL
-        }
-    )
-    put(
-        "playing",
-        JSONArray().apply {
-            queue.playing.forEach { registration ->
-                put(buildPublicRegistration(queueId, registration))
+): JSONObject {
+    val waitingProjection = queue.waitingProjection(
+        includeCommonPlayPreview = showCommonPlayPreview && status.isOperational
+    ).positions
+    return JSONObject().apply {
+        put("id", machineId)
+        put("name", machineName)
+        put("operational", status.isOperational)
+        put("stop_reason", status.stopReason?.name ?: JSONObject.NULL)
+        put("stop_reason_detail", status.stopReasonDetail ?: JSONObject.NULL)
+        put("stopped_at", status.stoppedAtMillis ?: JSONObject.NULL)
+        put(
+            "playing_started_at",
+            queue.playingStartedAtMillis.takeIf { status.isOperational } ?: JSONObject.NULL
+        )
+        put("registration_count", queue.registrationCount)
+        put("waiting_position_count", waitingProjection.size)
+        put(
+            "new_registration_estimated_wait_minutes",
+            if (status.isOperational && queue.registrationCount < 20) {
+                estimatedWaitForNewOpenRegistration(queue, capturedAtMillis) ?: JSONObject.NULL
+            } else {
+                JSONObject.NULL
             }
-        }
-    )
-    put(
-        "waiting_positions",
-        JSONArray().apply {
-            queue.waitingPositions().forEachIndexed { index, registrations ->
-                val registrationKeys = registrations.map { it.key }.toSet()
-                put(
-                    JSONObject().apply {
-                        put("index", index + 1)
-                        put("position_id", publicPositionId(queueId, registrationKeys))
-                        put("fixed_pair", registrations.size == 2 && registrations.all {
-                            it.fixedPartnerKey != null && it.fixedPartnerKey in registrationKeys
-                        })
-                        put(
-                            "estimated_wait_minutes",
-                            if (status.isOperational) {
-                                estimatedMinutesUntilPlaying(
-                                    queue = queue,
-                                    targetRegistrationKeys = registrationKeys,
-                                    nowMillis = capturedAtMillis
-                                ) ?: JSONObject.NULL
-                            } else {
-                                JSONObject.NULL
-                            }
-                        )
-                        put(
-                            "registrations",
-                            JSONArray().apply {
-                                registrations.forEach { registration ->
-                                    put(buildPublicRegistration(queueId, registration))
+        )
+        put(
+            "playing",
+            JSONArray().apply {
+                queue.playing.forEach { registration ->
+                    put(buildPublicRegistration(queueId, registration))
+                }
+            }
+        )
+        put(
+            "waiting_positions",
+            JSONArray().apply {
+                waitingProjection.forEachIndexed { index, position ->
+                    val registrations = position.registrations
+                    val registrationKeys = registrations.map { it.key }.toSet()
+                    put(
+                        JSONObject().apply {
+                            put("index", index + 1)
+                            put("position_id", publicPositionId(queueId, registrationKeys))
+                            put("fixed_pair", registrations.size == 2 && registrations.all {
+                                it.fixedPartnerKey != null && it.fixedPartnerKey in registrationKeys
+                            })
+                            put(
+                                "estimated_wait_minutes",
+                                if (status.isOperational) {
+                                    estimatedMinutesUntilPlaying(
+                                        queue = queue,
+                                        targetRegistrationKeys = registrationKeys,
+                                        nowMillis = capturedAtMillis
+                                    ) ?: JSONObject.NULL
+                                } else {
+                                    JSONObject.NULL
                                 }
-                            }
-                        )
-                    }
-                )
+                            )
+                            put(
+                                "registrations",
+                                JSONArray().apply {
+                                    registrations.forEach { registration ->
+                                        put(buildPublicRegistration(queueId, registration))
+                                    }
+                                }
+                            )
+                            put(
+                                "common_play_preview",
+                                position.commonPlayPreview?.let { preview ->
+                                    JSONObject().apply {
+                                        put(
+                                            "registration_id",
+                                            publicRegistrationId(queueId, preview.key)
+                                        )
+                                        put("display_id", preview.displayId)
+                                    }
+                                } ?: JSONObject.NULL
+                            )
+                        }
+                    )
+                }
             }
-        }
-    )
+        )
+    }
 }
 
 private fun buildPublicRegistration(queueId: String, registration: Registration): JSONObject =

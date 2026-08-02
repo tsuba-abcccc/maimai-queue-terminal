@@ -69,7 +69,7 @@ class AuditLogsTest {
 
         assertTrue(log.detail.contains("“原昵称”更名为“新昵称”"))
         assertTrue(log.detail.contains("“新昵称”改为单人游玩"))
-        assertTrue(log.detail.contains("“新昵称”已暂缓一轮"))
+        assertTrue(log.detail.contains("“新昵称”已暂缓一次"))
         assertTrue(log.detail.contains("第 1 次未到场"))
     }
 
@@ -148,7 +148,7 @@ class AuditLogsTest {
             publicEventTypeOverride = PublicQueueEventType.NO_SHOW_REMOVED
         )!!
 
-        assertEquals("机台 A · 未到场 · 已暂缓一轮", deferredLog.title)
+        assertEquals("机台 A · 未到场 · 已暂缓一次", deferredLog.title)
         assertEquals("机台 A · 未到场 · 已移至队尾", movedLog.title)
         assertEquals("机台 A · 未到场 · 已移除登记", removedLog.title)
         assertTrue(removedLog.detail.contains("“未到场玩家”本次未到场，登记已移除"))
@@ -239,8 +239,8 @@ class AuditLogsTest {
         assertEquals(PublicQueueEventType.REGISTRATION_UPDATED, log.publicEventType)
         assertEquals(listOf(1, 2), log.affectedRegistrationKeys)
         assertTrue(log.detail.contains("从左侧 · 机台 A 转至右侧 · 机台 B"))
-        assertTrue(log.detail.contains("转入登记的暂缓一轮状态已解除"))
-        assertTrue(log.detail.contains("留在原机台的登记仍保持暂缓一轮"))
+        assertTrue(log.detail.contains("转入登记不再暂缓"))
+        assertTrue(log.detail.contains("留在原机台的登记仍会暂缓一次"))
         assertTrue(log.detail.contains("原固定组合已解除"))
 
         val temporarilyAwayLog = requireNotNull(

@@ -40,7 +40,7 @@ internal fun queueUndoFeedbackOutcome(
         }
         if (deferredCleared.isNotEmpty()) {
             add(
-                "${quotedNames(deferredCleared)}已跳过本轮，暂缓一轮状态已自动解除，登记位置保持不变。"
+                "${quotedNames(deferredCleared)}已跳过本次机会，随后自动恢复；真实等待顺序未改变，画面位置已按后续轮换重新计算。"
             )
         }
         temporaryAwayAdvanced

@@ -376,6 +376,112 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(800_000, stored_registration["created_at"])
         self.assertEqual(900_000, stored_registration["online_check_in_started_at"])
 
+    def test_common_play_preview_is_public_and_does_not_count_as_a_registration(self):
+        snapshot = self.remote_ready_snapshot(revision=27, with_registration=True)
+        machine = snapshot["machines"]["A"]
+        registration = machine["waiting_positions"][0]["registrations"][0]
+        registration["preference"] = "OPEN_TO_JOIN"
+        partner = self.registration("c" * 24, "预计搭档")
+        partner["preference"] = "OPEN_TO_JOIN"
+        machine["playing"] = [partner]
+        machine["playing_started_at"] = 900_000
+        machine["registration_count"] = 2
+        machine["waiting_positions"][0]["common_play_preview"] = {
+            "registration_id": partner["registration_id"],
+            "display_id": partner["display_id"],
+        }
+
+        publish = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        public_machine = self.client.get("/api/queue-status").get_json()["machines"]["A"]
+        bot_player = self.client.post(
+            "/api/queue-bot/players",
+            json={"qq": "12345678"},
+            headers=self.bot_headers,
+        ).get_json()["players"][0]
+
+        self.assertEqual(204, publish.status_code)
+        self.assertEqual(2, public_machine["registration_count"])
+        self.assertEqual(1, len(public_machine["waiting_positions"][0]["registrations"]))
+        self.assertEqual(
+            {
+                "registration_id": partner["registration_id"],
+                "display_id": "预计搭档",
+            },
+            public_machine["waiting_positions"][0]["common_play_preview"],
+        )
+        self.assertEqual(["预计搭档"], bot_player["co_player_display_ids"])
+        self.assertEqual(
+            "预计搭档", bot_player["common_play_preview_display_id"]
+        )
+
+    def test_rejects_invalid_common_play_preview_references(self):
+        def snapshot_with_preview():
+            snapshot = self.snapshot(revision=28)
+            machine = snapshot["machines"]["A"]
+            partner = machine["playing"][0]
+            partner["preference"] = "OPEN_TO_JOIN"
+            waiting = self.registration("c" * 24, "等待玩家")
+            waiting["preference"] = "OPEN_TO_JOIN"
+            machine["waiting_positions"] = [
+                {
+                    "index": 1,
+                    "position_id": "d" * 24,
+                    "fixed_pair": False,
+                    "estimated_wait_minutes": 10,
+                    "registrations": [waiting],
+                    "common_play_preview": {
+                        "registration_id": partner["registration_id"],
+                        "display_id": partner["display_id"],
+                    },
+                }
+            ]
+            machine["registration_count"] = 2
+            machine["waiting_position_count"] = 1
+            return snapshot
+
+        invalid_snapshots = []
+
+        missing = snapshot_with_preview()
+        missing["machines"]["A"]["waiting_positions"][0]["common_play_preview"] = {
+            "registration_id": "e" * 24,
+            "display_id": "不存在",
+        }
+        invalid_snapshots.append(("引用不存在的登记", missing))
+
+        duplicate = snapshot_with_preview()
+        position = duplicate["machines"]["A"]["waiting_positions"][0]
+        position["common_play_preview"] = {
+            "registration_id": position["registrations"][0]["registration_id"],
+            "display_id": position["registrations"][0]["display_id"],
+        }
+        invalid_snapshots.append(("重复当前位置登记", duplicate))
+
+        mismatched_name = snapshot_with_preview()
+        mismatched_name["machines"]["A"]["waiting_positions"][0][
+            "common_play_preview"
+        ]["display_id"] = "错误昵称"
+        invalid_snapshots.append(("昵称不一致", mismatched_name))
+
+        solo = snapshot_with_preview()
+        solo["machines"]["A"]["playing"][0]["preference"] = "SOLO"
+        invalid_snapshots.append(("搭档要求单人游玩", solo))
+
+        malformed = snapshot_with_preview()
+        malformed["machines"]["A"]["waiting_positions"][0][
+            "common_play_preview"
+        ] = "invalid"
+        invalid_snapshots.append(("字段类型无效", malformed))
+
+        for label, snapshot in invalid_snapshots:
+            with self.subTest(label=label):
+                response = self.client.post(
+                    "/api/queue-status", json=snapshot, headers=self.headers
+                )
+                self.assertEqual(400, response.status_code)
+                self.assertIn("共同游玩预览", response.get_json()["error"])
+
     def test_preserves_temporary_away_state_and_rejects_invalid_count(self):
         snapshot = self.snapshot()
         registration = snapshot["machines"]["A"]["playing"][0]
@@ -2582,6 +2688,10 @@ class QueueStatusApiTest(unittest.TestCase):
                 "/api/queue-status", json=closing, headers=self.headers
             ).status_code,
         )
+        public_status = self.client.get("/api/queue-status").get_json()
+        website_profile = self.client.post(
+            "/api/queue-online/profile", json={"qq": "12345678"}
+        )
         website_join = self.client.post(
             "/api/queue-online/join",
             json={
@@ -2610,6 +2720,9 @@ class QueueStatusApiTest(unittest.TestCase):
             headers=self.headers,
         )
 
+        self.assertFalse(public_status["capabilities"]["online_registration"])
+        self.assertEqual(409, website_profile.status_code)
+        self.assertIn("闭店收尾", website_profile.get_json()["error"])
         self.assertEqual(409, website_join.status_code)
         self.assertIn("闭店收尾", website_join.get_json()["error"])
         self.assertEqual(409, bot_join.status_code)

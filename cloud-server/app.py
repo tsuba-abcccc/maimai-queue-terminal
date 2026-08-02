@@ -1472,7 +1472,17 @@ def read_bot_players():
                     registration["display_id"]
                     for registration in context["position_registrations"]
                     if registration["registration_id"] != contact["registration_id"]
-                ],
+                ]
+                + (
+                    [context["common_play_preview"]["display_id"]]
+                    if context.get("common_play_preview") is not None
+                    else []
+                ),
+                "common_play_preview_display_id": (
+                    context["common_play_preview"]["display_id"]
+                    if context.get("common_play_preview") is not None
+                    else None
+                ),
                 "preference": context["registration"]["preference"],
                 "fixed_pair": context["registration"]["fixed_pair"],
                 "registration_type": context["registration"]["registration_type"],
@@ -1799,6 +1809,10 @@ def read_online_profile():
         if snapshot_row is None:
             return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
         snapshot = json.loads(snapshot_row["payload"])
+        if snapshot_in_closing_grace(snapshot):
+            return jsonify(
+                {"ok": False, "error": "闭店收尾期间不再接收新的排队登记"}
+            ), 409
         if not online_registration_allowed(snapshot):
             return jsonify({"ok": False, "error": "现场规则暂不允许线上登记"}), 503
         profile = find_player_profile_by_qq(connection, qq_number)
@@ -2054,10 +2068,10 @@ def build_queue_operation_payload(
     }
 
     if operation == "JOIN_QUEUE":
+        if snapshot_in_closing_grace(snapshot):
+            return None, ("闭店收尾期间不再接收新的排队登记", 409)
         if not online_registration_allowed(snapshot):
             return None, ("现场规则暂不允许线上登记", 409)
-        if snapshot_in_closing_grace(snapshot):
-            return None, ("今日营业时间已结束，闭店收尾期间不再接收新的排队登记", 409)
         if registration_contexts:
             return None, ("你已经有一份正在排队的登记，不能重复加入", 409)
         if not snapshot.get("registration_open", True):
@@ -2100,7 +2114,7 @@ def build_queue_operation_payload(
     queue_rules = snapshot.get("queue_rules") or normalize_public_queue_rules(None)
     if operation == "DEFER_ONE_ROUND":
         if not queue_rules["allow_defer_one_round"]:
-            return None, ("系统规则不允许暂缓一轮", 409)
+            return None, ("系统规则不允许暂缓一次", 409)
     elif operation == "TEMPORARILY_LEAVE":
         if not queue_rules["allow_temporary_leave"]:
             return None, ("系统规则不允许暂时离开", 409)
@@ -3003,6 +3017,8 @@ def remote_operation_availability_error(
         return "现场终端已关闭网站同步，暂不能在线操作", 503
     if operation_source == "QQ_BOT" and not snapshot.get("onebot_sync_enabled", True):
         return "现场终端已关闭 QQ Bot 联动", 503
+    if operation == "JOIN_QUEUE" and snapshot_in_closing_grace(snapshot):
+        return "闭店收尾期间不再接收新的排队登记", 409
     if operation == "JOIN_QUEUE" and not online_registration_allowed(snapshot):
         return "现场规则暂不允许线上登记", 503
     return None
@@ -3567,6 +3583,9 @@ def index_snapshot_registrations(snapshot: dict[str, Any]) -> dict[str, dict[str
                 indexed[registration["registration_id"]] = {
                     "registration": registration,
                     "position_registrations": waiting_position.get("registrations", []),
+                    "common_play_preview": waiting_position.get(
+                        "common_play_preview"
+                    ),
                     "machine_id": machine_id,
                     "position": "WAITING",
                     "position_index": waiting_position["index"],
@@ -3600,9 +3619,10 @@ def public_capabilities(
 
 def online_registration_allowed(snapshot: dict[str, Any]) -> bool:
     queue_rules = snapshot.get("queue_rules")
-    return not isinstance(queue_rules, dict) or queue_rules.get(
+    rule_allows = not isinstance(queue_rules, dict) or queue_rules.get(
         "allow_online_registration", True
     ) is not False
+    return rule_allows and not snapshot_in_closing_grace(snapshot)
 
 
 def snapshot_in_closing_grace(snapshot: dict[str, Any]) -> bool:
@@ -4122,6 +4142,41 @@ def normalize_machine(
     if len(position_ids) != len(set(position_ids)):
         raise ValidationError(f"机台 {machine_id} 的等待位置编号不能重复")
 
+    registrations_by_id = {
+        registration["registration_id"]: registration
+        for registration in playing
+    }
+    registrations_by_id.update(
+        {
+            registration["registration_id"]: registration
+            for position in waiting_positions
+            for registration in position["registrations"]
+        }
+    )
+    for position in waiting_positions:
+        preview = position["common_play_preview"]
+        if preview is None:
+            continue
+        previewed = registrations_by_id.get(preview["registration_id"])
+        if previewed is None:
+            raise ValidationError(f"机台 {machine_id} 的共同游玩预览登记不存在")
+        position_registration_ids = {
+            registration["registration_id"]
+            for registration in position["registrations"]
+        }
+        if preview["registration_id"] in position_registration_ids:
+            raise ValidationError(f"机台 {machine_id} 的共同游玩预览不能重复当前位置登记")
+        if previewed["display_id"] != preview["display_id"]:
+            raise ValidationError(f"机台 {machine_id} 的共同游玩预览昵称不一致")
+        if (
+            len(position["registrations"]) != 1
+            or position["registrations"][0]["preference"] != "OPEN_TO_JOIN"
+            or position["registrations"][0]["fixed_pair"]
+            or previewed["preference"] != "OPEN_TO_JOIN"
+            or previewed["fixed_pair"]
+        ):
+            raise ValidationError(f"机台 {machine_id} 的共同游玩预览与游玩偏好不一致")
+
     playing_started_at = read_optional_integer(
         source, "playing_started_at", minimum=1
     )
@@ -4198,6 +4253,20 @@ def normalize_waiting_position(machine_id: str, index: int, source: Any) -> dict
             source, "estimated_wait_minutes", minimum=0, maximum=24 * 60
         ),
         "registrations": registrations,
+        "common_play_preview": normalize_common_play_preview(
+            source.get("common_play_preview")
+        ),
+    }
+
+
+def normalize_common_play_preview(source: Any) -> dict[str, str] | None:
+    if source is None:
+        return None
+    if not isinstance(source, dict):
+        raise ValidationError("共同游玩预览必须是对象或 null")
+    return {
+        "registration_id": read_public_id(source, "registration_id"),
+        "display_id": read_string(source, "display_id", maximum_length=18),
     }
 
 
@@ -4228,7 +4297,7 @@ def normalize_registration(source: Any, label: str) -> dict[str, Any]:
         raise ValidationError("非暂时离开登记不能包含轮空次数")
     deferred_once = read_boolean(source, "deferred_once")
     if deferred_once and temporarily_away:
-        raise ValidationError("登记不能同时处于暂缓一轮和暂时离开状态")
+        raise ValidationError("登记不能同时处于暂缓一次和暂时离开状态")
     no_show_count = read_integer(source, "no_show_count", minimum=0, maximum=10_000)
     last_no_show_action_was_defer = read_boolean(
         source, "last_no_show_action_was_defer"
@@ -4244,7 +4313,7 @@ def normalize_registration(source: Any, label: str) -> dict[str, Any]:
     if online_registration_pending_check_in and registration_type != "PLAYER_PROFILE":
         raise ValidationError("待签到的线上登记必须关联玩家资料")
     if online_registration_pending_check_in and (deferred_once or temporarily_away):
-        raise ValidationError("待签到的线上登记不能同时暂缓一轮或暂时离开")
+        raise ValidationError("待签到的线上登记不能同时暂缓一次或暂时离开")
     created_at = read_integer(source, "created_at", minimum=1)
     online_check_in_started_at = source.get("online_check_in_started_at", created_at)
     if type(online_check_in_started_at) is not int or online_check_in_started_at < 1:

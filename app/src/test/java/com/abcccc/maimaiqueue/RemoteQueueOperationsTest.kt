@@ -176,8 +176,8 @@ class RemoteQueueOperationsTest {
             state(machineA = pairedQueue, nextKey = 4)
         ) as RemoteQueueOperationDecision.Apply
 
-        assertTrue(transferred.detail.contains("转入登记的暂缓一轮状态已解除"))
-        assertTrue(transferred.detail.contains("留在原机台的登记仍保持暂缓一轮"))
+        assertTrue(transferred.detail.contains("转入登记不再暂缓"))
+        assertTrue(transferred.detail.contains("留在原机台的登记仍会暂缓一次"))
         assertTrue(transferred.detail.contains("固定组合已解除"))
         assertEquals(
             QueueAbsenceStatus.NONE,
@@ -208,7 +208,7 @@ class RemoteQueueOperationsTest {
         ) as RemoteQueueOperationDecision.Apply
 
         assertTrue(exited.detail.contains("对方保留原位"))
-        assertTrue(exited.detail.contains("对方仍保持暂缓一轮"))
+        assertTrue(exited.detail.contains("对方仍保持暂缓一次"))
         assertTrue(exited.detail.contains("游玩位置中的空缺不会自动"))
     }
 
@@ -322,7 +322,7 @@ class RemoteQueueOperationsTest {
             setOf(QueueAbsenceStatus.DEFER_ONE_ROUND),
             deferred.state.queues.getValue("A").waiting.map { it.absenceStatus }.toSet()
         )
-        assertEquals("固定组合的两份登记已同时暂缓一轮。", deferred.detail)
+        assertEquals("固定组合的两份登记已同时暂缓一次。", deferred.detail)
         current = deferred.state
 
         val deferCancelled = decideRemoteQueueOperation(
@@ -333,7 +333,7 @@ class RemoteQueueOperationsTest {
             setOf(QueueAbsenceStatus.NONE),
             deferCancelled.state.queues.getValue("A").waiting.map { it.absenceStatus }.toSet()
         )
-        assertEquals("固定组合的两份登记已同时取消暂缓一轮。", deferCancelled.detail)
+        assertEquals("固定组合的两份登记已同时取消暂缓一次。", deferCancelled.detail)
         current = deferCancelled.state
 
         val temporarilyAway = decideRemoteQueueOperation(

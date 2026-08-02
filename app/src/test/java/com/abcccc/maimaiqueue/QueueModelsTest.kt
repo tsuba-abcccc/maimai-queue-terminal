@@ -1871,7 +1871,7 @@ class QueueModelsTest {
     }
 
     @Test
-    fun pendingOnlineRegistrationIsRemovedWhenItsPlayingOpportunityIsReached() {
+    fun pendingOnlineRegistrationIsProjectedNormallyButRemovedIfStillUnsignedAtItsTurn() {
         val nowMillis = 6_000_000L
         val pending = registration(2).copy(requiresOnSiteCheckIn = true)
         val queue = MachineQueue(
@@ -1886,8 +1886,8 @@ class QueueModelsTest {
         )
 
         assertEquals(listOf(1, 3), queue.waitingPositions().first().map { it.key })
-        assertEquals(7L, estimatedMinutesUntilPlaying(queue, setOf(3), nowMillis))
-        assertEquals(null, estimatedMinutesUntilPlaying(queue, setOf(2), nowMillis))
+        assertEquals(22L, estimatedMinutesUntilPlaying(queue, setOf(3), nowMillis))
+        assertEquals(7L, estimatedMinutesUntilPlaying(queue, setOf(2), nowMillis))
 
         val advanced = queue.finishRound(nowMillis)
 

@@ -84,6 +84,10 @@ interface WaitingPosition {
   index: number;
   estimated_wait_minutes: number | null;
   registrations: QueueRegistration[];
+  common_play_preview?: {
+    registration_id: string;
+    display_id: string;
+  } | null;
 }
 
 interface QueueMachine {
@@ -133,6 +137,7 @@ interface BotPlayer {
   position_index: number | null;
   estimated_wait_minutes: number | null;
   co_player_display_ids?: string[];
+  common_play_preview_display_id?: string | null;
   preference?: PlayPreference;
   fixed_pair?: boolean;
   registration_type?: "TEMPORARY" | "PLAYER_PROFILE";
@@ -270,9 +275,9 @@ const NOTIFICATION_OPTIONS: ReadonlyArray<{
   },
   {
     field: "notify_absence",
-    title: "暂缓一轮、暂时离开和未到场",
+    title: "暂缓一次、暂时离开和未到场",
     commandId: "absence",
-    commandLabel: "暂缓一轮与暂时离开",
+    commandLabel: "暂缓一次与暂时离开",
   },
   {
     field: "notify_machine_status",
@@ -532,8 +537,8 @@ export function apply(ctx: Context, config: Config) {
       })
     );
 
-  ctx.command("maimaiq.status.defer", "将当前登记暂缓一轮")
-    .alias("暂缓一轮")
+  ctx.command("maimaiq.status.defer", "将当前登记暂缓一次")
+    .alias("暂缓一次")
     .action(async ({ session }) =>
       withCommandError(() =>
         changeAbsenceState(
@@ -545,8 +550,8 @@ export function apply(ctx: Context, config: Config) {
       )
     );
 
-  ctx.command("maimaiq.status.defer.cancel", "取消当前登记的暂缓一轮")
-    .alias("取消暂缓一轮")
+  ctx.command("maimaiq.status.defer.cancel", "取消当前登记的暂缓一次")
+    .alias("取消暂缓一次")
     .action(async ({ session }) =>
       withCommandError(() =>
         changeAbsenceState(
@@ -969,7 +974,7 @@ export async function changeAbsenceState(
 
   if (operation === "DEFER_ONE_ROUND") {
     if (response.queue_rules?.allow_defer_one_round === false) {
-      throw new Error("系统规则不允许暂缓一轮。");
+      throw new Error("系统规则不允许暂缓一次。");
     }
   } else if (operation === "TEMPORARILY_LEAVE") {
     if (response.queue_rules?.allow_temporary_leave === false) {
@@ -1008,9 +1013,9 @@ export function absenceOperationSuccessMessage(
   if (!fixedPair) {
     return {
       DEFER_ONE_ROUND:
-        "登记已暂缓一轮。下一次轮到时会跳过这份登记，之后自动恢复；等待顺序保持不变。",
+        "登记已暂缓一次。下一次轮到时会跳过这份登记，之后自动恢复；队列会显示预计下次游玩的位置，真实等待顺序不变。",
       CANCEL_DEFER_ONE_ROUND:
-        "登记已取消暂缓一轮，将按照当前等待顺序正常参与游玩位置分配。",
+        "登记已取消暂缓一次，将按照当前等待顺序正常参与游玩位置分配。",
       TEMPORARILY_LEAVE: [
         "登记已设为暂时离开。",
         "",
@@ -1022,9 +1027,9 @@ export function absenceOperationSuccessMessage(
   }
   return {
     DEFER_ONE_ROUND:
-      "固定组合的两份登记已同时暂缓一轮。下一次轮到时会跳过整组，之后两份登记自动恢复；等待顺序保持不变。",
+      "固定组合的两份登记已同时暂缓一次。下一次轮到时会跳过整组，之后两份登记自动恢复；队列会显示预计下次游玩的位置，真实等待顺序不变。",
     CANCEL_DEFER_ONE_ROUND:
-      "固定组合的两份登记已同时取消暂缓一轮，将按照当前等待顺序正常参与游玩位置分配。",
+      "固定组合的两份登记已同时取消暂缓一次，将按照当前等待顺序正常参与游玩位置分配。",
     TEMPORARILY_LEAVE: [
       "固定组合的两份登记已同时设为暂时离开。",
       "",
@@ -1108,8 +1113,8 @@ async function transferQueueMachine(
       "确认后，这份登记会离开当前机台，并进入目标机台的等待顺序末端。",
       ...(current.player.deferred_once
         ? [current.player.fixed_pair
-          ? "转入登记的暂缓一轮状态会解除；留在原机台的登记仍保持暂缓一轮。"
-          : "暂缓一轮状态会在转入后解除。"]
+          ? "转入登记不再暂缓；留在原机台的登记仍会暂缓一次。"
+          : "转入后不再暂缓。"]
         : []),
       ...(current.player.temporarily_away
         ? [current.player.fixed_pair
@@ -1144,7 +1149,7 @@ async function changeCurrentPreference(
       "",
       "当前登记属于固定组合。修改本次游玩偏好会解除这个固定组合；另一份登记保留原位，并恢复为允许他人加入。",
       ...(current.player.deferred_once
-        ? ["两份登记当前的暂缓一轮状态不会因解除组合而清除。"]
+        ? ["两份登记的“暂缓一次”安排不会因解除组合而取消。"]
         : current.player.temporarily_away
         ? [`两份登记当前的暂时离开状态和已轮空 ${current.player.temporary_away_skipped_turns} 次不会因解除组合而清除。`]
         : []),
@@ -1201,7 +1206,7 @@ async function leaveQueueFromBot(
         ? ["原固定组合会解除；另一份登记保留原位，并恢复为允许他人加入。"]
         : []),
       ...(current.player.fixed_pair && current.player.deferred_once
-        ? ["另一份登记仍保持暂缓一轮，并会在下一次轮到后自动解除。"]
+        ? ["另一份登记仍保持暂缓一次，并会在下一次轮到后自动解除。"]
         : current.player.fixed_pair && current.player.temporarily_away
         ? [`另一份登记仍保持暂时离开和已轮空 ${current.player.temporary_away_skipped_turns} 次，返回后需要手动取消。`]
         : []),
@@ -2059,18 +2064,13 @@ function formatMachine(machine: QueueMachine, terminalOnline = true): string {
     sections.push([`游玩位置 ${machine.id}·空闲`]);
   }
   for (const position of machine.waiting_positions) {
-    const hasPendingCheckIn = position.registrations.some((registration) =>
-      registration.online_registration_pending_check_in
-    );
     const hasTemporaryAway = position.registrations.some((registration) =>
       registration.temporarily_away
     );
     const estimate = !terminalOnline
       ? "·状态待更新"
       : machine.operational
-      ? hasPendingCheckIn
-        ? "·签到后可估算"
-        : hasTemporaryAway
+      ? hasTemporaryAway
         ? "·暂时离开，无法估算"
         : position.estimated_wait_minutes === null
         ? "·暂时无法估算"
@@ -2081,7 +2081,10 @@ function formatMachine(machine: QueueMachine, terminalOnline = true): string {
     sections.push(
       [
         `位置 ${machine.id}${position.index}${estimate}`,
-        ...formatQueueRegistrations(position.registrations),
+        ...formatQueueRegistrations(
+          position.registrations,
+          position.common_play_preview,
+        ),
       ],
     );
   }
@@ -2145,8 +2148,7 @@ export function formatOwnQueue(
         Number.isFinite(player.estimated_wait_minutes)
       ? Math.max(0, Math.trunc(player.estimated_wait_minutes))
       : null;
-    const estimate = player.position === "WAITING" &&
-        !player.online_registration_pending_check_in
+    const estimate = player.position === "WAITING"
       ? terminalOnline === false
         ? "，终端恢复同步后重新估算"
         : machineOperational === false
@@ -2176,7 +2178,7 @@ export function formatOwnQueue(
     if (player.online_registration_pending_check_in) {
       states.push("线上登记·待签到");
     }
-    if (player.deferred_once) states.push("暂缓一轮");
+    if (player.deferred_once) states.push("暂缓一次");
     if (player.temporarily_away) {
       states.push(
         `暂时离开${
@@ -2188,7 +2190,7 @@ export function formatOwnQueue(
     }
     if (player.no_show_count) {
       const lastAction = player.last_no_show_action_was_defer
-        ? "上次处理：暂缓一轮"
+        ? "上次处理：暂缓一次"
         : "上次处理：移至队尾";
       states.push(`未到场记录 ${player.no_show_count} 次·${lastAction}`);
     }
@@ -2200,12 +2202,15 @@ export function formatOwnQueue(
         fixed_pair: player.fixed_pair ?? false,
       })
       : null;
+    const waitingPosition = machine && player.position === "WAITING"
+      ? machine.waiting_positions.find((position) =>
+        position.index === player.position_index
+      )
+      : undefined;
     const positionRegistrations = machine
       ? player.position === "PLAYING"
         ? machine.playing
-        : machine.waiting_positions.find((position) =>
-          position.index === player.position_index
-        )?.registrations
+        : waitingPosition?.registrations
       : undefined;
     const coPlayerDisplayIds = positionRegistrations
       ? positionRegistrations
@@ -2213,10 +2218,9 @@ export function formatOwnQueue(
         .map((item) => item.display_id)
       : player.co_player_display_ids ?? [];
     const subject = players.length === 1 ? "你" : `${player.display_id}：`;
-    const positionSentence = player.online_registration_pending_check_in &&
-        player.position === "WAITING"
-      ? `${subject}${location}，签到后可以估算等待时间。`
-      : `${subject}${location}${estimate}。`;
+    const commonPlayPreviewDisplayId = waitingPosition?.common_play_preview?.display_id ??
+      player.common_play_preview_display_id ?? null;
+    const positionSentence = `${subject}${location}${estimate}。`;
     const lines = [
       `${positionSentence}${
         currentPreference ? `游玩偏好：${currentPreference}。` : ""
@@ -2233,7 +2237,15 @@ export function formatOwnQueue(
     }
     if (machineState) lines.push(`机台状态：${machineState}`);
     if (coPlayerDisplayIds.length) {
-      lines.push(`共同游玩：${coPlayerDisplayIds.join("、")}。`);
+      const actualCoPlayers = coPlayerDisplayIds.filter((displayId) =>
+        displayId !== commonPlayPreviewDisplayId
+      );
+      if (actualCoPlayers.length) {
+        lines.push(`共同游玩：${actualCoPlayers.join("、")}。`);
+      }
+    }
+    if (commonPlayPreviewDisplayId) {
+      lines.push(`预计与“${commonPlayPreviewDisplayId}”共同游玩。`);
     }
     if (states.length) lines.push(`当前状态：${states.join("；")}。`);
     return lines.join("\n");
@@ -2292,11 +2304,11 @@ export function formatOwnQueueActions(
   const actions: string[] = [];
   if (player.position === "WAITING") {
     if (player.deferred_once) {
-      actions.push("取消暂缓一轮");
+      actions.push("取消暂缓一次");
     } else if (player.temporarily_away) {
       actions.push("取消暂时离开");
     } else {
-      if (queueRules?.allow_defer_one_round !== false) actions.push("暂缓一轮");
+      if (queueRules?.allow_defer_one_round !== false) actions.push("暂缓一次");
       if (queueRules?.allow_temporary_leave !== false) actions.push("暂时离开");
     }
     actions.push("切换机台");
@@ -2319,9 +2331,7 @@ export function formatNotificationQueueStatus(players: BotPlayer[]): string {
         Number.isFinite(player.estimated_wait_minutes)
       ? Math.max(0, Math.trunc(player.estimated_wait_minutes))
       : null;
-    const estimate = player.online_registration_pending_check_in
-      ? "签到后可以估算等待时间"
-      : player.temporarily_away
+    const estimate = player.temporarily_away
       ? "暂时离开期间无法估算等待时间"
       : player.machine_operational === false
       ? "机台恢复使用后重新估算"
@@ -2361,10 +2371,15 @@ function formatProfile(profile: PlayerProfile): string {
 
 function formatQueueRegistrations(
   registrations: QueueRegistration[],
+  commonPlayPreview?: { display_id: string } | null,
 ): string[] {
-  return registrations.length
+  const lines = registrations.length
     ? registrations.flatMap(formatQueueRegistration)
     : ["暂无登记"];
+  if (commonPlayPreview) {
+    lines.push(` - ${commonPlayPreview.display_id} (共同游玩预览)`);
+  }
+  return lines;
 }
 
 function formatQueueRegistration(registration: QueueRegistration): string[] {
@@ -2376,7 +2391,7 @@ function formatQueueRegistration(registration: QueueRegistration): string[] {
   if (registration.online_registration_pending_check_in) {
     lines.push("    - 线上登记·待签到");
   }
-  if (registration.deferred_once) lines.push("    - 暂缓一轮");
+  if (registration.deferred_once) lines.push("    - 暂缓一次");
   if (registration.temporarily_away) {
     lines.push(
       `    - 暂时离开${

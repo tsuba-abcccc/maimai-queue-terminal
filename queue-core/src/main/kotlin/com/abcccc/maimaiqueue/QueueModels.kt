@@ -129,6 +129,20 @@ data class NextPlayingPositionPreview(
             nominalRegistrations.map { it.key }.toSet() != nextRegistrations.map { it.key }.toSet()
 }
 
+/** A read-only waiting position used by queue surfaces. */
+data class WaitingPositionProjection(
+    val registrations: List<Registration>,
+    val commonPlayPreview: Registration? = null
+)
+
+data class WaitingQueueProjection(
+    val positions: List<WaitingPositionProjection>
+) {
+    fun positionIndexOf(registrationKey: Int): Int? = positions.indexOfFirst { position ->
+        position.registrations.any { it.key == registrationKey }
+    }.takeIf { it >= 0 }
+}
+
 data class MachineQueue(
     val playing: List<Registration> = emptyList(),
     val waiting: List<Registration> = emptyList(),
@@ -149,6 +163,17 @@ data class MachineQueue(
     }
 
     fun waitingPositions(): List<List<Registration>> = groupIntoPositions(waiting)
+
+    /**
+     * Returns the queue as players should currently see it. The result is derived only:
+     * saving, undo, reordering, and round execution continue to use [waiting].
+     */
+    fun waitingProjection(
+        includeCommonPlayPreview: Boolean = true
+    ): WaitingQueueProjection = RoundPlanner.waitingProjection(
+        queue = this,
+        includeCommonPlayPreview = includeCommonPlayPreview
+    )
 
     fun firstAvailableWaitingPositionIndex(): Int? = waitingPositions().indexOfFirst { position ->
         position.all { it.canEnterPlayingPosition }

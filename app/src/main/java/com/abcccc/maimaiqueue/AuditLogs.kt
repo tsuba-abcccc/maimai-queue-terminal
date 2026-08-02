@@ -200,12 +200,12 @@ fun createQueueAuditLog(
             affectedRegistrationKeys += key
             changeKinds += "absence"
             details += when (new.absenceStatus) {
-                QueueAbsenceStatus.DEFER_ONE_ROUND -> "“${new.displayId}”已暂缓一轮"
+                QueueAbsenceStatus.DEFER_ONE_ROUND -> "“${new.displayId}”已暂缓一次"
                 QueueAbsenceStatus.TEMPORARILY_AWAY -> "“${new.displayId}”已设为暂时离开"
                 QueueAbsenceStatus.NONE -> when (old.absenceStatus) {
-                    QueueAbsenceStatus.DEFER_ONE_ROUND -> "“${new.displayId}”的暂缓一轮已解除"
+                    QueueAbsenceStatus.DEFER_ONE_ROUND -> "“${new.displayId}”已结束暂缓"
                     QueueAbsenceStatus.TEMPORARILY_AWAY -> "“${new.displayId}”已取消暂时离开"
-                    QueueAbsenceStatus.NONE -> "“${new.displayId}”的暂缓一轮或暂时离开状态已恢复"
+                    QueueAbsenceStatus.NONE -> "“${new.displayId}”已恢复正常排队状态"
                 }
             }
         }
@@ -285,7 +285,7 @@ fun createQueueAuditLog(
         else -> PublicQueueEventType.OTHER
     }
     val generatedTitle = when (publicEventType) {
-        PublicQueueEventType.NO_SHOW_DEFERRED -> "未到场 · 已暂缓一轮"
+        PublicQueueEventType.NO_SHOW_DEFERRED -> "未到场 · 已暂缓一次"
         PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场 · 已移至队尾"
         PublicQueueEventType.NO_SHOW_REMOVED -> "未到场 · 已移除登记"
         PublicQueueEventType.TEMPORARY_AWAY_EXPIRED -> "暂时离开已达轮空上限"
@@ -301,7 +301,7 @@ fun createQueueAuditLog(
             "profile" in changeKinds -> "登记资料已更新"
             "no_show" in changeKinds -> "未到场状态已更新"
             "check_in" in changeKinds -> "线上登记签到状态已更新"
-            "absence" in changeKinds -> "暂缓一轮或暂时离开状态已修改"
+            "absence" in changeKinds -> "暂缓一次或暂时离开状态已修改"
             "pair" in changeKinds -> "固定组合已修改"
             "preference" in changeKinds -> "游玩偏好已修改"
             "playing" in changeKinds -> "游玩位置已更新"
@@ -429,9 +429,9 @@ fun createMachineTransferAuditLog(
             if (releasedPartnerRegistrations.any {
                     it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
                 }) {
-                add("转入登记的暂缓一轮状态已解除，留在原机台的登记仍保持暂缓一轮")
+                add("转入登记不再暂缓，留在原机台的登记仍会暂缓一次")
             } else {
-                add("转入后，暂缓一轮状态已解除")
+                add("转入后不再暂缓")
             }
         }
         registrations.filter {

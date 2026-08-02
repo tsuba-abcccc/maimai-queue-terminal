@@ -13,6 +13,7 @@ class QueueRuleSettingsTest {
 
         assertEquals(true, settings.websiteSyncEnabled)
         assertEquals(true, settings.allowOnlineRegistration)
+        assertEquals(true, settings.showCommonPlayPreview)
         assertEquals("左侧", settings.machineARemark)
         assertEquals("右侧", settings.machineBRemark)
     }

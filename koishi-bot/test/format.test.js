@@ -60,7 +60,7 @@ test('does not present a wait estimate while the current QQ is temporarily away'
   assert.doesNotMatch(text, /约 18 分钟后/)
   assert.match(text, /暂时离开·已轮空 2 次/)
   assert.match(text, /未到场记录 1 次/)
-  assert.match(text, /未到场记录 1 次·上次处理：暂缓一轮/)
+  assert.match(text, /未到场记录 1 次·上次处理：暂缓一次/)
 })
 
 test('shows move-to-end as the latest no-show handling result', () => {
@@ -710,7 +710,7 @@ test('queue notifications append only the concise current position', () => {
     '【排队通知】\n\n左侧日框·机台 A·线上登记签到状态已更新\n“啊波呲”已在现场完成签到。\n\n现在，你位于队列位置 A1，约 10 分钟后可以游玩。',
   )
   assert.doesNotMatch(message, /\s·|·\s/)
-  assert.doesNotMatch(message, /你好|游玩偏好|暂缓一轮|退出排队/)
+  assert.doesNotMatch(message, /你好|游玩偏好|暂缓一次|退出排队/)
 })
 
 test('notification position summaries handle playing and unavailable estimates', () => {
@@ -753,7 +753,7 @@ test('notification position summaries handle playing and unavailable estimates',
       estimated_wait_minutes: 12,
       online_registration_pending_check_in: true,
     }]),
-    '现在，你位于队列位置 B2，签到后可以估算等待时间。',
+    '现在，你位于队列位置 B2，约 12 分钟后可以游玩。',
   )
 })
 
@@ -819,7 +819,7 @@ test('shows the pending check-in state and only allows leaving the queue', () =>
     machine_id: 'A',
     position: 'WAITING',
     position_index: 4,
-    estimated_wait_minutes: null,
+    estimated_wait_minutes: 18,
     preference: 'OPEN_TO_JOIN',
     fixed_pair: false,
     deferred_once: false,
@@ -835,11 +835,11 @@ test('shows the pending check-in state and only allows leaving the queue', () =>
   const text = formatOwnQueue([player])
 
   assert.match(text, /^你好，糍粑。/)
-  assert.match(text, /你位于队列位置 A4，签到后可以估算等待时间。/)
+  assert.match(text, /你位于队列位置 A4，约 18 分钟后可以游玩。/)
   assert.match(text, /请在创建登记后的 30 分钟内/)
   assert.match(text, /当前状态：线上登记·待签到。/)
   assert.match(text, /\n\n - 退出排队$/)
-  assert.doesNotMatch(text, /暂缓一轮|暂时离开|切换机台|修改游玩偏好/)
+  assert.doesNotMatch(text, /暂缓一次|暂时离开|切换机台|修改游玩偏好/)
   assert.deepEqual(formatOwnQueueActions(player), ['退出排队'])
 
   const restartedText = formatOwnQueue([{
@@ -871,7 +871,7 @@ test('formats pending check-in registrations in the public queue', () => {
     playing_started_at: null,
     playing: [],
     waiting_positions: id === 'A'
-      ? [{ index: 1, estimated_wait_minutes: null, registrations: [registration] }]
+      ? [{ index: 1, estimated_wait_minutes: 9, registrations: [registration] }]
       : [],
   })
   const text = formatQueue({
@@ -882,8 +882,80 @@ test('formats pending check-in registrations in the public queue', () => {
     machines: { A: machine('A'), B: machine('B') },
   })
 
-  assert.match(text, /位置 A1·签到后可估算/)
+  assert.match(text, /位置 A1·约 9 分钟后/)
   assert.match(text, /糍粑 \(允许加入\)\n    - 线上登记·待签到/)
+})
+
+test('formats common-play previews without counting them as real registrations', () => {
+  const registration = {
+    registration_id: 'registration-real',
+    display_id: '戊',
+    preference: 'OPEN_TO_JOIN',
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    fixed_pair: false,
+    no_show_count: 0,
+    online_registration_pending_check_in: false,
+  }
+  const text = formatQueue({
+    queue_id: 'queue-preview',
+    captured_at: Date.now(),
+    registration_open: true,
+    terminal: { online: true },
+    machines: {
+      A: {
+        id: 'A',
+        name: '左侧·机台 A',
+        operational: true,
+        stop_reason: null,
+        stop_reason_detail: null,
+        playing_started_at: null,
+        playing: [],
+        waiting_positions: [{
+          index: 1,
+          estimated_wait_minutes: 20,
+          registrations: [registration],
+          common_play_preview: {
+            registration_id: 'registration-returning',
+            display_id: '甲',
+          },
+        }],
+      },
+    },
+  })
+
+  assert.match(text, /1 个等待位置·1 个登记/)
+  assert.match(text, / - 戊 \(允许加入\)\n - 甲 \(共同游玩预览\)/)
+})
+
+test('distinguishes a projected partner from real group members in personal status', () => {
+  const player = {
+    registration_id: 'registration-self',
+    profile_id: 'profile-self',
+    qq_number: '12345678',
+    display_id: '戊',
+    machine_id: 'A',
+    position: 'WAITING',
+    position_index: 3,
+    estimated_wait_minutes: 20,
+    co_player_display_ids: ['乙', '甲'],
+    common_play_preview_display_id: '甲',
+    preference: 'OPEN_TO_JOIN',
+    fixed_pair: false,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+    online_registration_pending_check_in: false,
+  }
+
+  const text = formatOwnQueue([player])
+
+  assert.match(text, /共同游玩：乙。/)
+  assert.match(text, /预计与“甲”共同游玩。/)
+  assert.doesNotMatch(text, /共同游玩：乙、甲/)
 })
 
 test('changes the personal menu with absence state and queue rules', () => {
@@ -897,14 +969,14 @@ test('changes the personal menu with absence state and queue rules', () => {
     allow_defer_one_round: true,
     allow_temporary_leave: true,
   }), [
-    '暂缓一轮',
+    '暂缓一次',
     '暂时离开',
     '切换机台',
     '修改游玩偏好',
     '退出排队',
   ])
   assert.deepEqual(formatOwnQueueActions({ ...player, deferred_once: true }), [
-    '取消暂缓一轮',
+    '取消暂缓一次',
     '切换机台',
     '修改游玩偏好',
     '退出排队',
@@ -1001,11 +1073,11 @@ test('fixed-pair personal menu exposes the matching cancel action', () => {
 test('explains all fixed-pair absence operations as whole-group changes', () => {
   assert.match(
     absenceOperationSuccessMessage('DEFER_ONE_ROUND', true),
-    /两份登记已同时暂缓一轮.*跳过整组/,
+    /两份登记已同时暂缓一次.*跳过整组/,
   )
   assert.match(
     absenceOperationSuccessMessage('CANCEL_DEFER_ONE_ROUND', true),
-    /两份登记已同时取消暂缓一轮/,
+    /两份登记已同时取消暂缓一次/,
   )
   assert.match(
     absenceOperationSuccessMessage('TEMPORARILY_LEAVE', true),

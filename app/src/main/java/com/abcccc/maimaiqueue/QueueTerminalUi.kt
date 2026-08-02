@@ -466,6 +466,7 @@ internal fun RegistrationApp() {
         queueRuleSettings.allowOnlineRegistration,
         queueRuleSettings.allowDeferOneRound,
         queueRuleSettings.allowTemporaryLeave,
+        queueRuleSettings.showCommonPlayPreview,
         queueRuleSettings.syncMode,
         queueRuleSettings.machineARemark,
         queueRuleSettings.machineBRemark,
@@ -501,6 +502,7 @@ internal fun RegistrationApp() {
                 allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
                 allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
                 allowOnlineRegistration = queueRuleSettings.allowOnlineRegistration,
+                showCommonPlayPreview = queueRuleSettings.showCommonPlayPreview,
                 businessHours = QueuePublicBusinessHours(
                     enabled = businessHoursStatus.enabled,
                     outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
@@ -668,6 +670,7 @@ internal fun RegistrationApp() {
                             allowDeferOneRound = settings.allowDeferOneRound,
                             allowTemporaryLeave = settings.allowTemporaryLeave,
                             allowOnlineRegistration = settings.allowOnlineRegistration,
+                            showCommonPlayPreview = settings.showCommonPlayPreview,
                             businessHours = QueuePublicBusinessHours(
                                 enabled = closingStatus.enabled,
                                 outsideBusinessHours = closingStatus.outsideBusinessHours,
@@ -686,10 +689,15 @@ internal fun RegistrationApp() {
         }
         val changeDescriptions = buildList {
             if (previousSettings.allowDeferOneRound != settings.allowDeferOneRound) {
-                add("暂缓一轮：${if (settings.allowDeferOneRound) "允许" else "不允许"}")
+                add("暂缓一次：${if (settings.allowDeferOneRound) "允许" else "不允许"}")
             }
             if (previousSettings.allowTemporaryLeave != settings.allowTemporaryLeave) {
                 add("暂时离开：${if (settings.allowTemporaryLeave) "允许" else "不允许"}")
+            }
+            if (previousSettings.showCommonPlayPreview != settings.showCommonPlayPreview) {
+                add(
+                    "共同游玩预览：${if (settings.showCommonPlayPreview) "显示" else "隐藏"}"
+                )
             }
             if (cloudSyncAvailable && previousSettings.websiteSyncEnabled != settings.websiteSyncEnabled) {
                 add("网站同步：${if (settings.websiteSyncEnabled) "已开启" else "已关闭"}")
@@ -3273,6 +3281,7 @@ internal fun RegistrationApp() {
                             acceptingNewRegistrations = acceptingNewRegistrations,
                             businessHoursStatus = businessHoursStatus,
                             closingGracePeriod = activeClosingGracePeriod,
+                            showCommonPlayPreview = queueRuleSettings.showCommonPlayPreview,
                             cloudSyncStatus = displayedCloudSyncStatus.takeIf { cloudSyncAvailable },
                             queueUndoAction = queueUndoAction,
                             onUndoQueueAction = ::undoLatestQueueAction,
@@ -3706,6 +3715,18 @@ internal fun RegistrationApp() {
                         .firstOrNull { it.key == selection.registrationKey }
                     if (registration != null) {
                         val currentPlayer = queue.playing.singleOrNull()
+                        val projectedPosition = queue.waitingProjection(
+                            includeCommonPlayPreview = queueRuleSettings.showCommonPlayPreview
+                        ).positions.firstOrNull { position ->
+                            position.registrations.any { it.key == registration.key }
+                        }
+                        val waitingPartnerDisplayId = projectedPosition
+                            ?.registrations
+                            ?.firstOrNull { it.key != registration.key }
+                            ?.displayId
+                        val commonPlayPreviewDisplayId = projectedPosition
+                            ?.commonPlayPreview
+                            ?.displayId
                         val isInFirstWaitingPosition = queue.waitingPositions()
                             .getOrNull(queue.firstAvailableWaitingPositionIndex() ?: -1)
                             ?.any { it.key == registration.key } == true
@@ -3730,6 +3751,8 @@ internal fun RegistrationApp() {
                             playingPartnerDisplayId = queue.playing
                                 .firstOrNull { it.key != registration.key }
                                 ?.displayId,
+                            waitingPartnerDisplayId = waitingPartnerDisplayId,
+                            commonPlayPreviewDisplayId = commonPlayPreviewDisplayId,
                             isPlayingPosition = queue.playing.any { it.key == selection.registrationKey },
                             playingPositionLabel = playingPositionName(selection.machineId),
                             canMoveIntoPlaying = currentPlayer != null &&
@@ -3772,9 +3795,9 @@ internal fun RegistrationApp() {
                                     ),
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTitle = if (registration.fixedPartnerKey == null) {
-                                        "暂缓一轮已取消"
+                                        "暂缓一次已取消"
                                     } else {
-                                        "固定组合已取消暂缓一轮"
+                                        "固定组合已取消暂缓一次"
                                     }
                                 )
                                 selectedRegistration = null
@@ -3978,9 +4001,9 @@ internal fun RegistrationApp() {
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
                                         homeFeedbackTitle = if (registration.fixedPartnerKey == null) {
-                                            "登记已暂缓一轮"
+                                            "登记已暂缓一次"
                                         } else {
-                                            "固定组合已暂缓一轮"
+                                            "固定组合已暂缓一次"
                                         }
                                     )
                                     absenceChoiceTarget = null
@@ -5550,7 +5573,7 @@ private fun QueueRuleSettingsScreen(
                     .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
             ) {
                 QueueRuleSettingRow(
-                    title = "允许暂缓一轮",
+                    title = "允许暂缓一次",
                     description = "允许玩家跳过一次游玩机会，并保留当前等待顺序。",
                     checked = settings.allowDeferOneRound,
                     onCheckedChange = {
@@ -5572,8 +5595,17 @@ private fun QueueRuleSettingsScreen(
             Column(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius)).background(CardBackground)
                     .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(CardRadius))
-                    .padding(16.dp)
             ) {
+                QueueRuleSettingRow(
+                    title = "显示共同游玩预览",
+                    description = "在开放单人位置中显示按当前轮换规则预计的共同游玩玩家。预览不会改变真实队列。",
+                    checked = settings.showCommonPlayPreview,
+                    onCheckedChange = {
+                        updateDraft(settings.copy(showCommonPlayPreview = it))
+                    }
+                )
+                HorizontalDivider(color = Separator.copy(alpha = .72f))
+                Column(Modifier.fillMaxWidth().padding(16.dp)) {
                 Text(
                     "备注用于帮助玩家辨认机台的现场位置，固定标识“机台 A”和“机台 B”始终保留。",
                     color = SecondaryText,
@@ -5600,6 +5632,7 @@ private fun QueueRuleSettingsScreen(
                         },
                         modifier = Modifier.weight(1f)
                     )
+                }
                 }
             }
             Spacer(Modifier.height(22.dp))
@@ -5989,8 +6022,8 @@ private fun auditLogSourceLabel(source: AuditLogSource): String = when (source) 
 private fun remoteQueueOperationFeedbackTitle(operation: RemoteQueueOperation): String =
     when (operation) {
         RemoteQueueOperation.JOIN_QUEUE -> "线上登记已加入"
-        RemoteQueueOperation.DEFER_ONE_ROUND -> "登记已暂缓一轮"
-        RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND -> "暂缓一轮已取消"
+        RemoteQueueOperation.DEFER_ONE_ROUND -> "登记已暂缓一次"
+        RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND -> "暂缓一次已取消"
         RemoteQueueOperation.TEMPORARILY_LEAVE -> "登记已设为暂时离开"
         RemoteQueueOperation.CANCEL_TEMPORARY_LEAVE -> "暂时离开已取消"
         RemoteQueueOperation.TRANSFER_MACHINE -> "登记已切换机台"
@@ -6019,6 +6052,7 @@ private fun HomeScreen(
     acceptingNewRegistrations: Boolean,
     businessHoursStatus: BusinessHoursStatus,
     closingGracePeriod: Boolean,
+    showCommonPlayPreview: Boolean,
     cloudSyncStatus: QueueCloudSyncStatus?,
     queueUndoAction: QueueUndoAction?,
     onUndoQueueAction: () -> Unit,
@@ -6123,6 +6157,7 @@ private fun HomeScreen(
                             acceptingNewRegistrations = acceptingNewRegistrations,
                             businessHoursClosingSoon = businessHoursStatus.closingSoon,
                             businessHoursClosingGrace = closingGracePeriod,
+                            showCommonPlayPreview = showCommonPlayPreview,
                             nowMillis = nowMillis,
                             inlineReorderSession = inlineReorderSession?.takeIf { it.machineId == MachineId.A },
                             inlineReorderResetToken = inlineReorderResetToken,
@@ -6159,6 +6194,7 @@ private fun HomeScreen(
                             acceptingNewRegistrations = acceptingNewRegistrations,
                             businessHoursClosingSoon = businessHoursStatus.closingSoon,
                             businessHoursClosingGrace = closingGracePeriod,
+                            showCommonPlayPreview = showCommonPlayPreview,
                             nowMillis = nowMillis,
                             inlineReorderSession = inlineReorderSession?.takeIf { it.machineId == MachineId.B },
                             inlineReorderResetToken = inlineReorderResetToken,
@@ -6466,6 +6502,7 @@ private fun MachineLane(
     acceptingNewRegistrations: Boolean,
     businessHoursClosingSoon: Boolean,
     businessHoursClosingGrace: Boolean,
+    showCommonPlayPreview: Boolean,
     nowMillis: Long,
     inlineReorderSession: ReorderSession?,
     inlineReorderResetToken: Int,
@@ -6485,8 +6522,11 @@ private fun MachineLane(
     modifier: Modifier = Modifier
 ) {
     val letter = machineId.name
+    val displayedWaitingPositionCount = queue.waitingProjection(
+        includeCommonPlayPreview = false
+    ).positions.size
     val queueCountSummary =
-        "${queue.waitingPositions().size} 个等待位置 · ${queue.registrationCount} 个登记"
+        "$displayedWaitingPositionCount 个等待位置 · ${queue.registrationCount} 个登记"
     Column(
         modifier.padding(horizontal = 2.dp, vertical = 3.dp)
     ) {
@@ -6606,12 +6646,21 @@ private fun MachineLane(
                         (nowMillis - it).coerceAtLeast(0L) / 60_000L
                     }
                     val playingOvertime = playingMinutes != null && playingMinutes > 20
-                    val waitingPositions = displayedQueue.waitingPositions()
+                    val actualWaitingPositions = displayedQueue.waitingPositions()
+                    val projectedWaitingPositions = displayedQueue.waitingProjection(
+                        includeCommonPlayPreview = showCommonPlayPreview
+                    ).positions
                     // A status, preference, nickname, or pair change can regroup or relabel
                     // a position even when the registration keys remain in the same order.
-                    val waitingPositionSignature = displayedQueue.waiting
+                    val waitingPositionSignature = Triple(
+                        displayedQueue.playing,
+                        displayedQueue.waiting,
+                        showCommonPlayPreview
+                    )
                     val visualWaitingPositions = remember(waitingPositionSignature) {
-                        mutableStateListOf<List<Registration>>().apply { addAll(waitingPositions) }
+                        mutableStateListOf<WaitingPositionProjection>().apply {
+                            addAll(projectedWaitingPositions)
+                        }
                     }
                     var queueViewportBounds by remember(waitingPositionSignature) {
                         mutableStateOf<Rect?>(null)
@@ -6648,8 +6697,8 @@ private fun MachineLane(
                         val key = highlightedRegistrationKey ?: return@LaunchedEffect
                         val targetIndex = when {
                             displayedQueue.playing.any { it.key == key } -> 0
-                            else -> waitingPositions.indexOfFirst { registrations ->
-                                registrations.any { it.key == key }
+                            else -> projectedWaitingPositions.indexOfFirst { position ->
+                                position.registrations.any { it.key == key }
                             }.takeIf { it >= 0 }?.plus(1)
                         } ?: return@LaunchedEffect
                         delay(180L)
@@ -6680,14 +6729,14 @@ private fun MachineLane(
                     fun reorderDraggedPosition() {
                         val draggedKey = draggedPositionKey ?: return
                         val sourceIndex = visualWaitingPositions.indexOfFirst {
-                            waitingPositionKey(it) == draggedKey
+                            waitingPositionKey(it.registrations) == draggedKey
                         }
                         if (sourceIndex < 0) return
                         val update = calculateDragReorder(
                             sourceIndex = sourceIndex,
                             dragOffset = positionDragOffset.x,
                             itemSizes = visualWaitingPositions.map {
-                                with(density) { waitingPositionWidth(it).toPx() }
+                                with(density) { waitingPositionWidth(it.registrations).toPx() }
                             },
                             spacing = with(density) { 10.dp.toPx() }
                         )
@@ -6699,12 +6748,9 @@ private fun MachineLane(
                     }
 
                     fun restoreWaitingPositionOrder() {
-                        if (
-                            visualWaitingPositions.map(::waitingPositionKey) !=
-                            waitingPositions.map(::waitingPositionKey)
-                        ) {
+                        if (visualWaitingPositions != projectedWaitingPositions) {
                             visualWaitingPositions.clear()
-                            visualWaitingPositions.addAll(waitingPositions)
+                            visualWaitingPositions.addAll(projectedWaitingPositions)
                         }
                     }
 
@@ -6782,28 +6828,36 @@ private fun MachineLane(
                         }
                         itemsIndexed(
                             items = visualWaitingPositions,
-                            key = { _, registrations -> waitingPositionKey(registrations) }
-                        ) { index, registrations ->
+                            key = { _, position -> waitingPositionKey(position.registrations) }
+                        ) { index, position ->
+                            val registrations = position.registrations
                             val fixedPair = registrations.size == 2 &&
                                 registrations[0].fixedPartnerKey == registrations[1].key &&
                                 registrations[1].fixedPartnerKey == registrations[0].key
                             val positionLabel = "位置 $letter${index + 1}" +
                                 if (fixedPair) " · 固定组合" else ""
                             val positionKey = waitingPositionKey(registrations)
+                            val actualPositionIndex = actualWaitingPositions.indexOfFirst { actual ->
+                                actual.map { it.key }.toSet() == registrations.map { it.key }.toSet()
+                            }
+                            val mapsToSingleActualPosition = actualPositionIndex >= 0
                             val isDraggingPosition = draggedPositionKey == positionKey
                             QueuePosition(
                                 label = positionLabel,
                                 registrations = registrations,
+                                commonPlayPreview = position.commonPlayPreview,
                                 isPlaying = false,
                                 overtimeWarning = false,
-                                dragEnabled = visualWaitingPositions.size > 1,
+                                dragEnabled = mapsToSingleActualPosition && actualWaitingPositions.size > 1,
                                 isDragging = isDraggingPosition,
                                 highlightedRegistrationKey = highlightedRegistrationKey,
                                 onPositionDragStart = { pointerInRoot ->
+                                    visualWaitingPositions.clear()
+                                    visualWaitingPositions.addAll(
+                                        actualWaitingPositions.map { WaitingPositionProjection(it) }
+                                    )
                                     draggedPositionKey = positionKey
-                                    draggedOriginalIndex = waitingPositions.indexOfFirst {
-                                        waitingPositionKey(it) == positionKey
-                                    }
+                                    draggedOriginalIndex = actualPositionIndex
                                     positionDragOffset = Offset.Zero
                                     dragPointerInRoot = pointerInRoot
                                     edgeScrollPerFramePx = 0f
@@ -6817,7 +6871,7 @@ private fun MachineLane(
                                 onPositionDragEnd = {
                                     val originalIndex = draggedOriginalIndex
                                     val destinationIndex = visualWaitingPositions.indexOfFirst {
-                                        waitingPositionKey(it) == positionKey
+                                        waitingPositionKey(it.registrations) == positionKey
                                     }
                                     val validDrop = originalIndex != null &&
                                         destinationIndex >= 0 &&
@@ -6855,7 +6909,8 @@ private fun MachineLane(
                                             label = positionLabel,
                                             registrationKeys = registrations.map { it.key },
                                             isPlayingPosition = false,
-                                            waitingPositionIndex = index
+                                            waitingPositionIndex = actualPositionIndex
+                                                .takeIf { mapsToSingleActualPosition }
                                         )
                                     )
                                 },
@@ -7178,6 +7233,7 @@ private fun InlineReorderRegistrationTile(
 private fun QueuePosition(
     label: String,
     registrations: List<Registration>,
+    commonPlayPreview: Registration? = null,
     isPlaying: Boolean,
     overtimeWarning: Boolean,
     modifier: Modifier = Modifier,
@@ -7198,7 +7254,8 @@ private fun QueuePosition(
     val dragOverlayController = LocalGlobalDragOverlayController.current
     val textMeasurer = rememberTextMeasurer()
     val density = LocalDensity.current
-    val tileWidths = registrations.map { registrationTileWidth(it.displayId) }
+    val displayedRegistrations = registrations + listOfNotNull(commonPlayPreview)
+    val tileWidths = displayedRegistrations.map { registrationTileWidth(it.displayId) }
     val registrationContentWidth = tileWidths.fold(0.dp) { total, width -> total + width } +
         if (tileWidths.size > 1) 7.dp * (tileWidths.size - 1) else 0.dp
     val hasWarning = overtimeWarning || warningTitle != null
@@ -7265,6 +7322,7 @@ private fun QueuePosition(
                             QueuePosition(
                                 label = label,
                                 registrations = registrations,
+                                commonPlayPreview = null,
                                 isPlaying = isPlaying,
                                 overtimeWarning = overtimeWarning,
                                 warningTitle = warningTitle,
@@ -7397,6 +7455,17 @@ private fun QueuePosition(
                         modifier = Modifier.width(tileWidths[index])
                     )
                 }
+                commonPlayPreview?.let { preview ->
+                    RegistrationTile(
+                        registration = preview,
+                        isPlaying = false,
+                        highlighted = false,
+                        commonPlayPreview = true,
+                        onClick = {},
+                        onLongClick = {},
+                        modifier = Modifier.width(tileWidths.last())
+                    )
+                }
             }
         }
     }
@@ -7408,6 +7477,7 @@ private fun RegistrationTile(
     registration: Registration,
     isPlaying: Boolean,
     highlighted: Boolean,
+    commonPlayPreview: Boolean = false,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier
@@ -7420,18 +7490,21 @@ private fun RegistrationTile(
     val noShowStatus = registration.noShowCount.takeIf { it > 0 }?.let { "未到场 $it 次" }
     val pendingCheckIn = registration.requiresOnSiteCheckIn
     val visibleStatus = when {
+        commonPlayPreview -> "共同游玩预览"
         pendingCheckIn -> "线上登记 · 待签到"
         absenceStatus != null -> absenceStatus
         else -> noShowStatus
     }
     val showNoShowStatus = !pendingCheckIn && absenceStatus == null && noShowStatus != null
     val normalBackground = when {
+        commonPlayPreview -> Color(0xFFEDEDF1)
         pendingCheckIn -> OnlineRegistrationStatusBackground
         isPlaying -> PlayingRegistrationBackground
         showNoShowStatus -> NoShowStatusBackground
         else -> CardBackground
     }
     val normalBorder = when {
+        commonPlayPreview -> Separator.copy(alpha = .72f)
         pendingCheckIn -> OnlineRegistrationStatusColor.copy(alpha = .20f)
         isPlaying -> SystemBlue.copy(alpha = .08f)
         showNoShowStatus -> NoShowStatusColor.copy(alpha = .16f)
@@ -7459,7 +7532,11 @@ private fun RegistrationTile(
                 scaleY = tileScale
             }
             .clip(shape)
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .combinedClickable(
+                enabled = !commonPlayPreview,
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
             .background(tileBackground)
             .border(1.dp, tileBorder, shape)
             .padding(horizontal = 10.dp, vertical = 8.dp),
@@ -7468,7 +7545,7 @@ private fun RegistrationTile(
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(
                 queueDisplayId(registration.displayId),
-                color = PrimaryText,
+                color = if (commonPlayPreview) SecondaryText else PrimaryText,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Medium,
                 maxLines = 1,
@@ -7476,11 +7553,13 @@ private fun RegistrationTile(
                 modifier = Modifier.weight(1f)
             )
             Spacer(Modifier.width(6.dp))
-            Text(
-                "›",
-                color = if (isPlaying) SystemBlue.copy(alpha = .48f) else TertiaryText,
-                fontSize = 17.sp
-            )
+            if (!commonPlayPreview) {
+                Text(
+                    "›",
+                    color = if (isPlaying) SystemBlue.copy(alpha = .48f) else TertiaryText,
+                    fontSize = 17.sp
+                )
+            }
         }
         Spacer(Modifier.height(5.dp))
         Text(
@@ -7490,6 +7569,7 @@ private fun RegistrationTile(
                 else -> "允许他人加入"
             },
             color = when {
+                commonPlayPreview -> TertiaryText
                 pendingCheckIn -> OnlineRegistrationStatusColor
                 absenceStatus != null -> AbsenceStatusColor
                 showNoShowStatus -> NoShowStatusColor
@@ -8701,7 +8781,7 @@ private fun PlayerProfileEditorScreen(
                     )
                     HorizontalDivider(color = Separator.copy(alpha = .58f))
                     ProfileNotificationToggle(
-                        title = "暂缓一轮、暂时离开和未到场",
+                        title = "暂缓一次、暂时离开和未到场",
                         description = "相关个人状态及系统处理结果。",
                         checked = notificationPreferences.absence,
                         enabled = notificationPreferences.enabled,
@@ -10097,6 +10177,8 @@ private fun RegistrationActions(
     playerProfileQqNumber: String?,
     fixedPartnerDisplayId: String?,
     playingPartnerDisplayId: String?,
+    waitingPartnerDisplayId: String?,
+    commonPlayPreviewDisplayId: String?,
     isPlayingPosition: Boolean,
     playingPositionLabel: String,
     canMoveIntoPlaying: Boolean,
@@ -10259,6 +10341,9 @@ private fun RegistrationActions(
                     }
                     DetailPill(
                         fixedPartnerDisplayId?.let { "与 $it 共同游玩" }
+                            ?: playingPartnerDisplayId?.let { "正在与 $it 共同游玩" }
+                            ?: waitingPartnerDisplayId?.let { "将与 $it 共同游玩" }
+                            ?: commonPlayPreviewDisplayId?.let { "预计与“$it”共同游玩" }
                             ?: playPreferenceLabel(registration)
                     )
                     DetailPill(
@@ -10302,7 +10387,7 @@ private fun RegistrationActions(
                     MetadataRow("未到场记录", "${registration.noShowCount} 次")
                     MetadataRow(
                         "上次未到场处理",
-                        if (registration.lastNoShowActionWasDefer) "暂缓一轮" else "移至队尾"
+                        if (registration.lastNoShowActionWasDefer) "暂缓一次" else "移至队尾"
                     )
                 }
                 Spacer(Modifier.height(16.dp))
@@ -10366,7 +10451,7 @@ private fun RegistrationActions(
                     when (registration.absenceStatus) {
                         QueueAbsenceStatus.DEFER_ONE_ROUND -> add(
                             MenuAction(
-                                "取消暂缓一轮",
+                                "取消暂缓一次",
                                 "恢复下一次游玩机会；登记保持当前顺序。",
                                 onCancelDeferOneRound,
                                 accented = false
@@ -10382,9 +10467,9 @@ private fun RegistrationActions(
                         )
                         QueueAbsenceStatus.NONE -> add(
                             MenuAction(
-                                "暂缓一轮或暂时离开",
+                                "暂缓一次或暂时离开",
                                 if (allowDeferOneRound || allowTemporaryLeave) {
-                                    "选择只跳过下一轮，或在返回前持续轮空。"
+                                    "选择只跳过下一次进入游玩位置的机会，或在返回前持续轮空。"
                                 } else {
                                     "系统规则不允许。"
                                 },
@@ -10934,22 +11019,24 @@ private fun PositionActions(
     val detailPositionLabel = if (selection.isPlayingPosition) {
         playingPositionLabel
     } else {
-        buildString {
-            append("队列位置 ${selection.machineId.name}${(selection.waitingPositionIndex ?: 0) + 1}")
-            if (isFixedPair) append(" · 固定组合")
-        }
+        selection.label.replaceFirst("位置 ", "队列位置 ")
     }
     val firstAvailablePositionIndex = queue.firstAvailableWaitingPositionIndex()
     val hasPendingCheckIn = registrations.any { it.requiresOnSiteCheckIn }
-    val showsRoundEndShortcut = !selection.isPlayingPosition &&
+    val targetPosition = selection.waitingPositionIndex?.let {
+        queue.waitingPositions().getOrNull(it)
+    }
+    val isPhysicalWaitingPosition = !selection.isPlayingPosition &&
+        targetPosition?.map { it.key }?.toSet() == selection.registrationKeys.toSet()
+    val showsRoundEndShortcut = isPhysicalWaitingPosition &&
         selection.waitingPositionIndex == firstAvailablePositionIndex &&
         queue.playing.isNotEmpty()
     val canReportNoShow = registrations.isNotEmpty() && registrations.all { queue.canMarkNoShow(it.key) }
     val playingOvertime = queue.playingStartedAtMillis?.let { startedAt ->
         (nowMillis - startedAt).coerceAtLeast(0L) / 60_000L > 20
     } == true
-    val targetPosition = selection.waitingPositionIndex?.let { queue.waitingPositions().getOrNull(it) }
     val canAdvanceToPlaying = playingOvertime &&
+        isPhysicalWaitingPosition &&
         (selection.waitingPositionIndex ?: 0) > 0 &&
         !showsRoundEndShortcut &&
         targetPosition?.map { it.key }?.toSet() == selection.registrationKeys.toSet() &&
@@ -10992,7 +11079,7 @@ private fun PositionActions(
         }
     }
     val queueArrangementActions = buildList {
-        if (registrations.isNotEmpty() && !selection.isPlayingPosition && !hasPendingCheckIn) {
+        if (registrations.isNotEmpty() && isPhysicalWaitingPosition && !hasPendingCheckIn) {
             add(
                 MenuAction(
                     "转至 $transferMachineName",
@@ -11006,7 +11093,7 @@ private fun PositionActions(
                 )
             )
         }
-        if (isFixedPair && !selection.isPlayingPosition && !hasPendingCheckIn) {
+        if (isFixedPair && isPhysicalWaitingPosition && !hasPendingCheckIn) {
             add(
                 MenuAction(
                     "释放组合",
@@ -11043,6 +11130,8 @@ private fun PositionActions(
         Text(
             when {
                 registrations.isEmpty() -> "这个位置目前没有登记。"
+                !selection.isPlayingPosition && !isPhysicalWaitingPosition ->
+                    "这是按当前轮换结果合并显示的预计位置。登记仍保留真实等待顺序；请点开单份登记进行操作。"
                 registrations.size == 1 -> "这个位置包含 1 份登记。"
                 else -> "这是一个由 ${registrations.size} 份登记组成的共同游玩位置。以下操作会作用于整组登记。"
             },
@@ -11149,7 +11238,11 @@ private fun PositionActions(
             MenuSectionHeader("队列安排")
             CompactActionGrid(queueArrangementActions, accented = false)
         }
-        if (registrations.isNotEmpty() && !hasPendingCheckIn) {
+        if (
+            registrations.isNotEmpty() &&
+            !hasPendingCheckIn &&
+            (selection.isPlayingPosition || isPhysicalWaitingPosition)
+        ) {
             Spacer(Modifier.height(16.dp))
             MenuSectionHeader("到场与登记")
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
@@ -11402,9 +11495,9 @@ private fun NoShowDialog(
             if (occurrence == 1) {
                 "请根据玩家是否仍会回来，选择保留原位、移至队尾或退出排队。"
             } else if (!allowDeferOneRound) {
-                "这是再次未到场。系统规则不允许暂缓一轮，请选择移至队尾或移除登记。"
+                "这是再次未到场。系统规则不允许暂缓一次，请选择移至队尾或移除登记。"
             } else {
-                "这是再次未到场。确认玩家仍会回来时可以暂缓一轮或移至队尾，否则建议移除登记。"
+                "这是再次未到场。确认玩家仍会回来时可以暂缓一次或移至队尾，否则建议移除登记。"
             },
             color = SecondaryText,
             fontSize = 13.sp,
@@ -11413,7 +11506,7 @@ private fun NoShowDialog(
         Spacer(Modifier.height(17.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             NoShowChoice(
-                "暂缓一轮",
+                "暂缓一次",
                 if (allowDeferOneRound) {
                     if (fromPlayingPosition) {
                         "回到$waitingFrontPositionLabel，跳过本次机会后自动解除。"
@@ -11481,9 +11574,9 @@ private fun GroupNoShowDialog(
             if (!anyPreviousNoShow) {
                 "以下操作会同时作用于组内全部登记。请根据玩家是否仍会回来选择处理方式。"
             } else if (!allowDeferOneRound) {
-                "组内已有登记曾被记录为未到场。系统规则不允许暂缓一轮，请选择整组移至队尾或移除整组登记。"
+                "组内已有登记曾被记录为未到场。系统规则不允许暂缓一次，请选择整组移至队尾或移除整组登记。"
             } else {
-                "组内已有登记曾被记录为未到场。确认仍会回来时可以暂缓一轮或移至队尾，否则建议移除整组登记。"
+                "组内已有登记曾被记录为未到场。确认仍会回来时可以暂缓一次或移至队尾，否则建议移除整组登记。"
             },
             color = SecondaryText,
             fontSize = 13.sp,
@@ -11492,7 +11585,7 @@ private fun GroupNoShowDialog(
         Spacer(Modifier.height(17.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             NoShowChoice(
-                "暂缓一轮",
+                "暂缓一次",
                 if (allowDeferOneRound) {
                     if (fromPlayingPosition) {
                         "整组回到$waitingFrontPositionLabel，跳过本次机会后自动解除。"
@@ -11543,12 +11636,12 @@ private fun QueueAbsenceDialog(
     }
     val subject = fixedPartnerDisplayId?.let { "“$displayId”和“$it”" } ?: "“$displayId”"
     ModalSurface(onDismiss, width = 500.dp) {
-        AnimatedContent(targetState = choice, label = "暂缓一轮或暂时离开选项") { selectedChoice ->
+        AnimatedContent(targetState = choice, label = "暂缓一次或暂时离开选项") { selectedChoice ->
             Column(Modifier.fillMaxWidth()) {
                 when (selectedChoice) {
                     null -> {
                         Text(
-                            "暂缓一轮或暂时离开",
+                            "暂缓一次或暂时离开",
                             color = PrimaryText,
                             fontSize = 22.sp,
                             fontWeight = FontWeight.SemiBold
@@ -11567,7 +11660,7 @@ private fun QueueAbsenceDialog(
                         Spacer(Modifier.height(17.dp))
                         MenuActionButton(
                             MenuAction(
-                                "暂缓一轮",
+                                "暂缓一次",
                                 if (allowDeferOneRound) {
                                     "只跳过下一次游玩机会；本轮按其余在场登记重新组合，之后自动解除。"
                                 } else {
@@ -11600,7 +11693,7 @@ private fun QueueAbsenceDialog(
 
                     QueueAbsenceChoice.DEFER_ONE_ROUND -> {
                         Text(
-                            if (fixedPartnerDisplayId == null) "确认暂缓一轮？" else "确认整组暂缓一轮？",
+                            if (fixedPartnerDisplayId == null) "确认暂缓一次？" else "确认整组暂缓一次？",
                             color = PrimaryText,
                             fontSize = 22.sp,
                             fontWeight = FontWeight.SemiBold
@@ -11635,11 +11728,11 @@ private fun QueueAbsenceDialog(
                         )
                         Spacer(Modifier.height(18.dp))
                         PrimaryButton(
-                            "确认暂缓一轮",
+                            "确认暂缓一次",
                             onDeferOneRound,
                             Modifier.fillMaxWidth(),
                             enabled = allowDeferOneRound,
-                            disabledReason = "系统规则不允许暂缓一轮。"
+                            disabledReason = "系统规则不允许暂缓一次。"
                         )
                         Spacer(Modifier.height(8.dp))
                         CancelAction("返回选择") { choice = null }
@@ -12030,7 +12123,7 @@ private fun QueueRestoreDialog(
             Text("继续使用上次的队列？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(7.dp))
             Text(
-                "上次队列保存于 ${formatQueueSnapshotTime(savedState.savedAtMillis)}。继续后会恢复游玩位置、等待顺序、暂缓一轮、暂时离开、未到场和机台状态。",
+                "上次队列保存于 ${formatQueueSnapshotTime(savedState.savedAtMillis)}。继续后会恢复游玩位置、等待顺序、暂缓一次、暂时离开、未到场和机台状态。",
                 color = SecondaryText,
                 fontSize = 13.sp,
                 lineHeight = 20.sp
@@ -12092,7 +12185,7 @@ private fun QueueRestoreMachineRow(
                 if (queue.registrationCount == 0) {
                     append("没有登记")
                 } else {
-                    append("${queue.waitingPositions().size} 个等待位置 · ${queue.registrationCount} 个登记")
+                    append("${queue.waitingProjection(includeCommonPlayPreview = false).positions.size} 个等待位置 · ${queue.registrationCount} 个登记")
                 }
                 if (!status.isOperational) append(" · 已停止使用")
             },
@@ -12239,6 +12332,11 @@ private fun AppDetailsDialog(
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
         Triple(
+            "0.7.2",
+            "队列投影与共同游玩预览",
+            "暂缓一次的真实登记会显示在预计下次进入游玩位置的位置，待签到登记也按正常登记参与分组和估时；底层顺序、拖动、保存、撤销及实际轮换保持不变。开放的单人位置会显示灰色、不可操作的共同游玩预览，并可在设置中关闭。App、网站和 QQ Bot 同步使用相同的位置、估时与搭档说明。"
+        ),
+        Triple(
             "0.7.1",
             "线上登记开放状态修复",
             "修复终端关闭登记后再次开放时，网站和 QQ Bot 仍可能被旧状态拒绝加入排队的问题。远程命令轮询现在会持续读取终端最新的登记开放状态，无需重启应用或重新切换同步开关。"
@@ -12256,7 +12354,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.6.6",
             "固定组合远程操作一致性",
-            "固定组合的暂缓一轮、取消暂缓一轮、暂时离开和取消暂时离开继续沿用现场终端规则，并同时作用于两份登记；后端和 QQ Bot 改由终端最终确认状态，避免旧快照阻止取消操作。"
+            "固定组合的暂缓一次、取消暂缓一次、暂时离开和取消暂时离开继续沿用现场终端规则，并同时作用于两份登记；后端和 QQ Bot 改由终端最终确认状态，避免旧快照阻止取消操作。"
         ),
         Triple(
             "0.6.5",
@@ -12276,7 +12374,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.6.2",
             "首页操作反馈",
-            "首页右侧动态区域现在会反馈签到、暂缓一轮与暂时离开、偏好修改、切换机台、本轮处理、机台状态和远程操作等结果；可撤销的重要操作也迁入右侧，并将撤销时间延长至 10 秒。"
+            "首页右侧动态区域现在会反馈签到、暂缓一次与暂时离开、偏好修改、切换机台、本轮处理、机台状态和远程操作等结果；可撤销的重要操作也迁入右侧，并将撤销时间延长至 10 秒。"
         ),
         Triple(
             "0.6.1",
@@ -12286,7 +12384,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.6.0",
             "队列可靠性与结构整理",
-            "终端内部职责完成第一阶段拆分；队列和玩家资料增加本机有效快照保护，并通过连续组合动作测试核对轮换、暂缓一轮、暂时离开、签到、未到场、固定组合和顺序调整的一致性。"
+            "终端内部职责完成第一阶段拆分；队列和玩家资料增加本机有效快照保护，并通过连续组合动作测试核对轮换、暂缓一次、暂时离开、签到、未到场、固定组合和顺序调整的一致性。"
         ),
         Triple(
             "0.5.5",
@@ -14063,7 +14161,17 @@ internal fun estimatedMinutesUntilPlaying(
     ) return null
     if (queue.playing.any { it.key in targetRegistrationKeys }) return 0L
 
-    var simulatedQueue = queue
+    // Public estimates use the same assumption as the waiting-position projection: an online
+    // registration that is still pending will complete check-in before its turn.
+    var simulatedQueue = queue.copy(
+        waiting = queue.waiting.map { registration ->
+            if (registration.requiresOnSiteCheckIn) {
+                registration.copy(requiresOnSiteCheckIn = false)
+            } else {
+                registration
+            }
+        }
+    )
     var waitMillis = 0L
     if (simulatedQueue.playing.isNotEmpty()) {
         val elapsedMillis = simulatedQueue.playingStartedAtMillis
@@ -14132,7 +14240,7 @@ private fun availabilityOutcomeMessage(
         }
         if (deferred.isNotEmpty()) {
             add(
-                "${names(deferred)}已暂缓一轮，本轮会被跳过；跳过后暂缓一轮状态自动解除，登记位置保持不变。"
+                "${names(deferred)}已设置为暂缓一次，本次进入游玩位置的机会会被跳过；跳过后自动恢复。真实等待顺序不变，画面位置会按后续轮换重新计算。"
             )
         }
         temporaryAwayWillRemain.forEach { registration ->
@@ -14196,7 +14304,6 @@ private fun positionWaitEstimateLabel(
     registrations: List<Registration>,
     minutes: Long?
 ): String = when {
-    registrations.any { it.requiresOnSiteCheckIn } -> "签到后可估算"
     registrations.any { it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY } ->
         "暂时离开，无法估算"
     else -> formatPositionWaitEstimate(minutes)
@@ -14276,10 +14383,9 @@ private fun MachineQueue.registrationPositionName(
     registrationKey: Int
 ): String? {
     if (playing.any { it.key == registrationKey }) return playingPositionName(machineId)
-    val waitingPositionIndex = waitingPositions().indexOfFirst { registrations ->
-        registrations.any { it.key == registrationKey }
-    }
-    return waitingPositionIndex.takeIf { it >= 0 }
+    val waitingPositionIndex = waitingProjection(includeCommonPlayPreview = false)
+        .positionIndexOf(registrationKey)
+    return waitingPositionIndex
         ?.let { "位置 ${machineId.name}${it + 1}" }
 }
 
@@ -14326,7 +14432,7 @@ private fun registrationAbsenceStatusLabel(
     includeSkippedTurns: Boolean
 ): String? = when (registration.absenceStatus) {
     QueueAbsenceStatus.NONE -> null
-    QueueAbsenceStatus.DEFER_ONE_ROUND -> "暂缓一轮"
+    QueueAbsenceStatus.DEFER_ONE_ROUND -> "暂缓一次"
     QueueAbsenceStatus.TEMPORARILY_AWAY -> buildString {
         append("暂时离开")
         if (includeSkippedTurns && registration.temporaryAwaySkippedTurns > 0) {
@@ -14347,7 +14453,7 @@ private fun fixedPairFormationAbsenceNotice(
             if (skippedTurns >= 3) "下一次轮到时，整组会自动退出排队。" else ""
     }
     if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
-        return "其中至少一份登记当前已暂缓一轮。固定组合建立后，两份登记都会暂缓一轮；下一次轮到整组时会跳过，随后同时自动解除。"
+        return "其中至少一份登记当前已暂缓一次。固定组合建立后，两份登记都会暂缓一次；下一次轮到整组时会跳过，随后同时自动解除。"
     }
     return null
 }
@@ -14361,7 +14467,7 @@ private fun fixedPairCreatedStatusDetail(registrations: List<Registration>): Str
         return "两份登记现均为暂时离开，已轮空次数统一为 $skippedTurns 次。"
     }
     return if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
-        "两份登记现均已暂缓一轮。"
+        "两份登记现均已暂缓一次。"
     } else {
         null
     }
@@ -14370,7 +14476,7 @@ private fun fixedPairCreatedStatusDetail(registrations: List<Registration>): Str
 private fun fixedPairAbsenceRetentionNotice(registration: Registration): String? =
     when (registration.absenceStatus) {
         QueueAbsenceStatus.DEFER_ONE_ROUND ->
-            "两份登记当前的暂缓一轮状态不会因解除组合而清除。"
+            "两份登记的“暂缓一次”安排不会因解除组合而取消。"
         QueueAbsenceStatus.TEMPORARILY_AWAY ->
             "两份登记当前的暂时离开状态和已轮空 ${registration.temporaryAwaySkippedTurns} 次不会因解除组合而清除。"
         QueueAbsenceStatus.NONE -> null
@@ -14379,7 +14485,7 @@ private fun fixedPairAbsenceRetentionNotice(registration: Registration): String?
 private fun remainingPartnerAbsenceNotice(registration: Registration): String? =
     when (registration.absenceStatus) {
         QueueAbsenceStatus.DEFER_ONE_ROUND ->
-            "对方仍保持暂缓一轮，并会在下一次轮到后自动解除。"
+            "对方仍保持暂缓一次，并会在下一次轮到后自动解除。"
         QueueAbsenceStatus.TEMPORARILY_AWAY ->
             "对方仍保持暂时离开和已轮空 ${registration.temporaryAwaySkippedTurns} 次，返回后需要手动取消。"
         QueueAbsenceStatus.NONE -> null
@@ -14402,9 +14508,9 @@ private fun machineTransferAbsenceNotice(
     }
     if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
         return if (breaksFixedPair) {
-            "转入登记的暂缓一轮状态会解除；留在原机台的登记仍保持暂缓一轮。"
+            "转入登记不再暂缓；留在原机台的登记仍会暂缓一次。"
         } else {
-            "这些登记转入后，暂缓一轮状态会解除。"
+            "这些登记转入后不再暂缓。"
         }
     }
     return null
@@ -14423,11 +14529,11 @@ private fun unavailableNoShowExplanation(registrations: List<Registration>): Str
         hasPendingCheckIn ->
             "$subject 尚未完成现场签到，不会进入游玩位置，不能标记为未到场。"
         hasTemporaryLeave && hasOneRoundDeferral ->
-            "$subject 包含暂缓一轮或暂时离开的登记，本次不会进入游玩位置，不能标记为未到场。"
+            "$subject 包含暂缓一次或暂时离开的登记，本次不会进入游玩位置，不能标记为未到场。"
         hasTemporaryLeave ->
             "$subject 处于暂时离开状态，本次不会进入游玩位置，不能标记为未到场。"
         else ->
-            "$subject 已暂缓一轮，本次机会会被跳过，不能标记为未到场。"
+            "$subject 已暂缓一次，本次机会会被跳过，不能标记为未到场。"
     }
 }
 

@@ -62,6 +62,108 @@ object RoundPlanner {
     fun removeCurrentRoundAndStartNext(queue: MachineQueue): RoundPlan =
         create(queue, RoundAction.REMOVE_CURRENT_ROUND_AND_START_NEXT)
 
+    /**
+     * Builds the queue presentation without mutating physical waiting order.
+     *
+     * Pending online registrations are grouped as if they will check in before their turn.
+     * A one-time deferral is placed at its first predicted playing turn, while the actual
+     * registration retains its deferral state and physical position.
+     */
+    fun waitingProjection(
+        queue: MachineQueue,
+        includeCommonPlayPreview: Boolean = true
+    ): WaitingQueueProjection {
+        if (queue.waiting.isEmpty()) return WaitingQueueProjection(emptyList())
+
+        val originalByKey = queue.allRegistrations.associateBy { it.key }
+        val waitingIndexByKey = queue.waiting.mapIndexed { index, registration ->
+            registration.key to index
+        }.toMap()
+        val schedule = projectedFirstPlayingTurns(queue)
+        val scheduledKeysInOrder = schedule.entries
+            .sortedWith(
+                compareBy<Map.Entry<Int, ProjectedPlayingTurn>>(
+                    { it.value.turnIndex },
+                    { it.value.orderInTurn },
+                    { waitingIndexByKey[it.key] ?: Int.MAX_VALUE }
+                )
+            )
+            .map { it.key }
+        val scheduledKeySet = scheduledKeysInOrder.toSet()
+        var scheduledIndex = 0
+        val reorderedWaiting = queue.waiting.map { registration ->
+            if (registration.key in scheduledKeySet) {
+                originalByKey.getValue(scheduledKeysInOrder[scheduledIndex++])
+            } else {
+                registration
+            }
+        }
+        val projectedIndexByKey = reorderedWaiting.mapIndexed { index, registration ->
+            registration.key to index
+        }.toMap()
+
+        // Registrations belong to the same visible position only when their first predicted
+        // playing turn is the same. Regrouping the reordered list directly is not sufficient:
+        // a player who returns from an earlier turn is a preview partner, not a second real
+        // registration in the deferred player's position.
+        val scheduledPositions = schedule.entries
+            .groupBy { it.value.turnIndex }
+            .values
+            .map { entries ->
+                val registrations = entries
+                    .sortedWith(
+                        compareBy<Map.Entry<Int, ProjectedPlayingTurn>>(
+                            { it.value.orderInTurn },
+                            { waitingIndexByKey[it.key] ?: Int.MAX_VALUE }
+                        )
+                    )
+                    .map { originalByKey.getValue(it.key) }
+                val commonPlayPreview = if (
+                    includeCommonPlayPreview && registrations.size == 1
+                ) {
+                    val registration = registrations.single()
+                    entries.first().value.participantKeys
+                        .singleOrNull { it != registration.key }
+                        ?.let(originalByKey::get)
+                        ?.takeIf { partner ->
+                            registration.preference == PlayPreference.OPEN_TO_JOIN &&
+                                registration.fixedPartnerKey == null &&
+                                partner.preference == PlayPreference.OPEN_TO_JOIN &&
+                                partner.fixedPartnerKey == null
+                        }
+                } else {
+                    null
+                }
+                AnchoredWaitingPosition(
+                    anchorIndex = registrations.minOf { projectedIndexByKey.getValue(it.key) },
+                    projection = WaitingPositionProjection(
+                        registrations = registrations,
+                        commonPlayPreview = commonPlayPreview
+                    )
+                )
+            }
+
+        // Temporarily-away registrations, and a deferred registration for which no future
+        // opportunity currently exists, retain their physical grouping and relative anchor.
+        val unscheduledPositions = queue.waitingPositions().mapNotNull { physicalPosition ->
+            val registrations = physicalPosition.filter { it.key !in scheduledKeySet }
+            if (registrations.isEmpty()) {
+                null
+            } else {
+                AnchoredWaitingPosition(
+                    anchorIndex = registrations.minOf { projectedIndexByKey.getValue(it.key) },
+                    projection = WaitingPositionProjection(registrations = registrations)
+                )
+            }
+        }
+
+        return WaitingQueueProjection(
+            positions = (scheduledPositions + unscheduledPositions)
+                .sortedBy(AnchoredWaitingPosition::anchorIndex)
+                .map(AnchoredWaitingPosition::projection)
+        )
+    }
+
     internal fun advance(
         queue: MachineQueue,
         skippedThisOpportunity: Set<Int>
@@ -70,6 +172,66 @@ object RoundPlanner {
         action = RoundAction.ENTER_PLAYING_POSITION,
         skippedThisOpportunity = skippedThisOpportunity
     )
+
+    private data class ProjectedPlayingTurn(
+        val turnIndex: Int,
+        val orderInTurn: Int,
+        val participantKeys: List<Int>
+    )
+
+    private data class AnchoredWaitingPosition(
+        val anchorIndex: Int,
+        val projection: WaitingPositionProjection
+    )
+
+    private fun projectedFirstPlayingTurns(
+        queue: MachineQueue
+    ): Map<Int, ProjectedPlayingTurn> {
+        val targetKeys = queue.waiting.mapTo(linkedSetOf()) { it.key }
+        if (targetKeys.isEmpty()) return emptyMap()
+
+        // The presentation assumes pending online registrations complete check-in. Execution
+        // keeps the real flag and still removes a registration that reaches its turn unsigned.
+        var simulatedQueue = queue.copy(
+            waiting = queue.waiting.map { registration ->
+                if (registration.requiresOnSiteCheckIn) {
+                    registration.copy(requiresOnSiteCheckIn = false)
+                } else {
+                    registration
+                }
+            }
+        )
+        val scheduled = mutableMapOf<Int, ProjectedPlayingTurn>()
+        val maximumTurns = targetKeys.size * 4 + queue.playing.size * 2 + 8
+
+        repeat(maximumTurns) { turnIndex ->
+            val plan = when {
+                simulatedQueue.playing.isNotEmpty() -> finishRound(simulatedQueue)
+                simulatedQueue.firstAvailableWaitingPositionIndex() != null ->
+                    enterPlayingPosition(simulatedQueue)
+                else -> return scheduled
+            }
+            val nextQueue = plan.execute(atMillis = turnIndex + 1L)
+            val participantKeys = nextQueue.playing.map { it.key }
+            nextQueue.playing.forEachIndexed { orderInTurn, registration ->
+                if (registration.key in targetKeys && registration.key !in scheduled) {
+                    scheduled[registration.key] = ProjectedPlayingTurn(
+                        turnIndex = turnIndex,
+                        orderInTurn = orderInTurn,
+                        participantKeys = participantKeys
+                    )
+                }
+            }
+            simulatedQueue = nextQueue
+            if (scheduled.keys.containsAll(targetKeys.filter { key ->
+                    queue.waiting.first { it.key == key }.absenceStatus !=
+                        QueueAbsenceStatus.TEMPORARILY_AWAY
+                })) {
+                return scheduled
+            }
+        }
+        return scheduled
+    }
 
     private fun create(
         queue: MachineQueue,

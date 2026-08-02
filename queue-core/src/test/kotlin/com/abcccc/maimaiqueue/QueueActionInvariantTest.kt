@@ -105,7 +105,7 @@ class QueueActionInvariantTest {
             .assertConsistent("批量登记")
 
         queue = queue.finishRound(atMillis = 20_000L).assertConsistent("结束本轮")
-        queue = queue.deferOneRound(2).assertConsistent("暂缓一轮")
+        queue = queue.deferOneRound(2).assertConsistent("暂缓一次")
         queue = queue.cancelDeferOneRound(2).assertConsistent("取消暂缓")
         queue = queue.temporarilyLeave(3).assertConsistent("暂时离开")
         queue = queue.cancelTemporaryLeave(3).assertConsistent("取消暂离")

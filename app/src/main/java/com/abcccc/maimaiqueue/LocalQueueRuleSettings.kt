@@ -14,6 +14,7 @@ data class QueueRuleSettings(
     val allowDeferOneRound: Boolean = true,
     val allowTemporaryLeave: Boolean = true,
     val allowOnlineRegistration: Boolean = true,
+    val showCommonPlayPreview: Boolean = true,
     val websiteSyncEnabled: Boolean = true,
     val oneBotSyncEnabled: Boolean = true,
     val syncMode: QueueSyncMode = QueueSyncMode.UNSPECIFIED,
@@ -44,6 +45,10 @@ class LocalQueueRuleSettingsRepository(
             allowTemporaryLeave = preferences.getBoolean(KEY_ALLOW_TEMPORARY_LEAVE, true),
             allowOnlineRegistration = preferences.getBoolean(
                 KEY_ALLOW_ONLINE_REGISTRATION,
+                true
+            ),
+            showCommonPlayPreview = preferences.getBoolean(
+                KEY_SHOW_COMMON_PLAY_PREVIEW,
                 true
             ),
             websiteSyncEnabled = websiteSyncEnabled,
@@ -93,6 +98,7 @@ class LocalQueueRuleSettingsRepository(
             .putBoolean(KEY_ALLOW_DEFER_ONE_ROUND, settings.allowDeferOneRound)
             .putBoolean(KEY_ALLOW_TEMPORARY_LEAVE, settings.allowTemporaryLeave)
             .putBoolean(KEY_ALLOW_ONLINE_REGISTRATION, settings.allowOnlineRegistration)
+            .putBoolean(KEY_SHOW_COMMON_PLAY_PREVIEW, settings.showCommonPlayPreview)
             .putBoolean(KEY_WEBSITE_SYNC_ENABLED, settings.websiteSyncEnabled)
             .putBoolean(KEY_ONEBOT_SYNC_ENABLED, oneBotSyncEnabled)
             .putString(KEY_SYNC_MODE, settings.syncMode.name)
@@ -150,6 +156,7 @@ class LocalQueueRuleSettingsRepository(
         const val KEY_ALLOW_DEFER_ONE_ROUND = "allow_defer_one_round"
         const val KEY_ALLOW_TEMPORARY_LEAVE = "allow_temporary_leave"
         const val KEY_ALLOW_ONLINE_REGISTRATION = "allow_online_registration"
+        const val KEY_SHOW_COMMON_PLAY_PREVIEW = "show_common_play_preview"
         const val KEY_WEBSITE_SYNC_ENABLED = "website_sync_enabled"
         const val KEY_ONEBOT_SYNC_ENABLED = "onebot_sync_enabled"
         const val KEY_SYNC_MODE = "sync_mode"

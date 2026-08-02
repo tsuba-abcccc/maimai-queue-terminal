@@ -217,6 +217,133 @@ class QueueCloudSnapshotTest {
     }
 
     @Test
+    fun publicSnapshotGroupsPendingCheckInLikeANormalRegistration() {
+        val pending = Registration(
+            key = 1,
+            displayId = "待签到",
+            preference = PlayPreference.OPEN_TO_JOIN,
+            createdAtMillis = 100L,
+            requiresOnSiteCheckIn = true
+        )
+        val available = Registration(
+            key = 2,
+            displayId = "现场玩家",
+            preference = PlayPreference.OPEN_TO_JOIN,
+            createdAtMillis = 200L
+        )
+
+        val machine = buildPublicQueueSnapshot(
+            state(machineA = MachineQueue(waiting = listOf(pending, available))),
+            terminalId = "terminal-1",
+            capturedAtMillis = 1_000L
+        ).getJSONObject("machines").getJSONObject("A")
+        val positions = machine.getJSONArray("waiting_positions")
+
+        assertEquals(1, positions.length())
+        assertEquals(2, positions.getJSONObject(0).getJSONArray("registrations").length())
+        assertEquals(0L, positions.getJSONObject(0).getLong("estimated_wait_minutes"))
+        val registrationIds = positions.getJSONObject(0).getJSONArray("registrations")
+        assertEquals(
+            listOf(publicRegistrationId(queueId, 1), publicRegistrationId(queueId, 2)),
+            (0 until registrationIds.length()).map { index ->
+                registrationIds.getJSONObject(index).getString("registration_id")
+            }
+        )
+    }
+
+    @Test
+    fun publicSnapshotPublishesCommonPlayPreviewWithoutCountingItAsARegistration() {
+        val queue = MachineQueue(
+            waiting = (1..5).map { key ->
+                Registration(
+                    key = key,
+                    displayId = "玩家-$key",
+                    preference = PlayPreference.OPEN_TO_JOIN,
+                    createdAtMillis = 100L + key
+                )
+            }
+        )
+
+        val machine = buildPublicQueueSnapshot(
+            state(machineA = queue),
+            terminalId = "terminal-1",
+            capturedAtMillis = 1_000L
+        ).getJSONObject("machines").getJSONObject("A")
+        val lastPosition = machine.getJSONArray("waiting_positions").getJSONObject(2)
+        val preview = lastPosition.getJSONObject("common_play_preview")
+
+        assertEquals(5, machine.getInt("registration_count"))
+        assertEquals(3, machine.getInt("waiting_position_count"))
+        assertEquals(1, lastPosition.getJSONArray("registrations").length())
+        assertEquals("玩家-1", preview.getString("display_id"))
+        assertEquals(publicRegistrationId(queueId, 1), preview.getString("registration_id"))
+    }
+
+    @Test
+    fun commonPlayPreviewSettingDoesNotChangeProjectedRealPositions() {
+        val queue = MachineQueue(
+            waiting = (1..5).map { key ->
+                Registration(
+                    key = key,
+                    displayId = "玩家-$key",
+                    preference = PlayPreference.OPEN_TO_JOIN,
+                    createdAtMillis = 100L + key
+                )
+            }
+        )
+
+        val machine = buildPublicQueueSnapshot(
+            state(machineA = queue),
+            terminalId = "terminal-1",
+            capturedAtMillis = 1_000L,
+            displaySettings = QueuePublicDisplaySettings(showCommonPlayPreview = false)
+        ).getJSONObject("machines").getJSONObject("A")
+        val positions = machine.getJSONArray("waiting_positions")
+
+        assertEquals(3, positions.length())
+        assertTrue(positions.getJSONObject(2).isNull("common_play_preview"))
+        assertEquals(5, machine.getInt("registration_count"))
+    }
+
+    @Test
+    fun publicSnapshotProjectsDeferredOpenRegistrationAtItsActualNextOpportunity() {
+        val deferred = Registration(
+            key = 1,
+            displayId = "暂缓玩家",
+            preference = PlayPreference.OPEN_TO_JOIN,
+            absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND,
+            createdAtMillis = 100L
+        )
+        val next = Registration(
+            key = 2,
+            displayId = "先行玩家",
+            preference = PlayPreference.OPEN_TO_JOIN,
+            createdAtMillis = 200L
+        )
+        val queue = MachineQueue(waiting = listOf(deferred, next))
+
+        val machine = buildPublicQueueSnapshot(
+            state(machineA = queue),
+            terminalId = "terminal-1",
+            capturedAtMillis = 1_000L
+        ).getJSONObject("machines").getJSONObject("A")
+        val positions = machine.getJSONArray("waiting_positions")
+        val first = positions.getJSONObject(0)
+        val second = positions.getJSONObject(1)
+
+        assertEquals("先行玩家", first.getJSONArray("registrations")
+            .getJSONObject(0).getString("display_id"))
+        assertEquals("暂缓玩家", second.getJSONArray("registrations")
+            .getJSONObject(0).getString("display_id"))
+        assertEquals(0L, first.getLong("estimated_wait_minutes"))
+        assertEquals(12L, second.getLong("estimated_wait_minutes"))
+        assertEquals("先行玩家", second.getJSONObject("common_play_preview")
+            .getString("display_id"))
+        assertEquals(listOf(1, 2), queue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.DEFER_ONE_ROUND, queue.waiting.first().absenceStatus)
+    }
+
+    @Test
     fun publicSnapshotIncludesOnlyQueueScopedPublicEvents() {
         val state = state(machineA = MachineQueue(waiting = listOf(
             Registration(

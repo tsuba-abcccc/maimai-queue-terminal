@@ -49,8 +49,8 @@ class QueueHomeFeedbackTest {
         )
 
         assertEquals(HomeSidePanelFeedbackTone.SUCCESS, outcome.tone)
-        assertTrue(outcome.detailLines.single().contains("暂缓一轮状态已自动解除"))
-        assertTrue(outcome.detailLines.single().contains("登记位置保持不变"))
+        assertTrue(outcome.detailLines.single().contains("已跳过本次机会，随后自动恢复"))
+        assertTrue(outcome.detailLines.single().contains("真实等待顺序未改变"))
     }
 
     @Test
