@@ -155,7 +155,7 @@ class AuditLogsTest {
     }
 
     @Test
-    fun completedRoundReportsClearedNoShowRecordWithoutReplacingPlayingEvent() {
+    fun completedRoundSeparatesClearedNoShowRecordFromPlayingNotification() {
         val completed = registration(1, "曾未到场玩家").copy(
             noShowCount = 2,
             lastNoShowActionWasDefer = true
@@ -167,20 +167,33 @@ class AuditLogsTest {
             playingStartedAtMillis = 500L
         )
 
-        val log = queueLog(before, before.finishRound(atMillis = 900L))!!
-
-        assertEquals("机台 A · 游玩位置已更新", log.title)
-        assertEquals(PublicQueueEventType.PLAYING_CHANGED, log.publicEventType)
-        assertEquals(
-            setOf(
-                PublicQueueNotificationCategory.PLAYING_POSITION,
-                PublicQueueNotificationCategory.ABSENCE,
-                PublicQueueNotificationCategory.QUEUE_CHANGES
-            ),
-            log.notificationCategories
+        val logs = createQueueAuditLogs(
+            category = AuditLogCategory.MACHINE_A,
+            machineLabel = "机台 A",
+            before = before,
+            after = before.finishRound(atMillis = 900L),
+            classifyAvailabilityOutcomes = true,
+            semanticAction = QueueAction.FinishRound("A")
         )
-        assertTrue(log.detail.contains("“曾未到场玩家”正常完成游玩，未到场记录已清除"))
-        assertTrue(1 in log.affectedRegistrationKeys)
+        val playingLog = logs.single {
+            it.publicEventType == PublicQueueEventType.PLAYING_CHANGED
+        }
+        val clearedLog = logs.single {
+            it.title.endsWith("未到场记录已清除")
+        }
+
+        assertEquals(
+            setOf(PublicQueueNotificationCategory.PLAYING_POSITION),
+            playingLog.notificationCategories
+        )
+        assertFalse(playingLog.detail.contains("未到场记录已清除"))
+        assertFalse(playingLog.detail.contains("登记顺序已调整为"))
+        assertEquals(
+            setOf(PublicQueueNotificationCategory.ABSENCE),
+            clearedLog.notificationCategories
+        )
+        assertEquals(listOf(completed.key), clearedLog.affectedRegistrationKeys)
+        assertTrue(clearedLog.detail.contains("“曾未到场玩家”正常完成本次游玩"))
     }
 
     @Test
@@ -539,6 +552,42 @@ class AuditLogsTest {
         assertEquals(listOf(first.key), deferLog.affectedRegistrationKeys)
         assertTrue(deferLog.detail.contains("已跳过当前游玩机会"))
         assertTrue(deferLog.detail.contains("暂缓状态已随即解除"))
+    }
+
+    @Test
+    fun immediatelyConsumedNoShowDeferUsesCompletedOutcomeTitle() {
+        val absent = registration(1, "未到场玩家", PlayPreference.SOLO)
+        val next = registration(2, "下一位玩家", PlayPreference.SOLO)
+        val before = MachineQueue(
+            playing = listOf(absent),
+            waiting = listOf(next),
+            playingStartedAtMillis = 100L
+        )
+        val action = QueueAction.MarkNoShow(
+            machineId = "A",
+            registrationKeys = setOf(absent.key),
+            resolution = NoShowResolution.DEFER_ONE_ROUND
+        )
+        val after = (QueueEngine.execute(
+            QueueEngineState.single("A", before),
+            action,
+            QueueActionContext(atMillis = 6_500L)
+        ) as QueueActionExecution.Applied).state.queue("A")!!
+
+        val noShowLog = createQueueAuditLogs(
+            category = AuditLogCategory.MACHINE_A,
+            machineLabel = "机台 A",
+            before = before,
+            after = after,
+            publicEventTypeOverride = PublicQueueEventType.NO_SHOW_DEFERRED,
+            affectedRegistrationKeysOverride = setOf(absent.key),
+            classifyAvailabilityOutcomes = true,
+            semanticAction = action
+        ).single { it.publicEventType == PublicQueueEventType.NO_SHOW_DEFERRED }
+
+        assertEquals("机台 A · 未到场 · 本次机会已跳过", noShowLog.title)
+        assertTrue(noShowLog.detail.contains("本次机会已跳过"))
+        assertTrue(noShowLog.detail.contains("暂缓状态已自动解除"))
     }
 
     @Test

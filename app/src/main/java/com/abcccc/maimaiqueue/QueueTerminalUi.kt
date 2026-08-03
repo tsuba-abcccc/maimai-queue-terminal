@@ -170,6 +170,9 @@ internal fun RegistrationApp() {
     val terminalCommandReceiptRepository = remember(context) {
         LocalTerminalCommandReceiptRepository(context)
     }
+    val terminalCommandReceiptsPendingPersistence = remember(terminalCommandReceiptRepository) {
+        mutableMapOf<String, TerminalCommandReceipt>()
+    }
     val auditLogRepository = remember(context) { LocalAuditLogRepository(context) }
     val queueStateRepository = remember(context) { LocalQueueStateRepository(context) }
     val queueRuleSettingsRepository = remember(context) {
@@ -377,6 +380,24 @@ internal fun RegistrationApp() {
             detail = detail,
             contextLabel = contextLabel,
             tone = tone
+        )
+    }
+
+    fun showQueueAdjustmentNotApplied(machineId: MachineId) {
+        val machineOperational = if (machineId == MachineId.A) {
+            machineAStatus.isOperational
+        } else {
+            machineBStatus.isOperational
+        }
+        showHomeOperationFeedback(
+            title = "本次调整未执行",
+            detail = if (machineOperational) {
+                "队列已发生变化，请根据当前队列重新调整。"
+            } else {
+                "${configuredMachineName(machineId)}已停止使用，恢复正常使用后才能调整队列。"
+            },
+            contextLabel = configuredMachineName(machineId),
+            tone = HomeSidePanelFeedbackTone.WARNING
         )
     }
 
@@ -2401,13 +2422,19 @@ internal fun RegistrationApp() {
             .filter(TerminalCommandReceipt::applied)
             .mapTo(mutableSetOf(), TerminalCommandReceipt::commandId)
         suspend fun persistTerminalCommandReceipt(receipt: TerminalCommandReceipt): Boolean {
-            if (receipt.commandId in terminalCommandReceipts) return true
-            if (!terminalCommandReceiptRepository.record(receipt)) return false
+            val stableReceipt = terminalCommandReceipts[receipt.commandId]
+                ?: terminalCommandReceiptsPendingPersistence[receipt.commandId]
+                ?: receipt
             terminalCommandReceipts = appendRecentCommandReceipt(
                 terminalCommandReceipts.values.toList(),
-                receipt
+                stableReceipt
             ).associateBy(TerminalCommandReceipt::commandId)
-            return true
+            terminalCommandReceiptsPendingPersistence[stableReceipt.commandId] = stableReceipt
+            val persisted = terminalCommandReceiptRepository.record(stableReceipt)
+            if (persisted) {
+                terminalCommandReceiptsPendingPersistence.remove(stableReceipt.commandId)
+            }
+            return persisted
         }
         while (true) {
             if (
@@ -2433,6 +2460,15 @@ internal fun RegistrationApp() {
                         for (command in commands) {
                         val existingReceipt = terminalCommandReceipts[command.commandId]
                         if (existingReceipt != null) {
+                            if (
+                                command.commandId in terminalCommandReceiptsPendingPersistence &&
+                                !persistTerminalCommandReceipt(existingReceipt)
+                            ) {
+                                localWriteFailureDetail =
+                                    "远程命令结果暂时无法写入本机，应用将继续重试。"
+                                localWriteFailureAtMillis = System.currentTimeMillis()
+                                continue
+                            }
                             localWriteFailureDetail = null
                             queueCommandClient.complete(
                                 commandId = existingReceipt.commandId,
@@ -3269,11 +3305,10 @@ internal fun RegistrationApp() {
                     explicitEditMode = activeReorder.explicitEditMode,
                     onCancel = { reorderSession = null },
                         onCommit = { registrations ->
-                        if (
+                        val changed =
                             statusFor(activeReorder.machineId).isOperational &&
                             queueFor(activeReorder.machineId)
-                                .hasSameQueueOperationState(activeReorder.queueSnapshot)
-                        ) {
+                                .hasSameQueueOperationState(activeReorder.queueSnapshot) &&
                             updateQueueWithUndoByAction(
                                 action = QueueAction.ReplaceOrder(
                                     activeReorder.machineId.name,
@@ -3283,7 +3318,7 @@ internal fun RegistrationApp() {
                                 feedbackTitle = "登记顺序已调整",
                                 feedbackDetail = "等待登记已经按照确认后的顺序重新排列。"
                             )
-                        }
+                        if (!changed) showQueueAdjustmentNotApplied(activeReorder.machineId)
                         reorderSession = null
                     }
                 )
@@ -3682,13 +3717,12 @@ internal fun RegistrationApp() {
                         },
                         onConfirm = {
                             val activeSession = reorderSession
-                            if (
+                            val changed =
                                 activeSession?.machineId == proposal.machineId &&
                                 !activeSession.explicitEditMode &&
                                 statusFor(proposal.machineId).isOperational &&
                                 queueFor(proposal.machineId)
-                                    .hasSameQueueOperationState(proposal.originalQueue)
-                            ) {
+                                    .hasSameQueueOperationState(proposal.originalQueue) &&
                                 updateQueueWithUndoByAction(
                                     action = QueueAction.ReplaceOrder(
                                         proposal.machineId.name,
@@ -3698,7 +3732,7 @@ internal fun RegistrationApp() {
                                     feedbackTitle = "登记顺序已调整",
                                     feedbackDetail = "等待登记已经按照确认后的顺序重新排列。"
                                 )
-                            }
+                            if (!changed) showQueueAdjustmentNotApplied(proposal.machineId)
                             inlineReorderProposal = null
                             reorderSession = null
                         }
@@ -3713,11 +3747,10 @@ internal fun RegistrationApp() {
                             positionReorderResetToken++
                         },
                         onConfirm = {
-                            if (
+                            val changed =
                                 statusFor(proposal.machineId).isOperational &&
                                 queueFor(proposal.machineId)
-                                    .hasSameQueueOperationState(proposal.originalQueue)
-                            ) {
+                                    .hasSameQueueOperationState(proposal.originalQueue) &&
                                 updateQueueWithUndoByAction(
                                     action = QueueAction.ReplaceOrder(
                                         proposal.machineId.name,
@@ -3727,7 +3760,7 @@ internal fun RegistrationApp() {
                                     feedbackTitle = "队列位置已调整",
                                     feedbackDetail = "组间位置已经交换，队列位置编号也已同步更新。"
                                 )
-                            }
+                            if (!changed) showQueueAdjustmentNotApplied(proposal.machineId)
                             positionReorderProposal = null
                         }
                     )
@@ -4011,6 +4044,14 @@ internal fun RegistrationApp() {
                         val temporarilyLeavePlan = planQueueAction(
                             QueueAction.TemporarilyLeave(selection.machineId.name, registration.key)
                         )
+                        val deferResultQueue = deferPlan.resultState.queue(selection.machineId.name)
+                        val deferCompletesImmediately = deferPlan.canApply &&
+                            affectedKeys.isNotEmpty() &&
+                            affectedKeys.all { key ->
+                                deferResultQueue?.allRegistrations
+                                    ?.firstOrNull { it.key == key }
+                                    ?.absenceStatus == QueueAbsenceStatus.NONE
+                            }
                         QueueAbsenceDialog(
                             displayId = registration.displayId,
                             fixedPartnerDisplayId = registration.fixedPartnerKey?.let { partnerKey ->
@@ -4039,7 +4080,13 @@ internal fun RegistrationApp() {
                                         soundCue = QueueSoundCue.QUEUE_CHANGE,
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
-                                        homeFeedbackTitle = if (registration.fixedPartnerKey == null) {
+                                        homeFeedbackTitle = if (deferCompletesImmediately) {
+                                            if (registration.fixedPartnerKey == null) {
+                                                "暂缓一次已执行"
+                                            } else {
+                                                "固定组合已完成暂缓一次"
+                                            }
+                                        } else if (registration.fixedPartnerKey == null) {
                                             "登记已暂缓一次"
                                         } else {
                                             "固定组合已暂缓一次"
@@ -6084,7 +6131,7 @@ private fun auditLogSourceLabel(source: AuditLogSource): String = when (source) 
 private fun remoteQueueOperationFeedbackTitle(operation: RemoteQueueOperation): String =
     when (operation) {
         RemoteQueueOperation.JOIN_QUEUE -> "线上登记已加入"
-        RemoteQueueOperation.DEFER_ONE_ROUND -> "登记已暂缓一次"
+        RemoteQueueOperation.DEFER_ONE_ROUND -> "暂缓一次已执行"
         RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND -> "暂缓一次已取消"
         RemoteQueueOperation.TEMPORARILY_LEAVE -> "登记已设为暂时离开"
         RemoteQueueOperation.CANCEL_TEMPORARY_LEAVE -> "暂时离开已取消"
@@ -12543,6 +12590,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.7.4",
+            "跨端反馈与通知准确性",
+            "网站在终端确认线上登记后立即显示成功；远程命令回执写入失败时会保留首次结果并继续重试，避免当前运行周期内重复执行。正常轮换、未到场记录清除和暂缓一次改为按实际结果分别生成通知，顺序调整失效时也会明确说明未执行。"
+        ),
         Triple(
             "0.7.3",
             "特殊状态轮换可靠性",

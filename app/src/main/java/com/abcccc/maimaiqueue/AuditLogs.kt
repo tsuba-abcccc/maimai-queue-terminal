@@ -267,7 +267,9 @@ fun createQueueAuditLog(
     if (beforeOrder.toSet() == afterOrder.toSet() && beforeOrder != afterOrder) {
         affectedRegistrationKeys += afterOrder
         changeKinds += "order"
-        details += "登记顺序已调整为${quotedNames(after.allRegistrations)}"
+        if ("playing" !in changeKinds) {
+            details += "登记顺序已调整为${quotedNames(after.allRegistrations)}"
+        }
     }
     if (
         before.playingStartedAtMillis != after.playingStartedAtMillis &&
@@ -327,19 +329,20 @@ fun createQueueAuditLog(
             "no_show_cleared" in changeKinds ||
             temporaryAwayExpired.isNotEmpty()
         ) add(PublicQueueNotificationCategory.ABSENCE)
-        if (changeKinds.any {
-            it in setOf(
-                "added",
-                "removed",
-                "renamed",
-                "profile",
-                "preference",
-                "pair",
-                "claimed",
-                "order",
-                "timer"
-            )
-        }) add(PublicQueueNotificationCategory.QUEUE_CHANGES)
+        if (
+            changeKinds.any {
+                it in setOf(
+                    "added",
+                    "removed",
+                    "renamed",
+                    "profile",
+                    "preference",
+                    "pair",
+                    "claimed",
+                    "timer"
+                )
+            } || "order" in changeKinds && "playing" !in changeKinds
+        ) add(PublicQueueNotificationCategory.QUEUE_CHANGES)
     }
     return createAuditLogEntry(
         category = category,
@@ -412,6 +415,14 @@ fun createQueueAuditLogs(
     } else {
         emptyList()
     }
+    val noShowRecordsCleared = if (classifyAvailabilityOutcomes) {
+        after.allRegistrations.filter { registration ->
+            val old = beforeByKey[registration.key]
+            old != null && old.noShowCount > 0 && registration.noShowCount == 0
+        }
+    } else {
+        emptyList()
+    }
     val temporaryAwayAdvanced = if (classifyAvailabilityOutcomes) {
         after.allRegistrations.filter { registration ->
             val old = beforeByKey[registration.key]
@@ -449,7 +460,7 @@ fun createQueueAuditLogs(
         addAll(temporaryAwayAdvanced.map(Registration::key))
         addAll(semanticAbsenceKeys)
     }
-    if (splitKeys.isEmpty()) {
+    if (splitKeys.isEmpty() && noShowRecordsCleared.isEmpty()) {
         return listOfNotNull(
             createQueueAuditLog(
                 category = category,
@@ -486,11 +497,11 @@ fun createQueueAuditLogs(
     val entries = mutableListOf<AuditLogEntry>()
     if (noShowKeys.isNotEmpty()) {
         val registrations = noShowKeys.mapNotNull { beforeByKey[it] ?: afterByKey[it] }
+        val stillDeferred = noShowKeys.any {
+            afterByKey[it]?.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
+        }
         val detail = when (publicEventTypeOverride) {
             PublicQueueEventType.NO_SHOW_DEFERRED -> {
-                val stillDeferred = noShowKeys.any {
-                    afterByKey[it]?.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
-                }
                 if (stillDeferred) {
                     "${names(registrations)}本次未到场，记录已更新并暂缓一次；相关登记会在跳过本次机会后自动恢复。"
                 } else {
@@ -511,7 +522,11 @@ fun createQueueAuditLogs(
         entries += event(
             type = publicEventTypeOverride ?: PublicQueueEventType.REGISTRATION_UPDATED,
             title = when (publicEventTypeOverride) {
-                PublicQueueEventType.NO_SHOW_DEFERRED -> "未到场 · 已暂缓一次"
+                PublicQueueEventType.NO_SHOW_DEFERRED -> if (stillDeferred) {
+                    "未到场 · 已暂缓一次"
+                } else {
+                    "未到场 · 本次机会已跳过"
+                }
                 PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场 · 已移至队尾"
                 else -> "未到场 · 已移除登记"
             },
@@ -543,6 +558,14 @@ fun createQueueAuditLogs(
             deferredCompleted.map(Registration::key)
         )
     }
+    if (noShowRecordsCleared.isNotEmpty()) {
+        entries += event(
+            PublicQueueEventType.ABSENCE_CHANGED,
+            "未到场记录已清除",
+            "${names(noShowRecordsCleared)}正常完成本次游玩，未到场记录已清除。",
+            noShowRecordsCleared.map(Registration::key)
+        )
+    }
     temporaryAwayAdvanced.groupBy(Registration::temporaryAwaySkippedTurns)
         .toSortedMap()
         .forEach { (skippedTurns, registrations) ->
@@ -572,7 +595,26 @@ fun createQueueAuditLogs(
         }
     }
 
-    val remainingBefore = before.removeAll(splitKeys)
+    val clearedNoShowByKey = noShowRecordsCleared.associateBy(Registration::key)
+    val beforeWithoutSplitOutcomes = before.removeAll(splitKeys)
+    val remainingBefore = beforeWithoutSplitOutcomes.copy(
+        playing = beforeWithoutSplitOutcomes.playing.map { registration ->
+            clearedNoShowByKey[registration.key]?.let { cleared ->
+                registration.copy(
+                    noShowCount = cleared.noShowCount,
+                    lastNoShowActionWasDefer = cleared.lastNoShowActionWasDefer
+                )
+            } ?: registration
+        },
+        waiting = beforeWithoutSplitOutcomes.waiting.map { registration ->
+            clearedNoShowByKey[registration.key]?.let { cleared ->
+                registration.copy(
+                    noShowCount = cleared.noShowCount,
+                    lastNoShowActionWasDefer = cleared.lastNoShowActionWasDefer
+                )
+            } ?: registration
+        }
+    )
     val remainingAfter = after.removeAll(splitKeys)
     createQueueAuditLog(
         category = category,
