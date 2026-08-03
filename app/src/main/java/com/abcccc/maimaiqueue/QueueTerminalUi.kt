@@ -754,9 +754,11 @@ internal fun RegistrationApp() {
         titleOverride: String? = null,
         publicEventTypeOverride: PublicQueueEventType? = null,
         affectedRegistrationKeysOverride: Collection<Int> = emptyList(),
-        source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL
-    ): AuditLogEntry? {
-        val entry = createQueueAuditLog(
+        source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
+        classifyAvailabilityOutcomes: Boolean = false,
+        semanticAction: QueueAction? = null
+    ): List<AuditLogEntry> {
+        val entries = createQueueAuditLogs(
             category = auditCategoryFor(machineId),
             machineLabel = configuredMachineName(machineId),
             before = beforeQueue,
@@ -764,10 +766,12 @@ internal fun RegistrationApp() {
             titleOverride = titleOverride,
             publicEventTypeOverride = publicEventTypeOverride,
             affectedRegistrationKeysOverride = affectedRegistrationKeysOverride,
-            source = source
-        ) ?: return null
-        appendAuditLog(entry)
-        return entry
+            source = source,
+            classifyAvailabilityOutcomes = classifyAvailabilityOutcomes,
+            semanticAction = semanticAction
+        )
+        entries.asReversed().forEach(::appendAuditLog)
+        return entries
     }
 
     fun removedPendingCheckInKeys(
@@ -790,6 +794,7 @@ internal fun RegistrationApp() {
         surfaceHomeFeedback: Boolean = false,
         homeFeedbackTone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS,
         homeFeedbackTitle: String? = null,
+        semanticAction: QueueAction? = null,
         transform: (MachineQueue) -> MachineQueue
     ): Boolean {
         val beforeQueue = queueFor(machineId)
@@ -803,7 +808,7 @@ internal fun RegistrationApp() {
         queueUndoAction = null
         homeSidePanelFeedback = null
         setQueue(machineId, afterQueue)
-        val auditEntry = appendQueueAuditLog(
+        val auditEntries = appendQueueAuditLog(
             machineId,
             beforeQueue,
             afterQueue,
@@ -812,14 +817,20 @@ internal fun RegistrationApp() {
                     .takeIf { missedOnlineRegistrationKeys.isNotEmpty() },
             affectedRegistrationKeysOverride =
                 affectedRegistrationKeysOverride + missedOnlineRegistrationKeys,
-            source = source
+            source = source,
+            classifyAvailabilityOutcomes = classifyMissedOnlineRegistrations,
+            semanticAction = semanticAction
         )
-        if (surfaceHomeFeedback && auditEntry != null) {
+        if (surfaceHomeFeedback && auditEntries.isNotEmpty()) {
             val machineLabel = configuredMachineName(machineId)
             showHomeOperationFeedback(
                 title = homeFeedbackTitle
-                    ?: auditEntry.title.removePrefix("$machineLabel · "),
-                detail = auditEntry.detail,
+                    ?: if (auditEntries.size == 1) {
+                        auditEntries.single().title.removePrefix("$machineLabel · ")
+                    } else {
+                        "队列已更新"
+                    },
+                detail = auditEntries.joinToString("\n") { it.detail },
                 contextLabel = machineLabel,
                 tone = if (missedOnlineRegistrationKeys.isNotEmpty()) {
                     HomeSidePanelFeedbackTone.WARNING
@@ -855,7 +866,8 @@ internal fun RegistrationApp() {
             source = source,
             surfaceHomeFeedback = surfaceHomeFeedback,
             homeFeedbackTone = homeFeedbackTone,
-            homeFeedbackTitle = homeFeedbackTitle
+            homeFeedbackTitle = homeFeedbackTitle,
+            semanticAction = plan.action
         ) { currentQueue ->
             val currentState = currentQueueEngineState().replace(machineId.name, currentQueue)
             when (val execution = plan.applyTo(
@@ -934,6 +946,8 @@ internal fun RegistrationApp() {
         message: String,
         feedbackTitle: String = message.substringAfter(" 的 ", message),
         feedbackDetail: String = "$message。",
+        classifyAvailabilityOutcomes: Boolean = false,
+        semanticAction: QueueAction? = null,
         transform: (MachineQueue) -> MachineQueue
     ): Boolean {
         val beforeQueue = queueFor(machineId)
@@ -951,7 +965,9 @@ internal fun RegistrationApp() {
             titleOverride = message,
             publicEventTypeOverride = PublicQueueEventType.ONLINE_CHECK_IN_MISSED
                 .takeIf { nonRestorableRegistrationKeys.isNotEmpty() },
-            affectedRegistrationKeysOverride = nonRestorableRegistrationKeys
+            affectedRegistrationKeysOverride = nonRestorableRegistrationKeys,
+            classifyAvailabilityOutcomes = classifyAvailabilityOutcomes,
+            semanticAction = semanticAction
         )
         queueUndoAction = QueueUndoAction(
             id = nextQueueUndoId++,
@@ -986,7 +1002,9 @@ internal fun RegistrationApp() {
             machineId = machineId,
             message = message,
             feedbackTitle = feedbackTitle,
-            feedbackDetail = feedbackDetail
+            feedbackDetail = feedbackDetail,
+            classifyAvailabilityOutcomes = true,
+            semanticAction = plan.action
         ) { currentQueue ->
             val currentState = currentQueueEngineState().replace(machineId.name, currentQueue)
             when (val execution = plan.applyTo(
@@ -1038,7 +1056,8 @@ internal fun RegistrationApp() {
                 action.machineId,
                 action.afterQueue,
                 restoredQueue,
-                "撤销：${action.message}"
+                "撤销：${action.message}",
+                publicEventTypeOverride = PublicQueueEventType.QUEUE_RESTORED
             )
             restored = restoredQueue != action.afterQueue
         }
@@ -2628,15 +2647,20 @@ internal fun RegistrationApp() {
                                                     machineId = machineId,
                                                     beforeQueue = beforeQueues.getValue(machineName),
                                                     afterQueue = result.state.queues.getValue(machineName),
-                                                    publicEventTypeOverride = when (command.operation) {
+                                                     publicEventTypeOverride = when (command.operation) {
                                                         RemoteQueueOperation.JOIN_QUEUE ->
                                                             PublicQueueEventType.ONLINE_REGISTRATION_ADDED
                                                         RemoteQueueOperation.LEAVE_QUEUE ->
                                                             PublicQueueEventType.REGISTRATION_REMOVED
-                                                        else -> null
-                                                    },
-                                                    source = command.source.auditLogSource
-                                                )
+                                                         else -> null
+                                                     },
+                                                     source = command.source.auditLogSource,
+                                                     classifyAvailabilityOutcomes = command.operation in setOf(
+                                                         RemoteQueueOperation.DEFER_ONE_ROUND,
+                                                         RemoteQueueOperation.TEMPORARILY_LEAVE
+                                                     ),
+                                                     semanticAction = result.action
+                                                 )
                                             }
                                         }
                                         if (result.changedMachineIds.isNotEmpty()) {
@@ -3977,6 +4001,16 @@ internal fun RegistrationApp() {
                     val registration = queue.allRegistrations
                         .firstOrNull { it.key == selection.registrationKey }
                     if (registration != null) {
+                        val affectedKeys = buildSet {
+                            add(registration.key)
+                            registration.fixedPartnerKey?.let(::add)
+                        }
+                        val deferPlan = planQueueAction(
+                            QueueAction.DeferOneRound(selection.machineId.name, registration.key)
+                        )
+                        val temporarilyLeavePlan = planQueueAction(
+                            QueueAction.TemporarilyLeave(selection.machineId.name, registration.key)
+                        )
                         QueueAbsenceDialog(
                             displayId = registration.displayId,
                             fixedPartnerDisplayId = registration.fixedPartnerKey?.let { partnerKey ->
@@ -3989,14 +4023,19 @@ internal fun RegistrationApp() {
                             playingPositionLabel = playingPositionName(selection.machineId),
                             allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
                             allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
+                            deferAdvanceNotice = actionAdvanceOutcomeMessage(
+                                deferPlan.impact.roundPreview,
+                                affectedKeys
+                            ),
+                            temporarilyLeaveAdvanceNotice = actionAdvanceOutcomeMessage(
+                                temporarilyLeavePlan.impact.roundPreview,
+                                affectedKeys
+                            ),
                             onDismiss = { absenceChoiceTarget = null },
                             onDeferOneRound = {
                                 if (queueRuleSettings.allowDeferOneRound) {
-                                    updateQueueByAction(
-                                        action = QueueAction.DeferOneRound(
-                                            selection.machineId.name,
-                                            registration.key
-                                        ),
+                                    updateQueueByPlan(
+                                        plan = deferPlan,
                                         soundCue = QueueSoundCue.QUEUE_CHANGE,
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
@@ -4004,18 +4043,16 @@ internal fun RegistrationApp() {
                                             "登记已暂缓一次"
                                         } else {
                                             "固定组合已暂缓一次"
-                                        }
+                                        },
+                                        executionAtMillis = System.currentTimeMillis()
                                     )
                                     absenceChoiceTarget = null
                                 }
                             },
                             onTemporarilyLeave = {
                                 if (queueRuleSettings.allowTemporaryLeave) {
-                                    updateQueueByAction(
-                                        action = QueueAction.TemporarilyLeave(
-                                            selection.machineId.name,
-                                            registration.key
-                                        ),
+                                    updateQueueByPlan(
+                                        plan = temporarilyLeavePlan,
                                         soundCue = QueueSoundCue.QUEUE_CHANGE,
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
@@ -4023,7 +4060,8 @@ internal fun RegistrationApp() {
                                             "登记已设为暂时离开"
                                         } else {
                                             "固定组合已设为暂时离开"
-                                        }
+                                        },
+                                        executionAtMillis = System.currentTimeMillis()
                                     )
                                     absenceChoiceTarget = null
                                 }
@@ -4711,65 +4749,77 @@ internal fun RegistrationApp() {
                     val registration = queue.allRegistrations
                         .firstOrNull { it.key == selection.registrationKey }
                     if (registration != null) {
+                        val startNextWhenPlayingBecomesEmpty = !selection.fromPlayingPosition
+                        fun noShowPlan(resolution: NoShowResolution) = planQueueAction(
+                            QueueAction.MarkNoShow(
+                                selection.machineId.name,
+                                setOf(registration.key),
+                                resolution,
+                                startNextWhenPlayingBecomesEmpty
+                            )
+                        )
+                        val deferPlan = noShowPlan(NoShowResolution.DEFER_ONE_ROUND)
+                        val movePlan = noShowPlan(NoShowResolution.MOVE_TO_TAIL)
+                        val removePlan = noShowPlan(NoShowResolution.REMOVE)
                         NoShowDialog(
                             registration = registration,
                             fromPlayingPosition = selection.fromPlayingPosition,
                             playingPositionLabel = playingPositionName(selection.machineId),
                             waitingFrontPositionLabel = waitingFrontPositionName(selection.machineId),
                             allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
+                            deferAdvanceNotice = actionAdvanceOutcomeMessage(
+                                deferPlan.impact.roundPreview,
+                                setOf(registration.key)
+                            ),
+                            moveAdvanceNotice = actionAdvanceOutcomeMessage(
+                                movePlan.impact.roundPreview,
+                                setOf(registration.key)
+                            ),
+                            removeAdvanceNotice = actionAdvanceOutcomeMessage(
+                                removePlan.impact.roundPreview,
+                                setOf(registration.key)
+                            ),
                             onDismiss = { noShowTarget = null },
                             onDefer = {
                                 if (queueRuleSettings.allowDeferOneRound) {
-                                    updateQueueByAction(
-                                        action = QueueAction.MarkNoShow(
-                                            selection.machineId.name,
-                                            setOf(registration.key),
-                                            NoShowResolution.DEFER_ONE_ROUND,
-                                            startNextWhenPlayingBecomesEmpty =
-                                                !selection.fromPlayingPosition
-                                        ),
+                                    updateQueueByPlan(
+                                        plan = deferPlan,
                                         soundCue = QueueSoundCue.CAUTION,
                                         publicEventTypeOverride =
                                             PublicQueueEventType.NO_SHOW_DEFERRED,
                                         affectedRegistrationKeysOverride = setOf(registration.key),
+                                        classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
-                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
+                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                        executionAtMillis = System.currentTimeMillis()
                                     )
                                     noShowTarget = null
                                 }
                             },
                             onMoveToEnd = {
-                                updateQueueByAction(
-                                    action = QueueAction.MarkNoShow(
-                                        selection.machineId.name,
-                                        setOf(registration.key),
-                                        NoShowResolution.MOVE_TO_TAIL,
-                                        startNextWhenPlayingBecomesEmpty =
-                                            !selection.fromPlayingPosition
-                                    ),
+                                updateQueueByPlan(
+                                    plan = movePlan,
                                     soundCue = QueueSoundCue.CAUTION,
                                     publicEventTypeOverride =
                                         PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
                                     affectedRegistrationKeysOverride = setOf(registration.key),
+                                    classifyMissedOnlineRegistrations = true,
                                     surfaceHomeFeedback = true,
-                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
+                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                    executionAtMillis = System.currentTimeMillis()
                                 )
                                 noShowTarget = null
                             },
                             onRemove = {
-                                updateQueueByAction(
-                                    action = QueueAction.MarkNoShow(
-                                        selection.machineId.name,
-                                        setOf(registration.key),
-                                        NoShowResolution.REMOVE,
-                                        startNextWhenPlayingBecomesEmpty =
-                                            !selection.fromPlayingPosition
-                                    ),
+                                updateQueueByPlan(
+                                    plan = removePlan,
                                     soundCue = QueueSoundCue.CAUTION,
                                     publicEventTypeOverride = PublicQueueEventType.NO_SHOW_REMOVED,
                                     affectedRegistrationKeysOverride = setOf(registration.key),
+                                    classifyMissedOnlineRegistrations = true,
                                     surfaceHomeFeedback = true,
-                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
+                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                    executionAtMillis = System.currentTimeMillis()
                                 )
                                 noShowTarget = null
                             }
@@ -4785,65 +4835,77 @@ internal fun RegistrationApp() {
                     val registrations = queue.allRegistrations
                         .filter { it.key in selection.registrationKeys }
                     if (registrations.isNotEmpty() && registrations.map { it.key }.toSet() == targetKeys) {
+                        val startNextWhenPlayingBecomesEmpty = !selection.fromPlayingPosition
+                        fun groupNoShowPlan(resolution: NoShowResolution) = planQueueAction(
+                            QueueAction.MarkNoShow(
+                                selection.machineId.name,
+                                targetKeys,
+                                resolution,
+                                startNextWhenPlayingBecomesEmpty
+                            )
+                        )
+                        val deferPlan = groupNoShowPlan(NoShowResolution.DEFER_GROUP_ONE_ROUND)
+                        val movePlan = groupNoShowPlan(NoShowResolution.MOVE_TO_TAIL)
+                        val removePlan = groupNoShowPlan(NoShowResolution.REMOVE)
                         GroupNoShowDialog(
                             registrations = registrations,
                             fromPlayingPosition = selection.fromPlayingPosition,
                             playingPositionLabel = playingPositionName(selection.machineId),
                             waitingFrontPositionLabel = waitingFrontPositionName(selection.machineId),
                             allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
+                            deferAdvanceNotice = actionAdvanceOutcomeMessage(
+                                deferPlan.impact.roundPreview,
+                                targetKeys
+                            ),
+                            moveAdvanceNotice = actionAdvanceOutcomeMessage(
+                                movePlan.impact.roundPreview,
+                                targetKeys
+                            ),
+                            removeAdvanceNotice = actionAdvanceOutcomeMessage(
+                                removePlan.impact.roundPreview,
+                                targetKeys
+                            ),
                             onDismiss = { groupNoShowTarget = null },
                             onDefer = {
                                 if (queueRuleSettings.allowDeferOneRound) {
-                                    updateQueueByAction(
-                                        action = QueueAction.MarkNoShow(
-                                            selection.machineId.name,
-                                            targetKeys,
-                                            NoShowResolution.DEFER_GROUP_ONE_ROUND,
-                                            startNextWhenPlayingBecomesEmpty =
-                                                !selection.fromPlayingPosition
-                                        ),
+                                    updateQueueByPlan(
+                                        plan = deferPlan,
                                         soundCue = QueueSoundCue.CAUTION,
                                         publicEventTypeOverride =
                                             PublicQueueEventType.NO_SHOW_DEFERRED,
                                         affectedRegistrationKeysOverride = targetKeys,
+                                        classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
-                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
+                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                        executionAtMillis = System.currentTimeMillis()
                                     )
                                     groupNoShowTarget = null
                                 }
                             },
                             onMoveToEnd = {
-                                updateQueueByAction(
-                                    action = QueueAction.MarkNoShow(
-                                        selection.machineId.name,
-                                        targetKeys,
-                                        NoShowResolution.MOVE_TO_TAIL,
-                                        startNextWhenPlayingBecomesEmpty =
-                                            !selection.fromPlayingPosition
-                                    ),
+                                updateQueueByPlan(
+                                    plan = movePlan,
                                     soundCue = QueueSoundCue.CAUTION,
                                     publicEventTypeOverride =
                                         PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
                                     affectedRegistrationKeysOverride = targetKeys,
+                                    classifyMissedOnlineRegistrations = true,
                                     surfaceHomeFeedback = true,
-                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
+                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                    executionAtMillis = System.currentTimeMillis()
                                 )
                                 groupNoShowTarget = null
                             },
                             onRemove = {
-                                updateQueueByAction(
-                                    action = QueueAction.MarkNoShow(
-                                        selection.machineId.name,
-                                        targetKeys,
-                                        NoShowResolution.REMOVE,
-                                        startNextWhenPlayingBecomesEmpty =
-                                            !selection.fromPlayingPosition
-                                    ),
+                                updateQueueByPlan(
+                                    plan = removePlan,
                                     soundCue = QueueSoundCue.CAUTION,
                                     publicEventTypeOverride = PublicQueueEventType.NO_SHOW_REMOVED,
                                     affectedRegistrationKeysOverride = targetKeys,
+                                    classifyMissedOnlineRegistrations = true,
                                     surfaceHomeFeedback = true,
-                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING
+                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                    executionAtMillis = System.currentTimeMillis()
                                 )
                                 groupNoShowTarget = null
                             }
@@ -11467,75 +11529,110 @@ private fun NoShowDialog(
     playingPositionLabel: String,
     waitingFrontPositionLabel: String,
     allowDeferOneRound: Boolean,
+    deferAdvanceNotice: String?,
+    moveAdvanceNotice: String?,
+    removeAdvanceNotice: String?,
     onDismiss: () -> Unit,
     onDefer: () -> Unit,
     onMoveToEnd: () -> Unit,
     onRemove: () -> Unit
 ) {
     val occurrence = registration.noShowCount + 1
+    var selectedResolution by remember(registration.key, occurrence) {
+        mutableStateOf<NoShowResolution?>(null)
+    }
     ModalSurface(onDismiss, width = 540.dp) {
-        Text("第 $occurrence 次未到场", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(8.dp))
-        if (fromPlayingPosition) {
-            Text(
-                "这份登记当前处于$playingPositionLabel。确认处理后，它会离开游玩位置；如果该位置因此无人游玩，将保持空缺，不会自动安排下一组。请核对现场后，再手动让下一组进入游玩位置。取消不会改变队列。",
-                color = PrimaryText,
-                fontSize = 12.sp,
-                lineHeight = 18.sp,
-                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                    .background(SoftBlue).border(
-                        1.dp,
-                        SystemBlue.copy(alpha = .14f),
-                        RoundedCornerShape(12.dp)
-                    ).padding(horizontal = 13.dp, vertical = 10.dp)
-            )
-            Spacer(Modifier.height(10.dp))
-        }
-        Text(
-            if (occurrence == 1) {
-                "请根据玩家是否仍会回来，选择保留原位、移至队尾或退出排队。"
-            } else if (!allowDeferOneRound) {
-                "这是再次未到场。系统规则不允许暂缓一次，请选择移至队尾或移除登记。"
-            } else {
-                "这是再次未到场。确认玩家仍会回来时可以暂缓一次或移至队尾，否则建议移除登记。"
-            },
-            color = SecondaryText,
-            fontSize = 13.sp,
-            lineHeight = 20.sp
-        )
-        Spacer(Modifier.height(17.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            NoShowChoice(
-                "暂缓一次",
-                if (allowDeferOneRound) {
+        AnimatedContent(targetState = selectedResolution, label = "未到场处理确认") { resolution ->
+            if (resolution == null) {
+                Column(Modifier.fillMaxWidth()) {
+                    Text("第 $occurrence 次未到场", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(8.dp))
                     if (fromPlayingPosition) {
-                        "回到$waitingFrontPositionLabel，跳过本次机会后自动解除。"
-                    } else {
-                        "$waitingFrontPositionLabel 保持不变；跳过本次机会后自动解除。"
+                        Text(
+                            "这份登记当前处于$playingPositionLabel。确认处理后，它会离开游玩位置；如果该位置因此无人游玩，将保持空缺，不会自动安排下一组。请核对现场后，再手动让下一组进入游玩位置。取消不会改变队列。",
+                            color = PrimaryText,
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp,
+                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                                .background(SoftBlue).border(
+                                    1.dp,
+                                    SystemBlue.copy(alpha = .14f),
+                                    RoundedCornerShape(12.dp)
+                                ).padding(horizontal = 13.dp, vertical = 10.dp)
+                        )
+                        Spacer(Modifier.height(10.dp))
                     }
-                } else {
-                    "系统规则不允许。"
-                },
-                onClick = onDefer,
-                visuallyDisabled = !allowDeferOneRound,
-                modifier = Modifier.weight(1f)
-            )
-            NoShowChoice(
-                "移至队尾",
-                "将这份登记移动到当前队尾。",
-                onClick = onMoveToEnd,
-                modifier = Modifier.weight(1f)
-            )
-            NoShowChoice(
-                "移除登记",
-                "从当前排队中移除这份登记。",
-                destructive = true,
-                onClick = onRemove,
-                modifier = Modifier.weight(1f)
-            )
+                    Text(
+                        if (occurrence == 1) {
+                            "请根据玩家是否仍会回来，选择保留原位、移至队尾或退出排队。"
+                        } else if (!allowDeferOneRound) {
+                            "这是再次未到场。系统规则不允许暂缓一次，请选择移至队尾或移除登记。"
+                        } else {
+                            "这是再次未到场。确认玩家仍会回来时可以暂缓一次或移至队尾，否则建议移除登记。"
+                        },
+                        color = SecondaryText,
+                        fontSize = 13.sp,
+                        lineHeight = 20.sp
+                    )
+                    Spacer(Modifier.height(17.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        NoShowChoice(
+                            "暂缓一次",
+                            if (allowDeferOneRound) {
+                                if (fromPlayingPosition) {
+                                    "回到$waitingFrontPositionLabel，跳过本次机会后自动解除。"
+                                } else {
+                                    "$waitingFrontPositionLabel 保持不变；跳过本次机会后自动解除。"
+                                }
+                            } else {
+                                "系统规则不允许。"
+                            },
+                            onClick = { selectedResolution = NoShowResolution.DEFER_ONE_ROUND },
+                            visuallyDisabled = !allowDeferOneRound,
+                            modifier = Modifier.weight(1f)
+                        )
+                        NoShowChoice(
+                            "移至队尾",
+                            "将这份登记移动到当前队尾。",
+                            onClick = { selectedResolution = NoShowResolution.MOVE_TO_TAIL },
+                            modifier = Modifier.weight(1f)
+                        )
+                        NoShowChoice(
+                            "移除登记",
+                            "从当前排队中移除这份登记。",
+                            destructive = true,
+                            onClick = { selectedResolution = NoShowResolution.REMOVE },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    CancelAction(onDismiss)
+                }
+            } else {
+                NoShowResolutionConfirmation(
+                    subject = "“${registration.displayId}”",
+                    group = false,
+                    resolution = resolution,
+                    fromPlayingPosition = fromPlayingPosition,
+                    playingPositionLabel = playingPositionLabel,
+                    waitingFrontPositionLabel = waitingFrontPositionLabel,
+                    allowDeferOneRound = allowDeferOneRound,
+                    advanceNotice = when (resolution) {
+                        NoShowResolution.DEFER_ONE_ROUND -> deferAdvanceNotice
+                        NoShowResolution.MOVE_TO_TAIL -> moveAdvanceNotice
+                        NoShowResolution.REMOVE -> removeAdvanceNotice
+                        NoShowResolution.DEFER_GROUP_ONE_ROUND -> null
+                    },
+                    onConfirm = when (resolution) {
+                        NoShowResolution.DEFER_ONE_ROUND -> onDefer
+                        NoShowResolution.MOVE_TO_TAIL -> onMoveToEnd
+                        NoShowResolution.REMOVE -> onRemove
+                        NoShowResolution.DEFER_GROUP_ONE_ROUND -> onDefer
+                    },
+                    onBack = { selectedResolution = null }
+                )
+            }
         }
-        Spacer(Modifier.height(12.dp))
-        CancelAction(onDismiss)
     }
 }
 
@@ -11546,75 +11643,171 @@ private fun GroupNoShowDialog(
     playingPositionLabel: String,
     waitingFrontPositionLabel: String,
     allowDeferOneRound: Boolean,
+    deferAdvanceNotice: String?,
+    moveAdvanceNotice: String?,
+    removeAdvanceNotice: String?,
     onDismiss: () -> Unit,
     onDefer: () -> Unit,
     onMoveToEnd: () -> Unit,
     onRemove: () -> Unit
 ) {
     val anyPreviousNoShow = registrations.any { it.noShowCount > 0 }
+    var selectedResolution by remember(registrations.map { it.key }, anyPreviousNoShow) {
+        mutableStateOf<NoShowResolution?>(null)
+    }
     ModalSurface(onDismiss, width = 550.dp) {
-        Text("记录这组玩家未到场", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(8.dp))
-        if (fromPlayingPosition) {
-            Text(
-                "这组登记当前处于$playingPositionLabel。确认处理后，整组会离开游玩位置，该位置将保持空缺，不会自动安排下一组。请核对现场后，再手动让下一组进入游玩位置。取消不会改变队列。",
-                color = PrimaryText,
-                fontSize = 12.sp,
-                lineHeight = 18.sp,
-                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                    .background(SoftBlue).border(
-                        1.dp,
-                        SystemBlue.copy(alpha = .14f),
-                        RoundedCornerShape(12.dp)
-                    ).padding(horizontal = 13.dp, vertical = 10.dp)
-            )
-            Spacer(Modifier.height(10.dp))
-        }
-        Text(
-            if (!anyPreviousNoShow) {
-                "以下操作会同时作用于组内全部登记。请根据玩家是否仍会回来选择处理方式。"
-            } else if (!allowDeferOneRound) {
-                "组内已有登记曾被记录为未到场。系统规则不允许暂缓一次，请选择整组移至队尾或移除整组登记。"
+        AnimatedContent(targetState = selectedResolution, label = "整组未到场处理确认") { resolution ->
+            if (resolution == null) {
+                Column(Modifier.fillMaxWidth()) {
+                    Text("记录这组玩家未到场", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(8.dp))
+                    if (fromPlayingPosition) {
+                        Text(
+                            "这组登记当前处于$playingPositionLabel。确认处理后，整组会离开游玩位置，该位置将保持空缺，不会自动安排下一组。请核对现场后，再手动让下一组进入游玩位置。取消不会改变队列。",
+                            color = PrimaryText,
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp,
+                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                                .background(SoftBlue).border(
+                                    1.dp,
+                                    SystemBlue.copy(alpha = .14f),
+                                    RoundedCornerShape(12.dp)
+                                ).padding(horizontal = 13.dp, vertical = 10.dp)
+                        )
+                        Spacer(Modifier.height(10.dp))
+                    }
+                    Text(
+                        if (!anyPreviousNoShow) {
+                            "以下操作会同时作用于组内全部登记。请根据玩家是否仍会回来选择处理方式。"
+                        } else if (!allowDeferOneRound) {
+                            "组内已有登记曾被记录为未到场。系统规则不允许暂缓一次，请选择整组移至队尾或移除整组登记。"
+                        } else {
+                            "组内已有登记曾被记录为未到场。确认仍会回来时可以暂缓一次或移至队尾，否则建议移除整组登记。"
+                        },
+                        color = SecondaryText,
+                        fontSize = 13.sp,
+                        lineHeight = 20.sp
+                    )
+                    Spacer(Modifier.height(17.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        NoShowChoice(
+                            "暂缓一次",
+                            if (allowDeferOneRound) {
+                                if (fromPlayingPosition) {
+                                    "整组回到$waitingFrontPositionLabel，跳过本次机会后自动解除。"
+                                } else {
+                                    "$waitingFrontPositionLabel 保持不变；整组跳过本次机会后自动解除。"
+                                }
+                            } else {
+                                "系统规则不允许。"
+                            },
+                            onClick = { selectedResolution = NoShowResolution.DEFER_GROUP_ONE_ROUND },
+                            visuallyDisabled = !allowDeferOneRound,
+                            modifier = Modifier.weight(1f)
+                        )
+                        NoShowChoice(
+                            "整组移至队尾",
+                            "将这组登记移动到当前队尾。",
+                            onClick = { selectedResolution = NoShowResolution.MOVE_TO_TAIL },
+                            modifier = Modifier.weight(1f)
+                        )
+                        NoShowChoice(
+                            "移除整组",
+                            "从当前排队中移除这组登记。",
+                            destructive = true,
+                            onClick = { selectedResolution = NoShowResolution.REMOVE },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    CancelAction(onDismiss)
+                }
             } else {
-                "组内已有登记曾被记录为未到场。确认仍会回来时可以暂缓一次或移至队尾，否则建议移除整组登记。"
+                NoShowResolutionConfirmation(
+                    subject = registrations.joinToString("和") { "“${it.displayId}”" },
+                    group = true,
+                    resolution = resolution,
+                    fromPlayingPosition = fromPlayingPosition,
+                    playingPositionLabel = playingPositionLabel,
+                    waitingFrontPositionLabel = waitingFrontPositionLabel,
+                    allowDeferOneRound = allowDeferOneRound,
+                    advanceNotice = when (resolution) {
+                        NoShowResolution.DEFER_ONE_ROUND,
+                        NoShowResolution.DEFER_GROUP_ONE_ROUND -> deferAdvanceNotice
+                        NoShowResolution.MOVE_TO_TAIL -> moveAdvanceNotice
+                        NoShowResolution.REMOVE -> removeAdvanceNotice
+                    },
+                    onConfirm = when (resolution) {
+                        NoShowResolution.DEFER_ONE_ROUND,
+                        NoShowResolution.DEFER_GROUP_ONE_ROUND -> onDefer
+                        NoShowResolution.MOVE_TO_TAIL -> onMoveToEnd
+                        NoShowResolution.REMOVE -> onRemove
+                    },
+                    onBack = { selectedResolution = null }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun NoShowResolutionConfirmation(
+    subject: String,
+    group: Boolean,
+    resolution: NoShowResolution,
+    fromPlayingPosition: Boolean,
+    playingPositionLabel: String,
+    waitingFrontPositionLabel: String,
+    allowDeferOneRound: Boolean,
+    advanceNotice: String?,
+    onConfirm: () -> Unit,
+    onBack: () -> Unit
+) {
+    val isDefer = resolution == NoShowResolution.DEFER_ONE_ROUND ||
+        resolution == NoShowResolution.DEFER_GROUP_ONE_ROUND
+    val actionLabel = when (resolution) {
+        NoShowResolution.DEFER_ONE_ROUND,
+        NoShowResolution.DEFER_GROUP_ONE_ROUND -> "暂缓一次"
+        NoShowResolution.MOVE_TO_TAIL -> if (group) "整组移至队尾" else "移至队尾"
+        NoShowResolution.REMOVE -> if (group) "移除整组" else "移除登记"
+    }
+    Column(Modifier.fillMaxWidth()) {
+        Text("确认$actionLabel？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            when {
+                fromPlayingPosition && isDefer ->
+                    "$subject 会离开${playingPositionLabel}并回到$waitingFrontPositionLabel。未到场记录会增加一次；暂缓状态会在工作人员下一次安排游玩位置时处理，不会立即把玩家重新选入本轮。"
+                fromPlayingPosition && resolution == NoShowResolution.MOVE_TO_TAIL ->
+                    "$subject 会离开${playingPositionLabel}并移至等待顺序末端。未到场记录会增加一次；如果游玩位置因此无人游玩，将保持空缺，等待工作人员安排下一组。"
+                fromPlayingPosition ->
+                    "$subject 会离开${playingPositionLabel}并退出本次排队。未到场记录不会保留在已移除的登记中；如果游玩位置因此无人游玩，将保持空缺。"
+                isDefer ->
+                    "$subject 的未到场记录会增加一次，本次机会会被跳过；登记保持真实顺序，并在跳过后自动解除暂缓。"
+                resolution == NoShowResolution.MOVE_TO_TAIL ->
+                    "$subject 的未到场记录会增加一次，并移至等待顺序末端。本次自动安排会明确跳过相关登记，下次正常轮换时再参与。"
+                else ->
+                    "$subject 会记录本次未到场并退出排队。"
             },
             color = SecondaryText,
             fontSize = 13.sp,
             lineHeight = 20.sp
         )
-        Spacer(Modifier.height(17.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            NoShowChoice(
-                "暂缓一次",
-                if (allowDeferOneRound) {
-                    if (fromPlayingPosition) {
-                        "整组回到$waitingFrontPositionLabel，跳过本次机会后自动解除。"
-                    } else {
-                        "$waitingFrontPositionLabel 保持不变；整组跳过本次机会后自动解除。"
-                    }
-                } else {
-                    "系统规则不允许。"
-                },
-                onClick = onDefer,
-                visuallyDisabled = !allowDeferOneRound,
-                modifier = Modifier.weight(1f)
-            )
-            NoShowChoice(
-                "整组移至队尾",
-                "将这组登记移动到当前队尾。",
-                onClick = onMoveToEnd,
-                modifier = Modifier.weight(1f)
-            )
-            NoShowChoice(
-                "移除整组",
-                "从当前排队中移除这组登记。",
-                destructive = true,
-                onClick = onRemove,
-                modifier = Modifier.weight(1f)
+        AutomaticAdvanceNotice(advanceNotice)
+        Spacer(Modifier.height(18.dp))
+        if (resolution == NoShowResolution.REMOVE) {
+            DestructiveButton("确认$actionLabel", onConfirm, Modifier.fillMaxWidth())
+        } else {
+            PrimaryButton(
+                "确认$actionLabel",
+                onConfirm,
+                Modifier.fillMaxWidth(),
+                enabled = !isDefer || allowDeferOneRound,
+                disabledReason = "系统规则不允许暂缓一次。"
             )
         }
-        Spacer(Modifier.height(12.dp))
-        CancelAction(onDismiss)
+        Spacer(Modifier.height(8.dp))
+        CancelAction("返回选择", onBack)
     }
 }
 
@@ -11627,6 +11820,8 @@ private fun QueueAbsenceDialog(
     playingPositionLabel: String,
     allowDeferOneRound: Boolean,
     allowTemporaryLeave: Boolean,
+    deferAdvanceNotice: String?,
+    temporarilyLeaveAdvanceNotice: String?,
     onDismiss: () -> Unit,
     onDeferOneRound: () -> Unit,
     onTemporarilyLeave: () -> Unit
@@ -11726,6 +11921,7 @@ private fun QueueAbsenceDialog(
                                 .background(AbsenceStatusBackground)
                                 .padding(horizontal = 13.dp, vertical = 10.dp)
                         )
+                        AutomaticAdvanceNotice(deferAdvanceNotice)
                         Spacer(Modifier.height(18.dp))
                         PrimaryButton(
                             "确认暂缓一次",
@@ -11766,6 +11962,7 @@ private fun QueueAbsenceDialog(
                                 .background(AbsenceStatusBackground)
                                 .padding(horizontal = 13.dp, vertical = 10.dp)
                         )
+                        AutomaticAdvanceNotice(temporarilyLeaveAdvanceNotice)
                         Spacer(Modifier.height(18.dp))
                         PrimaryButton(
                             "确认暂时离开",
@@ -11781,6 +11978,21 @@ private fun QueueAbsenceDialog(
             }
         }
     }
+}
+
+@Composable
+private fun AutomaticAdvanceNotice(notice: String?) {
+    if (notice == null) return
+    Spacer(Modifier.height(10.dp))
+    Text(
+        "队列还会同时处理以下情况：\n$notice",
+        color = AbsenceStatusColor,
+        fontSize = 12.sp,
+        lineHeight = 19.sp,
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+            .background(AbsenceStatusBackground)
+            .padding(horizontal = 13.dp, vertical = 10.dp)
+    )
 }
 
 @Composable
@@ -12331,6 +12543,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.7.3",
+            "特殊状态轮换可靠性",
+            "修复待签到、暂缓一次、暂时离开和固定组合在连续轮换、短队列及位置校正中的边界问题。自动处理结果现在分别生成准确的日志和通知；网站与 QQ Bot 的延迟操作会在终端复核登记位置、固定组合和缺席状态，避免旧确认覆盖现场新变化。"
+        ),
         Triple(
             "0.7.2",
             "队列投影与共同游玩预览",
@@ -14203,11 +14420,26 @@ private fun nextPlayingChangeMessage(preview: NextPlayingPositionPreview?): Stri
     )
 }
 
+private fun actionAdvanceOutcomeMessage(
+    preview: NextPlayingPositionPreview?,
+    actionRegistrationKeys: Set<Int>
+): String? {
+    if (preview == null) return null
+    return availabilityOutcomeMessage(
+        unavailableRegistrations = preview.unavailableRegistrations.filterNot {
+            it.key in actionRegistrationKeys
+        },
+        nextRegistrations = preview.nextRegistrations,
+        alwaysIncludeNextResult = true
+    )
+}
+
 private fun availabilityOutcomeMessage(
     unavailableRegistrations: List<Registration>,
-    nextRegistrations: List<Registration>
+    nextRegistrations: List<Registration>,
+    alwaysIncludeNextResult: Boolean = false
 ): String? {
-    if (unavailableRegistrations.isEmpty()) return null
+    if (unavailableRegistrations.isEmpty() && !alwaysIncludeNextResult) return null
 
     fun names(registrations: List<Registration>): String =
         registrations.joinToString("和") { "“${it.displayId}”" }
@@ -14265,6 +14497,7 @@ private fun availabilityOutcomeMessage(
         1 -> "实际将由${names(nextRegistrations)}单人游玩。"
         else -> "实际将由${names(nextRegistrations)}共同游玩。"
     }
+    if (outcomes.isEmpty()) return nextRound
     return (outcomes + "系统会按照其余有效登记的顺序和游玩偏好重新组合。$nextRound")
         .joinToString("\n")
 }

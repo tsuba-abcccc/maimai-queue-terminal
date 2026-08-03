@@ -900,11 +900,38 @@ object QueueEngine {
                 queue.moveFirstWaitingRegistrationIntoCurrentRound(action.registrationKey)
             is QueueAction.AdvanceToWaitingPosition ->
                 queue.advanceToWaitingPosition(action.registrationKeys, context.atMillis)
-            is QueueAction.DeferOneRound ->
-                queue.deferOneRound(action.registrationKey, context.atMillis)
+            is QueueAction.DeferOneRound -> {
+                val staged = queue.deferOneRound(
+                    registrationKey = action.registrationKey,
+                    atMillis = context.atMillis,
+                    advanceWhenPlayingBecomesEmpty = false
+                )
+                if (queue.playing.isNotEmpty() && staged.playing.isEmpty()) {
+                    RoundPlanner.enterPlayingPosition(staged).let { plan ->
+                        roundPreview = plan.preview
+                        plan.execute(context.atMillis)
+                    }
+                } else {
+                    staged
+                }
+            }
             is QueueAction.CancelDeferOneRound -> queue.cancelDeferOneRound(action.registrationKey)
-            is QueueAction.TemporarilyLeave ->
-                queue.temporarilyLeave(action.registrationKey, context.atMillis)
+            is QueueAction.TemporarilyLeave -> {
+                val affectedKeys = queue.fixedGroupKeys(action.registrationKey)
+                val staged = queue.temporarilyLeave(
+                    registrationKey = action.registrationKey,
+                    atMillis = context.atMillis,
+                    advanceWhenPlayingBecomesEmpty = false
+                )
+                if (queue.playing.isNotEmpty() && staged.playing.isEmpty()) {
+                    RoundPlanner.advance(staged, affectedKeys).let { plan ->
+                        roundPreview = plan.preview
+                        plan.execute(context.atMillis)
+                    }
+                } else {
+                    staged
+                }
+            }
             is QueueAction.CancelTemporaryLeave -> queue.cancelTemporaryLeave(action.registrationKey)
             is QueueAction.ChangePreference ->
                 queue.changePreference(action.registrationKey, action.preference)
@@ -951,27 +978,44 @@ object QueueEngine {
                 gender = action.gender,
                 preferenceOverride = action.preferenceOverride
             )
-            is QueueAction.MarkNoShow -> when (action.resolution) {
-                NoShowResolution.DEFER_ONE_ROUND -> queue.markNoShowDeferOneRound(
-                    action.registrationKeys.singleOrNull() ?: return AppliedBehavior(state),
-                    action.startNextWhenPlayingBecomesEmpty,
-                    context.atMillis
-                )
-                NoShowResolution.DEFER_GROUP_ONE_ROUND -> queue.markNoShowGroupDeferOneRound(
-                    action.registrationKeys,
-                    action.startNextWhenPlayingBecomesEmpty,
-                    context.atMillis
-                )
-                NoShowResolution.MOVE_TO_TAIL -> queue.markNoShowMoveToEnd(
-                    action.registrationKeys,
-                    action.startNextWhenPlayingBecomesEmpty,
-                    context.atMillis
-                )
-                NoShowResolution.REMOVE -> queue.markNoShowAndRemove(
-                    action.registrationKeys,
-                    action.startNextWhenPlayingBecomesEmpty,
-                    context.atMillis
-                )
+            is QueueAction.MarkNoShow -> {
+                val staged = when (action.resolution) {
+                    NoShowResolution.DEFER_ONE_ROUND -> queue.markNoShowDeferOneRound(
+                        action.registrationKeys.singleOrNull() ?: return AppliedBehavior(state),
+                        startNextWhenPlayingBecomesEmpty = false,
+                        atMillis = context.atMillis
+                    )
+                    NoShowResolution.DEFER_GROUP_ONE_ROUND -> queue.markNoShowGroupDeferOneRound(
+                        action.registrationKeys,
+                        startNextWhenPlayingBecomesEmpty = false,
+                        atMillis = context.atMillis
+                    )
+                    NoShowResolution.MOVE_TO_TAIL -> queue.markNoShowMoveToEnd(
+                        action.registrationKeys,
+                        startNextWhenPlayingBecomesEmpty = false,
+                        atMillis = context.atMillis
+                    )
+                    NoShowResolution.REMOVE -> queue.markNoShowAndRemove(
+                        action.registrationKeys,
+                        startNextWhenPlayingBecomesEmpty = false,
+                        atMillis = context.atMillis
+                    )
+                }
+                if (action.startNextWhenPlayingBecomesEmpty && staged.playing.isEmpty()) {
+                    val skippedThisOpportunity = if (
+                        action.resolution == NoShowResolution.MOVE_TO_TAIL
+                    ) {
+                        action.registrationKeys
+                    } else {
+                        emptySet()
+                    }
+                    RoundPlanner.advance(staged, skippedThisOpportunity).let { plan ->
+                        roundPreview = plan.preview
+                        plan.execute(context.atMillis)
+                    }
+                } else {
+                    staged
+                }
             }
             is QueueAction.CheckIn -> queue.checkIn(action.registrationKey)
             is QueueAction.RemoveRegistrations -> queue.removeAll(action.registrationKeys)

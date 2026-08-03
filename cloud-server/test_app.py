@@ -2858,6 +2858,13 @@ class QueueStatusApiTest(unittest.TestCase):
         command = response.get_json()
         self.assertEqual("CANCEL_TEMPORARY_LEAVE", command["payload"]["operation"])
         self.assertEqual(first["registration_id"], command["payload"]["registration_id"])
+        self.assertEqual("WAITING", command["payload"]["expected_position"])
+        self.assertEqual("f" * 24, command["payload"]["expected_fixed_pair_id"])
+        self.assertEqual("NONE", command["payload"]["expected_absence_status"])
+        self.assertEqual(
+            0, command["payload"]["expected_temporary_away_skipped_turns"]
+        )
+        self.assertFalse(command["payload"]["expected_pending_check_in"])
 
     def test_disabling_onebot_does_not_reject_a_pending_website_join(self):
         enabled = self.remote_ready_snapshot(revision=4)

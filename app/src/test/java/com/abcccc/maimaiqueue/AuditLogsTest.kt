@@ -465,4 +465,174 @@ class AuditLogsTest {
         assertTrue(editedLog.detail.contains("QQ 号已更新"))
         assertTrue(!editedLog.detail.contains("12345678"))
     }
+
+    @Test
+    fun mixedAutomaticOutcomesUseSeparateTitlesAndRecipients() {
+        val current = registration(9, "本轮玩家").copy(preference = PlayPreference.SOLO)
+        val pending = registration(1, "未签到玩家").copy(
+            preference = PlayPreference.SOLO,
+            requiresOnSiteCheckIn = true
+        )
+        val away = registration(2, "暂离玩家").copy(
+            preference = PlayPreference.SOLO,
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            temporaryAwaySkippedTurns = 3
+        )
+        val deferred = registration(3, "暂缓玩家").copy(
+            preference = PlayPreference.SOLO,
+            absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+        )
+        val next = registration(4, "下一位玩家").copy(preference = PlayPreference.SOLO)
+        val before = MachineQueue(
+            playing = listOf(current),
+            waiting = listOf(pending, away, deferred, next),
+            playingStartedAtMillis = 100L
+        )
+        val after = RoundPlanner.finishRound(before).execute(5_000L)
+
+        val logs = createQueueAuditLogs(
+            category = AuditLogCategory.MACHINE_A,
+            machineLabel = "机台 A",
+            before = before,
+            after = after,
+            classifyAvailabilityOutcomes = true,
+            semanticAction = QueueAction.FinishRound("A")
+        )
+
+        val pendingLog = logs.single { it.publicEventType == PublicQueueEventType.ONLINE_CHECK_IN_MISSED }
+        val awayLog = logs.single { it.publicEventType == PublicQueueEventType.TEMPORARY_AWAY_EXPIRED }
+        val deferredLog = logs.single {
+            it.title.endsWith("暂缓一次已完成")
+        }
+        assertEquals(listOf(pending.key), pendingLog.affectedRegistrationKeys)
+        assertEquals(listOf(away.key), awayLog.affectedRegistrationKeys)
+        assertEquals(listOf(deferred.key), deferredLog.affectedRegistrationKeys)
+        assertFalse(awayLog.title.contains("未签到"))
+        assertFalse(pendingLog.title.contains("暂时离开"))
+    }
+
+    @Test
+    fun immediatelyConsumedDeferStillProducesAnActionLog() {
+        val first = registration(1, "小雨")
+        val second = registration(2, "青空")
+        val before = MachineQueue(
+            playing = listOf(first, second),
+            playingStartedAtMillis = 100L
+        )
+        val action = QueueAction.DeferOneRound("A", first.key)
+        val after = (QueueEngine.execute(
+            QueueEngineState.single("A", before),
+            action,
+            QueueActionContext(atMillis = 6_000L)
+        ) as QueueActionExecution.Applied).state.queue("A")!!
+
+        val logs = createQueueAuditLogs(
+            category = AuditLogCategory.MACHINE_A,
+            machineLabel = "机台 A",
+            before = before,
+            after = after,
+            classifyAvailabilityOutcomes = true,
+            semanticAction = action
+        )
+        val deferLog = logs.single { it.title.endsWith("暂缓一次已执行") }
+
+        assertEquals(listOf(first.key), deferLog.affectedRegistrationKeys)
+        assertTrue(deferLog.detail.contains("已跳过当前游玩机会"))
+        assertTrue(deferLog.detail.contains("暂缓状态已随即解除"))
+    }
+
+    @Test
+    fun undoRestoreDescribesRestoredRegistrationsInsteadOfNewOnes() {
+        val restored = registration(1, "小雨").copy(
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            temporaryAwaySkippedTurns = 3
+        )
+        val log = createQueueAuditLog(
+            category = AuditLogCategory.MACHINE_A,
+            machineLabel = "机台 A",
+            before = MachineQueue(),
+            after = MachineQueue(waiting = listOf(restored)),
+            titleOverride = "撤销：本轮已结束",
+            publicEventTypeOverride = PublicQueueEventType.QUEUE_RESTORED
+        )!!
+
+        assertTrue(log.detail.contains("撤销操作后恢复"))
+        assertFalse(log.detail.contains("新增"))
+    }
+
+    @Test
+    fun noShowTailLogOnlyMentionsAutomaticArrangementWhenItActuallyRuns() {
+        val absent = registration(1, "小雨", PlayPreference.SOLO)
+        val next = registration(2, "青空", PlayPreference.SOLO)
+        val before = MachineQueue(playing = listOf(absent), waiting = listOf(next))
+        val after = before.markNoShowMoveToEnd(
+            registrationKeys = setOf(absent.key),
+            startNextWhenPlayingBecomesEmpty = false
+        )
+
+        val manualLog = createQueueAuditLogs(
+            category = AuditLogCategory.MACHINE_A,
+            machineLabel = "机台 A",
+            before = before,
+            after = after,
+            publicEventTypeOverride = PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
+            affectedRegistrationKeysOverride = setOf(absent.key),
+            classifyAvailabilityOutcomes = true,
+            semanticAction = QueueAction.MarkNoShow(
+                machineId = "A",
+                registrationKeys = setOf(absent.key),
+                resolution = NoShowResolution.MOVE_TO_TAIL,
+                startNextWhenPlayingBecomesEmpty = false
+            )
+        ).single()
+
+        assertTrue(manualLog.detail.contains("等待工作人员安排"))
+        assertFalse(manualLog.detail.contains("本次自动安排"))
+    }
+
+    @Test
+    fun noShowTargetAndAutomaticallyRemovedPendingRegistrationUseSeparateEvents() {
+        val absent = registration(1, "未到场玩家", PlayPreference.SOLO)
+        val pending = registration(2, "未签到玩家", PlayPreference.SOLO).copy(
+            requiresOnSiteCheckIn = true
+        )
+        val next = registration(3, "下一位玩家", PlayPreference.SOLO)
+        val before = MachineQueue(waiting = listOf(absent, pending, next))
+        val action = QueueAction.MarkNoShow(
+            machineId = "A",
+            registrationKeys = setOf(absent.key),
+            resolution = NoShowResolution.MOVE_TO_TAIL,
+            startNextWhenPlayingBecomesEmpty = true
+        )
+        val after = (QueueEngine.execute(
+            QueueEngineState.single("A", before),
+            action,
+            QueueActionContext(atMillis = 7_000L)
+        ) as QueueActionExecution.Applied).state.queue("A")!!
+
+        val logs = createQueueAuditLogs(
+            category = AuditLogCategory.MACHINE_A,
+            machineLabel = "机台 A",
+            before = before,
+            after = after,
+            publicEventTypeOverride = PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
+            affectedRegistrationKeysOverride = setOf(absent.key, pending.key),
+            classifyAvailabilityOutcomes = true,
+            semanticAction = action
+        )
+
+        val noShowLog = logs.single {
+            it.publicEventType == PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL
+        }
+        val pendingLog = logs.single {
+            it.publicEventType == PublicQueueEventType.ONLINE_CHECK_IN_MISSED
+        }
+        assertEquals(listOf(absent.key), noShowLog.affectedRegistrationKeys)
+        assertEquals(listOf(pending.key), pendingLog.affectedRegistrationKeys)
+        assertTrue(noShowLog.detail.contains("未到场玩家"))
+        assertFalse(noShowLog.detail.contains("未签到玩家"))
+        assertTrue(pendingLog.detail.contains("未签到玩家"))
+        assertFalse(pendingLog.detail.contains("未到场玩家"))
+        assertEquals(listOf(next.key), after.playing.map(Registration::key))
+    }
 }

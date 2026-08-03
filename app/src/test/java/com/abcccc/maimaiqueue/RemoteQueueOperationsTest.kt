@@ -495,6 +495,50 @@ class RemoteQueueOperationsTest {
         }
     }
 
+    @Test
+    fun delayedRemoteMutationRejectsAChangedPositionPairOrAbsenceState() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id
+        )
+        val expected = operationCommand(RemoteQueueOperation.LEAVE_QUEUE, player).copy(
+            expectedPosition = RemoteRegistrationPosition.WAITING,
+            expectedAbsenceStatus = QueueAbsenceStatus.NONE,
+            expectedTemporaryAwaySkippedTurns = 0,
+            expectedPendingCheckIn = false
+        )
+
+        val movedToPlaying = decideRemoteQueueOperation(
+            expected,
+            state(machineA = MachineQueue(playing = listOf(player)), nextKey = 3)
+        ) as RemoteQueueOperationDecision.Reject
+        assertTrue(movedToPlaying.detail.contains("所在位置已经变化"))
+
+        val partner = registration(3, "固定搭档")
+        val pairedQueue = MachineQueue(waiting = listOf(player, partner)).let { queue ->
+            queue.applyFriendPair(requireNotNull(queue.planFriendPair(player.key, partner.key)))
+        }
+        val paired = decideRemoteQueueOperation(
+            expected,
+            state(machineA = pairedQueue, nextKey = 4)
+        ) as RemoteQueueOperationDecision.Reject
+        assertTrue(paired.detail.contains("固定组合状态已经变化"))
+
+        val deferred = decideRemoteQueueOperation(
+            expected.copy(
+                operation = RemoteQueueOperation.CHANGE_PLAY_PREFERENCE,
+                preference = PlayPreference.SOLO
+            ),
+            state(
+                machineA = MachineQueue(
+                    waiting = listOf(player.copy(absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND))
+                ),
+                nextKey = 3
+            )
+        ) as RemoteQueueOperationDecision.Reject
+        assertTrue(deferred.detail.contains("登记状态已经变化"))
+    }
+
     private fun state(
         machineA: MachineQueue = MachineQueue(),
         machineB: MachineQueue = MachineQueue(),

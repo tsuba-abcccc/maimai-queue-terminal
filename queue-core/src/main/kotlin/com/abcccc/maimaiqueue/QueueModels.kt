@@ -122,10 +122,12 @@ data class FriendPairPlan(
 data class NextPlayingPositionPreview(
     val nominalRegistrations: List<Registration>,
     val nextRegistrations: List<Registration>,
-    val unavailableRegistrations: List<Registration>
+    val unavailableRegistrations: List<Registration>,
+    val skippedThisOpportunityRegistrations: List<Registration> = emptyList()
 ) {
     val changedByAvailability: Boolean
-        get() = unavailableRegistrations.isNotEmpty() &&
+        get() = (unavailableRegistrations.isNotEmpty() ||
+            skippedThisOpportunityRegistrations.isNotEmpty()) &&
             nominalRegistrations.map { it.key }.toSet() != nextRegistrations.map { it.key }.toSet()
 }
 
@@ -365,7 +367,8 @@ data class MachineQueue(
     /** Skips exactly one opportunity while preserving the registration's physical order. */
     fun deferOneRound(
         registrationKey: Int,
-        atMillis: Long = System.currentTimeMillis()
+        atMillis: Long = System.currentTimeMillis(),
+        advanceWhenPlayingBecomesEmpty: Boolean = true
     ): MachineQueue {
         val affectedKeys = fixedGroupKeys(registrationKey)
         if (
@@ -377,7 +380,14 @@ data class MachineQueue(
             val remainingPlayers = sanitizeFriendPairs(playing.filterNot { it.key in affectedKeys })
             val returnedToFront = movedFromPlaying.map {
                 it.copy(
-                    absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND,
+                    // When one player leaves a shared playing position, that player's current
+                    // opportunity has already been skipped. Keeping the flag until the following
+                    // round would skip a second opportunity.
+                    absenceStatus = if (remainingPlayers.isEmpty()) {
+                        QueueAbsenceStatus.DEFER_ONE_ROUND
+                    } else {
+                        QueueAbsenceStatus.NONE
+                    },
                     temporaryAwaySkippedTurns = 0
                 )
             }
@@ -386,7 +396,7 @@ data class MachineQueue(
                 waiting = sanitizeFriendPairs(returnedToFront + waiting),
                 playingStartedAtMillis = if (remainingPlayers.isEmpty()) null else playingStartedAtMillis
             )
-            return if (remainingPlayers.isEmpty()) {
+            return if (advanceWhenPlayingBecomesEmpty && remainingPlayers.isEmpty()) {
                 updated.advanceIfNeeded(atMillis)
             } else {
                 updated
@@ -421,7 +431,8 @@ data class MachineQueue(
     /** Keeps skipping turns until manually cancelled, rotating to the tail after each skipped turn. */
     fun temporarilyLeave(
         registrationKey: Int,
-        atMillis: Long = System.currentTimeMillis()
+        atMillis: Long = System.currentTimeMillis(),
+        advanceWhenPlayingBecomesEmpty: Boolean = true
     ): MachineQueue {
         val affectedKeys = fixedGroupKeys(registrationKey)
         if (
@@ -442,7 +453,7 @@ data class MachineQueue(
                 waiting = sanitizeFriendPairs(waiting + movedToTail),
                 playingStartedAtMillis = if (remainingPlayers.isEmpty()) null else playingStartedAtMillis
             )
-            return if (remainingPlayers.isEmpty()) {
+            return if (advanceWhenPlayingBecomesEmpty && remainingPlayers.isEmpty()) {
                 updated.advanceIfNeeded(
                     atMillis = atMillis,
                     skippedThisOpportunity = affectedKeys
@@ -896,7 +907,9 @@ data class MachineQueue(
             playingStartedAtMillis = if (sanitizedPlaying.isEmpty()) null else playingStartedAtMillis
         )
         return if (startNextWhenPlayingBecomesEmpty && updated.playing.isEmpty()) {
-            updated.advanceIfNeeded(atMillis)
+            // Moving an absent registration to the tail must not immediately select it again
+            // when the remaining queue is short. It rejoins normal selection next time.
+            updated.advanceIfNeeded(atMillis, registrationKeys)
         } else {
             updated
         }
@@ -1029,7 +1042,7 @@ data class MachineQueue(
         skippedThisOpportunity: Set<Int> = emptySet()
     ): MachineQueue = RoundPlanner.advance(this, skippedThisOpportunity).execute(atMillis)
 
-    private fun fixedGroupKeys(registrationKey: Int): Set<Int> {
+    internal fun fixedGroupKeys(registrationKey: Int): Set<Int> {
         val registration = allRegistrations.firstOrNull { it.key == registrationKey }
             ?: return emptySet()
         val partnerKey = registration.fixedPartnerKey

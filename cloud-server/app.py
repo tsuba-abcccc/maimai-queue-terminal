@@ -2144,6 +2144,19 @@ def build_queue_operation_payload(
         {
             "registration_id": registration["registration_id"],
             "machine_id": context["machine_id"],
+            "expected_position": context["position"],
+            "expected_fixed_pair_id": registration.get("fixed_pair_id"),
+            "expected_absence_status": (
+                "DEFER_ONE_ROUND"
+                if registration.get("deferred_once", False)
+                else "TEMPORARILY_AWAY"
+                if registration.get("temporarily_away", False)
+                else "NONE"
+            ),
+            "expected_temporary_away_skipped_turns": registration.get(
+                "temporary_away_skipped_turns", 0
+            ),
+            "expected_pending_check_in": pending_check_in,
         }
     )
     return payload, None

@@ -129,7 +129,11 @@ fun createQueueAuditLog(
 
     if (added.isNotEmpty()) {
         changeKinds += "added"
-        details += "新增 ${quotedNames(added)}"
+        details += if (publicEventTypeOverride == PublicQueueEventType.QUEUE_RESTORED) {
+            "撤销操作后恢复 ${quotedNames(added)}"
+        } else {
+            "新增 ${quotedNames(added)}"
+        }
     }
     if (removed.isNotEmpty()) {
         changeKinds += "removed"
@@ -351,6 +355,240 @@ fun createQueueAuditLog(
         notificationCategories = notificationCategories,
         affectedRegistrationKeys = affectedRegistrationKeys
     )
+}
+
+fun createQueueAuditLogs(
+    category: AuditLogCategory,
+    machineLabel: String,
+    before: MachineQueue,
+    after: MachineQueue,
+    titleOverride: String? = null,
+    publicEventTypeOverride: PublicQueueEventType? = null,
+    affectedRegistrationKeysOverride: Collection<Int> = emptyList(),
+    source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
+    timestampMillis: Long = System.currentTimeMillis(),
+    classifyAvailabilityOutcomes: Boolean = false,
+    semanticAction: QueueAction? = null
+): List<AuditLogEntry> {
+    if (before == after) return emptyList()
+
+    val beforeByKey = before.allRegistrations.associateBy(Registration::key)
+    val afterByKey = after.allRegistrations.associateBy(Registration::key)
+    val noShowEventTypes = setOf(
+        PublicQueueEventType.NO_SHOW_DEFERRED,
+        PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
+        PublicQueueEventType.NO_SHOW_REMOVED
+    )
+    val noShowKeys = if (publicEventTypeOverride in noShowEventTypes) {
+        when (semanticAction) {
+            is QueueAction.MarkNoShow -> semanticAction.registrationKeys
+            else -> affectedRegistrationKeysOverride.toSet()
+        }
+    } else {
+        emptySet()
+    }
+    val removed = before.allRegistrations.filter { it.key !in afterByKey }
+    val pendingCheckInRemoved = if (classifyAvailabilityOutcomes) {
+        removed.filter { it.requiresOnSiteCheckIn && it.key !in noShowKeys }
+    } else {
+        emptyList()
+    }
+    val temporaryAwayExpired = if (classifyAvailabilityOutcomes) {
+        removed.filter {
+            it.key !in noShowKeys &&
+                it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
+                it.temporaryAwaySkippedTurns >= 3
+        }
+    } else {
+        emptyList()
+    }
+    val deferredCompleted = if (classifyAvailabilityOutcomes) {
+        after.allRegistrations.filter { registration ->
+            registration.key !in noShowKeys &&
+                beforeByKey[registration.key]?.absenceStatus ==
+                QueueAbsenceStatus.DEFER_ONE_ROUND &&
+                registration.absenceStatus == QueueAbsenceStatus.NONE
+        }
+    } else {
+        emptyList()
+    }
+    val temporaryAwayAdvanced = if (classifyAvailabilityOutcomes) {
+        after.allRegistrations.filter { registration ->
+            val old = beforeByKey[registration.key]
+            registration.key !in noShowKeys &&
+                old?.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
+                registration.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
+                registration.temporaryAwaySkippedTurns > old.temporaryAwaySkippedTurns
+        }
+    } else {
+        emptyList()
+    }
+    fun fixedGroupKeys(registrationKey: Int): Set<Int> {
+        val registration = before.allRegistrations.firstOrNull { it.key == registrationKey }
+            ?: return emptySet()
+        val partner = registration.fixedPartnerKey?.let { partnerKey ->
+            before.allRegistrations.firstOrNull { it.key == partnerKey }
+        }
+        return if (partner?.fixedPartnerKey == registration.key) {
+            setOf(registration.key, partner.key)
+        } else {
+            setOf(registration.key)
+        }
+    }
+    val semanticAbsenceKeys = when (semanticAction) {
+        is QueueAction.DeferOneRound -> fixedGroupKeys(semanticAction.registrationKey)
+        is QueueAction.TemporarilyLeave -> fixedGroupKeys(semanticAction.registrationKey)
+        else -> emptySet()
+    }.filterTo(mutableSetOf()) { key -> before.playing.any { it.key == key } }
+
+    val splitKeys = buildSet {
+        addAll(noShowKeys)
+        addAll(pendingCheckInRemoved.map(Registration::key))
+        addAll(temporaryAwayExpired.map(Registration::key))
+        addAll(deferredCompleted.map(Registration::key))
+        addAll(temporaryAwayAdvanced.map(Registration::key))
+        addAll(semanticAbsenceKeys)
+    }
+    if (splitKeys.isEmpty()) {
+        return listOfNotNull(
+            createQueueAuditLog(
+                category = category,
+                machineLabel = machineLabel,
+                before = before,
+                after = after,
+                titleOverride = titleOverride,
+                publicEventTypeOverride = publicEventTypeOverride,
+                affectedRegistrationKeysOverride = affectedRegistrationKeysOverride,
+                source = source,
+                timestampMillis = timestampMillis
+            )
+        )
+    }
+
+    fun names(registrations: Collection<Registration>): String =
+        registrations.joinToString("、") { "“${it.displayId}”" }
+
+    fun event(
+        type: PublicQueueEventType,
+        title: String,
+        detail: String,
+        keys: Collection<Int>
+    ): AuditLogEntry = createAuditLogEntry(
+        category = category,
+        title = "$machineLabel · $title",
+        detail = detail,
+        source = source,
+        timestampMillis = timestampMillis,
+        publicEventType = type,
+        affectedRegistrationKeys = keys
+    )
+
+    val entries = mutableListOf<AuditLogEntry>()
+    if (noShowKeys.isNotEmpty()) {
+        val registrations = noShowKeys.mapNotNull { beforeByKey[it] ?: afterByKey[it] }
+        val detail = when (publicEventTypeOverride) {
+            PublicQueueEventType.NO_SHOW_DEFERRED -> {
+                val stillDeferred = noShowKeys.any {
+                    afterByKey[it]?.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
+                }
+                if (stillDeferred) {
+                    "${names(registrations)}本次未到场，记录已更新并暂缓一次；相关登记会在跳过本次机会后自动恢复。"
+                } else {
+                    "${names(registrations)}本次未到场，记录已更新；本次机会已跳过，暂缓状态已自动解除。"
+                }
+            }
+            PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL ->
+                if (
+                    semanticAction is QueueAction.MarkNoShow &&
+                    semanticAction.startNextWhenPlayingBecomesEmpty
+                ) {
+                    "${names(registrations)}本次未到场，记录已更新并移至等待顺序末端；本次自动安排不会再次选中相关登记。"
+                } else {
+                    "${names(registrations)}本次未到场，记录已更新并移至等待顺序末端；游玩位置保持当前状态，等待工作人员安排。"
+                }
+            else -> "${names(registrations)}本次未到场，相关登记已移除。"
+        }
+        entries += event(
+            type = publicEventTypeOverride ?: PublicQueueEventType.REGISTRATION_UPDATED,
+            title = when (publicEventTypeOverride) {
+                PublicQueueEventType.NO_SHOW_DEFERRED -> "未到场 · 已暂缓一次"
+                PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场 · 已移至队尾"
+                else -> "未到场 · 已移除登记"
+            },
+            detail = detail,
+            keys = noShowKeys
+        )
+    }
+    if (pendingCheckInRemoved.isNotEmpty()) {
+        entries += event(
+            PublicQueueEventType.ONLINE_CHECK_IN_MISSED,
+            "未签到登记已自动移除",
+            "${names(pendingCheckInRemoved)}轮到进入游玩位置时尚未完成现场签到，登记已自动移除。",
+            pendingCheckInRemoved.map(Registration::key)
+        )
+    }
+    if (temporaryAwayExpired.isNotEmpty()) {
+        entries += event(
+            PublicQueueEventType.TEMPORARY_AWAY_EXPIRED,
+            "暂时离开已达轮空上限",
+            "${names(temporaryAwayExpired)}在暂时离开期间第四次轮到，已自动退出排队。",
+            temporaryAwayExpired.map(Registration::key)
+        )
+    }
+    if (deferredCompleted.isNotEmpty()) {
+        entries += event(
+            PublicQueueEventType.ABSENCE_CHANGED,
+            "暂缓一次已完成",
+            "${names(deferredCompleted)}已跳过本次机会，暂缓状态随后自动解除；真实等待顺序未改变。",
+            deferredCompleted.map(Registration::key)
+        )
+    }
+    temporaryAwayAdvanced.groupBy(Registration::temporaryAwaySkippedTurns)
+        .toSortedMap()
+        .forEach { (skippedTurns, registrations) ->
+            entries += event(
+                PublicQueueEventType.ABSENCE_CHANGED,
+                "暂时离开 · 已轮空 $skippedTurns 次",
+                "${names(registrations)}本次已轮空并移至等待顺序末端，累计已轮空 $skippedTurns 次。",
+                registrations.map(Registration::key)
+            )
+        }
+    if (semanticAbsenceKeys.isNotEmpty()) {
+        val registrations = semanticAbsenceKeys.mapNotNull(beforeByKey::get)
+        when (semanticAction) {
+            is QueueAction.DeferOneRound -> entries += event(
+                PublicQueueEventType.ABSENCE_CHANGED,
+                "暂缓一次已执行",
+                "${names(registrations)}已跳过当前游玩机会并回到等待顺序前端，暂缓状态已随即解除。",
+                semanticAbsenceKeys
+            )
+            is QueueAction.TemporarilyLeave -> entries += event(
+                PublicQueueEventType.ABSENCE_CHANGED,
+                "已设为暂时离开",
+                "${names(registrations)}已离开游玩位置并移至等待顺序末端，累计已轮空 1 次；返回后需要手动取消暂时离开。",
+                semanticAbsenceKeys
+            )
+            else -> Unit
+        }
+    }
+
+    val remainingBefore = before.removeAll(splitKeys)
+    val remainingAfter = after.removeAll(splitKeys)
+    createQueueAuditLog(
+        category = category,
+        machineLabel = machineLabel,
+        before = remainingBefore,
+        after = remainingAfter,
+        titleOverride = titleOverride,
+        publicEventTypeOverride = publicEventTypeOverride
+            ?.takeUnless { it in noShowEventTypes || it == PublicQueueEventType.ONLINE_CHECK_IN_MISSED },
+        affectedRegistrationKeysOverride = affectedRegistrationKeysOverride.filterNot {
+            it in splitKeys
+        },
+        source = source,
+        timestampMillis = timestampMillis
+    )?.let(entries::add)
+    return entries
 }
 
 internal fun notificationCategoryForEventType(

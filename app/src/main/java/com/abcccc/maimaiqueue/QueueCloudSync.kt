@@ -757,6 +757,25 @@ private fun parseQueueOperation(command: JSONObject?): RemoteQueueOperationComma
             registrationId = payload.optionalNonBlankString("registration_id"),
             preference = payload.optionalNonBlankString("preference")?.let {
                 PlayPreference.valueOf(it)
+            },
+            expectedPosition = payload.optionalNonBlankString("expected_position")?.let {
+                RemoteRegistrationPosition.valueOf(it)
+            },
+            expectedFixedPairId = payload.optionalNonBlankString("expected_fixed_pair_id"),
+            expectedAbsenceStatus = payload.optionalNonBlankString(
+                "expected_absence_status"
+            )?.let(QueueAbsenceStatus::valueOf),
+            expectedTemporaryAwaySkippedTurns = if (
+                payload.has("expected_temporary_away_skipped_turns")
+            ) {
+                payload.getInt("expected_temporary_away_skipped_turns")
+            } else {
+                null
+            },
+            expectedPendingCheckIn = if (payload.has("expected_pending_check_in")) {
+                payload.getBoolean("expected_pending_check_in")
+            } else {
+                null
             }
         )
     }.getOrNull()?.takeIf(::isValidQueueOperationCommand)
@@ -857,6 +876,14 @@ private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): 
         value != null && value.matches(Regex("[A-Z][A-Z0-9_-]{0,7}"))
     }
     val validRegistrationId = command.registrationId?.matches(Regex("[0-9a-f]{24}")) == true
+    val hasExpectedContext = command.expectedPosition != null
+    val validExpectedContext = !hasExpectedContext || (
+        command.expectedAbsenceStatus != null &&
+            command.expectedTemporaryAwaySkippedTurns?.let { it in 0..3 } == true &&
+            command.expectedPendingCheckIn != null &&
+            (command.expectedFixedPairId == null ||
+                command.expectedFixedPairId.matches(Regex("[0-9a-f]{24}")))
+        )
     if (
         !validUuid(command.commandId) ||
         !validUuid(command.queueId) ||
@@ -864,6 +891,7 @@ private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): 
         command.createdAtMillis <= 0L ||
         command.actorQq.isBlank() ||
         !isValidQqNumber(command.actorQq) ||
+        !validExpectedContext ||
         (command.source == RemoteQueueOperationSource.WEBSITE_REMOTE &&
             command.operation != RemoteQueueOperation.JOIN_QUEUE)
     ) return false
@@ -1489,7 +1517,7 @@ private fun buildPublicRegistration(queueId: String, registration: Registration)
 internal fun publicRegistrationId(queueId: String, registrationKey: Int): String =
     stablePublicId("registration:$queueId:$registrationKey")
 
-private fun publicPositionId(queueId: String, registrationKeys: Set<Int>): String =
+internal fun publicPositionId(queueId: String, registrationKeys: Set<Int>): String =
     stablePublicId("position:$queueId:${registrationKeys.sorted().joinToString(",")}")
 
 private fun stablePublicId(value: String): String = MessageDigest.getInstance("SHA-256")

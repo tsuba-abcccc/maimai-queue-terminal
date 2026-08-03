@@ -21,6 +21,15 @@ class QueueActionInvariantTest {
 
     private fun MachineQueue.assertConsistent(step: String): MachineQueue = apply {
         assertTrue("$step: ${invariantViolations().joinToString()} ", invariantViolations().isEmpty())
+        val projectedKeys = waitingProjection().positions.flatMap { position ->
+            position.registrations.map(Registration::key)
+        }
+        assertEquals("$step：等待投影必须恰好包含全部真实登记", waiting.size, projectedKeys.size)
+        assertEquals(
+            "$step：等待投影不能新增、删除或重复真实登记",
+            waiting.map(Registration::key).toSet(),
+            projectedKeys.toSet()
+        )
         assertRoundPlansConsistent(step)
     }
 

@@ -255,7 +255,7 @@ object RoundPlanner {
                 }
             }
         }
-        val preview = nextPlayingPositionPreview(preparedQueue)
+        val preview = nextPlayingPositionPreview(preparedQueue, skippedThisOpportunity)
         val shouldAdvance = action != RoundAction.END_ROUND_ONLY &&
             !(action == RoundAction.REMOVE_CURRENT_ROUND_AND_START_NEXT && queue.playing.isEmpty())
         val resultTemplate = if (shouldAdvance) {
@@ -281,32 +281,27 @@ object RoundPlanner {
         )
     }
 
-    private fun nextPlayingPositionPreview(queue: MachineQueue): NextPlayingPositionPreview? {
+    private fun nextPlayingPositionPreview(
+        queue: MachineQueue,
+        skippedThisOpportunity: Set<Int> = emptySet()
+    ): NextPlayingPositionPreview? {
         if (queue.waiting.isEmpty()) return null
 
-        val nominalRegistrations = groupIntoPositions(
-            queue.waiting.map { registration ->
-                registration.copy(
-                    absenceStatus = QueueAbsenceStatus.NONE,
-                    temporaryAwaySkippedTurns = 0,
-                    requiresOnSiteCheckIn = false
-                )
-            }
-        ).firstOrNull().orEmpty()
-        val nextRegistrations = queue.waitingPositions()
-            .getOrNull(queue.firstAvailableWaitingPositionIndex() ?: -1)
+        val nominalRegistrations = nominalFirstPosition(queue)
+        val nextRegistrations = opportunityPositions(queue, skippedThisOpportunity)
+            .firstOrNull { position -> position.all { it.canEnterPlayingPosition } }
             .orEmpty()
-        val lastNextRegistrationIndex = nextRegistrations
-            .maxOfOrNull { next -> queue.waiting.indexOfFirst { it.key == next.key } }
-            ?: queue.waiting.lastIndex
         val unavailableRegistrations = queue.waiting
-            .take(lastNextRegistrationIndex + 1)
+            .take(opportunityEndIndex(queue, nominalRegistrations, nextRegistrations) + 1)
             .filterNot { it.canEnterPlayingPosition }
 
         return NextPlayingPositionPreview(
             nominalRegistrations = nominalRegistrations,
             nextRegistrations = nextRegistrations,
-            unavailableRegistrations = unavailableRegistrations
+            unavailableRegistrations = unavailableRegistrations,
+            skippedThisOpportunityRegistrations = queue.waiting.filter {
+                it.key in skippedThisOpportunity
+            }
         )
     }
 
@@ -317,16 +312,16 @@ object RoundPlanner {
     ): MachineQueue {
         if (queue.playing.isNotEmpty() || queue.waiting.isEmpty()) return queue
 
-        val positions = queue.waitingPositions()
+        val positions = opportunityPositions(queue, skippedThisOpportunity)
         val nextPlayers = positions.firstOrNull { position ->
             position.all { it.canEnterPlayingPosition }
         }.orEmpty()
         val nextPlayerKeys = nextPlayers.mapTo(mutableSetOf()) { it.key }
-        val opportunityEndIndex = if (nextPlayers.isEmpty()) {
-            queue.waiting.lastIndex
-        } else {
-            nextPlayers.maxOf { next -> queue.waiting.indexOfFirst { it.key == next.key } }
-        }
+        val opportunityEndIndex = opportunityEndIndex(
+            queue = queue,
+            nominalRegistrations = nominalFirstPosition(queue),
+            nextRegistrations = nextPlayers
+        )
         val crossedUnavailableKeys = queue.waiting
             .take(opportunityEndIndex + 1)
             .filter {
@@ -399,5 +394,58 @@ object RoundPlanner {
             waiting = sanitizeFriendPairs(retained + movedToTail),
             playingStartedAtMillis = if (nextPlayers.isEmpty()) null else atMillis
         )
+    }
+
+    private fun nominalFirstPosition(queue: MachineQueue): List<Registration> =
+        groupIntoPositions(
+            queue.waiting.map { registration ->
+                registration.copy(
+                    absenceStatus = QueueAbsenceStatus.NONE,
+                    temporaryAwaySkippedTurns = 0,
+                    requiresOnSiteCheckIn = false
+                )
+            }
+        ).firstOrNull().orEmpty()
+
+    private fun opportunityPositions(
+        queue: MachineQueue,
+        skippedThisOpportunity: Set<Int>
+    ): List<List<Registration>> {
+        if (skippedThisOpportunity.isEmpty()) return queue.waitingPositions()
+
+        val originalByKey = queue.waiting.associateBy { it.key }
+        return groupIntoPositions(
+            queue.waiting.map { registration ->
+                if (registration.key in skippedThisOpportunity && registration.canEnterPlayingPosition) {
+                    registration.copy(absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND)
+                } else {
+                    registration
+                }
+            }
+        ).map { position -> position.map { originalByKey.getValue(it.key) } }
+    }
+
+    /**
+     * One opportunity ends after both its nominal group and the group that can actually play.
+     * An unavailable second open registration still belongs to the first nominal two-player
+     * opportunity even when the available player enters the playing position alone.
+     */
+    private fun opportunityEndIndex(
+        queue: MachineQueue,
+        nominalRegistrations: List<Registration>,
+        nextRegistrations: List<Registration>
+    ): Int {
+        if (nextRegistrations.isEmpty()) return queue.waiting.lastIndex
+
+        fun lastIndexOf(registrations: List<Registration>): Int = registrations
+            .maxOfOrNull { registration ->
+                queue.waiting.indexOfFirst { it.key == registration.key }
+            }
+            ?: -1
+
+        return maxOf(
+            lastIndexOf(nominalRegistrations),
+            lastIndexOf(nextRegistrations)
+        ).coerceAtLeast(0)
     }
 }
