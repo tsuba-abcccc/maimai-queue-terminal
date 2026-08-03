@@ -1181,21 +1181,53 @@ internal fun buildQueueSyncSnapshot(
     put(
         "private_player_contacts",
         JSONArray().apply {
+            val contactsByRegistrationKey = linkedMapOf<Int, AuditPlayerContact>()
             sequenceOf(state.machineA, state.machineB)
                 .flatMap { machine -> machine.allRegistrations.asSequence() }
-                .mapNotNull { registration ->
-                    val profileId = registration.playerProfileId ?: return@mapNotNull null
+                .forEach { registration ->
+                    val profileId = registration.playerProfileId ?: return@forEach
                     val qqNumber = profilesById[profileId]
                         ?.normalizedQqNumber()
                         ?.takeIf(::isValidQqNumber)
-                        ?: return@mapNotNull null
-                    JSONObject().apply {
-                        put("registration_id", publicRegistrationId(state.queueId, registration.key))
-                        put("profile_id", profileId)
-                        put("qq_number", qqNumber)
-                    }
+                        ?: return@forEach
+                    contactsByRegistrationKey[registration.key] = AuditPlayerContact(
+                        registrationKey = registration.key,
+                        profileId = profileId,
+                        qqNumber = qqNumber
+                    )
                 }
-                .forEach(::put)
+            auditLogs.asSequence()
+                .filter { event ->
+                    event.queueId == state.queueId && event.publicEventType != null
+                }
+                .sortedByDescending(AuditLogEntry::timestampMillis)
+                .take(MAX_PUBLIC_EVENTS_PER_SNAPSHOT)
+                .flatMap { it.affectedPlayerContacts.asSequence() }
+                .mapNotNull { contact ->
+                    if (contact.registrationKey <= 0 || contact.profileId.isBlank()) {
+                        return@mapNotNull null
+                    }
+                    val currentQqNumber = profilesById[contact.profileId]
+                        ?.normalizedQqNumber()
+                        ?.takeIf(::isValidQqNumber)
+                        ?: return@mapNotNull null
+                    contact.copy(qqNumber = currentQqNumber)
+                }
+                .forEach { contact ->
+                    contactsByRegistrationKey.putIfAbsent(contact.registrationKey, contact)
+                }
+            contactsByRegistrationKey.values
+                .take(MAX_PRIVATE_CONTACTS_PER_SNAPSHOT)
+                .forEach { contact ->
+                    put(JSONObject().apply {
+                        put(
+                            "registration_id",
+                            publicRegistrationId(state.queueId, contact.registrationKey)
+                        )
+                        put("profile_id", contact.profileId)
+                        put("qq_number", contact.qqNumber)
+                    })
+                }
         }
     )
 }
@@ -1582,6 +1614,7 @@ private class LocalTerminalIdentity(context: Context) {
 private const val PUBLIC_SCHEMA_VERSION = 5
 private const val SYNC_SCHEMA_VERSION = 5
 private const val MAX_PUBLIC_EVENTS_PER_SNAPSHOT = 200
+private const val MAX_PRIVATE_CONTACTS_PER_SNAPSHOT = 440
 private const val MAX_PUBLIC_EVENT_TITLE_LENGTH = 120
 private const val MAX_PUBLIC_EVENT_DETAIL_LENGTH = 2_000
 private const val NETWORK_TIMEOUT_MILLIS = 8_000

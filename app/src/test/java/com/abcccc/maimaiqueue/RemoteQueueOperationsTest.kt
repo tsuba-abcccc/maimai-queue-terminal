@@ -66,6 +66,22 @@ class RemoteQueueOperationsTest {
     }
 
     @Test
+    fun repeatedJoinRepairsUsageAfterQueueWasSavedBeforeTheProfile() {
+        val first = decideRemoteQueueOperation(
+            joinCommand(),
+            state(),
+            appliedAtMillis = 5_000L
+        ) as RemoteQueueOperationDecision.Apply
+
+        val replay = decideRemoteQueueOperation(joinCommand(), first.state)
+            as RemoteQueueOperationDecision.AlreadyApplied
+
+        assertEquals(1, replay.updatedProfile?.usageCount)
+        assertEquals(5_000L, replay.updatedProfile?.lastUsedAtMillis)
+        assertEquals(1, first.state.queues.getValue("A").registrationCount)
+    }
+
+    @Test
     fun appliedJoinReceiptPreventsRecreatingARegistrationThatAlreadyLeft() {
         val command = joinCommand()
 

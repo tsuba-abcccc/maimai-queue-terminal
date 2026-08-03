@@ -95,6 +95,32 @@ internal fun deserializeAuditLogs(serialized: String, maxLogs: Int = 1_000): Lis
                                     }
                                 }
                             }
+                            .orEmpty(),
+                        affectedPlayerContacts = item.optJSONArray("affectedPlayerContacts")
+                            ?.let { contacts ->
+                                buildList {
+                                    repeat(contacts.length()) { contactIndex ->
+                                        val contact = contacts.optJSONObject(contactIndex)
+                                            ?: return@repeat
+                                        val registrationKey = contact.optInt("registrationKey")
+                                            .takeIf { it > 0 }
+                                            ?: return@repeat
+                                        val profileId = contact.optString("profileId")
+                                            .takeIf(String::isNotBlank)
+                                            ?: return@repeat
+                                        val qqNumber = contact.optString("qqNumber")
+                                            .takeIf { it.isNotBlank() && isValidQqNumber(it) }
+                                            ?: return@repeat
+                                        add(
+                                            AuditPlayerContact(
+                                                registrationKey = registrationKey,
+                                                profileId = profileId,
+                                                qqNumber = qqNumber
+                                            )
+                                        )
+                                    }
+                                }.distinctBy(AuditPlayerContact::registrationKey)
+                            }
                             .orEmpty()
                     )
                 )
@@ -126,6 +152,18 @@ internal fun serializeAuditLogs(logs: List<AuditLogEntry>): String = JSONArray()
                     "affectedRegistrationKeys",
                     JSONArray().apply {
                         entry.affectedRegistrationKeys.forEach(::put)
+                    }
+                )
+                put(
+                    "affectedPlayerContacts",
+                    JSONArray().apply {
+                        entry.affectedPlayerContacts.forEach { contact ->
+                            put(JSONObject().apply {
+                                put("registrationKey", contact.registrationKey)
+                                put("profileId", contact.profileId)
+                                put("qqNumber", contact.qqNumber)
+                            })
+                        }
                     }
                 )
             }

@@ -22,7 +22,14 @@ class LocalAuditLogPersistenceTest {
                 PublicQueueNotificationCategory.ONLINE_CHECK_IN,
                 PublicQueueNotificationCategory.QUEUE_CHANGES
             ),
-            affectedRegistrationKeys = listOf(1, 2)
+            affectedRegistrationKeys = listOf(1, 2),
+            affectedPlayerContacts = listOf(
+                AuditPlayerContact(
+                    registrationKey = 1,
+                    profileId = "00000000-0000-0000-0000-000000000901",
+                    qqNumber = "12345678"
+                )
+            )
         )
 
         assertEquals(listOf(entry), deserializeAuditLogs(serializeAuditLogs(listOf(entry))))

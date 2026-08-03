@@ -29,7 +29,8 @@ data class PersistedQueueState(
     val machineBStatus: MachineStatus,
     val registrationOpen: Boolean,
     val nextRegistrationKey: Int,
-    val savedAtMillis: Long
+    val savedAtMillis: Long,
+    val terminalCommandReceipts: List<TerminalCommandReceipt> = emptyList()
 ) {
     val totalRegistrationCount: Int
         get() = machineA.registrationCount + machineB.registrationCount
@@ -116,6 +117,22 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
         put("machineB", encodeQueue(state.machineB))
         put("machineAStatus", encodeStatus(state.machineAStatus))
         put("machineBStatus", encodeStatus(state.machineBStatus))
+        put(
+            "terminalCommandReceipts",
+            JSONArray().apply {
+                state.terminalCommandReceipts.forEach { receipt ->
+                    put(JSONObject().apply {
+                        put("commandId", receipt.commandId)
+                        put("applied", receipt.applied)
+                        put("detail", receipt.detail)
+                        put(
+                            "resultRegistrationId",
+                            receipt.resultRegistrationId ?: JSONObject.NULL
+                        )
+                    })
+                }
+            }
+        )
     }
 
     private fun encodeQueue(queue: MachineQueue): JSONObject = JSONObject().apply {
@@ -193,9 +210,34 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
             machineBStatus = decodeStatus(root.optJSONObject("machineBStatus")),
             registrationOpen = root.optBoolean("registrationOpen", true),
             nextRegistrationKey = root.optInt("nextRegistrationKey", 1).coerceAtLeast(1),
-            savedAtMillis = savedAtMillis
+            savedAtMillis = savedAtMillis,
+            terminalCommandReceipts = if (schemaVersion >= 5) {
+                decodeTerminalCommandReceipts(root.optJSONArray("terminalCommandReceipts"))
+            } else {
+                emptyList()
+            }
         )
     }.getOrNull()
+
+    private fun decodeTerminalCommandReceipts(value: JSONArray?): List<TerminalCommandReceipt> {
+        value ?: return emptyList()
+        val receipts = buildList {
+            repeat(value.length()) { index ->
+                val item = value.optJSONObject(index) ?: return@repeat
+                val commandId = item.optString("commandId")
+                if (!isValidQueueId(commandId) || !item.has("applied")) return@repeat
+                add(
+                    TerminalCommandReceipt(
+                        commandId = commandId,
+                        applied = item.optBoolean("applied"),
+                        detail = item.optString("detail"),
+                        resultRegistrationId = item.optNullableString("resultRegistrationId")
+                    )
+                )
+            }
+        }
+        return mergeRecentCommandReceipts(receipts)
+    }
 
     private fun decodeQueue(value: JSONObject?): MachineQueue? {
         value ?: return null
@@ -297,7 +339,7 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
         const val KEY_STATE = "latest"
         const val KEY_BACKUP_STATE = "previous_valid"
         const val MIN_SUPPORTED_SCHEMA_VERSION = 1
-        const val SCHEMA_VERSION = 4
+        const val SCHEMA_VERSION = 5
         const val MAX_REGISTRATIONS_PER_MACHINE = 20
     }
 }

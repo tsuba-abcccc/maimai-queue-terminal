@@ -89,6 +89,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -401,6 +402,15 @@ internal fun RegistrationApp() {
         )
     }
 
+    fun showStalePositionActionNotApplied(machineId: MachineId) {
+        showHomeOperationFeedback(
+            title = "本次操作未执行",
+            detail = "队列位置、组内登记或登记状态已发生变化，请按当前队列重新选择后再操作。",
+            contextLabel = configuredMachineName(machineId),
+            tone = HomeSidePanelFeedbackTone.WARNING
+        )
+    }
+
     fun dismissHomeSidePanelContent() {
         newRegistrationHighlight = null
         homeSidePanelFeedback = null
@@ -426,7 +436,8 @@ internal fun RegistrationApp() {
         machineBStatus = machineBStatus,
         registrationOpen = registrationOpen,
         nextRegistrationKey = nextKey,
-        savedAtMillis = System.currentTimeMillis()
+        savedAtMillis = System.currentTimeMillis(),
+        terminalCommandReceipts = terminalCommandReceipts.values.toList()
     )
 
     suspend fun persistQueueStateBeforeRemoteAcknowledgement() {
@@ -449,17 +460,27 @@ internal fun RegistrationApp() {
         playerProfilesLoaded = true
     }
 
-    LaunchedEffect(terminalCommandReceiptRepository) {
-        terminalCommandReceipts = terminalCommandReceiptRepository.getReceipts()
-        terminalCommandReceiptsLoaded = true
-    }
-
     LaunchedEffect(auditLogRepository) {
         auditLogs = auditLogRepository.getLogs()
     }
 
-    LaunchedEffect(queueStateRepository) {
+    LaunchedEffect(queueStateRepository, terminalCommandReceiptRepository) {
         val savedState = queueStateRepository.getState()
+        val standaloneReceipts = terminalCommandReceiptRepository.getReceipts()
+        val mergedReceipts = mergeRecentCommandReceipts(
+            standaloneReceipts.values,
+            savedState?.terminalCommandReceipts.orEmpty()
+        )
+        terminalCommandReceipts = mergedReceipts.associateBy(
+            TerminalCommandReceipt::commandId
+        )
+        terminalCommandReceiptsPendingPersistence.clear()
+        mergedReceipts.forEach { receipt ->
+            if (standaloneReceipts[receipt.commandId] != receipt) {
+                terminalCommandReceiptsPendingPersistence[receipt.commandId] = receipt
+            }
+        }
+        terminalCommandReceiptsLoaded = true
         if (savedState != null) {
             queueId = savedState.queueId
             queueRevision.set(savedState.revision)
@@ -480,6 +501,7 @@ internal fun RegistrationApp() {
         registrationOpen,
         nextKey,
         queueId,
+        terminalCommandReceipts,
         auditLogs,
         playerProfiles,
         queueRuleSettings.websiteSyncEnabled,
@@ -584,7 +606,15 @@ internal fun RegistrationApp() {
     )
 
     fun appendAuditLog(entry: AuditLogEntry) {
-        val queueScopedEntry = if (entry.queueId == null) entry.copy(queueId = queueId) else entry
+        val enrichedEntry = entry.withAffectedPlayerContacts(
+            registrations = machineA.allRegistrations + machineB.allRegistrations,
+            playerProfiles = playerProfiles
+        )
+        val queueScopedEntry = if (enrichedEntry.queueId == null) {
+            enrichedEntry.copy(queueId = queueId)
+        } else {
+            enrichedEntry
+        }
         auditLogs = (listOf(queueScopedEntry) + auditLogs.filterNot {
             it.id == queueScopedEntry.id
         }).take(1_000)
@@ -791,7 +821,12 @@ internal fun RegistrationApp() {
             classifyAvailabilityOutcomes = classifyAvailabilityOutcomes,
             semanticAction = semanticAction
         )
-        entries.asReversed().forEach(::appendAuditLog)
+        val contactRegistrations = beforeQueue.allRegistrations + afterQueue.allRegistrations
+        entries.asReversed().forEach { entry ->
+            appendAuditLog(
+                entry.withAffectedPlayerContacts(contactRegistrations, playerProfiles)
+            )
+        }
         return entries
     }
 
@@ -1213,6 +1248,11 @@ internal fun RegistrationApp() {
         val destinationMachineId = otherMachine(request.sourceMachineId)
         val registrationKeys = request.registrationKeys.toSet()
         val sourceQueue = queueFor(request.sourceMachineId)
+        if (request.sourcePosition?.let(sourceQueue::matchesExactPosition) == false) return false
+        if (!sourceQueue.matchesRegistrationConfirmationSnapshots(
+                request.confirmationSnapshots
+            )
+        ) return false
         val registrations = sourceQueue.allRegistrations
             .filter { it.key in registrationKeys }
         val releasedPartnerRegistrations = sourceQueue.allRegistrations.filter { registration ->
@@ -1473,9 +1513,9 @@ internal fun RegistrationApp() {
     fun closeRegistration(businessHoursTrigger: BusinessHoursCloseTrigger? = null) {
         if (!registrationOpen) return
         val automaticBusinessHours = businessHoursTrigger != null
-        val removedCount = machineA.registrationCount + machineB.registrationCount
-        val removedRegistrationKeys = (machineA.allRegistrations + machineB.allRegistrations)
-            .map { it.key }
+        val removedRegistrations = machineA.allRegistrations + machineB.allRegistrations
+        val removedCount = removedRegistrations.size
+        val removedRegistrationKeys = removedRegistrations.map { it.key }
         val clearExecution = QueueEngine.execute(
             state = currentQueueEngineState(),
             action = QueueAction.ClearRegistrations(MachineId.entries.mapTo(mutableSetOf()) { it.name }),
@@ -1524,7 +1564,7 @@ internal fun RegistrationApp() {
                 },
                 publicEventType = PublicQueueEventType.REGISTRATION_CLOSED,
                 affectedRegistrationKeys = removedRegistrationKeys
-            )
+            ).withAffectedPlayerContacts(removedRegistrations, playerProfiles)
         )
         showHomeOperationFeedback(
             title = if (automaticBusinessHours) "营业结束，登记排队已关闭" else "登记排队已关闭",
@@ -2430,6 +2470,7 @@ internal fun RegistrationApp() {
                 stableReceipt
             ).associateBy(TerminalCommandReceipt::commandId)
             terminalCommandReceiptsPendingPersistence[stableReceipt.commandId] = stableReceipt
+            persistQueueStateBeforeRemoteAcknowledgement()
             val persisted = terminalCommandReceiptRepository.record(stableReceipt)
             if (persisted) {
                 terminalCommandReceiptsPendingPersistence.remove(stableReceipt.commandId)
@@ -2516,7 +2557,6 @@ internal fun RegistrationApp() {
                                 )) {
                                     is PlayerProfileCommandPersistenceResult.Applied -> {
                                         val detail = "玩家资料已由终端更新。"
-                                        persistQueueStateBeforeRemoteAcknowledgement()
                                         if (!persistTerminalCommandReceipt(
                                                 TerminalCommandReceipt(
                                                     commandId = command.commandId,
@@ -2599,32 +2639,6 @@ internal fun RegistrationApp() {
                                     commandAppliedAtMillis,
                                     appliedTerminalCommandIds()
                                 )
-                                val profileToPersist =
-                                    (decision as? RemoteQueueOperationDecision.Apply)
-                                        ?.updatedProfile
-                                if (profileToPersist != null) {
-                                    val persisted = playerProfilePersistence.persistAndApply(
-                                        profileToPersist
-                                    ) { profile ->
-                                        applyPlayerProfileToState(
-                                            profile,
-                                            recordAudit = false,
-                                            source = command.source.auditLogSource
-                                        )
-                                    }
-                                    if (!persisted) {
-                                        localWriteFailureDetail =
-                                            "线上登记的玩家资料暂时无法写入本机，应用将继续重试。"
-                                        localWriteFailureAtMillis = System.currentTimeMillis()
-                                        continue
-                                    }
-                                    decision = decideRemoteQueueOperation(
-                                        command,
-                                        currentRemoteQueueExecutionState(),
-                                        commandAppliedAtMillis,
-                                        appliedTerminalCommandIds()
-                                    )
-                                }
                                 when (val result = decision) {
                                     is RemoteQueueOperationDecision.Apply -> {
                                         val beforeQueues = mapOf(
@@ -2763,6 +2777,23 @@ internal fun RegistrationApp() {
                                             )
                                         }
                                         persistQueueStateBeforeRemoteAcknowledgement()
+                                        if (result.updatedProfile != null) {
+                                            val persisted = playerProfilePersistence.persistAndApply(
+                                                result.updatedProfile
+                                            ) { profile ->
+                                                applyPlayerProfileToState(
+                                                    profile,
+                                                    recordAudit = false,
+                                                    source = command.source.auditLogSource
+                                                )
+                                            }
+                                            if (!persisted) {
+                                                localWriteFailureDetail =
+                                                    "线上登记的玩家资料暂时无法写入本机，应用将继续重试。"
+                                                localWriteFailureAtMillis = System.currentTimeMillis()
+                                                continue
+                                            }
+                                        }
                                         val resultRegistrationId = if (
                                             command.operation == RemoteQueueOperation.JOIN_QUEUE
                                         ) {
@@ -2800,7 +2831,23 @@ internal fun RegistrationApp() {
                                     }
 
                                     is RemoteQueueOperationDecision.AlreadyApplied -> {
-                                        persistQueueStateBeforeRemoteAcknowledgement()
+                                        if (result.updatedProfile != null) {
+                                            val persisted = playerProfilePersistence.persistAndApply(
+                                                result.updatedProfile
+                                            ) { profile ->
+                                                applyPlayerProfileToState(
+                                                    profile,
+                                                    recordAudit = false,
+                                                    source = command.source.auditLogSource
+                                                )
+                                            }
+                                            if (!persisted) {
+                                                localWriteFailureDetail =
+                                                    "线上登记的玩家资料暂时无法写入本机，应用将继续重试。"
+                                                localWriteFailureAtMillis = System.currentTimeMillis()
+                                                continue
+                                            }
+                                        }
                                         val resultRegistrationId = if (
                                             command.operation == RemoteQueueOperation.JOIN_QUEUE
                                         ) {
@@ -2862,35 +2909,11 @@ internal fun RegistrationApp() {
                             }
 
                             is MobileDeviceRegistrationCommand -> {
-                                var decision = decideMobileDeviceRegistration(
+                                val decision = decideMobileDeviceRegistration(
                                     command,
                                     currentRemoteQueueExecutionState(),
                                     appliedTerminalCommandIds()
                                 )
-                                val profileToPersist =
-                                    (decision as? MobileDeviceRegistrationDecision.Apply)
-                                        ?.profileToPersist
-                                if (profileToPersist != null) {
-                                    val persisted = playerProfilePersistence.persistAndApply(
-                                        profileToPersist
-                                    ) { profile ->
-                                        applyPlayerProfileToState(
-                                            profile,
-                                            source = AuditLogSource.MOBILE_DEVICE
-                                        )
-                                    }
-                                    if (!persisted) {
-                                        localWriteFailureDetail =
-                                            "移动设备登记的玩家资料暂时无法写入本机，应用将继续重试。"
-                                        localWriteFailureAtMillis = System.currentTimeMillis()
-                                        continue
-                                    }
-                                    decision = decideMobileDeviceRegistration(
-                                        command,
-                                        currentRemoteQueueExecutionState(),
-                                        appliedTerminalCommandIds()
-                                    )
-                                }
                                 when (val result = decision) {
                                     is MobileDeviceRegistrationDecision.Apply -> {
                                         val beforeQueue = result.changedMachineId.let { machineName ->
@@ -2923,6 +2946,22 @@ internal fun RegistrationApp() {
                                             )
                                         }
                                         persistQueueStateBeforeRemoteAcknowledgement()
+                                        if (result.profileToPersist != null) {
+                                            val persisted = playerProfilePersistence.persistAndApply(
+                                                result.profileToPersist
+                                            ) { profile ->
+                                                applyPlayerProfileToState(
+                                                    profile,
+                                                    source = AuditLogSource.MOBILE_DEVICE
+                                                )
+                                            }
+                                            if (!persisted) {
+                                                localWriteFailureDetail =
+                                                    "移动设备登记的玩家资料暂时无法写入本机，应用将继续重试。"
+                                                localWriteFailureAtMillis = System.currentTimeMillis()
+                                                continue
+                                            }
+                                        }
                                         if (!persistTerminalCommandReceipt(
                                                 TerminalCommandReceipt(
                                                     commandId = command.commandId,
@@ -2963,7 +3002,22 @@ internal fun RegistrationApp() {
                                     }
 
                                     is MobileDeviceRegistrationDecision.AlreadyApplied -> {
-                                        persistQueueStateBeforeRemoteAcknowledgement()
+                                        if (result.profileToPersist != null) {
+                                            val persisted = playerProfilePersistence.persistAndApply(
+                                                result.profileToPersist
+                                            ) { profile ->
+                                                applyPlayerProfileToState(
+                                                    profile,
+                                                    source = AuditLogSource.MOBILE_DEVICE
+                                                )
+                                            }
+                                            if (!persisted) {
+                                                localWriteFailureDetail =
+                                                    "移动设备登记的玩家资料暂时无法写入本机，应用将继续重试。"
+                                                localWriteFailureAtMillis = System.currentTimeMillis()
+                                                continue
+                                            }
+                                        }
                                         if (!persistTerminalCommandReceipt(
                                                 TerminalCommandReceipt(
                                                     commandId = command.commandId,
@@ -3820,16 +3874,36 @@ internal fun RegistrationApp() {
                             },
                             onDismiss = { selectedRegistration = null },
                             onMoveIntoPlaying = {
-                                moveIntoPlayingTarget = selection
+                                val currentQueue = queueFor(selection.machineId)
+                                val confirmationKeys = buildSet {
+                                    add(selection.registrationKey)
+                                    currentQueue.playing.forEach { add(it.key) }
+                                }
+                                moveIntoPlayingTarget = selection.copy(
+                                    confirmationSnapshots = currentQueue
+                                        .registrationConfirmationSnapshots(confirmationKeys)
+                                )
                                 selectedRegistration = null
                             },
                             onReturnToWaitingFront = {
-                                returnPlayingRegistrationTarget = selection
+                                val currentQueue = queueFor(selection.machineId)
+                                returnPlayingRegistrationTarget = selection.copy(
+                                    confirmationSnapshots = currentQueue
+                                        .registrationConfirmationSnapshots(
+                                            setOf(selection.registrationKey)
+                                        )
+                                )
                                 selectedRegistration = null
                             },
                             onPauseOrLeave = {
                                 if (queueRuleSettings.allowsAnyAbsenceAction) {
-                                    absenceChoiceTarget = selection
+                                    val currentQueue = queueFor(selection.machineId)
+                                    absenceChoiceTarget = selection.copy(
+                                        confirmationSnapshots = currentQueue
+                                            .registrationConfirmationSnapshots(
+                                                setOf(selection.registrationKey)
+                                            )
+                                    )
                                     selectedRegistration = null
                                 }
                             },
@@ -3911,9 +3985,14 @@ internal fun RegistrationApp() {
                                 }
                             },
                             onTransfer = {
+                                val currentQueue = queueFor(selection.machineId)
                                 machineTransferTarget = MachineTransferRequest(
                                     selection.machineId,
-                                    listOf(selection.registrationKey)
+                                    listOf(selection.registrationKey),
+                                    confirmationSnapshots = currentQueue
+                                        .registrationConfirmationSnapshots(
+                                            setOf(selection.registrationKey)
+                                        )
                                 )
                                 selectedRegistration = null
                             },
@@ -3976,7 +4055,13 @@ internal fun RegistrationApp() {
                                 selectedRegistration = null
                             },
                             onExit = {
-                                exitTarget = selection
+                                val currentQueue = queueFor(selection.machineId)
+                                exitTarget = selection.copy(
+                                    confirmationSnapshots = currentQueue
+                                        .registrationConfirmationSnapshots(
+                                            setOf(selection.registrationKey)
+                                        )
+                                )
                                 selectedRegistration = null
                             }
                         )
@@ -3991,7 +4076,13 @@ internal fun RegistrationApp() {
                     val joiningPlayer = queue.waitingPositions()
                         .getOrNull(queue.firstAvailableWaitingPositionIndex() ?: -1)
                         ?.firstOrNull { it.key == selection.registrationKey }
-                    if (currentPlayer != null && joiningPlayer != null) {
+                    if (
+                        currentPlayer != null &&
+                        joiningPlayer != null &&
+                        queue.matchesRegistrationConfirmationSnapshots(
+                            selection.confirmationSnapshots
+                        )
+                    ) {
                         MoveIntoPlayingConfirmation(
                             currentPlayer = currentPlayer,
                             joiningPlayer = joiningPlayer,
@@ -4001,7 +4092,12 @@ internal fun RegistrationApp() {
                             },
                             onDismiss = { moveIntoPlayingTarget = null },
                             onConfirm = {
-                                updateQueueByAction(
+                                val currentQueue = queueFor(selection.machineId)
+                                val stateStillMatches = currentQueue
+                                    .matchesRegistrationConfirmationSnapshots(
+                                        selection.confirmationSnapshots
+                                    )
+                                val moved = stateStillMatches && updateQueueByAction(
                                     action = QueueAction.MoveWaitingRegistrationIntoCurrentRound(
                                         selection.machineId.name,
                                         selection.registrationKey
@@ -4010,11 +4106,17 @@ internal fun RegistrationApp() {
                                     surfaceHomeFeedback = true,
                                     homeFeedbackTitle = "登记已加入本轮"
                                 )
+                                if (!moved) {
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
                                 moveIntoPlayingTarget = null
                             }
                         )
                     } else {
-                        LaunchedEffect(selection, queue) { moveIntoPlayingTarget = null }
+                        LaunchedEffect(selection, queue) {
+                            moveIntoPlayingTarget = null
+                            showStalePositionActionNotApplied(selection.machineId)
+                        }
                     }
                 }
 
@@ -4022,7 +4124,12 @@ internal fun RegistrationApp() {
                     val queue = queueFor(selection.machineId)
                     val registration = queue.allRegistrations
                         .firstOrNull { it.key == selection.registrationKey }
-                    if (registration != null) {
+                    if (
+                        registration != null &&
+                        queue.matchesRegistrationConfirmationSnapshots(
+                            selection.confirmationSnapshots
+                        )
+                    ) {
                         val playArrangement = registrationPlayArrangement(
                             queue = queue,
                             registrationKey = registration.key,
@@ -4065,8 +4172,19 @@ internal fun RegistrationApp() {
                             onDismiss = { absenceChoiceTarget = null },
                             onDeferOneRound = {
                                 if (queueRuleSettings.allowDeferOneRound) {
-                                    updateQueueByPlan(
-                                        plan = deferPlan,
+                                    val currentQueue = queueFor(selection.machineId)
+                                    val stateStillMatches = currentQueue
+                                        .matchesRegistrationConfirmationSnapshots(
+                                            selection.confirmationSnapshots
+                                        )
+                                    val currentPlan = planQueueAction(
+                                        QueueAction.DeferOneRound(
+                                            selection.machineId.name,
+                                            selection.registrationKey
+                                        )
+                                    )
+                                    val changed = stateStillMatches && updateQueueByPlan(
+                                        plan = currentPlan,
                                         soundCue = QueueSoundCue.QUEUE_CHANGE,
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
@@ -4083,13 +4201,27 @@ internal fun RegistrationApp() {
                                         },
                                         executionAtMillis = System.currentTimeMillis()
                                     )
+                                    if (!changed) {
+                                        showStalePositionActionNotApplied(selection.machineId)
+                                    }
                                     absenceChoiceTarget = null
                                 }
                             },
                             onTemporarilyLeave = {
                                 if (queueRuleSettings.allowTemporaryLeave) {
-                                    updateQueueByPlan(
-                                        plan = temporarilyLeavePlan,
+                                    val currentQueue = queueFor(selection.machineId)
+                                    val stateStillMatches = currentQueue
+                                        .matchesRegistrationConfirmationSnapshots(
+                                            selection.confirmationSnapshots
+                                        )
+                                    val currentPlan = planQueueAction(
+                                        QueueAction.TemporarilyLeave(
+                                            selection.machineId.name,
+                                            selection.registrationKey
+                                        )
+                                    )
+                                    val changed = stateStillMatches && updateQueueByPlan(
+                                        plan = currentPlan,
                                         soundCue = QueueSoundCue.QUEUE_CHANGE,
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
@@ -4100,12 +4232,18 @@ internal fun RegistrationApp() {
                                         },
                                         executionAtMillis = System.currentTimeMillis()
                                     )
+                                    if (!changed) {
+                                        showStalePositionActionNotApplied(selection.machineId)
+                                    }
                                     absenceChoiceTarget = null
                                 }
                             }
                         )
                     } else {
-                        LaunchedEffect(selection, queue) { absenceChoiceTarget = null }
+                        LaunchedEffect(selection, queue) {
+                            absenceChoiceTarget = null
+                            showStalePositionActionNotApplied(selection.machineId)
+                        }
                     }
                 }
 
@@ -4567,9 +4705,15 @@ internal fun RegistrationApp() {
                             selectedPosition = null
                         },
                         onTransfer = {
+                            val currentQueue = queueFor(selection.machineId)
                             machineTransferTarget = MachineTransferRequest(
                                 selection.machineId,
-                                selection.registrationKeys
+                                selection.registrationKeys,
+                                sourcePosition = selection,
+                                confirmationSnapshots = currentQueue
+                                    .registrationConfirmationSnapshots(
+                                        selection.registrationKeys
+                                    )
                             )
                             selectedPosition = null
                         },
@@ -4600,9 +4744,14 @@ internal fun RegistrationApp() {
                         },
                         onRemove = {
                             if (selection.registrationKeys.size == 1) {
+                                val currentQueue = queueFor(selection.machineId)
                                 exitTarget = SelectedRegistration(
                                     selection.machineId,
-                                    selection.registrationKeys.first()
+                                    selection.registrationKeys.first(),
+                                    confirmationSnapshots = currentQueue
+                                        .registrationConfirmationSnapshots(
+                                            selection.registrationKeys
+                                        )
                                 )
                             } else {
                                 removeGroupTarget = selection
@@ -4613,28 +4762,45 @@ internal fun RegistrationApp() {
                 }
 
                 returnPlayingTarget?.let { selection ->
-                    ReturnPlayingToWaitingConfirmation(
-                        playingPositionLabel = playingPositionName(selection.machineId),
-                        onDismiss = { returnPlayingTarget = null },
-                        onConfirm = {
-                            updateQueueByAction(
-                                action = QueueAction.ReturnPlayingToWaitingFront(
-                                    selection.machineId.name,
-                                    selection.registrationKeys.toSet()
-                                ),
-                                surfaceHomeFeedback = true,
-                                homeFeedbackTitle = "已撤回等待顺序前端"
-                            )
+                    val queue = queueFor(selection.machineId)
+                    if (queue.matchesExactPosition(selection)) {
+                        ReturnPlayingToWaitingConfirmation(
+                            playingPositionLabel = playingPositionName(selection.machineId),
+                            onDismiss = { returnPlayingTarget = null },
+                            onConfirm = {
+                                if (queueFor(selection.machineId).matchesExactPosition(selection)) {
+                                    updateQueueByAction(
+                                        action = QueueAction.ReturnPlayingToWaitingFront(
+                                            selection.machineId.name,
+                                            selection.registrationKeys.toSet()
+                                        ),
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTitle = "已撤回等待顺序前端"
+                                    )
+                                } else {
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
+                                returnPlayingTarget = null
+                            }
+                        )
+                    } else {
+                        LaunchedEffect(selection, queue) {
                             returnPlayingTarget = null
+                            showStalePositionActionNotApplied(selection.machineId)
                         }
-                    )
+                    }
                 }
 
                 returnPlayingRegistrationTarget?.let { selection ->
                     val queue = queueFor(selection.machineId)
                     val registration = queue.playing
                         .firstOrNull { it.key == selection.registrationKey }
-                    if (registration != null) {
+                    if (
+                        registration != null &&
+                        queue.matchesRegistrationConfirmationSnapshots(
+                            selection.confirmationSnapshots
+                        )
+                    ) {
                         val remainingPlayer = queue.playing
                             .firstOrNull { it.key != registration.key }
                         val isFixedPair = remainingPlayer != null &&
@@ -4647,101 +4813,135 @@ internal fun RegistrationApp() {
                             playingPositionLabel = playingPositionName(selection.machineId),
                             onDismiss = { returnPlayingRegistrationTarget = null },
                             onConfirm = {
-                                updateQueueByAction(
-                                    action = QueueAction.ReturnPlayingToWaitingFront(
-                                        selection.machineId.name,
-                                        setOf(selection.registrationKey)
-                                    ),
-                                    surfaceHomeFeedback = true,
-                                    homeFeedbackTitle = "已撤回等待顺序前端"
-                                )
+                                if (queueFor(selection.machineId)
+                                        .matchesRegistrationConfirmationSnapshots(
+                                            selection.confirmationSnapshots
+                                        )
+                                ) {
+                                    updateQueueByAction(
+                                        action = QueueAction.ReturnPlayingToWaitingFront(
+                                            selection.machineId.name,
+                                            setOf(selection.registrationKey)
+                                        ),
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTitle = "已撤回等待顺序前端"
+                                    )
+                                } else {
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
                                 returnPlayingRegistrationTarget = null
                             }
                         )
                     } else {
-                        LaunchedEffect(selection, queue) { returnPlayingRegistrationTarget = null }
+                        LaunchedEffect(selection, queue) {
+                            returnPlayingRegistrationTarget = null
+                            showStalePositionActionNotApplied(selection.machineId)
+                        }
                     }
                 }
 
                 advanceToPlayingTarget?.let { selection ->
                     val queue = queueFor(selection.machineId)
-                    val positions = queue.waitingPositions()
-                    val targetKeys = selection.registrationKeys.toSet()
-                    val targetIndex = positions.indexOfFirst { position ->
-                        position.size == targetKeys.size && position.all { it.key in targetKeys }
-                    }
-                    val correctionNotice = availabilityOutcomeMessage(
-                        unavailableRegistrations = positions.take(targetIndex.coerceAtLeast(0))
-                            .flatten()
-                            .filterNot { it.canEnterPlayingPosition },
-                        nextRegistrations = positions.getOrNull(targetIndex).orEmpty()
-                    )
-                    val correctionPlan = planQueueAction(
-                        action = QueueAction.AdvanceToWaitingPosition(
-                            selection.machineId.name,
-                            targetKeys
-                        ),
-                        atMillis = 1L
-                    )
-                    val correctionPreview = correctionPlan.resultState
-                        .queue(selection.machineId.name) ?: queue
-                    val correctionCanApply = correctionPlan.canApply &&
-                        correctionPreview.playing.mapTo(mutableSetOf()) { it.key } == targetKeys
-                    val correctionDisabledReason = when {
-                        queue.playing.isEmpty() || targetIndex <= 0 ->
-                            "队列状态已经发生变化，请关闭后重新选择目标位置。"
-                        positions.getOrNull(targetIndex).orEmpty().any {
-                            !it.canEnterPlayingPosition
-                        } -> "所选位置包含当前不能进入游玩位置的登记，无法执行校正。"
-                        else ->
-                            "按照正常轮换推进时，所选登记会先与其他登记重新组合，不能直接校正为当前所选位置。请按现场实际情况逐轮结束。"
-                    }
-                    AdvanceToPlayingConfirmation(
-                        selectionLabel = selection.label.substringBefore(" · "),
-                        playingPositionLabel = playingPositionName(selection.machineId),
-                        registrations = positions.getOrNull(targetIndex).orEmpty(),
-                        completedWaitingPositionCount = targetIndex.coerceAtLeast(0),
-                        availabilityNotice = correctionNotice,
-                        enabled = correctionCanApply,
-                        disabledReason = correctionDisabledReason,
-                        onDismiss = { advanceToPlayingTarget = null },
-                        onConfirm = {
-                            updateQueueWithUndoByAction(
-                                action = QueueAction.AdvanceToWaitingPosition(
-                                    selection.machineId.name,
-                                    targetKeys
-                                ),
-                                message = "${playingPositionName(selection.machineId)} 已校正",
-                                feedbackTitle = "游玩位置已校正",
-                                feedbackDetail = "已将${selection.label.substringBefore(" · ")}及其之前的队列位置按实际进度完成处理。"
-                            )
-                            advanceToPlayingTarget = null
+                    if (queue.matchesExactPosition(selection)) {
+                        val positions = queue.waitingPositions()
+                        val targetKeys = selection.registrationKeys.toSet()
+                        val targetIndex = selection.waitingPositionIndex ?: -1
+                        val correctionNotice = availabilityOutcomeMessage(
+                            unavailableRegistrations = positions.take(targetIndex.coerceAtLeast(0))
+                                .flatten()
+                                .filterNot { it.canEnterPlayingPosition },
+                            nextRegistrations = positions.getOrNull(targetIndex).orEmpty()
+                        )
+                        val correctionPlan = planQueueAction(
+                            action = QueueAction.AdvanceToWaitingPosition(
+                                selection.machineId.name,
+                                targetKeys
+                            ),
+                            atMillis = 1L
+                        )
+                        val correctionPreview = correctionPlan.resultState
+                            .queue(selection.machineId.name) ?: queue
+                        val correctionCanApply = correctionPlan.canApply &&
+                            correctionPreview.playing.mapTo(mutableSetOf()) { it.key } == targetKeys
+                        val correctionDisabledReason = when {
+                            queue.playing.isEmpty() || targetIndex <= 0 ->
+                                "队列状态已经发生变化，请关闭后重新选择目标位置。"
+                            positions.getOrNull(targetIndex).orEmpty().any {
+                                !it.canEnterPlayingPosition
+                            } -> "所选位置包含当前不能进入游玩位置的登记，无法执行校正。"
+                            else ->
+                                "按照正常轮换推进时，所选登记会先与其他登记重新组合，不能直接校正为当前所选位置。请按现场实际情况逐轮结束。"
                         }
-                    )
+                        AdvanceToPlayingConfirmation(
+                            selectionLabel = selection.label.substringBefore(" · "),
+                            playingPositionLabel = playingPositionName(selection.machineId),
+                            registrations = positions.getOrNull(targetIndex).orEmpty(),
+                            completedWaitingPositionCount = targetIndex.coerceAtLeast(0),
+                            availabilityNotice = correctionNotice,
+                            enabled = correctionCanApply,
+                            disabledReason = correctionDisabledReason,
+                            onDismiss = { advanceToPlayingTarget = null },
+                            onConfirm = {
+                                if (queueFor(selection.machineId).matchesExactPosition(selection)) {
+                                    updateQueueWithUndoByAction(
+                                        action = QueueAction.AdvanceToWaitingPosition(
+                                            selection.machineId.name,
+                                            targetKeys
+                                        ),
+                                        message = "${playingPositionName(selection.machineId)} 已校正",
+                                        feedbackTitle = "游玩位置已校正",
+                                        feedbackDetail = "已将${selection.label.substringBefore(" · ")}及其之前的队列位置按实际进度完成处理。"
+                                    )
+                                } else {
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
+                                advanceToPlayingTarget = null
+                            }
+                        )
+                    } else {
+                        LaunchedEffect(selection, queue) {
+                            advanceToPlayingTarget = null
+                            showStalePositionActionNotApplied(selection.machineId)
+                        }
+                    }
                 }
 
                 releaseFixedPairTarget?.let { selection ->
-                    val registrations = queueFor(selection.machineId).allRegistrations
+                    val queue = queueFor(selection.machineId)
+                    val registrations = queue.allRegistrations
                         .filter { it.key in selection.registrationKeys }
-                    ReleaseFixedPairConfirmation(
-                        registrations = registrations,
-                        onDismiss = { releaseFixedPairTarget = null },
-                        onConfirm = {
-                            val firstKey = registrations.firstOrNull()?.key
-                            if (firstKey != null) {
-                                updateQueueByAction(
-                                    action = QueueAction.ChangePreference(
-                                        selection.machineId.name,
-                                        firstKey,
-                                        PlayPreference.OPEN_TO_JOIN
-                                    ),
-                                    surfaceHomeFeedback = true,
-                                    homeFeedbackTitle = "固定组合已解除"
-                                )
+                    if (queue.matchesFixedPairPosition(selection)) {
+                        ReleaseFixedPairConfirmation(
+                            registrations = registrations,
+                            onDismiss = { releaseFixedPairTarget = null },
+                            onConfirm = {
+                                val currentQueue = queueFor(selection.machineId)
+                                val firstKey = registrations.firstOrNull()?.key
+                                if (
+                                    firstKey != null &&
+                                    currentQueue.matchesFixedPairPosition(selection)
+                                ) {
+                                    updateQueueByAction(
+                                        action = QueueAction.ChangePreference(
+                                            selection.machineId.name,
+                                            firstKey,
+                                            PlayPreference.OPEN_TO_JOIN
+                                        ),
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTitle = "固定组合已解除"
+                                    )
+                                } else {
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
+                                releaseFixedPairTarget = null
                             }
+                        )
+                    } else {
+                        LaunchedEffect(selection, queue) {
                             releaseFixedPairTarget = null
+                            showStalePositionActionNotApplied(selection.machineId)
                         }
-                    )
+                    }
                 }
 
                 machineTransferTarget?.let { request ->
@@ -4751,41 +4951,63 @@ internal fun RegistrationApp() {
                     val requestedKeys = request.registrationKeys.toSet()
                     val registrations = sourceQueue.allRegistrations
                         .filter { it.key in requestedKeys }
-                    val transferUnavailableReason = when {
-                        requestedKeys.isEmpty() || registrations.size != requestedKeys.size ->
-                            "待转移的登记已经发生变化，请关闭窗口后重试。"
-                        !statusFor(request.sourceMachineId).isOperational ->
-                            "${configuredMachineName(request.sourceMachineId)} 已停止使用，暂时不能转出。"
-                        sourceQueue.playing.any { it.key in requestedKeys } ->
-                            "登记已经进入${playingPositionName(request.sourceMachineId)}，不能转移。"
-                        else -> machineTransferUnavailableReason(
-                            machineName = configuredMachineName(destinationMachineId),
-                            status = statusFor(destinationMachineId),
-                            queue = destinationQueue,
-                            incomingRegistrationCount = registrations.size
+                    val sourcePositionStillMatches = request.sourcePosition
+                        ?.let(sourceQueue::matchesExactPosition) != false
+                    val sourceStateStillMatches = sourceQueue
+                        .matchesRegistrationConfirmationSnapshots(
+                            request.confirmationSnapshots
                         )
-                    }
-                    MachineTransferConfirmation(
-                        registrations = registrations,
-                        sourceMachineName = configuredMachineName(request.sourceMachineId),
-                        destinationMachineName = configuredMachineName(destinationMachineId),
-                        sourcePlayingPositionLabel = playingPositionName(request.sourceMachineId),
-                        leavingPlayingPosition = sourceQueue.playing
-                            .any { it.key in request.registrationKeys },
-                        transferUnavailableReason = transferUnavailableReason,
-                        onDismiss = { machineTransferTarget = null },
-                        onConfirm = {
-                            transferRegistrations(request)
-                            machineTransferTarget = null
+                    if (sourcePositionStillMatches && sourceStateStillMatches) {
+                        val transferUnavailableReason = when {
+                            requestedKeys.isEmpty() || registrations.size != requestedKeys.size ->
+                                "待转移的登记已经发生变化，请关闭窗口后重试。"
+                            !statusFor(request.sourceMachineId).isOperational ->
+                                "${configuredMachineName(request.sourceMachineId)} 已停止使用，暂时不能转出。"
+                            sourceQueue.playing.any { it.key in requestedKeys } ->
+                                "登记已经进入${playingPositionName(request.sourceMachineId)}，不能转移。"
+                            else -> machineTransferUnavailableReason(
+                                machineName = configuredMachineName(destinationMachineId),
+                                status = statusFor(destinationMachineId),
+                                queue = destinationQueue,
+                                incomingRegistrationCount = registrations.size
+                            )
                         }
-                    )
+                        MachineTransferConfirmation(
+                            registrations = registrations,
+                            sourceMachineName = configuredMachineName(request.sourceMachineId),
+                            destinationMachineName = configuredMachineName(destinationMachineId),
+                            sourcePlayingPositionLabel = playingPositionName(request.sourceMachineId),
+                            leavingPlayingPosition = sourceQueue.playing
+                                .any { it.key in request.registrationKeys },
+                            transferUnavailableReason = transferUnavailableReason,
+                            onDismiss = { machineTransferTarget = null },
+                            onConfirm = {
+                                if (!transferRegistrations(request)) {
+                                    showHomeOperationFeedback(
+                                        title = "切换机台未执行",
+                                        detail = "原位置、登记状态或目标机台状态已经变化，请核对当前队列后重试。",
+                                        contextLabel = configuredMachineName(request.sourceMachineId),
+                                        tone = HomeSidePanelFeedbackTone.WARNING
+                                    )
+                                }
+                                machineTransferTarget = null
+                            }
+                        )
+                    } else {
+                        LaunchedEffect(request, sourceQueue) {
+                            machineTransferTarget = null
+                            showStalePositionActionNotApplied(request.sourceMachineId)
+                        }
+                    }
                 }
 
                 noShowTarget?.let { selection ->
                     val queue = queueFor(selection.machineId)
                     val registration = queue.allRegistrations
                         .firstOrNull { it.key == selection.registrationKey }
-                    if (registration != null) {
+                    if (registration != null && queue.matchesNoShowLocation(selection)) {
+                        fun currentTargetStillMatches(): Boolean =
+                            queueFor(selection.machineId).matchesNoShowLocation(selection)
                         val startNextWhenPlayingBecomesEmpty = !selection.fromPlayingPosition
                         fun noShowPlan(resolution: NoShowResolution) = planQueueAction(
                             QueueAction.MarkNoShow(
@@ -4818,7 +5040,10 @@ internal fun RegistrationApp() {
                             ),
                             onDismiss = { noShowTarget = null },
                             onDefer = {
-                                if (queueRuleSettings.allowDeferOneRound) {
+                                if (
+                                    queueRuleSettings.allowDeferOneRound &&
+                                    currentTargetStillMatches()
+                                ) {
                                     updateQueueByPlan(
                                         plan = deferPlan,
                                         soundCue = QueueSoundCue.CAUTION,
@@ -4830,39 +5055,52 @@ internal fun RegistrationApp() {
                                         homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
                                         executionAtMillis = System.currentTimeMillis()
                                     )
-                                    noShowTarget = null
+                                } else {
+                                    showStalePositionActionNotApplied(selection.machineId)
                                 }
+                                noShowTarget = null
                             },
                             onMoveToEnd = {
-                                updateQueueByPlan(
-                                    plan = movePlan,
-                                    soundCue = QueueSoundCue.CAUTION,
-                                    publicEventTypeOverride =
-                                        PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
-                                    affectedRegistrationKeysOverride = setOf(registration.key),
-                                    classifyMissedOnlineRegistrations = true,
-                                    surfaceHomeFeedback = true,
-                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
-                                    executionAtMillis = System.currentTimeMillis()
-                                )
+                                if (currentTargetStillMatches()) {
+                                    updateQueueByPlan(
+                                        plan = movePlan,
+                                        soundCue = QueueSoundCue.CAUTION,
+                                        publicEventTypeOverride =
+                                            PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
+                                        affectedRegistrationKeysOverride = setOf(registration.key),
+                                        classifyMissedOnlineRegistrations = true,
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                        executionAtMillis = System.currentTimeMillis()
+                                    )
+                                } else {
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
                                 noShowTarget = null
                             },
                             onRemove = {
-                                updateQueueByPlan(
-                                    plan = removePlan,
-                                    soundCue = QueueSoundCue.CAUTION,
-                                    publicEventTypeOverride = PublicQueueEventType.NO_SHOW_REMOVED,
-                                    affectedRegistrationKeysOverride = setOf(registration.key),
-                                    classifyMissedOnlineRegistrations = true,
-                                    surfaceHomeFeedback = true,
-                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
-                                    executionAtMillis = System.currentTimeMillis()
-                                )
+                                if (currentTargetStillMatches()) {
+                                    updateQueueByPlan(
+                                        plan = removePlan,
+                                        soundCue = QueueSoundCue.CAUTION,
+                                        publicEventTypeOverride = PublicQueueEventType.NO_SHOW_REMOVED,
+                                        affectedRegistrationKeysOverride = setOf(registration.key),
+                                        classifyMissedOnlineRegistrations = true,
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                        executionAtMillis = System.currentTimeMillis()
+                                    )
+                                } else {
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
                                 noShowTarget = null
                             }
                         )
                     } else {
-                        LaunchedEffect(selection, queue) { noShowTarget = null }
+                        LaunchedEffect(selection, queue) {
+                            noShowTarget = null
+                            showStalePositionActionNotApplied(selection.machineId)
+                        }
                     }
                 }
 
@@ -4871,7 +5109,14 @@ internal fun RegistrationApp() {
                     val targetKeys = selection.registrationKeys.toSet()
                     val registrations = queue.allRegistrations
                         .filter { it.key in selection.registrationKeys }
-                    if (registrations.isNotEmpty() && registrations.map { it.key }.toSet() == targetKeys) {
+                    val targetStillMatches = queue.matchesExactPosition(selection) &&
+                        targetKeys.all(queue::canMarkNoShow)
+                    if (targetStillMatches) {
+                        fun currentTargetStillMatches(): Boolean {
+                            val currentQueue = queueFor(selection.machineId)
+                            return currentQueue.matchesExactPosition(selection) &&
+                                targetKeys.all(currentQueue::canMarkNoShow)
+                        }
                         val startNextWhenPlayingBecomesEmpty = !selection.fromPlayingPosition
                         fun groupNoShowPlan(resolution: NoShowResolution) = planQueueAction(
                             QueueAction.MarkNoShow(
@@ -4904,7 +5149,10 @@ internal fun RegistrationApp() {
                             ),
                             onDismiss = { groupNoShowTarget = null },
                             onDefer = {
-                                if (queueRuleSettings.allowDeferOneRound) {
+                                if (
+                                    queueRuleSettings.allowDeferOneRound &&
+                                    currentTargetStillMatches()
+                                ) {
                                     updateQueueByPlan(
                                         plan = deferPlan,
                                         soundCue = QueueSoundCue.CAUTION,
@@ -4916,39 +5164,52 @@ internal fun RegistrationApp() {
                                         homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
                                         executionAtMillis = System.currentTimeMillis()
                                     )
-                                    groupNoShowTarget = null
+                                } else {
+                                    showStalePositionActionNotApplied(selection.machineId)
                                 }
+                                groupNoShowTarget = null
                             },
                             onMoveToEnd = {
-                                updateQueueByPlan(
-                                    plan = movePlan,
-                                    soundCue = QueueSoundCue.CAUTION,
-                                    publicEventTypeOverride =
-                                        PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
-                                    affectedRegistrationKeysOverride = targetKeys,
-                                    classifyMissedOnlineRegistrations = true,
-                                    surfaceHomeFeedback = true,
-                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
-                                    executionAtMillis = System.currentTimeMillis()
-                                )
+                                if (currentTargetStillMatches()) {
+                                    updateQueueByPlan(
+                                        plan = movePlan,
+                                        soundCue = QueueSoundCue.CAUTION,
+                                        publicEventTypeOverride =
+                                            PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
+                                        affectedRegistrationKeysOverride = targetKeys,
+                                        classifyMissedOnlineRegistrations = true,
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                        executionAtMillis = System.currentTimeMillis()
+                                    )
+                                } else {
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
                                 groupNoShowTarget = null
                             },
                             onRemove = {
-                                updateQueueByPlan(
-                                    plan = removePlan,
-                                    soundCue = QueueSoundCue.CAUTION,
-                                    publicEventTypeOverride = PublicQueueEventType.NO_SHOW_REMOVED,
-                                    affectedRegistrationKeysOverride = targetKeys,
-                                    classifyMissedOnlineRegistrations = true,
-                                    surfaceHomeFeedback = true,
-                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
-                                    executionAtMillis = System.currentTimeMillis()
-                                )
+                                if (currentTargetStillMatches()) {
+                                    updateQueueByPlan(
+                                        plan = removePlan,
+                                        soundCue = QueueSoundCue.CAUTION,
+                                        publicEventTypeOverride = PublicQueueEventType.NO_SHOW_REMOVED,
+                                        affectedRegistrationKeysOverride = targetKeys,
+                                        classifyMissedOnlineRegistrations = true,
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                        executionAtMillis = System.currentTimeMillis()
+                                    )
+                                } else {
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
                                 groupNoShowTarget = null
                             }
                         )
                     } else {
-                        LaunchedEffect(selection, queue) { groupNoShowTarget = null }
+                        LaunchedEffect(selection, queue) {
+                            groupNoShowTarget = null
+                            showStalePositionActionNotApplied(selection.machineId)
+                        }
                     }
                 }
 
@@ -4956,7 +5217,12 @@ internal fun RegistrationApp() {
                     val exitQueue = queueFor(selection.machineId)
                     val exitRegistration = exitQueue.allRegistrations
                         .firstOrNull { it.key == selection.registrationKey }
-                    if (exitRegistration != null) {
+                    if (
+                        exitRegistration != null &&
+                        exitQueue.matchesRegistrationConfirmationSnapshots(
+                            selection.confirmationSnapshots
+                        )
+                    ) {
                         val fixedPartner = exitRegistration.fixedPartnerKey?.let { partnerKey ->
                             exitQueue.allRegistrations.firstOrNull { it.key == partnerKey }
                                 ?.takeIf { it.fixedPartnerKey == exitRegistration.key }
@@ -4975,53 +5241,69 @@ internal fun RegistrationApp() {
                             confirmText = "确认退出",
                             onDismiss = { exitTarget = null },
                             onConfirm = {
-                                updateQueueByAction(
-                                    action = QueueAction.RemoveRegistrations(
-                                        selection.machineId.name,
-                                        setOf(selection.registrationKey)
-                                    ),
-                                    publicEventTypeOverride =
-                                        PublicQueueEventType.REGISTRATION_REMOVED,
-                                    surfaceHomeFeedback = true,
-                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
-                                    homeFeedbackTitle = "登记已退出排队"
-                                )
+                                if (queueFor(selection.machineId)
+                                        .matchesRegistrationConfirmationSnapshots(
+                                            selection.confirmationSnapshots
+                                        )
+                                ) {
+                                    updateQueueByAction(
+                                        action = QueueAction.RemoveRegistrations(
+                                            selection.machineId.name,
+                                            setOf(selection.registrationKey)
+                                        ),
+                                        publicEventTypeOverride =
+                                            PublicQueueEventType.REGISTRATION_REMOVED,
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                        homeFeedbackTitle = "登记已退出排队"
+                                    )
+                                } else {
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
                                 exitTarget = null
                             }
                         )
                     } else {
-                        LaunchedEffect(selection, exitQueue) { exitTarget = null }
+                        LaunchedEffect(selection, exitQueue) {
+                            exitTarget = null
+                            showStalePositionActionNotApplied(selection.machineId)
+                        }
                     }
                 }
 
                 removeGroupTarget?.let { selection ->
                     val queue = queueFor(selection.machineId)
                     val targetKeys = selection.registrationKeys.toSet()
-                    val allTargetsExist = targetKeys.isNotEmpty() &&
-                        queue.allRegistrations.count { it.key in targetKeys } == targetKeys.size
-                    if (allTargetsExist) {
+                    if (queue.matchesExactPosition(selection)) {
                         RemoveRegistrationConfirmation(
                             title = "移除这组登记？",
                             message = "这会同时移除该位置中的 ${targetKeys.size} 份登记。玩家如需继续游玩，只能重新加入队尾。",
                             confirmText = "移除这组登记",
                             onDismiss = { removeGroupTarget = null },
                             onConfirm = {
-                                updateQueueByAction(
-                                    action = QueueAction.RemoveRegistrations(
-                                        selection.machineId.name,
-                                        targetKeys
-                                    ),
-                                    publicEventTypeOverride =
-                                        PublicQueueEventType.REGISTRATION_REMOVED,
-                                    surfaceHomeFeedback = true,
-                                    homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
-                                    homeFeedbackTitle = "这组登记已移除"
-                                )
+                                if (queueFor(selection.machineId).matchesExactPosition(selection)) {
+                                    updateQueueByAction(
+                                        action = QueueAction.RemoveRegistrations(
+                                            selection.machineId.name,
+                                            targetKeys
+                                        ),
+                                        publicEventTypeOverride =
+                                            PublicQueueEventType.REGISTRATION_REMOVED,
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                        homeFeedbackTitle = "这组登记已移除"
+                                    )
+                                } else {
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
                                 removeGroupTarget = null
                             }
                         )
                     } else {
-                        LaunchedEffect(selection, queue) { removeGroupTarget = null }
+                        LaunchedEffect(selection, queue) {
+                            removeGroupTarget = null
+                            showStalePositionActionNotApplied(selection.machineId)
+                        }
                     }
                 }
 
@@ -6761,6 +7043,11 @@ private fun MachineLane(
                             addAll(projectedWaitingPositions)
                         }
                     }
+                    val dragOverlayController = LocalGlobalDragOverlayController.current
+                    val positionDragOverlayOwner = remember(waitingPositionSignature) { Any() }
+                    val measuredPositionWidths = remember(waitingPositionSignature) {
+                        mutableStateMapOf<String, Float>()
+                    }
                     var queueViewportBounds by remember(waitingPositionSignature) {
                         mutableStateOf<Rect?>(null)
                     }
@@ -6783,6 +7070,10 @@ private fun MachineLane(
                     val density = LocalDensity.current
                     val edgeZonePx = with(density) { 62.dp.toPx() }
                     val maximumEdgeScrollPx = with(density) { 7.dp.toPx() }
+
+                    DisposableEffect(dragOverlayController, positionDragOverlayOwner) {
+                        onDispose { dragOverlayController.clear(positionDragOverlayOwner) }
+                    }
 
                     LaunchedEffect(queueScrollResetToken) {
                         if (queueListState.firstVisibleItemIndex > 0 ||
@@ -6835,7 +7126,8 @@ private fun MachineLane(
                             sourceIndex = sourceIndex,
                             dragOffset = positionDragOffset.x,
                             itemSizes = visualWaitingPositions.map {
-                                with(density) { waitingPositionWidth(it.registrations).toPx() }
+                                measuredPositionWidths[waitingPositionKey(it.registrations)]
+                                    ?: with(density) { waitingPositionWidth(it.registrations).toPx() }
                             },
                             spacing = with(density) { 10.dp.toPx() }
                         )
@@ -6854,7 +7146,10 @@ private fun MachineLane(
                     }
 
                     LaunchedEffect(positionReorderResetToken, waitingPositionSignature) {
-                        if (draggedPositionKey == null) restoreWaitingPositionOrder()
+                        if (draggedPositionKey == null) {
+                            restoreWaitingPositionOrder()
+                            dragOverlayController.clear(positionDragOverlayOwner)
+                        }
                     }
 
                     LaunchedEffect(draggedPositionKey) {
@@ -6949,6 +7244,7 @@ private fun MachineLane(
                                 overtimeWarning = false,
                                 dragEnabled = mapsToSingleActualPosition && actualWaitingPositions.size > 1,
                                 isDragging = isDraggingPosition,
+                                dragOverlayOwner = positionDragOverlayOwner,
                                 highlightedRegistrationKey = highlightedRegistrationKey,
                                 onPositionDragStart = { pointerInRoot ->
                                     visualWaitingPositions.clear()
@@ -7013,7 +7309,11 @@ private fun MachineLane(
                                         )
                                     )
                                 },
-                                modifier = Modifier.zIndex(if (isDraggingPosition) 12f else 0f).let {
+                                modifier = Modifier
+                                    .onGloballyPositioned {
+                                        measuredPositionWidths[positionKey] = it.size.width.toFloat()
+                                    }
+                                    .zIndex(if (isDraggingPosition) 12f else 0f).let {
                                     if (isDraggingPosition) it else it.animateItem()
                                 }
                             )
@@ -7056,12 +7356,19 @@ private fun InlineReorderContent(
     }
     val density = LocalDensity.current
     val listState = rememberLazyListState()
+    val dragOverlayController = LocalGlobalDragOverlayController.current
+    val dragOverlayOwner = remember(initialQueue) { Any() }
+    val measuredItemWidths = remember(initialQueue) { mutableStateMapOf<Int, Float>() }
     var viewportBounds by remember(initialQueue) { mutableStateOf<Rect?>(null) }
     var registrationDragOffset by remember(initialQueue) { mutableStateOf(Offset.Zero) }
     var dragPointerInRoot by remember(initialQueue) { mutableStateOf<Offset?>(null) }
     var edgeScrollPerFramePx by remember(initialQueue) { mutableFloatStateOf(0f) }
     val edgeZonePx = with(density) { 58.dp.toPx() }
     val maximumEdgeScrollPx = with(density) { 7.dp.toPx() }
+
+    DisposableEffect(dragOverlayController, dragOverlayOwner) {
+        onDispose { dragOverlayController.clear(dragOverlayOwner) }
+    }
 
     fun updateEdgeScroll() {
         val pointer = dragPointerInRoot
@@ -7090,7 +7397,8 @@ private fun InlineReorderContent(
             sourceIndex = sourceIndex,
             dragOffset = registrationDragOffset.x,
             itemSizes = registrations.map {
-                with(density) { inlineReorderRegistrationTileWidth(it.displayId).toPx() }
+                measuredItemWidths[it.key]
+                    ?: with(density) { inlineReorderRegistrationTileWidth(it.displayId).toPx() }
             },
             spacing = with(density) { 8.dp.toPx() },
             minimumIndex = playingCount
@@ -7113,6 +7421,7 @@ private fun InlineReorderContent(
         registrationDragOffset = Offset.Zero
         dragPointerInRoot = null
         edgeScrollPerFramePx = 0f
+        dragOverlayController.clear(dragOverlayOwner)
     }
 
     LaunchedEffect(draggedKey) {
@@ -7154,7 +7463,12 @@ private fun InlineReorderContent(
                 active = !locked && (dragging || highlightedKey == registration.key),
                 locked = locked,
                 dragging = dragging,
-                modifier = Modifier.zIndex(if (dragging) 1f else 0f).let {
+                dragOverlayOwner = dragOverlayOwner,
+                modifier = Modifier
+                    .onGloballyPositioned {
+                        measuredItemWidths[registration.key] = it.size.width.toFloat()
+                    }
+                    .zIndex(if (dragging) 1f else 0f).let {
                     if (dragging) it else it.animateItem()
                 },
                 onDragStart = { pointerInRoot ->
@@ -7207,6 +7521,7 @@ private fun InlineReorderRegistrationTile(
     active: Boolean,
     locked: Boolean,
     dragging: Boolean,
+    dragOverlayOwner: Any,
     modifier: Modifier = Modifier,
     isDragOverlay: Boolean = false,
     onDragStart: (Offset) -> Unit,
@@ -7282,7 +7597,7 @@ private fun InlineReorderRegistrationTile(
                                 val pointerInRoot =
                                     dragSurfaceCoordinates?.localToRoot(position) ?: position
                                 tileCoordinates?.boundsInRoot()?.let { itemBounds ->
-                                    dragOverlayController.start(pointerInRoot, itemBounds) {
+                                    dragOverlayController.start(dragOverlayOwner, pointerInRoot, itemBounds) {
                                         InlineReorderRegistrationTile(
                                             orderLabel = orderLabel,
                                             registration = registration,
@@ -7290,6 +7605,7 @@ private fun InlineReorderRegistrationTile(
                                             active = true,
                                             locked = false,
                                             dragging = true,
+                                            dragOverlayOwner = dragOverlayOwner,
                                             isDragOverlay = true,
                                             onDragStart = {},
                                             onDrag = {},
@@ -7301,16 +7617,16 @@ private fun InlineReorderRegistrationTile(
                                 onDragStart(pointerInRoot)
                             },
                             onDragCancel = {
-                                dragOverlayController.clear()
+                                dragOverlayController.clear(dragOverlayOwner)
                                 onDragCancel()
                             },
                             onDragEnd = {
-                                dragOverlayController.clear()
+                                dragOverlayController.clear(dragOverlayOwner)
                                 onDragEnd()
                             },
                             onDrag = { change, dragAmount ->
                                 change.consume()
-                                dragOverlayController.moveBy(dragAmount)
+                                dragOverlayController.moveBy(dragOverlayOwner, dragAmount)
                                 onDrag(dragAmount)
                             }
                         )
@@ -7341,6 +7657,7 @@ private fun QueuePosition(
     highlightedRegistrationKey: Int? = null,
     dragEnabled: Boolean = false,
     isDragging: Boolean = false,
+    dragOverlayOwner: Any? = null,
     isDragOverlay: Boolean = false,
     onPositionDragStart: (Offset) -> Unit = {},
     onPositionDrag: (Offset) -> Unit = {},
@@ -7411,13 +7728,14 @@ private fun QueuePosition(
     )
     var dragSurfaceCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
     var positionCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
-    val dragHeaderModifier = if (dragEnabled) {
+    val activeDragOverlayOwner = dragOverlayOwner
+    val dragHeaderModifier = if (dragEnabled && activeDragOverlayOwner != null) {
         Modifier.pointerInput(dragEnabled) {
             detectDragGesturesAfterLongPress(
                 onDragStart = { position ->
                     val pointerInRoot = dragSurfaceCoordinates?.localToRoot(position) ?: position
                     positionCoordinates?.boundsInRoot()?.let { itemBounds ->
-                        dragOverlayController.start(pointerInRoot, itemBounds) {
+                        dragOverlayController.start(activeDragOverlayOwner, pointerInRoot, itemBounds) {
                             QueuePosition(
                                 label = label,
                                 registrations = registrations,
@@ -7429,6 +7747,7 @@ private fun QueuePosition(
                                 highlightedRegistrationKey = null,
                                 dragEnabled = false,
                                 isDragging = true,
+                                dragOverlayOwner = activeDragOverlayOwner,
                                 isDragOverlay = true,
                                 onRegistrationClick = {},
                                 onRegistrationLongPress = {},
@@ -7439,16 +7758,16 @@ private fun QueuePosition(
                     onPositionDragStart(pointerInRoot)
                 },
                 onDragCancel = {
-                    dragOverlayController.clear()
+                    dragOverlayController.clear(activeDragOverlayOwner)
                     onPositionDragCancel()
                 },
                 onDragEnd = {
-                    dragOverlayController.clear()
+                    dragOverlayController.clear(activeDragOverlayOwner)
                     onPositionDragEnd()
                 },
                 onDrag = { change, dragAmount ->
                     change.consume()
-                    dragOverlayController.moveBy(dragAmount)
+                    dragOverlayController.moveBy(activeDragOverlayOwner, dragAmount)
                     onPositionDrag(dragAmount)
                 }
             )
@@ -12581,6 +12900,11 @@ private fun AppDetailsDialog(
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
         Triple(
+            "0.7.5",
+            "拖动交互与跨端执行可靠性",
+            "拖动内容会继续跟随手指，避让空位只在越过相邻项目后移动；远程命令结果与队列状态一同保存，意外退出后不会重复执行。App 与 QQ Bot 的延迟确认会锁定具体搭档、位置及特殊状态；网站和 QQ 通知也会继续跟随线上登记离队或排队批次变化后的真实结果。"
+        ),
+        Triple(
             "0.7.4",
             "跨端反馈与通知准确性",
             "修复等待登记可能被误写成正在与游玩位置玩家共同游玩；网站在终端确认线上登记后立即显示成功；远程命令回执写入失败时会保留首次结果并继续重试，避免当前运行周期内重复执行。正常轮换、未到场记录清除和暂缓一次改为按实际结果分别生成通知，顺序调整失效时也会明确说明未执行。"
@@ -13222,7 +13546,7 @@ private fun ReorderScreen(
     val originalOrder = remember(initialQueue) { initialQueue.allRegistrations }
     val playingKeys = remember(initialQueue) { initialQueue.playing.map { it.key }.toSet() }
     val playingCount = initialQueue.playing.size
-    var draggedKey by remember { mutableStateOf<Int?>(null) }
+    var draggedKey by remember(initialQueue) { mutableStateOf<Int?>(null) }
     var dragStartOrder by remember(initialQueue) { mutableStateOf<List<Registration>?>(null) }
     var pendingMovedKey by remember { mutableStateOf<Int?>(null) }
     var discardConfirmationVisible by remember(initialQueue) { mutableStateOf(false) }
@@ -13236,6 +13560,9 @@ private fun ReorderScreen(
     BackHandler(onBack = requestCancel)
     val nowMillis = rememberCurrentTimeMillis()
     val listState = rememberLazyListState()
+    val dragOverlayController = LocalGlobalDragOverlayController.current
+    val dragOverlayOwner = remember(initialQueue) { Any() }
+    val measuredItemHeights = remember(initialQueue) { mutableStateMapOf<Int, Float>() }
     var viewportBounds by remember(initialQueue) { mutableStateOf<Rect?>(null) }
     var registrationDragOffset by remember(initialQueue) { mutableStateOf(Offset.Zero) }
     var dragPointerInRoot by remember(initialQueue) { mutableStateOf<Offset?>(null) }
@@ -13243,6 +13570,10 @@ private fun ReorderScreen(
     val density = LocalDensity.current
     val edgeZonePx = with(density) { 66.dp.toPx() }
     val maximumEdgeScrollPx = with(density) { 8.dp.toPx() }
+
+    DisposableEffect(dragOverlayController, dragOverlayOwner) {
+        onDispose { dragOverlayController.clear(dragOverlayOwner) }
+    }
 
     fun updateEdgeScroll() {
         val pointer = dragPointerInRoot
@@ -13270,7 +13601,9 @@ private fun ReorderScreen(
         val update = calculateDragReorder(
             sourceIndex = sourceIndex,
             dragOffset = registrationDragOffset.y,
-            itemSizes = List(registrations.size) { with(density) { 68.dp.toPx() } },
+            itemSizes = registrations.map {
+                measuredItemHeights[it.key] ?: with(density) { 68.dp.toPx() }
+            },
             spacing = with(density) { 9.dp.toPx() },
             minimumIndex = playingCount
         )
@@ -13361,7 +13694,12 @@ private fun ReorderScreen(
                         registration = registration,
                         dragging = dragging,
                         locked = locked,
-                        modifier = Modifier.zIndex(if (dragging) 1f else 0f).let {
+                        dragOverlayOwner = dragOverlayOwner,
+                        modifier = Modifier
+                            .onGloballyPositioned {
+                                measuredItemHeights[registration.key] = it.size.height.toFloat()
+                            }
+                            .zIndex(if (dragging) 1f else 0f).let {
                             if (dragging) it else it.animateItem()
                         },
                         onDragStart = { pointerInRoot ->
@@ -13441,6 +13779,7 @@ private fun ReorderRegistrationRow(
     registration: Registration,
     dragging: Boolean,
     locked: Boolean,
+    dragOverlayOwner: Any,
     modifier: Modifier = Modifier,
     isDragOverlay: Boolean = false,
     onDragStart: (Offset) -> Unit,
@@ -13509,12 +13848,13 @@ private fun ReorderRegistrationRow(
                                 val pointerInRoot =
                                     dragSurfaceCoordinates?.localToRoot(position) ?: position
                                 rowCoordinates?.boundsInRoot()?.let { itemBounds ->
-                                    dragOverlayController.start(pointerInRoot, itemBounds) {
+                                    dragOverlayController.start(dragOverlayOwner, pointerInRoot, itemBounds) {
                                         ReorderRegistrationRow(
                                             orderLabel = orderLabel,
                                             registration = registration,
                                             dragging = true,
                                             locked = false,
+                                            dragOverlayOwner = dragOverlayOwner,
                                             isDragOverlay = true,
                                             onDragStart = {},
                                             onDrag = {},
@@ -13526,16 +13866,16 @@ private fun ReorderRegistrationRow(
                                 onDragStart(pointerInRoot)
                             },
                             onDragCancel = {
-                                dragOverlayController.clear()
+                                dragOverlayController.clear(dragOverlayOwner)
                                 onDragCancel()
                             },
                             onDragEnd = {
-                                dragOverlayController.clear()
+                                dragOverlayController.clear(dragOverlayOwner)
                                 onDragEnd()
                             },
                             onDrag = { change, dragAmount ->
                                 change.consume()
-                                dragOverlayController.moveBy(dragAmount)
+                                dragOverlayController.moveBy(dragOverlayOwner, dragAmount)
                                 onDrag(dragAmount)
                             }
                         )
@@ -14321,8 +14661,7 @@ internal fun calculateDragReorder(
     dragOffset: Float,
     itemSizes: List<Float>,
     spacing: Float,
-    minimumIndex: Int = 0,
-    thresholdFraction: Float = .52f
+    minimumIndex: Int = 0
 ): DragReorderUpdate {
     if (
         sourceIndex !in itemSizes.indices ||
@@ -14343,13 +14682,16 @@ internal fun calculateDragReorder(
         }
         val destinationIndex = currentIndex + direction
         if (destinationIndex !in reorderedSizes.indices || destinationIndex < minimumIndex) break
-        val centerDistance =
+        // The invisible list item is the vacancy underneath the global drag overlay. Move that
+        // vacancy only after the overlay's centre has passed the adjacent item's centre. Subtracting
+        // the adjacent item's exact layout span keeps remainingOffset relative to the new vacancy,
+        // so repeated swaps do not accumulate drift when item sizes differ.
+        val adjacentCenterDistance =
             reorderedSizes[currentIndex] / 2f +
                 reorderedSizes[destinationIndex] / 2f +
                 spacing
         val layoutShift = reorderedSizes[destinationIndex] + spacing
-        val reorderThreshold = maxOf(centerDistance, layoutShift) * thresholdFraction
-        if (kotlin.math.abs(remainingOffset) < reorderThreshold) break
+        if (kotlin.math.abs(remainingOffset) <= adjacentCenterDistance) break
 
         reorderedSizes.add(destinationIndex, reorderedSizes.removeAt(currentIndex))
         currentIndex = destinationIndex

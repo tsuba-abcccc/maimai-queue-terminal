@@ -9,7 +9,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
-internal data class TerminalCommandReceipt(
+data class TerminalCommandReceipt(
     val commandId: String,
     val applied: Boolean,
     val detail: String,
@@ -130,6 +130,16 @@ internal fun appendRecentCommandReceipt(
 ): List<TerminalCommandReceipt> =
     (existing.filterNot { it.commandId == receipt.commandId } + receipt)
         .takeLast(maximumSize.coerceAtLeast(1))
+
+internal fun mergeRecentCommandReceipts(
+    vararg receiptCollections: Collection<TerminalCommandReceipt>,
+    maximumSize: Int = MAX_RECENT_COMMAND_IDS
+): List<TerminalCommandReceipt> = receiptCollections
+    .asSequence()
+    .flatten()
+    .fold(emptyList()) { merged, receipt ->
+        appendRecentCommandReceipt(merged, receipt, maximumSize)
+    }
 
 internal fun appendRecentCommandId(
     existing: List<String>,

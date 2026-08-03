@@ -17,9 +17,9 @@ PUBLIC_SCHEMA_VERSION = 5
 SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4, 5}
 MAX_PAYLOAD_BYTES = 1024 * 1024
 MAX_REGISTRATIONS_PER_MACHINE = 20
-MAX_PRIVATE_CONTACTS = MAX_REGISTRATIONS_PER_MACHINE * 2
 MAX_PLAYER_PROFILES = 500
 MAX_EVENTS_PER_SNAPSHOT = 200
+MAX_PRIVATE_CONTACTS = MAX_REGISTRATIONS_PER_MACHINE * 2 + MAX_EVENTS_PER_SNAPSHOT * 2
 MAX_STORED_EVENTS_PER_QUEUE = 2_000
 MAX_LOG_PAGE_SIZE = 100
 MAX_STOP_REASON_DETAIL_CHARACTERS = 40
@@ -1485,6 +1485,7 @@ def read_bot_players():
                 ),
                 "preference": context["registration"]["preference"],
                 "fixed_pair": context["registration"]["fixed_pair"],
+                "fixed_pair_id": context["registration"]["fixed_pair_id"],
                 "registration_type": context["registration"]["registration_type"],
                 "created_at": context["registration"]["created_at"],
                 "online_check_in_started_at": context["registration"][
@@ -1883,6 +1884,14 @@ def create_bot_queue_operation_command():
         "machine_id",
         "target_machine_id",
         "preference",
+        "expected_queue_id",
+        "expected_registration_id",
+        "expected_machine_id",
+        "expected_position",
+        "expected_fixed_pair_id",
+        "expected_absence_status",
+        "expected_temporary_away_skipped_turns",
+        "expected_pending_check_in",
     }
     if set(source) - allowed_fields:
         return jsonify({"ok": False, "error": "请求包含不支持的排队操作字段"}), 400
@@ -1897,6 +1906,44 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
         machine_id = read_optional_machine_id(source, "machine_id")
         target_machine_id = read_optional_machine_id(source, "target_machine_id")
         preference = read_optional_choice(source, "preference", PREFERENCES)
+        expected_field_names = {
+            "expected_queue_id",
+            "expected_registration_id",
+            "expected_machine_id",
+            "expected_position",
+            "expected_fixed_pair_id",
+            "expected_absence_status",
+            "expected_temporary_away_skipped_turns",
+            "expected_pending_check_in",
+        }
+        supplied_expected_fields = expected_field_names.intersection(source)
+        if supplied_expected_fields and supplied_expected_fields != expected_field_names:
+            raise ValidationError("确认状态字段不完整")
+        expected_context = None
+        if supplied_expected_fields:
+            expected_context = {
+                "queue_id": read_uuid(source, "expected_queue_id"),
+                "registration_id": read_public_id(source, "expected_registration_id"),
+                "machine_id": read_optional_machine_id(source, "expected_machine_id"),
+                "position": read_choice(source, "expected_position", {"PLAYING", "WAITING"}),
+                "fixed_pair_id": read_optional_public_id(
+                    source, "expected_fixed_pair_id"
+                ),
+                "absence_status": read_choice(
+                    source,
+                    "expected_absence_status",
+                    {"NONE", "DEFER_ONE_ROUND", "TEMPORARILY_AWAY"},
+                ),
+                "temporary_away_skipped_turns": read_integer(
+                    source,
+                    "expected_temporary_away_skipped_turns",
+                    minimum=0,
+                    maximum=3,
+                ),
+                "pending_check_in": read_boolean(source, "expected_pending_check_in"),
+            }
+            if expected_context["machine_id"] is None:
+                raise ValidationError("expected_machine_id 不能为空")
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
 
@@ -1907,6 +1954,7 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
         "machine_id": machine_id,
         "target_machine_id": target_machine_id,
         "preference": preference,
+        "expected_context": expected_context,
     }
 
     with open_database() as connection:
@@ -2003,6 +2051,7 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
             machine_id=machine_id,
             target_machine_id=target_machine_id,
             preference=preference,
+            expected_context=expected_context,
             registration_contexts=registration_contexts,
             request_identity=request_identity,
         )
@@ -2055,6 +2104,7 @@ def build_queue_operation_payload(
     machine_id: str | None,
     target_machine_id: str | None,
     preference: str | None,
+    expected_context: dict[str, Any] | None,
     registration_contexts: list[dict[str, Any]],
     request_identity: dict[str, Any],
 ):
@@ -2068,6 +2118,8 @@ def build_queue_operation_payload(
     }
 
     if operation == "JOIN_QUEUE":
+        if expected_context is not None:
+            return None, ("加入排队不接受登记确认状态", 400)
         if snapshot_in_closing_grace(snapshot):
             return None, ("闭店收尾期间不再接收新的排队登记", 409)
         if not online_registration_allowed(snapshot):
@@ -2104,6 +2156,34 @@ def build_queue_operation_payload(
         return None, ("当前没有可以执行此操作的排队登记", 409)
     context = registration_contexts[0]
     registration = context["registration"]
+    if expected_context is not None:
+        current_absence_status = (
+            "DEFER_ONE_ROUND"
+            if registration.get("deferred_once", False)
+            else "TEMPORARILY_AWAY"
+            if registration.get("temporarily_away", False)
+            else "NONE"
+        )
+        if (
+            expected_context["queue_id"] != queue_id
+            or expected_context["registration_id"] != registration.get("registration_id")
+        ):
+            return None, ("确认期间排队批次或登记已经变化，请重新查询后再操作", 409)
+        if (
+            expected_context["machine_id"] != context["machine_id"]
+            or expected_context["position"] != context["position"]
+        ):
+            return None, ("确认期间登记所在机台或位置已经变化，请重新查询后再操作", 409)
+        if (
+            expected_context["fixed_pair_id"]
+            != registration.get("fixed_pair_id")
+            or expected_context["absence_status"] != current_absence_status
+            or expected_context["temporary_away_skipped_turns"]
+            != registration.get("temporary_away_skipped_turns", 0)
+            or expected_context["pending_check_in"]
+            != registration.get("online_registration_pending_check_in", False)
+        ):
+            return None, ("确认期间登记状态已经变化，请重新查询后再操作", 409)
     source_machine = snapshot.get("machines", {}).get(context["machine_id"])
     if source_machine is None or not source_machine.get("operational", False):
         return None, ("登记所在机台已停止使用，恢复正常使用后才能操作", 409)
@@ -3813,6 +3893,7 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
         payload.get("private_player_contacts", []) if schema_version >= 3 else [],
         machines,
         private_player_profiles or [],
+        recent_events,
     )
     attach_public_registration_contacts(machines, private_player_contacts)
 
@@ -3926,6 +4007,7 @@ def normalize_private_contacts(
     source: Any,
     machines: dict[str, dict[str, Any]],
     private_profiles: list[dict[str, Any]],
+    recent_events: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     if not isinstance(source, list):
         raise ValidationError("private_player_contacts 必须是数组")
@@ -3936,6 +4018,11 @@ def normalize_private_contacts(
         registration["registration_id"]: registration
         for machine in machines.values()
         for registration in all_machine_registrations(machine)
+    }
+    event_registration_ids = {
+        registration_id
+        for event in recent_events
+        for registration_id in event["registration_ids"]
     }
     profiles = {profile["profile_id"]: profile for profile in private_profiles}
     contacts: list[dict[str, Any]] = []
@@ -3948,9 +4035,9 @@ def normalize_private_contacts(
         if not isinstance(qq_number, str) or QQ_NUMBER_PATTERN.fullmatch(qq_number) is None:
             raise ValidationError("qq_number 必须是 5 至 12 位数字")
         registration = registrations.get(registration_id)
-        if registration is None:
-            raise ValidationError("QQ 绑定引用了不存在的登记")
-        if registration["registration_type"] != "PLAYER_PROFILE":
+        if registration is None and registration_id not in event_registration_ids:
+            raise ValidationError("QQ 绑定必须引用当前登记或最近事件中的登记")
+        if registration is not None and registration["registration_type"] != "PLAYER_PROFILE":
             raise ValidationError("临时登记不能包含 QQ 绑定")
         profile = profiles.get(profile_id)
         if profile is None or profile["qq_number"] != qq_number:
@@ -3965,11 +4052,8 @@ def normalize_private_contacts(
         )
 
     registration_ids = [contact["registration_id"] for contact in contacts]
-    player_ids = [contact["profile_id"] for contact in contacts]
     if len(registration_ids) != len(set(registration_ids)):
         raise ValidationError("QQ 绑定的登记编号不能重复")
-    if len(player_ids) != len(set(player_ids)):
-        raise ValidationError("QQ 绑定的玩家编号不能重复")
     return contacts
 
 

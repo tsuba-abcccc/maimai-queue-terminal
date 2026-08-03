@@ -47,7 +47,10 @@ internal sealed interface MobileDeviceRegistrationDecision {
         val detail: String
     ) : MobileDeviceRegistrationDecision
 
-    data class AlreadyApplied(val detail: String) : MobileDeviceRegistrationDecision
+    data class AlreadyApplied(
+        val detail: String,
+        val profileToPersist: PlayerProfile? = null
+    ) : MobileDeviceRegistrationDecision
     data class Reject(val detail: String) : MobileDeviceRegistrationDecision
 }
 
@@ -68,7 +71,12 @@ internal fun decideMobileDeviceRegistration(
         .firstOrNull { it.originatingCommandId == command.commandId }
     if (exactRegistration != null) {
         return MobileDeviceRegistrationDecision.AlreadyApplied(
-            "已通过移动设备加入排队。"
+            "已通过移动设备加入排队。",
+            profileToPersist = profileAfterAppliedMobileRegistration(
+                command = command,
+                state = state,
+                registration = exactRegistration
+            )
         )
     }
     if (command.queueId != state.queueId) {
@@ -244,6 +252,87 @@ internal fun decideMobileDeviceRegistration(
         needsAvailabilityConfirmation = execution.impact.requiresAvailabilityConfirmation,
         detail = "已通过移动设备加入排队。"
     )
+}
+
+private fun profileAfterAppliedMobileRegistration(
+    command: MobileDeviceRegistrationCommand,
+    state: RemoteQueueExecutionState,
+    registration: Registration
+): PlayerProfile? {
+    val existingProfile = state.playerProfiles.firstOrNull { it.id == command.profileId }
+    val profileBeforeUsage = if (command.newProfile != null) {
+        val requested = command.newProfile
+        if (existingProfile == null) {
+            PlayerProfile(
+                id = command.profileId,
+                nickname = requested.nickname.trim(),
+                gender = requested.gender,
+                defaultPreference = requested.defaultPreference,
+                qqNumber = requested.qqNumber,
+                qqVisibility = requested.qqVisibility,
+                notificationPreferences = requested.notificationPreferences,
+                setupVersion = requested.setupVersion,
+                revision = 1L,
+                createdAtMillis = command.createdAtMillis,
+                updatedAtMillis = command.createdAtMillis
+            ).withCanonicalContact()
+        } else {
+            existingProfile.takeIf {
+                it.nickname == requested.nickname.trim() &&
+                    it.gender == requested.gender &&
+                    it.defaultPreference == requested.defaultPreference &&
+                    it.normalizedQqNumber() == requested.qqNumber &&
+                    it.qqVisibility == requested.qqVisibility &&
+                    it.notificationPreferences == requested.notificationPreferences &&
+                    it.setupVersion >= requested.setupVersion
+            }
+        }
+    } else {
+        existingProfile?.let { profile ->
+            val completion = command.completion
+            when {
+                completion == null &&
+                    profile.hasCompleteRequiredDetails &&
+                    profile.hasValidContact -> profile
+                completion != null &&
+                    profile.normalizedQqNumber() == completion.qqNumber &&
+                    profile.qqVisibility == completion.qqVisibility &&
+                    profile.notificationPreferences == completion.notificationPreferences &&
+                    profile.setupVersion >= completion.setupVersion -> profile
+                completion != null && profile.revision == command.expectedProfileRevision ->
+                    profile.copy(
+                        qqNumber = completion.qqNumber,
+                        qqVisibility = completion.qqVisibility,
+                        notificationPreferences = completion.notificationPreferences,
+                        setupVersion = completion.setupVersion,
+                        revision = profile.revision + 1L,
+                        updatedAtMillis = maxOf(
+                            command.createdAtMillis,
+                            profile.updatedAtMillis + 1L
+                        )
+                    ).withCanonicalContact()
+                else -> null
+            }
+        }
+    } ?: return null
+    if (
+        profileBeforeUsage.id != registration.playerProfileId ||
+        profileBeforeUsage.nickname != registration.displayId ||
+        profileBeforeUsage.normalizedQqNumber() != command.actorQq
+    ) return null
+    val usedProfile = if (
+        (profileBeforeUsage.lastUsedAtMillis ?: Long.MIN_VALUE) < registration.createdAtMillis
+    ) {
+        profileBeforeUsage.recordUsage(
+            atMillis = maxOf(
+                registration.createdAtMillis,
+                profileBeforeUsage.updatedAtMillis + 1L
+            )
+        )
+    } else {
+        profileBeforeUsage
+    }
+    return usedProfile.takeIf { it != existingProfile }
 }
 
 private const val MAX_MOBILE_REGISTRATIONS_PER_MACHINE = 20

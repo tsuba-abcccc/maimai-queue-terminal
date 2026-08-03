@@ -1478,71 +1478,190 @@ class QueueModelsTest {
     }
 
     @Test
+    fun exactPositionMatchRejectsAGroupThatWasSplitWhileConfirmationWasOpen() {
+        val first = registration(1)
+        val second = registration(2)
+        val selection = PositionSelection(
+            machineId = MachineId.A,
+            label = "位置 A1",
+            registrationKeys = listOf(first.key, second.key),
+            isPlayingPosition = false,
+            waitingPositionIndex = 0
+        )
+        val original = MachineQueue(waiting = listOf(first, second))
+        val regrouped = original.changePreference(first.key, PlayPreference.SOLO)
+
+        assertTrue(original.matchesExactPosition(selection))
+        assertFalse(regrouped.matchesExactPosition(selection))
+    }
+
+    @Test
+    fun exactPositionMatchRejectsTheSameGroupAfterItsPositionNumberChanges() {
+        val leading = registration(1, PlayPreference.SOLO)
+        val first = registration(2)
+        val second = registration(3)
+        val selection = PositionSelection(
+            machineId = MachineId.A,
+            label = "位置 A2",
+            registrationKeys = listOf(first.key, second.key),
+            isPlayingPosition = false,
+            waitingPositionIndex = 1
+        )
+        val original = MachineQueue(waiting = listOf(leading, first, second))
+        val shifted = original.remove(leading.key)
+
+        assertTrue(original.matchesExactPosition(selection))
+        assertFalse(shifted.matchesExactPosition(selection))
+    }
+
+    @Test
+    fun exactPlayingPositionMatchRejectsPartialCurrentRoundChanges() {
+        val first = registration(1)
+        val second = registration(2)
+        val selection = PositionSelection(
+            machineId = MachineId.A,
+            label = "游玩位置 A",
+            registrationKeys = listOf(first.key, second.key),
+            isPlayingPosition = true
+        )
+        val original = MachineQueue(playing = listOf(first, second))
+        val changed = original.copy(playing = listOf(first))
+
+        assertTrue(original.matchesExactPosition(selection))
+        assertFalse(changed.matchesExactPosition(selection))
+    }
+
+    @Test
+    fun fixedPairPositionMatchRequiresTheRelationshipToRemainMutual() {
+        val first = registration(1).copy(fixedPartnerKey = 2)
+        val second = registration(2).copy(fixedPartnerKey = 1)
+        val selection = PositionSelection(
+            machineId = MachineId.A,
+            label = "位置 A1 · 固定组合",
+            registrationKeys = listOf(first.key, second.key),
+            isPlayingPosition = false,
+            waitingPositionIndex = 0
+        )
+        val original = MachineQueue(waiting = listOf(first, second))
+        val released = original.copy(
+            waiting = listOf(
+                first.copy(fixedPartnerKey = null),
+                second.copy(fixedPartnerKey = null)
+            )
+        )
+
+        assertTrue(original.matchesFixedPairPosition(selection))
+        assertFalse(released.matchesFixedPairPosition(selection))
+    }
+
+    @Test
+    fun noShowConfirmationDoesNotFollowARegistrationBetweenWaitingAndPlaying() {
+        val playing = registration(1)
+        val waiting = registration(2)
+        val original = MachineQueue(playing = listOf(playing), waiting = listOf(waiting))
+        val waitingSelection = SelectedRegistration(
+            machineId = MachineId.A,
+            registrationKey = waiting.key,
+            fromPlayingPosition = false
+        )
+        val movedIntoPlaying = MachineQueue(playing = listOf(waiting), waiting = listOf(playing))
+
+        assertTrue(original.matchesNoShowLocation(waitingSelection))
+        assertFalse(movedIntoPlaying.matchesNoShowLocation(waitingSelection))
+    }
+
+    @Test
     fun dragReorderCrossesSeveralVariableWidthItemsWithoutLosingFingerOffset() {
         val update = calculateDragReorder(
             sourceIndex = 0,
-            dragOffset = 230f,
+            dragOffset = 251f,
             itemSizes = listOf(100f, 140f, 80f),
             spacing = 10f
         )
 
         assertEquals(2, update.destinationIndex)
-        assertEquals(-10f, update.remainingOffset)
+        assertEquals(11f, update.remainingOffset)
     }
 
     @Test
     fun dragReorderKeepsFingerOffsetWhenCrossingVariableWidthItemsToTheLeft() {
         val update = calculateDragReorder(
             sourceIndex = 2,
-            dragOffset = -230f,
+            dragOffset = -251f,
             itemSizes = listOf(100f, 140f, 80f),
             spacing = 10f
         )
 
         assertEquals(0, update.destinationIndex)
-        assertEquals(30f, update.remainingOffset)
+        assertEquals(9f, update.remainingOffset)
     }
 
     @Test
     fun dragReorderUsesHysteresisInsteadOfOscillatingAfterAPlacementChange() {
         val movedRight = calculateDragReorder(
             sourceIndex = 0,
-            dragOffset = 70f,
+            dragOffset = 111f,
             itemSizes = listOf(100f, 100f),
             spacing = 10f
         )
         val stillRight = calculateDragReorder(
             sourceIndex = movedRight.destinationIndex,
-            dragOffset = -45f,
+            dragOffset = -110f,
             itemSizes = listOf(100f, 100f),
             spacing = 10f
         )
 
         assertEquals(1, movedRight.destinationIndex)
-        assertEquals(-40f, movedRight.remainingOffset)
+        assertEquals(1f, movedRight.remainingOffset)
         assertEquals(1, stillRight.destinationIndex)
-        assertEquals(-45f, stillRight.remainingOffset)
+        assertEquals(-110f, stillRight.remainingOffset)
     }
 
     @Test
     fun dragReorderDoesNotBounceBackAfterCrossingAMuchWiderItem() {
         val movedRight = calculateDragReorder(
             sourceIndex = 0,
-            dragOffset = 170f,
+            dragOffset = 211f,
             itemSizes = listOf(100f, 300f),
             spacing = 10f
         )
         val remainsRight = calculateDragReorder(
             sourceIndex = movedRight.destinationIndex,
-            dragOffset = movedRight.remainingOffset,
+            dragOffset = -210f,
             itemSizes = listOf(300f, 100f),
             spacing = 10f
         )
 
         assertEquals(1, movedRight.destinationIndex)
-        assertEquals(-140f, movedRight.remainingOffset)
+        assertEquals(-99f, movedRight.remainingOffset)
         assertEquals(1, remainsRight.destinationIndex)
-        assertEquals(-140f, remainsRight.remainingOffset)
+        assertEquals(-210f, remainsRight.remainingOffset)
+    }
+
+    @Test
+    fun dragReorderKeepsVacancyUnderOverlayUntilAdjacentCenterIsPassed() {
+        val beforeCenter = calculateDragReorder(
+            sourceIndex = 0,
+            dragOffset = 209f,
+            itemSizes = listOf(100f, 300f),
+            spacing = 10f
+        )
+        val atCenter = calculateDragReorder(
+            sourceIndex = 0,
+            dragOffset = 210f,
+            itemSizes = listOf(100f, 300f),
+            spacing = 10f
+        )
+        val pastCenter = calculateDragReorder(
+            sourceIndex = 0,
+            dragOffset = 211f,
+            itemSizes = listOf(100f, 300f),
+            spacing = 10f
+        )
+
+        assertEquals(0, beforeCenter.destinationIndex)
+        assertEquals(0, atCenter.destinationIndex)
+        assertEquals(1, pastCenter.destinationIndex)
     }
 
     @Test
@@ -1566,6 +1685,107 @@ class QueueModelsTest {
         assertEquals(-500f, lockedPrefix.remainingOffset)
         assertEquals(2, listEnd.destinationIndex)
         assertEquals(500f, listEnd.remainingOffset)
+    }
+
+    @Test
+    fun confirmationSnapshotLocksTheReciprocalFixedPartnerAndAbsenceState() {
+        val first = registration(1).copy(
+            fixedPartnerKey = 2,
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            temporaryAwaySkippedTurns = 1
+        )
+        val second = registration(2).copy(
+            fixedPartnerKey = 1,
+            absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+            temporaryAwaySkippedTurns = 1
+        )
+        val queue = MachineQueue(waiting = listOf(first, second))
+        val snapshots = queue.registrationConfirmationSnapshots(setOf(first.key))
+
+        assertEquals(listOf(1, 2), snapshots.map { it.registrationKey })
+        assertTrue(queue.matchesRegistrationConfirmationSnapshots(snapshots))
+        assertFalse(
+            queue.copy(
+                waiting = listOf(
+                    first.copy(fixedPartnerKey = null),
+                    second.copy(fixedPartnerKey = null)
+                )
+            ).matchesRegistrationConfirmationSnapshots(snapshots)
+        )
+        assertFalse(
+            queue.copy(
+                waiting = listOf(
+                    first,
+                    second.copy(temporaryAwaySkippedTurns = 2)
+                )
+            ).matchesRegistrationConfirmationSnapshots(snapshots)
+        )
+    }
+
+    @Test
+    fun confirmationSnapshotAllowsWaitingReorderButRejectsEnteringPlayingPosition() {
+        val first = registration(1, PlayPreference.SOLO)
+        val second = registration(2, PlayPreference.SOLO)
+        val queue = MachineQueue(waiting = listOf(first, second))
+        val snapshots = queue.registrationConfirmationSnapshots(setOf(first.key))
+
+        assertTrue(
+            queue.copy(waiting = listOf(second, first))
+                .matchesRegistrationConfirmationSnapshots(snapshots)
+        )
+        assertFalse(
+            MachineQueue(playing = listOf(first), waiting = listOf(second))
+                .matchesRegistrationConfirmationSnapshots(snapshots)
+        )
+    }
+
+    @Test
+    fun moveIntoPlayingConfirmationLocksBothCurrentPlayerAndJoiningRegistration() {
+        val currentPlayer = registration(1)
+        val joiningPlayer = registration(2)
+        val queue = MachineQueue(
+            playing = listOf(currentPlayer),
+            waiting = listOf(joiningPlayer)
+        )
+        val snapshots = queue.registrationConfirmationSnapshots(
+            setOf(currentPlayer.key, joiningPlayer.key)
+        )
+
+        assertTrue(queue.matchesRegistrationConfirmationSnapshots(snapshots))
+        assertFalse(
+            MachineQueue(
+                playing = listOf(registration(3)),
+                waiting = listOf(currentPlayer, joiningPlayer)
+            ).matchesRegistrationConfirmationSnapshots(snapshots)
+        )
+        assertFalse(
+            queue.copy(
+                waiting = listOf(joiningPlayer.copy(requiresOnSiteCheckIn = true))
+            ).matchesRegistrationConfirmationSnapshots(snapshots)
+        )
+    }
+
+    @Test
+    fun absenceConfirmationRejectsAChangedFixedPartnerOrCheckInState() {
+        val first = registration(1).copy(fixedPartnerKey = 2)
+        val second = registration(2).copy(fixedPartnerKey = 1)
+        val queue = MachineQueue(waiting = listOf(first, second))
+        val snapshots = queue.registrationConfirmationSnapshots(setOf(first.key))
+
+        assertFalse(
+            queue.copy(
+                waiting = listOf(
+                    first.copy(fixedPartnerKey = 3),
+                    second.copy(fixedPartnerKey = null),
+                    registration(3).copy(fixedPartnerKey = 1)
+                )
+            ).matchesRegistrationConfirmationSnapshots(snapshots)
+        )
+        assertFalse(
+            queue.copy(
+                waiting = listOf(first.copy(requiresOnSiteCheckIn = true), second)
+            ).matchesRegistrationConfirmationSnapshots(snapshots)
+        )
     }
 
     @Test

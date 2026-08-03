@@ -1554,6 +1554,52 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(event["cursor"], events_response["next_cursor"])
         self.assertEqual(event["cursor"], events_response["latest_cursor"])
 
+    def test_join_and_leave_between_snapshots_still_route_both_events(self):
+        snapshot = self.snapshot(revision=4)
+        snapshot["schema_version"] = 5
+        registration = snapshot["machines"]["A"]["playing"][0]
+        snapshot["machines"]["A"] = self.machine(name="左侧 · 机台 A")
+        snapshot["private_player_profiles"] = [self.player_profile()]
+        snapshot["private_player_contacts"] = [
+            {
+                "registration_id": registration["registration_id"],
+                "profile_id": self.profile_id,
+                "qq_number": "12345678",
+            }
+        ]
+        snapshot["recent_events"] = [
+            self.event(
+                "00000000-0000-0000-0000-000000000194",
+                "ONLINE_REGISTRATION_ADDED",
+                1_000_100,
+            ),
+            self.event(
+                "00000000-0000-0000-0000-000000000195",
+                "REGISTRATION_REMOVED",
+                1_000_200,
+            ),
+        ]
+
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        players = self.client.get(
+            "/api/queue-bot/players", headers=self.bot_headers
+        ).get_json()["players"]
+        events = self.client.post(
+            "/api/queue-bot/events",
+            json={"qq": "12345678", "after": 0},
+            headers=self.bot_headers,
+        ).get_json()["events"]
+
+        self.assertEqual(204, response.status_code)
+        self.assertEqual([], players)
+        self.assertEqual(
+            ["ONLINE_REGISTRATION_ADDED", "REGISTRATION_REMOVED"],
+            [event["type"] for event in events],
+        )
+        self.assertTrue(all(event["affected_players"] for event in events))
+
     def test_composite_event_uses_every_related_notification_category(self):
         snapshot = self.snapshot(revision=4)
         snapshot["schema_version"] = 5
@@ -2809,6 +2855,61 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertIn("完成现场签到后", deferred.get_json()["error"])
         self.assertEqual(202, left.status_code)
 
+    def test_bot_confirmation_context_rejects_a_changed_registration_state(self):
+        snapshot = self.remote_ready_snapshot(with_registration=True)
+        self.client.post("/api/queue-status", json=snapshot, headers=self.headers)
+
+        response = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000406",
+                "actor_qq": "12345678",
+                "operation": "LEAVE_QUEUE",
+                "expected_queue_id": snapshot["queue_id"],
+                "expected_registration_id": "a" * 24,
+                "expected_machine_id": "A",
+                "expected_position": "WAITING",
+                "expected_fixed_pair_id": None,
+                "expected_absence_status": "DEFER_ONE_ROUND",
+                "expected_temporary_away_skipped_turns": 0,
+                "expected_pending_check_in": False,
+            },
+            headers=self.bot_headers,
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertIn("确认期间登记状态已经变化", response.get_json()["error"])
+
+    def test_bot_confirmation_context_becomes_the_terminal_command_precondition(self):
+        snapshot = self.remote_ready_snapshot(with_registration=True)
+        self.client.post("/api/queue-status", json=snapshot, headers=self.headers)
+
+        response = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000407",
+                "actor_qq": "12345678",
+                "operation": "LEAVE_QUEUE",
+                "expected_queue_id": snapshot["queue_id"],
+                "expected_registration_id": "a" * 24,
+                "expected_machine_id": "A",
+                "expected_position": "WAITING",
+                "expected_fixed_pair_id": None,
+                "expected_absence_status": "NONE",
+                "expected_temporary_away_skipped_turns": 0,
+                "expected_pending_check_in": False,
+            },
+            headers=self.bot_headers,
+        )
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+
+        self.assertEqual(202, response.status_code)
+        self.assertEqual("a" * 24, commands[0]["payload"]["registration_id"])
+        self.assertEqual("WAITING", commands[0]["payload"]["expected_position"])
+        self.assertEqual("NONE", commands[0]["payload"]["expected_absence_status"])
+
     def test_fixed_pair_cancel_temporary_leave_is_forwarded_for_terminal_validation(self):
         snapshot = self.remote_ready_snapshot()
         first = self.registration("a" * 24, "公开昵称")
@@ -2843,6 +2944,33 @@ class QueueStatusApiTest(unittest.TestCase):
                 "/api/queue-status", json=snapshot, headers=self.headers
             ).status_code,
         )
+
+        players = self.client.post(
+            "/api/queue-bot/players",
+            json={"qq": "12345678"},
+            headers=self.bot_headers,
+        ).get_json()["players"]
+        self.assertEqual("f" * 24, players[0]["fixed_pair_id"])
+
+        changed_pair = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000423",
+                "actor_qq": "12345678",
+                "operation": "LEAVE_QUEUE",
+                "expected_queue_id": snapshot["queue_id"],
+                "expected_registration_id": first["registration_id"],
+                "expected_machine_id": "A",
+                "expected_position": "WAITING",
+                "expected_fixed_pair_id": "e" * 24,
+                "expected_absence_status": "NONE",
+                "expected_temporary_away_skipped_turns": 0,
+                "expected_pending_check_in": False,
+            },
+            headers=self.bot_headers,
+        )
+        self.assertEqual(409, changed_pair.status_code)
+        self.assertIn("登记状态已经变化", changed_pair.get_json()["error"])
 
         response = self.client.post(
             "/api/queue-bot/queue-commands",

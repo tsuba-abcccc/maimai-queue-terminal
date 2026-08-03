@@ -140,6 +140,7 @@ interface BotPlayer {
   common_play_preview_display_id?: string | null;
   preference?: PlayPreference;
   fixed_pair?: boolean;
+  fixed_pair_id?: string | null;
   registration_type?: "TEMPORARY" | "PLAYER_PROFILE";
   created_at?: number | null;
   online_check_in_started_at?: number | null;
@@ -227,6 +228,14 @@ interface QueueCommandFields {
   machine_id?: string;
   target_machine_id?: string;
   preference?: PlayPreference;
+  expected_queue_id?: string;
+  expected_registration_id?: string;
+  expected_machine_id?: string;
+  expected_position?: "PLAYING" | "WAITING";
+  expected_fixed_pair_id?: string | null;
+  expected_absence_status?: "NONE" | "DEFER_ONE_ROUND" | "TEMPORARILY_AWAY";
+  expected_temporary_away_skipped_turns?: number;
+  expected_pending_check_in?: boolean;
 }
 
 interface EventCursor {
@@ -421,7 +430,7 @@ export class QueueApi {
     operation: QueueOperation,
     fields: QueueCommandFields = {},
   ): Promise<RemoteCommand> {
-    const data: Record<string, string> = {
+    const data: Record<string, string | number | boolean | null> = {
       request_id: randomUUID(),
       actor_qq: actorQq,
       operation,
@@ -1127,9 +1136,14 @@ async function transferQueueMachine(
     ].join("\n"),
     "确认切换机台",
   );
+  const expectedContext = queueConfirmationContextFields(
+    current.response.queue_id,
+    current.player,
+  );
   return formatQueueCommandResult(
     await submitQueueCommand(api, config, current.qq, "TRANSFER_MACHINE", {
       target_machine_id: target.id,
+      ...expectedContext,
     }),
     `登记已转至${compactMachineName(target.name)} 的等待顺序末端。`,
     true,
@@ -1216,11 +1230,44 @@ async function leaveQueueFromBot(
     ].join("\n"),
     "确认退出排队",
   );
+  const expectedContext = queueConfirmationContextFields(
+    current.response.queue_id,
+    current.player,
+  );
   return formatQueueCommandResult(
-    await submitQueueCommand(api, config, current.qq, "LEAVE_QUEUE"),
+    await submitQueueCommand(
+      api,
+      config,
+      current.qq,
+      "LEAVE_QUEUE",
+      expectedContext,
+    ),
     "登记已退出排队。",
     true,
   );
+}
+
+export function queueConfirmationContextFields(
+  queueId: string,
+  player: BotPlayer,
+): QueueCommandFields {
+  const absenceStatus = player.deferred_once
+    ? "DEFER_ONE_ROUND"
+    : player.temporarily_away
+    ? "TEMPORARILY_AWAY"
+    : "NONE";
+  return {
+    expected_queue_id: queueId,
+    expected_registration_id: player.registration_id,
+    expected_machine_id: player.machine_id,
+    expected_position: player.position,
+    expected_fixed_pair_id: player.fixed_pair_id ?? null,
+    expected_absence_status: absenceStatus,
+    expected_temporary_away_skipped_turns:
+      player.temporary_away_skipped_turns,
+    expected_pending_check_in:
+      player.online_registration_pending_check_in === true,
+  };
 }
 
 async function requireCurrentQueueRegistration(

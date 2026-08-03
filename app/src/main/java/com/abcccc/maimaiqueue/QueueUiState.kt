@@ -83,7 +83,17 @@ internal fun registrationPlayArrangement(
 internal data class SelectedRegistration(
     val machineId: MachineId,
     val registrationKey: Int,
-    val fromPlayingPosition: Boolean = false
+    val fromPlayingPosition: Boolean = false,
+    val confirmationSnapshots: List<RegistrationConfirmationSnapshot> = emptyList()
+)
+
+internal data class RegistrationConfirmationSnapshot(
+    val registrationKey: Int,
+    val fixedPartnerKey: Int?,
+    val absenceStatus: QueueAbsenceStatus,
+    val temporaryAwaySkippedTurns: Int,
+    val requiresOnSiteCheckIn: Boolean,
+    val inPlayingPosition: Boolean
 )
 
 internal data class PlayerProfileDraftSnapshot(
@@ -170,8 +180,70 @@ internal data class PositionSelection(
 
 internal data class MachineTransferRequest(
     val sourceMachineId: MachineId,
-    val registrationKeys: List<Int>
+    val registrationKeys: List<Int>,
+    val sourcePosition: PositionSelection? = null,
+    val confirmationSnapshots: List<RegistrationConfirmationSnapshot>
 )
+
+internal fun MachineQueue.registrationConfirmationSnapshots(
+    registrationKeys: Collection<Int>
+): List<RegistrationConfirmationSnapshot> {
+    val requestedKeys = registrationKeys.toSet()
+    if (requestedKeys.isEmpty()) return emptyList()
+    val registrationsByKey = allRegistrations.associateBy(Registration::key)
+    val relatedKeys = requestedKeys.toMutableSet()
+    requestedKeys.forEach { key ->
+        val registration = registrationsByKey[key] ?: return@forEach
+        val partnerKey = registration.fixedPartnerKey ?: return@forEach
+        val partner = registrationsByKey[partnerKey]
+        if (partner?.fixedPartnerKey == key) relatedKeys += partnerKey
+    }
+    return relatedKeys.sorted().mapNotNull { key ->
+        registrationsByKey[key]?.let { registration ->
+            RegistrationConfirmationSnapshot(
+                registrationKey = key,
+                fixedPartnerKey = registration.fixedPartnerKey,
+                absenceStatus = registration.absenceStatus,
+                temporaryAwaySkippedTurns = registration.temporaryAwaySkippedTurns,
+                requiresOnSiteCheckIn = registration.requiresOnSiteCheckIn,
+                inPlayingPosition = playing.any { it.key == key }
+            )
+        }
+    }.takeIf { snapshots -> snapshots.size == relatedKeys.size }.orEmpty()
+}
+
+internal fun MachineQueue.matchesRegistrationConfirmationSnapshots(
+    snapshots: Collection<RegistrationConfirmationSnapshot>
+): Boolean {
+    if (snapshots.isEmpty()) return false
+    val current = registrationConfirmationSnapshots(snapshots.map { it.registrationKey })
+    return current == snapshots.sortedBy(RegistrationConfirmationSnapshot::registrationKey)
+}
+
+internal fun MachineQueue.matchesExactPosition(selection: PositionSelection): Boolean {
+    val expectedKeys = selection.registrationKeys.toSet()
+    if (expectedKeys.isEmpty() || expectedKeys.size != selection.registrationKeys.size) return false
+    val currentPosition = if (selection.isPlayingPosition) {
+        playing
+    } else {
+        selection.waitingPositionIndex?.let { waitingPositions().getOrNull(it) }
+    } ?: return false
+    return currentPosition.size == expectedKeys.size && currentPosition.all { it.key in expectedKeys }
+}
+
+internal fun MachineQueue.matchesFixedPairPosition(selection: PositionSelection): Boolean {
+    if (!matchesExactPosition(selection)) return false
+    val registrations = allRegistrations.filter { it.key in selection.registrationKeys }
+    return registrations.size == 2 &&
+        registrations[0].fixedPartnerKey == registrations[1].key &&
+        registrations[1].fixedPartnerKey == registrations[0].key
+}
+
+internal fun MachineQueue.matchesNoShowLocation(selection: SelectedRegistration): Boolean {
+    if (!canMarkNoShow(selection.registrationKey)) return false
+    val isCurrentlyPlaying = playing.any { it.key == selection.registrationKey }
+    return if (selection.fromPlayingPosition) isCurrentlyPlaying else !isCurrentlyPlaying
+}
 
 internal data class JoinClosingWarningRequest(
     val requestedMachineId: MachineId?,
@@ -202,6 +274,7 @@ internal data class PositionReorderProposal(
 )
 
 internal data class GlobalDragOverlayState(
+    val ownerKey: Any,
     val pointerInRoot: Offset,
     val grabOffsetInItem: Offset,
     val widthPx: Float,
@@ -214,11 +287,13 @@ internal class GlobalDragOverlayController {
         private set
 
     fun start(
+        ownerKey: Any,
         pointerInRoot: Offset,
         itemBoundsInRoot: Rect,
         content: @Composable () -> Unit
     ) {
         state = GlobalDragOverlayState(
+            ownerKey = ownerKey,
             pointerInRoot = pointerInRoot,
             grabOffsetInItem = pointerInRoot - itemBoundsInRoot.topLeft,
             widthPx = itemBoundsInRoot.width,
@@ -227,10 +302,18 @@ internal class GlobalDragOverlayController {
         )
     }
 
-    fun moveBy(dragAmount: Offset) {
+    fun moveBy(ownerKey: Any, dragAmount: Offset) {
         state = state?.let { current ->
-            current.copy(pointerInRoot = current.pointerInRoot + dragAmount)
+            if (current.ownerKey === ownerKey) {
+                current.copy(pointerInRoot = current.pointerInRoot + dragAmount)
+            } else {
+                current
+            }
         }
+    }
+
+    fun clear(ownerKey: Any) {
+        if (state?.ownerKey === ownerKey) state = null
     }
 
     fun clear() {

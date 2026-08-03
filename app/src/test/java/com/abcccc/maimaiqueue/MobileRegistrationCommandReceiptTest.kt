@@ -43,4 +43,26 @@ class MobileRegistrationCommandReceiptTest {
         assertEquals(false, updated.first().applied)
         assertEquals("机台已停止使用。", updated.first().detail)
     }
+
+    @Test
+    fun mergingQueueSnapshotAndStandaloneReceiptsUsesTheSnapshotDecision() {
+        val commandId = "00000000-0000-0000-0000-000000000003"
+        val standalone = TerminalCommandReceipt(
+            commandId = commandId,
+            applied = true,
+            detail = "旧的独立回执"
+        )
+        val atomicSnapshot = TerminalCommandReceipt(
+            commandId = commandId,
+            applied = false,
+            detail = "队列变化后未执行"
+        )
+
+        val merged = mergeRecentCommandReceipts(
+            listOf(standalone),
+            listOf(atomicSnapshot)
+        )
+
+        assertEquals(listOf(atomicSnapshot), merged)
+    }
 }

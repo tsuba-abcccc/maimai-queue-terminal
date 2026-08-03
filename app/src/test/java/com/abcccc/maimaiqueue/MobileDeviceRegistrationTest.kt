@@ -52,6 +52,19 @@ class MobileDeviceRegistrationTest {
     }
 
     @Test
+    fun replayRepairsTheProfileWhenTheQueueWasSavedFirst() {
+        val first = decideMobileDeviceRegistration(command(), state())
+            as MobileDeviceRegistrationDecision.Apply
+
+        val replay = decideMobileDeviceRegistration(command(), first.state)
+            as MobileDeviceRegistrationDecision.AlreadyApplied
+
+        assertEquals(1, replay.profileToPersist?.usageCount)
+        assertEquals(command().createdAtMillis, replay.profileToPersist?.lastUsedAtMillis)
+        assertEquals(1, first.state.queues.getValue("A").registrationCount)
+    }
+
+    @Test
     fun persistedReceiptPreventsReplayAfterThePlayerHasLeftTheQueue() {
         val requested = command()
         val replay = decideMobileDeviceRegistration(

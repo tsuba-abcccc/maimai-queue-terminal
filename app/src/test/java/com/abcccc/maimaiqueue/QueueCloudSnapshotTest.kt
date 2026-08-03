@@ -468,6 +468,65 @@ class QueueCloudSnapshotTest {
     }
 
     @Test
+    fun shortLivedRegistrationEventsKeepTheirPrivateContactAfterLeavingTheQueue() {
+        val profileId = "00000000-0000-0000-0000-000000000930"
+        val contact = AuditPlayerContact(
+            registrationKey = 21,
+            profileId = profileId,
+            qqNumber = "12345678"
+        )
+        val events = listOf(
+            AuditLogEntry(
+                id = "event-removed",
+                timestampMillis = 2_000L,
+                category = AuditLogCategory.MACHINE_A,
+                title = "登记已退出排队",
+                detail = "登记已退出排队。",
+                queueId = queueId,
+                publicEventType = PublicQueueEventType.REGISTRATION_REMOVED,
+                affectedRegistrationKeys = listOf(21),
+                affectedPlayerContacts = listOf(contact)
+            ),
+            AuditLogEntry(
+                id = "event-added",
+                timestampMillis = 1_000L,
+                category = AuditLogCategory.MACHINE_A,
+                title = "线上登记已创建",
+                detail = "线上登记已加入等待顺序。",
+                queueId = queueId,
+                publicEventType = PublicQueueEventType.ONLINE_REGISTRATION_ADDED,
+                affectedRegistrationKeys = listOf(21),
+                affectedPlayerContacts = listOf(contact)
+            )
+        )
+
+        val snapshot = buildQueueSyncSnapshot(
+            state = state(),
+            terminalId = "terminal-1",
+            capturedAtMillis = 3_000L,
+            auditLogs = events,
+            playerProfiles = listOf(
+                PlayerProfile(
+                    id = profileId,
+                    nickname = "线上玩家",
+                    gender = PlayerGender.UNDISCLOSED,
+                    defaultPreference = ProfilePlayPreference.OPEN_TO_JOIN,
+                    qqNumber = "12345678"
+                )
+            )
+        )
+
+        assertEquals(2, snapshot.getJSONArray("recent_events").length())
+        val contacts = snapshot.getJSONArray("private_player_contacts")
+        assertEquals(1, contacts.length())
+        assertEquals(
+            publicRegistrationId(queueId, 21),
+            contacts.getJSONObject(0).getString("registration_id")
+        )
+        assertEquals("12345678", contacts.getJSONObject(0).getString("qq_number"))
+    }
+
+    @Test
     fun publicRegistrationIdIsStableWithinQueueAndChangesForNewQueue() {
         val first = publicRegistrationId(queueId, 12)
 

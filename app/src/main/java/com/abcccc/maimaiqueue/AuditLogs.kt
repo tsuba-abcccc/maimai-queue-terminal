@@ -49,6 +49,12 @@ enum class PublicQueueNotificationCategory {
     MACHINE_STATUS
 }
 
+data class AuditPlayerContact(
+    val registrationKey: Int,
+    val profileId: String,
+    val qqNumber: String
+)
+
 data class AuditLogEntry(
     val id: String,
     val timestampMillis: Long,
@@ -59,8 +65,35 @@ data class AuditLogEntry(
     val queueId: String? = null,
     val publicEventType: PublicQueueEventType? = null,
     val notificationCategories: Set<PublicQueueNotificationCategory> = emptySet(),
-    val affectedRegistrationKeys: List<Int> = emptyList()
+    val affectedRegistrationKeys: List<Int> = emptyList(),
+    val affectedPlayerContacts: List<AuditPlayerContact> = emptyList()
 )
+
+internal fun AuditLogEntry.withAffectedPlayerContacts(
+    registrations: Collection<Registration>,
+    playerProfiles: Collection<PlayerProfile>
+): AuditLogEntry {
+    if (affectedRegistrationKeys.isEmpty()) return this
+    val registrationsByKey = registrations.associateBy(Registration::key)
+    val profilesById = playerProfiles.associateBy(PlayerProfile::id)
+    val discovered = affectedRegistrationKeys.mapNotNull { registrationKey ->
+        val registration = registrationsByKey[registrationKey] ?: return@mapNotNull null
+        val profileId = registration.playerProfileId ?: return@mapNotNull null
+        val qqNumber = profilesById[profileId]
+            ?.normalizedQqNumber()
+            ?.takeIf(::isValidQqNumber)
+            ?: return@mapNotNull null
+        AuditPlayerContact(
+            registrationKey = registrationKey,
+            profileId = profileId,
+            qqNumber = qqNumber
+        )
+    }
+    return copy(
+        affectedPlayerContacts = (affectedPlayerContacts + discovered)
+            .distinctBy(AuditPlayerContact::registrationKey)
+    )
+}
 
 fun createAuditLogEntry(
     category: AuditLogCategory,

@@ -97,7 +97,10 @@ internal sealed interface RemoteQueueOperationDecision {
         val updatedProfile: PlayerProfile? = null
     ) : RemoteQueueOperationDecision
 
-    data class AlreadyApplied(val detail: String) : RemoteQueueOperationDecision
+    data class AlreadyApplied(
+        val detail: String,
+        val updatedProfile: PlayerProfile? = null
+    ) : RemoteQueueOperationDecision
     data class Reject(val detail: String) : RemoteQueueOperationDecision
 }
 
@@ -108,7 +111,10 @@ internal fun decideRemoteQueueOperation(
     appliedRegistrationCommandIds: Set<String> = emptySet()
 ): RemoteQueueOperationDecision {
     fun reject(detail: String) = RemoteQueueOperationDecision.Reject(detail)
-    fun already(detail: String) = RemoteQueueOperationDecision.AlreadyApplied(detail)
+    fun already(
+        detail: String,
+        updatedProfile: PlayerProfile? = null
+    ) = RemoteQueueOperationDecision.AlreadyApplied(detail, updatedProfile)
 
     if (command.queueId != state.queueId) {
         return reject("排队批次已经变化，请重新查询后再操作。")
@@ -118,8 +124,22 @@ internal fun decideRemoteQueueOperation(
             .flatMap { it.allRegistrations.asSequence() }
             .firstOrNull { it.originatingCommandId == command.commandId }
         if (exactRegistration != null) {
+            val profileToPersist = state.playerProfiles
+                .firstOrNull { it.id == exactRegistration.playerProfileId }
+                ?.takeIf {
+                    (it.lastUsedAtMillis ?: Long.MIN_VALUE) < exactRegistration.createdAtMillis
+                }
+                ?.let { profile ->
+                    profile.recordUsage(
+                        atMillis = maxOf(
+                            exactRegistration.createdAtMillis,
+                            profile.updatedAtMillis + 1L
+                        )
+                    )
+                }
             return already(
-                "线上登记已经加入等待顺序。请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。"
+                "线上登记已经加入等待顺序。请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。",
+                updatedProfile = profileToPersist
             )
         }
     }

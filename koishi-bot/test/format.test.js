@@ -20,7 +20,33 @@ const {
   parsePlayPreference,
   parsePreference,
   parseNotificationPreference,
+  queueConfirmationContextFields,
 } = require('../lib')
+
+test('locks the Bot confirmation to the registration state shown before the reply', () => {
+  const context = queueConfirmationContextFields('queue-1', {
+    registration_id: 'registration-1',
+    machine_id: 'B',
+    position: 'WAITING',
+    fixed_pair: true,
+    fixed_pair_id: 'pair-1',
+    deferred_once: false,
+    temporarily_away: true,
+    temporary_away_skipped_turns: 2,
+    online_registration_pending_check_in: false,
+  })
+
+  assert.deepEqual(context, {
+    expected_queue_id: 'queue-1',
+    expected_registration_id: 'registration-1',
+    expected_machine_id: 'B',
+    expected_position: 'WAITING',
+    expected_fixed_pair_id: 'pair-1',
+    expected_absence_status: 'TEMPORARILY_AWAY',
+    expected_temporary_away_skipped_turns: 2,
+    expected_pending_check_in: false,
+  })
+})
 
 test('explains the extra on-site step for legacy online-registration profiles', () => {
   const notice = onlineRegistrationProfileCompletionNotice(0)
