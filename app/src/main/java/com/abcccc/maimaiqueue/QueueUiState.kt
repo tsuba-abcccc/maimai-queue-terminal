@@ -40,6 +40,46 @@ internal enum class QueueAbsenceChoice { DEFER_ONE_ROUND, TEMPORARILY_AWAY }
 internal enum class PlayerProfileContext { JOIN_QUEUE, CLAIM_REGISTRATION, FRIEND_PAIR }
 internal enum class FriendPairStep { METHOD, SELECT_EXISTING, CONFIRM_EXISTING, CREATE_FRIEND }
 
+internal data class RegistrationPlayArrangement(
+    val isPlayingPosition: Boolean,
+    val fixedPartnerDisplayId: String?,
+    val playingPartnerDisplayId: String?,
+    val waitingPartnerDisplayId: String?,
+    val commonPlayPreviewDisplayId: String?
+)
+
+internal fun registrationPlayArrangement(
+    queue: MachineQueue,
+    registrationKey: Int,
+    includeCommonPlayPreview: Boolean
+): RegistrationPlayArrangement? {
+    val registration = queue.allRegistrations.firstOrNull { it.key == registrationKey }
+        ?: return null
+    val isPlayingPosition = queue.playing.any { it.key == registrationKey }
+    val projectedPosition = if (isPlayingPosition) {
+        null
+    } else {
+        queue.waitingProjection(includeCommonPlayPreview).positions.firstOrNull { position ->
+            position.registrations.any { it.key == registrationKey }
+        }
+    }
+    return RegistrationPlayArrangement(
+        isPlayingPosition = isPlayingPosition,
+        fixedPartnerDisplayId = registration.fixedPartnerKey?.let { partnerKey ->
+            queue.allRegistrations.firstOrNull { it.key == partnerKey }?.displayId
+        },
+        playingPartnerDisplayId = if (isPlayingPosition) {
+            queue.playing.firstOrNull { it.key != registrationKey }?.displayId
+        } else {
+            null
+        },
+        waitingPartnerDisplayId = projectedPosition?.registrations
+            ?.firstOrNull { it.key != registrationKey }
+            ?.displayId,
+        commonPlayPreviewDisplayId = projectedPosition?.commonPlayPreview?.displayId
+    )
+}
+
 internal data class SelectedRegistration(
     val machineId: MachineId,
     val registrationKey: Int,

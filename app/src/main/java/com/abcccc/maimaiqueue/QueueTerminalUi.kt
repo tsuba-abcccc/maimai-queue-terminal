@@ -3772,18 +3772,11 @@ internal fun RegistrationApp() {
                         .firstOrNull { it.key == selection.registrationKey }
                     if (registration != null) {
                         val currentPlayer = queue.playing.singleOrNull()
-                        val projectedPosition = queue.waitingProjection(
+                        val playArrangement = registrationPlayArrangement(
+                            queue = queue,
+                            registrationKey = registration.key,
                             includeCommonPlayPreview = queueRuleSettings.showCommonPlayPreview
-                        ).positions.firstOrNull { position ->
-                            position.registrations.any { it.key == registration.key }
-                        }
-                        val waitingPartnerDisplayId = projectedPosition
-                            ?.registrations
-                            ?.firstOrNull { it.key != registration.key }
-                            ?.displayId
-                        val commonPlayPreviewDisplayId = projectedPosition
-                            ?.commonPlayPreview
-                            ?.displayId
+                        )
                         val isInFirstWaitingPosition = queue.waitingPositions()
                             .getOrNull(queue.firstAvailableWaitingPositionIndex() ?: -1)
                             ?.any { it.key == registration.key } == true
@@ -3801,16 +3794,12 @@ internal fun RegistrationApp() {
                             registration = registration,
                             playerProfileGender = linkedPlayerProfile?.gender ?: registration.gender,
                             playerProfileQqNumber = linkedPlayerProfile?.qqNumber,
-                            fixedPartnerDisplayId = registration.fixedPartnerKey?.let { partnerKey ->
-                                queue.allRegistrations
-                                    .firstOrNull { it.key == partnerKey }?.displayId
-                            },
-                            playingPartnerDisplayId = queue.playing
-                                .firstOrNull { it.key != registration.key }
-                                ?.displayId,
-                            waitingPartnerDisplayId = waitingPartnerDisplayId,
-                            commonPlayPreviewDisplayId = commonPlayPreviewDisplayId,
-                            isPlayingPosition = queue.playing.any { it.key == selection.registrationKey },
+                            fixedPartnerDisplayId = playArrangement?.fixedPartnerDisplayId,
+                            playingPartnerDisplayId = playArrangement?.playingPartnerDisplayId,
+                            waitingPartnerDisplayId = playArrangement?.waitingPartnerDisplayId,
+                            commonPlayPreviewDisplayId = playArrangement
+                                ?.commonPlayPreviewDisplayId,
+                            isPlayingPosition = playArrangement?.isPlayingPosition == true,
                             playingPositionLabel = playingPositionName(selection.machineId),
                             canMoveIntoPlaying = currentPlayer != null &&
                                 isInFirstWaitingPosition &&
@@ -4034,6 +4023,11 @@ internal fun RegistrationApp() {
                     val registration = queue.allRegistrations
                         .firstOrNull { it.key == selection.registrationKey }
                     if (registration != null) {
+                        val playArrangement = registrationPlayArrangement(
+                            queue = queue,
+                            registrationKey = registration.key,
+                            includeCommonPlayPreview = false
+                        )
                         val affectedKeys = buildSet {
                             add(registration.key)
                             registration.fixedPartnerKey?.let(::add)
@@ -4054,13 +4048,9 @@ internal fun RegistrationApp() {
                             }
                         QueueAbsenceDialog(
                             displayId = registration.displayId,
-                            fixedPartnerDisplayId = registration.fixedPartnerKey?.let { partnerKey ->
-                                queue.allRegistrations.firstOrNull { it.key == partnerKey }?.displayId
-                            },
-                            playingPartnerDisplayId = queue.playing
-                                .firstOrNull { it.key != registration.key }
-                                ?.displayId,
-                            isPlayingPosition = queue.playing.any { it.key == registration.key },
+                            fixedPartnerDisplayId = playArrangement?.fixedPartnerDisplayId,
+                            playingPartnerDisplayId = playArrangement?.playingPartnerDisplayId,
+                            isPlayingPosition = playArrangement?.isPlayingPosition == true,
                             playingPositionLabel = playingPositionName(selection.machineId),
                             allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
                             allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
@@ -12593,7 +12583,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.7.4",
             "跨端反馈与通知准确性",
-            "网站在终端确认线上登记后立即显示成功；远程命令回执写入失败时会保留首次结果并继续重试，避免当前运行周期内重复执行。正常轮换、未到场记录清除和暂缓一次改为按实际结果分别生成通知，顺序调整失效时也会明确说明未执行。"
+            "修复等待登记可能被误写成正在与游玩位置玩家共同游玩；网站在终端确认线上登记后立即显示成功；远程命令回执写入失败时会保留首次结果并继续重试，避免当前运行周期内重复执行。正常轮换、未到场记录清除和暂缓一次改为按实际结果分别生成通知，顺序调整失效时也会明确说明未执行。"
         ),
         Triple(
             "0.7.3",
