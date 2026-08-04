@@ -992,10 +992,10 @@ export async function changeAbsenceState(
   }
 
   const stateWasAlreadyApplied = absenceStateMatchesOperation(player, operation);
-  const command = await submitQueueCommand(
+  const command = await submitCurrentRegistrationCommand(
     api,
     config,
-    current.qq,
+    current,
     operation,
   );
   if (
@@ -1136,14 +1136,9 @@ async function transferQueueMachine(
     ].join("\n"),
     "确认切换机台",
   );
-  const expectedContext = queueConfirmationContextFields(
-    current.response.queue_id,
-    current.player,
-  );
   return formatQueueCommandResult(
-    await submitQueueCommand(api, config, current.qq, "TRANSFER_MACHINE", {
+    await submitCurrentRegistrationCommand(api, config, current, "TRANSFER_MACHINE", {
       target_machine_id: target.id,
-      ...expectedContext,
     }),
     `登记已转至${compactMachineName(target.name)} 的等待顺序末端。`,
     true,
@@ -1189,10 +1184,10 @@ async function changeCurrentPreference(
     return `这份登记已经是“${queuePreferenceLabel(preference)}”。`;
   }
   return formatQueueCommandResult(
-    await submitQueueCommand(
+    await submitCurrentRegistrationCommand(
       api,
       config,
-      current.qq,
+      current,
       "CHANGE_PLAY_PREFERENCE",
       { preference },
     ),
@@ -1230,17 +1225,12 @@ async function leaveQueueFromBot(
     ].join("\n"),
     "确认退出排队",
   );
-  const expectedContext = queueConfirmationContextFields(
-    current.response.queue_id,
-    current.player,
-  );
   return formatQueueCommandResult(
-    await submitQueueCommand(
+    await submitCurrentRegistrationCommand(
       api,
       config,
-      current.qq,
+      current,
       "LEAVE_QUEUE",
-      expectedContext,
     ),
     "登记已退出排队。",
     true,
@@ -1318,6 +1308,22 @@ async function submitQueueCommand(
     command = await api.getCommand(command.command_id);
   }
   return command;
+}
+
+async function submitCurrentRegistrationCommand(
+  api: QueueApi,
+  config: Config,
+  current: CurrentQueueRegistration,
+  operation: Exclude<QueueOperation, "JOIN_QUEUE">,
+  fields: QueueCommandFields = {},
+): Promise<RemoteCommand> {
+  return submitQueueCommand(api, config, current.qq, operation, {
+    ...fields,
+    ...queueConfirmationContextFields(
+      current.response.queue_id,
+      current.player,
+    ),
+  });
 }
 
 function formatQueueCommandResult(

@@ -209,8 +209,7 @@ internal interface QueueStatePublisher {
 }
 
 internal data class QueuePublicDisplaySettings(
-    val machineARemark: String = DEFAULT_MACHINE_A_REMARK,
-    val machineBRemark: String = DEFAULT_MACHINE_B_REMARK,
+    val machineRemarks: Map<MachineId, String> = DEFAULT_MACHINE_REMARKS,
     val websiteRemoteEnabled: Boolean = true,
     val oneBotSyncEnabled: Boolean = true,
     val syncMode: QueueSyncMode = QueueSyncMode.UNSPECIFIED,
@@ -219,7 +218,12 @@ internal data class QueuePublicDisplaySettings(
     val allowOnlineRegistration: Boolean = true,
     val showCommonPlayPreview: Boolean = true,
     val businessHours: QueuePublicBusinessHours = QueuePublicBusinessHours()
-)
+) {
+    fun machineRemark(machineId: MachineId): String = normalizeMachineRemark(
+        machineRemarks[machineId],
+        DEFAULT_MACHINE_REMARKS.getValue(machineId)
+    )
+}
 
 internal data class QueuePublicBusinessHours(
     val enabled: Boolean = false,
@@ -1182,8 +1186,8 @@ internal fun buildQueueSyncSnapshot(
         "private_player_contacts",
         JSONArray().apply {
             val contactsByRegistrationKey = linkedMapOf<Int, AuditPlayerContact>()
-            sequenceOf(state.machineA, state.machineB)
-                .flatMap { machine -> machine.allRegistrations.asSequence() }
+            state.machines.values.asSequence()
+                .flatMap { machine -> machine.queue.allRegistrations.asSequence() }
                 .forEach { registration ->
                     val profileId = registration.playerProfileId ?: return@forEach
                     val qqNumber = profilesById[profileId]
@@ -1334,38 +1338,25 @@ internal fun buildPublicQueueSnapshot(
     put(
         "machines",
         JSONObject().apply {
-            put(
-                "A",
-                buildPublicMachine(
+            state.configuredMachineIds.forEach { machineId ->
+                val machine = state.machine(machineId)
+                put(
+                    machineId.name,
+                    buildPublicMachine(
                     queueId = state.queueId,
-                    machineId = "A",
+                    machineId = machineId.name,
                     machineName = publicMachineName(
-                        displaySettings.machineARemark,
-                        DEFAULT_MACHINE_A_REMARK,
-                        "A"
+                        displaySettings.machineRemark(machineId),
+                        DEFAULT_MACHINE_REMARKS.getValue(machineId),
+                        machineId.name
                     ),
-                    queue = state.machineA,
-                    status = state.machineAStatus,
+                    queue = machine.queue,
+                    status = machine.status,
                     showCommonPlayPreview = displaySettings.showCommonPlayPreview,
                     capturedAtMillis = capturedAtMillis
                 )
-            )
-            put(
-                "B",
-                buildPublicMachine(
-                    queueId = state.queueId,
-                    machineId = "B",
-                    machineName = publicMachineName(
-                        displaySettings.machineBRemark,
-                        DEFAULT_MACHINE_B_REMARK,
-                        "B"
-                    ),
-                    queue = state.machineB,
-                    status = state.machineBStatus,
-                    showCommonPlayPreview = displaySettings.showCommonPlayPreview,
-                    capturedAtMillis = capturedAtMillis
                 )
-            )
+            }
         }
     )
     put(
@@ -1403,6 +1394,8 @@ private fun buildPublicQueueEvent(queueId: String, event: AuditLogEntry): JSONOb
             when (event.category) {
                 AuditLogCategory.MACHINE_A -> "A"
                 AuditLogCategory.MACHINE_B -> "B"
+                AuditLogCategory.MACHINE_C -> "C"
+                AuditLogCategory.MACHINE_D -> "D"
                 else -> JSONObject.NULL
             }
         )
@@ -1614,7 +1607,7 @@ private class LocalTerminalIdentity(context: Context) {
 private const val PUBLIC_SCHEMA_VERSION = 5
 private const val SYNC_SCHEMA_VERSION = 5
 private const val MAX_PUBLIC_EVENTS_PER_SNAPSHOT = 200
-private const val MAX_PRIVATE_CONTACTS_PER_SNAPSHOT = 440
+private const val MAX_PRIVATE_CONTACTS_PER_SNAPSHOT = 480
 private const val MAX_PUBLIC_EVENT_TITLE_LENGTH = 120
 private const val MAX_PUBLIC_EVENT_DETAIL_LENGTH = 2_000
 private const val NETWORK_TIMEOUT_MILLIS = 8_000

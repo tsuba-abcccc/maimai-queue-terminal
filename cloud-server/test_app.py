@@ -361,6 +361,40 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertTrue(read.get_json()["terminal"]["online"])
 
+    def test_accepts_one_to_four_contiguous_machines(self):
+        for machine_count in range(1, 5):
+            snapshot = self.snapshot(revision=10 + machine_count)
+            snapshot["schema_version"] = 5
+            machine_ids = list("ABCD")[:machine_count]
+            snapshot["machines"] = {
+                machine_id: snapshot["machines"].get(machine_id)
+                or self.machine(name=f"测试位 · 机台 {machine_id}")
+                for machine_id in machine_ids
+            }
+
+            publish = self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            )
+            stored = self.client.get("/api/queue-status").get_json()
+
+            self.assertEqual(204, publish.status_code)
+            self.assertEqual(machine_ids, list(stored["machines"]))
+
+    def test_rejects_noncontiguous_or_unknown_machine_ids(self):
+        for machine_ids in (("A", "C"), ("B",), ("A", "B", "E")):
+            snapshot = self.snapshot(revision=20)
+            snapshot["schema_version"] = 5
+            snapshot["machines"] = {
+                machine_id: self.machine(name=f"测试位 · 机台 {machine_id}")
+                for machine_id in machine_ids
+            }
+
+            publish = self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            )
+
+            self.assertEqual(400, publish.status_code)
+
     def test_preserves_a_restarted_online_check_in_timer_without_changing_creation_time(self):
         snapshot = self.snapshot(revision=5)
         registration = snapshot["machines"]["A"]["playing"][0]
@@ -2573,6 +2607,122 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("QUEUE_OPERATION", commands[0]["type"])
         self.assertEqual("JOIN_QUEUE", commands[0]["payload"]["operation"])
         self.assertEqual("WEBSITE_REMOTE", commands[0]["payload"]["operation_source"])
+
+    def test_four_machine_profile_lookup_and_website_join_target_machine_c(self):
+        snapshot = self.remote_ready_snapshot(revision=31)
+        snapshot["machines"]["C"] = self.machine(name="靠窗 · 机台 C")
+        snapshot["machines"]["D"] = self.machine(name="入口 · 机台 D")
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+
+        profile = self.client.post(
+            "/api/queue-online/profile", json={"qq": "12345678"}
+        )
+        created = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000451",
+                "qq": "12345678",
+                "machine_id": "C",
+            },
+        )
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+
+        self.assertEqual(200, profile.status_code)
+        self.assertEqual(
+            list("ABCD"),
+            [machine["id"] for machine in profile.get_json()["machines"]],
+        )
+        self.assertEqual(202, created.status_code)
+        self.assertEqual("C", commands[0]["payload"]["machine_id"])
+
+    def test_bot_can_join_c_and_transfer_an_existing_registration_from_c_to_d(self):
+        join_snapshot = self.remote_ready_snapshot(revision=32)
+        join_snapshot["machines"]["C"] = self.machine(name="靠窗 · 机台 C")
+        join_snapshot["machines"]["D"] = self.machine(name="入口 · 机台 D")
+        self.client.post(
+            "/api/queue-status", json=join_snapshot, headers=self.headers
+        )
+        joined = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000452",
+                "actor_qq": "12345678",
+                "operation": "JOIN_QUEUE",
+                "machine_id": "C",
+            },
+            headers=self.bot_headers,
+        )
+        join_commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+
+        self.assertEqual(202, joined.status_code)
+        self.assertEqual("C", join_commands[0]["payload"]["machine_id"])
+        self.assertEqual(
+            "APPLIED",
+            self.client.post(
+                "/api/queue-terminal/commands/00000000-0000-0000-0000-000000000452/result",
+                json={"status": "APPLIED", "detail": "线上登记已保存。"},
+                headers=self.headers,
+            ).get_json()["status"],
+        )
+
+        transfer_snapshot = self.remote_ready_snapshot(
+            revision=33,
+            with_registration=True,
+        )
+        registration = transfer_snapshot["machines"]["A"]["waiting_positions"][0][
+            "registrations"
+        ][0]
+        machine_c = transfer_snapshot["machines"]["A"]
+        machine_c["name"] = "靠窗 · 机台 C"
+        transfer_snapshot["machines"]["A"] = self.machine(name="左侧 · 机台 A")
+        transfer_snapshot["machines"]["A"][
+            "new_registration_estimated_wait_minutes"
+        ] = 0
+        transfer_snapshot["machines"]["C"] = machine_c
+        transfer_snapshot["machines"]["D"] = self.machine(name="入口 · 机台 D")
+        self.client.post(
+            "/api/queue-status", json=transfer_snapshot, headers=self.headers
+        )
+        transferred = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000453",
+                "actor_qq": "12345678",
+                "operation": "TRANSFER_MACHINE",
+                "target_machine_id": "D",
+                "expected_queue_id": transfer_snapshot["queue_id"],
+                "expected_registration_id": registration["registration_id"],
+                "expected_machine_id": "C",
+                "expected_position": "WAITING",
+                "expected_fixed_pair_id": None,
+                "expected_absence_status": "NONE",
+                "expected_temporary_away_skipped_turns": 0,
+                "expected_pending_check_in": False,
+            },
+            headers=self.bot_headers,
+        )
+        transfer_commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+        transfer_command = next(
+            command
+            for command in transfer_commands
+            if command["command_id"]
+            == "00000000-0000-0000-0000-000000000453"
+        )
+
+        self.assertEqual(202, transferred.status_code)
+        self.assertEqual("C", transfer_command["payload"]["machine_id"])
+        self.assertEqual("D", transfer_command["payload"]["target_machine_id"])
 
     def test_recently_applied_website_join_cannot_be_duplicated_before_snapshot_sync(self):
         snapshot = self.remote_ready_snapshot(revision=30)

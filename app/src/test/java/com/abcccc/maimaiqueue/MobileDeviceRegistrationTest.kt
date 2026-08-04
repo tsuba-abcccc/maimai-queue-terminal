@@ -38,6 +38,42 @@ class MobileDeviceRegistrationTest {
     }
 
     @Test
+    fun configuredMachinesCAndDAreHandledLikeTheOriginalMachines() {
+        val queues = linkedMapOf(
+            "A" to MachineQueue(),
+            "B" to MachineQueue(),
+            "C" to MachineQueue(),
+            "D" to MachineQueue()
+        )
+        val joined = decideMobileDeviceRegistration(
+            command().copy(machineId = "C"),
+            stateWithQueues(queues),
+            appliedAtMillis = 5_000L
+        ) as MobileDeviceRegistrationDecision.Apply
+
+        assertEquals("C", joined.changedMachineId)
+        assertEquals(1, joined.state.queues.getValue("C").registrationCount)
+        assertTrue(joined.state.queues.getValue("A").allRegistrations.isEmpty())
+
+        val stopped = stateWithQueues(queues).copy(
+            machineStatuses = queues.keys.associateWith { machineId ->
+                if (machineId == "D") {
+                    MachineStatus().stop(MachineStopReason.MAINTENANCE, 4_000L)
+                } else {
+                    MachineStatus()
+                }
+            }
+        )
+        val rejected = decideMobileDeviceRegistration(
+            command().copy(machineId = "D"),
+            stopped
+        )
+
+        assertTrue(rejected is MobileDeviceRegistrationDecision.Reject)
+        assertTrue((rejected as MobileDeviceRegistrationDecision.Reject).detail.contains("停止使用"))
+    }
+
+    @Test
     fun replayedCommandDoesNotCreateASecondRegistrationOrUsageRecord() {
         val first = decideMobileDeviceRegistration(command(), state())
             as MobileDeviceRegistrationDecision.Apply
@@ -370,10 +406,20 @@ class MobileDeviceRegistrationTest {
         profile: PlayerProfile? = profile(),
         machineA: MachineQueue = MachineQueue(),
         nextKey: Int = 1
+    ) = stateWithQueues(
+        queues = mapOf("A" to machineA, "B" to MachineQueue()),
+        profile = profile,
+        nextKey = nextKey
+    )
+
+    private fun stateWithQueues(
+        queues: Map<String, MachineQueue>,
+        profile: PlayerProfile? = profile(),
+        nextKey: Int = 1
     ) = RemoteQueueExecutionState(
         queueId = "00000000-0000-0000-0000-000000000001",
-        queues = mapOf("A" to machineA, "B" to MachineQueue()),
-        machineStatuses = mapOf("A" to MachineStatus(), "B" to MachineStatus()),
+        queues = queues,
+        machineStatuses = queues.keys.associateWith { MachineStatus() },
         playerProfiles = listOfNotNull(profile),
         nextRegistrationKey = nextKey,
         acceptingNewRegistrations = true,

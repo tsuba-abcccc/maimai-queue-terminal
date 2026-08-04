@@ -5,6 +5,8 @@ import java.util.UUID
 enum class AuditLogCategory {
     MACHINE_A,
     MACHINE_B,
+    MACHINE_C,
+    MACHINE_D,
     SYSTEM,
     PLAYER_PROFILE
 }

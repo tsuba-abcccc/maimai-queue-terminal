@@ -140,6 +140,72 @@ class RemoteQueueOperationsTest {
     }
 
     @Test
+    fun machinesCAndDSupportJoinTransferCapacityStatusAndDuplicateChecks() {
+        val emptyQueues = linkedMapOf(
+            "A" to MachineQueue(),
+            "B" to MachineQueue(),
+            "C" to MachineQueue(),
+            "D" to MachineQueue()
+        )
+        val joined = decideRemoteQueueOperation(
+            joinCommand().copy(machineId = "C"),
+            stateWithQueues(emptyQueues),
+            appliedAtMillis = 5_000L
+        ) as RemoteQueueOperationDecision.Apply
+        assertTrue(joined.state.queues.getValue("C").waiting.single().requiresOnSiteCheckIn)
+        assertTrue(joined.changedMachineIds == setOf("C"))
+
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id
+        )
+        val source = stateWithQueues(
+            emptyQueues + ("C" to MachineQueue(waiting = listOf(player))),
+            nextKey = 3
+        )
+        val transferred = decideRemoteQueueOperation(
+            operationCommand(
+                RemoteQueueOperation.TRANSFER_MACHINE,
+                player,
+                targetMachineId = "D"
+            ).copy(machineId = "C"),
+            source
+        ) as RemoteQueueOperationDecision.Apply
+        assertTrue(transferred.state.queues.getValue("C").allRegistrations.isEmpty())
+        assertEquals(listOf(player.key), transferred.state.queues.getValue("D").waiting.map { it.key })
+        assertEquals(setOf("C", "D"), transferred.changedMachineIds)
+
+        val stoppedStatuses = emptyQueues.keys.associateWith { machineId ->
+            if (machineId == "D") {
+                MachineStatus().stop(MachineStopReason.MAINTENANCE, 4_000L)
+            } else {
+                MachineStatus()
+            }
+        }
+        val stoppedTransfer = decideRemoteQueueOperation(
+            operationCommand(
+                RemoteQueueOperation.TRANSFER_MACHINE,
+                player,
+                targetMachineId = "D"
+            ).copy(machineId = "C"),
+            source.copy(machineStatuses = stoppedStatuses)
+        )
+        assertTrue(stoppedTransfer is RemoteQueueOperationDecision.Reject)
+
+        val duplicateJoin = decideRemoteQueueOperation(
+            joinCommand().copy(machineId = "A"),
+            transferred.state
+        )
+        assertTrue(duplicateJoin is RemoteQueueOperationDecision.Reject)
+
+        val unknownMachine = decideRemoteQueueOperation(
+            joinCommand().copy(machineId = "E"),
+            stateWithQueues(emptyQueues)
+        )
+        assertTrue(unknownMachine is RemoteQueueOperationDecision.Reject)
+    }
+
+    @Test
     fun persistedReceiptPreventsAQueueOperationFromBeingReappliedAfterStateChanges() {
         val registration = registration(2, "资料玩家").copy(
             isTemporary = false,
@@ -559,10 +625,18 @@ class RemoteQueueOperationsTest {
         machineA: MachineQueue = MachineQueue(),
         machineB: MachineQueue = MachineQueue(),
         nextKey: Int = 1
+    ) = stateWithQueues(
+        queues = linkedMapOf("A" to machineA, "B" to machineB),
+        nextKey = nextKey
+    )
+
+    private fun stateWithQueues(
+        queues: Map<String, MachineQueue>,
+        nextKey: Int = 1
     ) = RemoteQueueExecutionState(
         queueId = QUEUE_ID,
-        queues = linkedMapOf("A" to machineA, "B" to machineB),
-        machineStatuses = mapOf("A" to MachineStatus(), "B" to MachineStatus()),
+        queues = queues,
+        machineStatuses = queues.keys.associateWith { MachineStatus() },
         playerProfiles = listOf(profile()),
         nextRegistrationKey = nextKey,
         acceptingNewRegistrations = true,

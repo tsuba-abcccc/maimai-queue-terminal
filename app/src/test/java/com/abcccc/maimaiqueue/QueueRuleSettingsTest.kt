@@ -14,8 +14,22 @@ class QueueRuleSettingsTest {
         assertEquals(true, settings.websiteSyncEnabled)
         assertEquals(true, settings.allowOnlineRegistration)
         assertEquals(true, settings.showCommonPlayPreview)
+        assertEquals(2, settings.configuredMachineCount)
+        assertEquals(listOf(MachineId.A, MachineId.B), settings.configuredMachineIds)
         assertEquals("左侧", settings.machineARemark)
         assertEquals("右侧", settings.machineBRemark)
+        assertEquals("中间左侧", settings.machineRemark(MachineId.C))
+        assertEquals("中间右侧", settings.machineRemark(MachineId.D))
+    }
+
+    @Test
+    fun configuredMachineIdsAreAlwaysContiguousFromAThroughD() {
+        assertEquals(listOf(MachineId.A), configuredMachineIds(0))
+        assertEquals(listOf(MachineId.A), configuredMachineIds(1))
+        assertEquals(listOf(MachineId.A, MachineId.B), configuredMachineIds(2))
+        assertEquals(listOf(MachineId.A, MachineId.B, MachineId.C), configuredMachineIds(3))
+        assertEquals(MachineId.entries, configuredMachineIds(4))
+        assertEquals(MachineId.entries, configuredMachineIds(5))
     }
 
     @Test

@@ -1688,6 +1688,34 @@ class QueueModelsTest {
     }
 
     @Test
+    fun dragReorderKeepsTheLeftmostPlacementThroughOverscrollAndReverseDrag() {
+        val movedToStart = calculateDragReorder(
+            sourceIndex = 2,
+            dragOffset = -251f,
+            itemSizes = listOf(100f, 140f, 80f),
+            spacing = 10f
+        )
+        val beyondStart = calculateDragReorder(
+            sourceIndex = movedToStart.destinationIndex,
+            dragOffset = movedToStart.remainingOffset - 200f,
+            itemSizes = listOf(80f, 100f, 140f),
+            spacing = 10f
+        )
+        val draggedBackRight = calculateDragReorder(
+            sourceIndex = beyondStart.destinationIndex,
+            dragOffset = beyondStart.remainingOffset + 302f,
+            itemSizes = listOf(80f, 100f, 140f),
+            spacing = 10f
+        )
+
+        assertEquals(0, movedToStart.destinationIndex)
+        assertEquals(0, beyondStart.destinationIndex)
+        assertEquals(-191f, beyondStart.remainingOffset)
+        assertEquals(1, draggedBackRight.destinationIndex)
+        assertEquals(1f, draggedBackRight.remainingOffset)
+    }
+
+    @Test
     fun confirmationSnapshotLocksTheReciprocalFixedPartnerAndAbsenceState() {
         val first = registration(1).copy(
             fixedPartnerKey = 2,

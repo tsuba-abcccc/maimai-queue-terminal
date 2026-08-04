@@ -2,8 +2,11 @@ package com.abcccc.maimaiqueue
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.json.JSONObject
+import java.util.UUID
 
 class QueueStatePersistenceTest {
     private fun state(
@@ -126,14 +129,222 @@ class QueueStatePersistenceTest {
     @Test
     fun emptyOpenQueueStillPreservesTheNextRegistrationKey() {
         val saved = state().copy(
-            machineA = MachineQueue(),
-            machineB = MachineQueue(),
+            machines = linkedMapOf(
+                MachineId.A to PersistedMachineState(),
+                MachineId.B to PersistedMachineState()
+            ),
             registrationOpen = true,
             nextRegistrationKey = 27
         )
 
         assertFalse(saved.hasMeaningfulState)
         assertEquals(27, saved.safeNextRegistrationKey)
+    }
+
+    @Test
+    fun schemaSixRoundTripsEverySupportedMachineCount() {
+        (1..MachineId.entries.size).forEach { machineCount ->
+            val machines = configuredMachineIds(machineCount).associateWith { machineId ->
+                val key = machineId.ordinal + 1
+                PersistedMachineState(
+                    queue = MachineQueue(
+                        waiting = listOf(
+                            Registration(
+                                key = key,
+                                displayId = "玩家$key",
+                                preference = PlayPreference.OPEN_TO_JOIN,
+                                createdAtMillis = 100L + key
+                            )
+                        )
+                    ),
+                    status = if (machineId == MachineId.D) {
+                        MachineStatus().stop(MachineStopReason.MAINTENANCE, 900L)
+                    } else {
+                        MachineStatus()
+                    }
+                )
+            }
+            val original = PersistedQueueState(
+                queueId = "00000000-0000-0000-0000-000000000001",
+                revision = 12L,
+                machines = machines,
+                registrationOpen = false,
+                nextRegistrationKey = machineCount + 1,
+                savedAtMillis = 1_000L,
+                terminalCommandReceipts = listOf(
+                    TerminalCommandReceipt(
+                        commandId = "00000000-0000-0000-0000-000000000401",
+                        applied = true,
+                        detail = "已执行。"
+                    )
+                )
+            )
+
+            val restored = LocalQueueStateRepository.Codec.decodeState(
+                LocalQueueStateRepository.Codec.encodeState(original).toString()
+            )
+
+            assertEquals("machine count $machineCount", original, restored)
+        }
+    }
+
+    @Test
+    fun schemasOneThroughFiveRestoreTheLegacyTwoMachineLayout() {
+        val legacy = state(
+            machineA = MachineQueue(
+                waiting = listOf(
+                    Registration(
+                        key = 7,
+                        displayId = "旧版玩家",
+                        preference = PlayPreference.OPEN_TO_JOIN,
+                        createdAtMillis = 100L
+                    )
+                )
+            ),
+            machineBStatus = MachineStatus().stop(MachineStopReason.MAINTENANCE, 500L),
+            nextRegistrationKey = 8
+        ).copy(
+            terminalCommandReceipts = listOf(
+                TerminalCommandReceipt(
+                    commandId = "00000000-0000-0000-0000-000000000402",
+                    applied = false,
+                    detail = "未执行。"
+                )
+            )
+        )
+
+        (1..5).forEach { schemaVersion ->
+            val encoded = LocalQueueStateRepository.Codec.encodeState(legacy)
+            val machines = encoded.getJSONObject("machines")
+            encoded.put("schemaVersion", schemaVersion)
+            encoded.put("machineA", machines.getJSONObject("A").getJSONObject("queue"))
+            encoded.put("machineB", machines.getJSONObject("B").getJSONObject("queue"))
+            encoded.put("machineAStatus", machines.getJSONObject("A").getJSONObject("status"))
+            encoded.put("machineBStatus", machines.getJSONObject("B").getJSONObject("status"))
+            encoded.remove("machines")
+            if (schemaVersion == 1) {
+                encoded.remove("queueId")
+                encoded.remove("revision")
+            }
+            if (schemaVersion < 5) encoded.remove("terminalCommandReceipts")
+
+            val restored = LocalQueueStateRepository.Codec.decodeState(encoded.toString())
+
+            assertEquals(
+                "schema $schemaVersion machine ids",
+                listOf(MachineId.A, MachineId.B),
+                restored?.configuredMachineIds
+            )
+            assertEquals("旧版玩家", restored?.machineA?.waiting?.single()?.displayId)
+            assertEquals(MachineStopReason.MAINTENANCE, restored?.machineBStatus?.stopReason)
+            assertEquals(8, restored?.safeNextRegistrationKey)
+            if (schemaVersion == 1) {
+                UUID.fromString(restored?.queueId)
+                assertEquals(0L, restored?.revision)
+            } else {
+                assertEquals(legacy.queueId, restored?.queueId)
+                assertEquals(legacy.revision, restored?.revision)
+            }
+            assertEquals(
+                schemaVersion >= 5,
+                restored?.terminalCommandReceipts?.isNotEmpty()
+            )
+        }
+    }
+
+    @Test
+    fun persistedMachineLayoutsMustBeContiguousAndUseUniqueRegistrationKeys() {
+        val registration = Registration(
+            key = 1,
+            displayId = "玩家",
+            preference = PlayPreference.SOLO,
+            createdAtMillis = 100L
+        )
+        val populated = PersistedMachineState(
+            queue = MachineQueue(waiting = listOf(registration))
+        )
+
+        (1..MachineId.entries.size).forEach { machineCount ->
+            val valid = configuredMachineIds(machineCount).associateWith { PersistedMachineState() }
+            assertTrue("machine count $machineCount", isValidPersistedMachineStates(valid))
+        }
+        assertFalse(isValidPersistedMachineStates(emptyMap()))
+        assertFalse(
+            isValidPersistedMachineStates(
+                linkedMapOf(
+                    MachineId.A to PersistedMachineState(),
+                    MachineId.C to PersistedMachineState()
+                )
+            )
+        )
+        assertFalse(
+            isValidPersistedMachineStates(
+                linkedMapOf(
+                    MachineId.A to populated,
+                    MachineId.B to populated
+                )
+            )
+        )
+    }
+
+    @Test
+    fun schemaSixRejectsMissingNoncontiguousUnknownAndDuplicateMachineData() {
+        val fourMachines = PersistedQueueState(
+            queueId = "00000000-0000-0000-0000-000000000001",
+            revision = 3L,
+            machines = configuredMachineIds(4).associateWith { machineId ->
+                PersistedMachineState(
+                    queue = MachineQueue(
+                        waiting = listOf(
+                            Registration(
+                                key = machineId.ordinal + 1,
+                                displayId = "玩家${machineId.name}",
+                                preference = PlayPreference.SOLO,
+                                createdAtMillis = 100L + machineId.ordinal
+                            )
+                        )
+                    )
+                )
+            },
+            registrationOpen = true,
+            nextRegistrationKey = 5,
+            savedAtMillis = 1_000L
+        )
+        fun encodedMachines(): JSONObject = LocalQueueStateRepository.Codec
+            .encodeState(fourMachines)
+            .getJSONObject("machines")
+
+        val missing = LocalQueueStateRepository.Codec.encodeState(fourMachines)
+        missing.put("machines", JSONObject())
+        assertNull(LocalQueueStateRepository.Codec.decodeState(missing.toString()))
+
+        val noncontiguous = LocalQueueStateRepository.Codec.encodeState(fourMachines)
+        noncontiguous.put(
+            "machines",
+            JSONObject().apply {
+                put("A", encodedMachines().getJSONObject("A"))
+                put("C", encodedMachines().getJSONObject("C"))
+            }
+        )
+        assertNull(LocalQueueStateRepository.Codec.decodeState(noncontiguous.toString()))
+
+        val unknown = LocalQueueStateRepository.Codec.encodeState(fourMachines)
+        unknown.put(
+            "machines",
+            JSONObject().apply {
+                put("A", encodedMachines().getJSONObject("A"))
+                put("E", encodedMachines().getJSONObject("B"))
+            }
+        )
+        assertNull(LocalQueueStateRepository.Codec.decodeState(unknown.toString()))
+
+        val duplicate = LocalQueueStateRepository.Codec.encodeState(fourMachines)
+        val duplicateMachines = duplicate.getJSONObject("machines")
+        duplicateMachines.getJSONObject("B").put(
+            "queue",
+            duplicateMachines.getJSONObject("A").getJSONObject("queue")
+        )
+        assertNull(LocalQueueStateRepository.Codec.decodeState(duplicate.toString()))
     }
 
     @Test

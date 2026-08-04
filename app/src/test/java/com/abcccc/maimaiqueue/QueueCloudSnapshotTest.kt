@@ -51,8 +51,10 @@ class QueueCloudSnapshotTest {
             terminalId = "terminal-1",
             capturedAtMillis = 1_000L,
             displaySettings = QueuePublicDisplaySettings(
-                machineARemark = "入口侧",
-                machineBRemark = "墙侧",
+                machineRemarks = DEFAULT_MACHINE_REMARKS + mapOf(
+                    MachineId.A to "入口侧",
+                    MachineId.B to "墙侧"
+                ),
                 oneBotSyncEnabled = false,
                 allowOnlineRegistration = false,
                 businessHours = QueuePublicBusinessHours(
@@ -80,6 +82,91 @@ class QueueCloudSnapshotTest {
         assertTrue(businessHours.getBoolean("closing_grace"))
         assertTrue(businessHours.isNull("closes_at"))
         assertEquals(2_000L, businessHours.getLong("registration_closes_at"))
+    }
+
+    @Test
+    fun publicSnapshotPublishesExactlyOneToFourConfiguredMachines() {
+        (1..MachineId.entries.size).forEach { machineCount ->
+            val machineIds = configuredMachineIds(machineCount)
+            val state = PersistedQueueState(
+                queueId = queueId,
+                revision = 9L,
+                machines = machineIds.associateWith { machineId ->
+                    PersistedMachineState(
+                        queue = MachineQueue(
+                            waiting = listOf(
+                                registration(machineId.ordinal + 1, "玩家${machineId.name}")
+                            )
+                        )
+                    )
+                },
+                registrationOpen = true,
+                nextRegistrationKey = machineCount + 1,
+                savedAtMillis = 900L
+            )
+            val snapshot = buildPublicQueueSnapshot(
+                state = state,
+                terminalId = "terminal-1",
+                capturedAtMillis = 1_000L,
+                displaySettings = QueuePublicDisplaySettings(
+                    machineRemarks = MachineId.entries.associateWith { "区域${it.name}" }
+                )
+            )
+            val machines = snapshot.getJSONObject("machines")
+            val publishedIds = buildSet {
+                val keys = machines.keys()
+                while (keys.hasNext()) add(keys.next())
+            }
+
+            assertEquals("machine count $machineCount", machineIds.map(MachineId::name).toSet(), publishedIds)
+            machineIds.forEach { machineId ->
+                val machine = machines.getJSONObject(machineId.name)
+                assertEquals("区域${machineId.name} · 机台 ${machineId.name}", machine.getString("name"))
+                assertEquals(1, machine.getInt("registration_count"))
+            }
+        }
+    }
+
+    @Test
+    fun publicEventsKeepMachineCAndDMappings() {
+        val events = listOf(
+            AuditLogEntry(
+                id = "00000000-0000-0000-0000-000000000701",
+                timestampMillis = 1_000L,
+                category = AuditLogCategory.MACHINE_C,
+                title = "机台 C · 新增登记",
+                detail = "已加入机台 C。",
+                queueId = queueId,
+                publicEventType = PublicQueueEventType.REGISTRATION_ADDED
+            ),
+            AuditLogEntry(
+                id = "00000000-0000-0000-0000-000000000702",
+                timestampMillis = 2_000L,
+                category = AuditLogCategory.MACHINE_D,
+                title = "机台 D · 机台停止使用",
+                detail = "机台 D 已停止使用。",
+                queueId = queueId,
+                publicEventType = PublicQueueEventType.MACHINE_STOPPED
+            )
+        )
+        val state = PersistedQueueState(
+            queueId = queueId,
+            revision = 9L,
+            machines = configuredMachineIds(4).associateWith { PersistedMachineState() },
+            registrationOpen = true,
+            nextRegistrationKey = 1,
+            savedAtMillis = 900L
+        )
+
+        val published = buildPublicQueueSnapshot(
+            state = state,
+            terminalId = "terminal-1",
+            capturedAtMillis = 3_000L,
+            auditLogs = events
+        ).getJSONArray("recent_events")
+
+        assertEquals("D", published.getJSONObject(0).getString("machine_id"))
+        assertEquals("C", published.getJSONObject(1).getString("machine_id"))
     }
 
     @Test
@@ -138,14 +225,20 @@ class QueueCloudSnapshotTest {
     fun publicSnapshotIncludesMaintenanceAndOptionalOtherStopDetail() {
         val snapshot = buildPublicQueueSnapshot(
             state().copy(
-                machineAStatus = MachineStatus().stop(
-                    MachineStopReason.OTHER,
-                    800L,
-                    "按钮失灵"
-                ),
-                machineBStatus = MachineStatus().stop(
-                    MachineStopReason.MAINTENANCE,
-                    900L
+                machines = linkedMapOf(
+                    MachineId.A to PersistedMachineState(
+                        status = MachineStatus().stop(
+                            MachineStopReason.OTHER,
+                            800L,
+                            "按钮失灵"
+                        )
+                    ),
+                    MachineId.B to PersistedMachineState(
+                        status = MachineStatus().stop(
+                            MachineStopReason.MAINTENANCE,
+                            900L
+                        )
+                    )
                 )
             ),
             terminalId = "terminal-1",
@@ -170,12 +263,18 @@ class QueueCloudSnapshotTest {
                 waiting = listOf(registration(2, "等待玩家")),
                 playingStartedAtMillis = nowMillis - 5 * 60_000L
             )
-        ).copy(
-            machineAStatus = MachineStatus().stop(
-                reason = MachineStopReason.MAINTENANCE,
-                atMillis = nowMillis - 60_000L
+        ).let { state ->
+            state.copy(
+                machines = state.machines + (
+                    MachineId.A to state.machine(MachineId.A).copy(
+                        status = MachineStatus().stop(
+                            reason = MachineStopReason.MAINTENANCE,
+                            atMillis = nowMillis - 60_000L
+                        )
+                    )
+                )
             )
-        )
+        }
 
         val machine = buildPublicQueueSnapshot(state, "terminal-1", nowMillis)
             .getJSONObject("machines")

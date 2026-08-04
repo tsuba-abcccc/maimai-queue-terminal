@@ -20,12 +20,27 @@ data class QueueRuleSettings(
     val syncMode: QueueSyncMode = QueueSyncMode.UNSPECIFIED,
     val queueSyncEndpoint: String = "",
     val queueSyncToken: String = "",
-    val machineARemark: String = DEFAULT_MACHINE_A_REMARK,
-    val machineBRemark: String = DEFAULT_MACHINE_B_REMARK,
+    val configuredMachineCount: Int = DEFAULT_CONFIGURED_MACHINE_IDS.size,
+    val machineRemarks: Map<MachineId, String> = DEFAULT_MACHINE_REMARKS,
     val businessHours: BusinessHoursSettings = BusinessHoursSettings()
 ) {
     val allowsAnyAbsenceAction: Boolean
         get() = allowDeferOneRound || allowTemporaryLeave
+
+    val configuredMachineIds: List<MachineId>
+        get() = configuredMachineIds(configuredMachineCount)
+
+    val machineARemark: String
+        get() = machineRemark(MachineId.A)
+
+    val machineBRemark: String
+        get() = machineRemark(MachineId.B)
+
+    fun machineRemark(machineId: MachineId): String =
+        normalizeMachineRemark(
+            machineRemarks[machineId],
+            DEFAULT_MACHINE_REMARKS.getValue(machineId)
+        )
 }
 
 class LocalQueueRuleSettingsRepository(
@@ -70,14 +85,25 @@ class LocalQueueRuleSettingsRepository(
                 KEY_QUEUE_SYNC_TOKEN,
                 defaultQueueSyncToken
             ),
-            machineARemark = normalizeMachineRemark(
-                preferences.getString(KEY_MACHINE_A_REMARK, DEFAULT_MACHINE_A_REMARK),
-                DEFAULT_MACHINE_A_REMARK
-            ),
-            machineBRemark = normalizeMachineRemark(
-                preferences.getString(KEY_MACHINE_B_REMARK, DEFAULT_MACHINE_B_REMARK),
-                DEFAULT_MACHINE_B_REMARK
-            ),
+            configuredMachineCount = preferences.getInt(
+                KEY_CONFIGURED_MACHINE_COUNT,
+                DEFAULT_CONFIGURED_MACHINE_IDS.size
+            ).coerceIn(1, MachineId.entries.size),
+            machineRemarks = MachineId.entries.associateWith { machineId ->
+                val legacyKey = when (machineId) {
+                    MachineId.A -> KEY_MACHINE_A_REMARK
+                    MachineId.B -> KEY_MACHINE_B_REMARK
+                    else -> null
+                }
+                normalizeMachineRemark(
+                    preferences.getString(
+                        machineRemarkKey(machineId),
+                        legacyKey?.let { preferences.getString(it, null) }
+                            ?: DEFAULT_MACHINE_REMARKS.getValue(machineId)
+                    ),
+                    DEFAULT_MACHINE_REMARKS.getValue(machineId)
+                )
+            },
             businessHours = BusinessHoursSettings(
                 enabled = preferences.getBoolean(KEY_BUSINESS_HOURS_ENABLED, false),
                 useWeeklySchedule = preferences.getBoolean(KEY_WEEKLY_BUSINESS_HOURS_ENABLED, false),
@@ -104,19 +130,21 @@ class LocalQueueRuleSettingsRepository(
             .putString(KEY_SYNC_MODE, settings.syncMode.name)
             .putString(KEY_QUEUE_SYNC_ENDPOINT, settings.queueSyncEndpoint.trim())
             .putString(KEY_QUEUE_SYNC_TOKEN, settings.queueSyncToken.trim())
+            .putInt(
+                KEY_CONFIGURED_MACHINE_COUNT,
+                settings.configuredMachineCount.coerceIn(1, MachineId.entries.size)
+            )
             .putBoolean(KEY_BUSINESS_HOURS_ENABLED, settings.businessHours.enabled)
             .putBoolean(KEY_WEEKLY_BUSINESS_HOURS_ENABLED, settings.businessHours.useWeeklySchedule)
             .putInt(KEY_DEFAULT_OPENING_MINUTES, settings.businessHours.defaultHours.openingMinutes)
             .putInt(KEY_DEFAULT_CLOSING_MINUTES, settings.businessHours.defaultHours.closingMinutes)
-            .putString(
-                KEY_MACHINE_A_REMARK,
-                normalizeMachineRemark(settings.machineARemark, DEFAULT_MACHINE_A_REMARK)
-            )
-            .putString(
-                KEY_MACHINE_B_REMARK,
-                normalizeMachineRemark(settings.machineBRemark, DEFAULT_MACHINE_B_REMARK)
-            )
             .also { editor ->
+                MachineId.entries.forEach { machineId ->
+                    editor.putString(
+                        machineRemarkKey(machineId),
+                        settings.machineRemark(machineId)
+                    )
+                }
                 DayOfWeek.entries.forEach { day ->
                     val hours = settings.businessHours.hoursFor(day).normalized()
                     editor.putInt(weekdayKey(day, "opening"), hours.openingMinutes)
@@ -144,6 +172,9 @@ class LocalQueueRuleSettingsRepository(
     private fun weekdayKey(day: DayOfWeek, suffix: String): String =
         "business_hours_${day.name.lowercase()}_$suffix"
 
+    private fun machineRemarkKey(machineId: MachineId): String =
+        "machine_${machineId.name.lowercase()}_remark"
+
     private fun readConnectionValue(key: String, defaultValue: String): String =
         if (preferences.contains(key)) {
             preferences.getString(key, "").orEmpty().trim()
@@ -162,6 +193,7 @@ class LocalQueueRuleSettingsRepository(
         const val KEY_SYNC_MODE = "sync_mode"
         const val KEY_QUEUE_SYNC_ENDPOINT = "queue_sync_endpoint"
         const val KEY_QUEUE_SYNC_TOKEN = "queue_sync_token"
+        const val KEY_CONFIGURED_MACHINE_COUNT = "configured_machine_count"
         const val KEY_MACHINE_A_REMARK = "machine_a_remark"
         const val KEY_MACHINE_B_REMARK = "machine_b_remark"
         const val KEY_BUSINESS_HOURS_ENABLED = "business_hours_enabled"
@@ -174,6 +206,14 @@ class LocalQueueRuleSettingsRepository(
 
 internal const val DEFAULT_MACHINE_A_REMARK = "左侧"
 internal const val DEFAULT_MACHINE_B_REMARK = "右侧"
+internal const val DEFAULT_MACHINE_C_REMARK = "中间左侧"
+internal const val DEFAULT_MACHINE_D_REMARK = "中间右侧"
+internal val DEFAULT_MACHINE_REMARKS: Map<MachineId, String> = linkedMapOf(
+    MachineId.A to DEFAULT_MACHINE_A_REMARK,
+    MachineId.B to DEFAULT_MACHINE_B_REMARK,
+    MachineId.C to DEFAULT_MACHINE_C_REMARK,
+    MachineId.D to DEFAULT_MACHINE_D_REMARK
+)
 internal const val MAX_MACHINE_REMARK_CHARACTERS = 8
 internal const val MIN_QUEUE_SYNC_TOKEN_BYTES = 32
 internal const val MAX_QUEUE_SYNC_TOKEN_CHARACTERS = 256

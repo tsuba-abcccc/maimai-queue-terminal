@@ -153,6 +153,45 @@ import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 import kotlin.random.Random
 
+private class MachineRuntimeStateStore {
+    private val states = mutableStateMapOf<MachineId, PersistedMachineState>().apply {
+        MachineId.entries.forEach { machineId ->
+            put(machineId, PersistedMachineState())
+        }
+    }
+
+    fun state(machineId: MachineId): PersistedMachineState =
+        states[machineId] ?: PersistedMachineState()
+
+    fun queue(machineId: MachineId): MachineQueue = state(machineId).queue
+
+    fun status(machineId: MachineId): MachineStatus = state(machineId).status
+
+    fun setQueue(machineId: MachineId, queue: MachineQueue) {
+        states[machineId] = state(machineId).copy(queue = queue)
+    }
+
+    fun setStatus(machineId: MachineId, status: MachineStatus) {
+        states[machineId] = state(machineId).copy(status = status)
+    }
+
+    fun replace(machineStates: Map<MachineId, PersistedMachineState>) {
+        MachineId.entries.forEach { machineId ->
+            states[machineId] = machineStates[machineId] ?: PersistedMachineState()
+        }
+    }
+
+    fun reset(machineIds: Collection<MachineId>) {
+        machineIds.forEach { machineId -> states[machineId] = PersistedMachineState() }
+    }
+
+    fun snapshot(machineIds: Collection<MachineId>): Map<MachineId, PersistedMachineState> =
+        linkedMapOf<MachineId, PersistedMachineState>().apply {
+            machineIds.forEach { machineId -> put(machineId, state(machineId)) }
+        }
+
+}
+
 @Composable
 internal fun RegistrationApp() {
     val context = LocalContext.current
@@ -233,10 +272,7 @@ internal fun RegistrationApp() {
             onStatusChange = { cloudSyncStatus = it }
         )
     }
-    var machineA by remember { mutableStateOf(MachineQueue()) }
-    var machineB by remember { mutableStateOf(MachineQueue()) }
-    var machineAStatus by remember { mutableStateOf(MachineStatus()) }
-    var machineBStatus by remember { mutableStateOf(MachineStatus()) }
+    val machineStates = remember { MachineRuntimeStateStore() }
     var screen by remember { mutableStateOf(Screen.HOME) }
     var selectedMachine by remember { mutableStateOf<MachineId?>(null) }
     var isBatchFlow by remember { mutableStateOf(false) }
@@ -261,13 +297,20 @@ internal fun RegistrationApp() {
     var terminalCommandReceiptsLoaded by remember { mutableStateOf(false) }
     var auditLogs by remember { mutableStateOf<List<AuditLogEntry>>(emptyList()) }
     var queueRuleSettings by remember { mutableStateOf(initialQueueRuleSettings) }
+    val configuredMachineIds = queueRuleSettings.configuredMachineIds
+    val configuredMachineStateSnapshot = machineStates.snapshot(configuredMachineIds)
+    val configuredMachines = configuredMachineIds.map { machineId ->
+        val state = configuredMachineStateSnapshot.getValue(machineId)
+        MachineDisplayState(
+            machineId = machineId,
+            queue = state.queue,
+            status = state.status,
+            remark = queueRuleSettings.machineRemark(machineId)
+        )
+    }
     fun configuredMachineName(machineId: MachineId): String = machineName(
         machineId = machineId,
-        remark = if (machineId == MachineId.A) {
-            queueRuleSettings.machineARemark
-        } else {
-            queueRuleSettings.machineBRemark
-        }
+        remark = queueRuleSettings.machineRemark(machineId)
     )
     var lastHandledClosingOccurrenceId by remember {
         mutableStateOf(initialHandledClosingOccurrenceId)
@@ -312,8 +355,12 @@ internal fun RegistrationApp() {
     var registrationActionMode by remember { mutableStateOf(RegistrationActionMode.ACTIONS) }
     var renameDraft by remember { mutableStateOf("") }
     var claimTarget by remember { mutableStateOf<SelectedRegistration?>(null) }
-    var finishConfirmation by remember { mutableStateOf<MachineId?>(null) }
-    var enterPlayingConfirmation by remember { mutableStateOf<MachineId?>(null) }
+    var finishConfirmation by remember {
+        mutableStateOf<QueueOperationConfirmationRequest?>(null)
+    }
+    var enterPlayingConfirmation by remember {
+        mutableStateOf<QueueOperationConfirmationRequest?>(null)
+    }
     var moreMenuVisible by remember { mutableStateOf(false) }
     var appDetailsVisible by remember { mutableStateOf(false) }
     var versionHistoryVisible by remember { mutableStateOf(false) }
@@ -385,11 +432,7 @@ internal fun RegistrationApp() {
     }
 
     fun showQueueAdjustmentNotApplied(machineId: MachineId) {
-        val machineOperational = if (machineId == MachineId.A) {
-            machineAStatus.isOperational
-        } else {
-            machineBStatus.isOperational
-        }
+        val machineOperational = machineStates.status(machineId).isOperational
         showHomeOperationFeedback(
             title = "本次调整未执行",
             detail = if (machineOperational) {
@@ -406,6 +449,23 @@ internal fun RegistrationApp() {
         showHomeOperationFeedback(
             title = "本次操作未执行",
             detail = "队列位置、组内登记或登记状态已发生变化，请按当前队列重新选择后再操作。",
+            contextLabel = configuredMachineName(machineId),
+            tone = HomeSidePanelFeedbackTone.WARNING
+        )
+    }
+
+    fun showQueueConfirmationNotApplied(
+        machineId: MachineId,
+        operationLabel: String,
+        queueChanged: Boolean
+    ) {
+        showHomeOperationFeedback(
+            title = if (queueChanged) "队列已更新" else "${operationLabel}未执行",
+            detail = if (queueChanged) {
+                "本次${operationLabel}操作未执行，请按当前队列重新确认。"
+            } else {
+                "队列状态或操作条件已经变化，请按当前队列重新确认。"
+            },
             contextLabel = configuredMachineName(machineId),
             tone = HomeSidePanelFeedbackTone.WARNING
         )
@@ -430,10 +490,7 @@ internal fun RegistrationApp() {
     fun currentPersistedQueueState(): PersistedQueueState = PersistedQueueState(
         queueId = queueId,
         revision = queueRevision.incrementAndGet(),
-        machineA = machineA,
-        machineB = machineB,
-        machineAStatus = machineAStatus,
-        machineBStatus = machineBStatus,
+        machines = machineStates.snapshot(configuredMachineIds),
         registrationOpen = registrationOpen,
         nextRegistrationKey = nextKey,
         savedAtMillis = System.currentTimeMillis(),
@@ -485,6 +542,24 @@ internal fun RegistrationApp() {
             queueId = savedState.queueId
             queueRevision.set(savedState.revision)
             nextKey = savedState.safeNextRegistrationKey
+            val restoredMachineCount = maxOf(
+                queueRuleSettings.configuredMachineCount,
+                savedState.configuredMachineIds.size
+            )
+            if (restoredMachineCount != queueRuleSettings.configuredMachineCount) {
+                queueRuleSettings = queueRuleSettings.copy(
+                    configuredMachineCount = restoredMachineCount
+                )
+                queueRuleSettingsRepository.saveSettings(queueRuleSettings)
+            }
+            if (!savedState.hasMeaningfulState) {
+                machineStates.replace(
+                    configuredMachineIds(restoredMachineCount).associateWith { machineId ->
+                        savedState.machines[machineId] ?: PersistedMachineState()
+                    }
+                )
+                registrationOpen = savedState.registrationOpen
+            }
         }
         pendingQueueRestore = savedState?.takeIf(PersistedQueueState::hasMeaningfulState)
         queuePersistenceReady = true
@@ -494,10 +569,7 @@ internal fun RegistrationApp() {
         queuePersistenceReady,
         playerProfilesLoaded,
         pendingQueueRestore,
-        machineA,
-        machineB,
-        machineAStatus,
-        machineBStatus,
+        configuredMachineStateSnapshot,
         registrationOpen,
         nextKey,
         queueId,
@@ -511,8 +583,8 @@ internal fun RegistrationApp() {
         queueRuleSettings.allowTemporaryLeave,
         queueRuleSettings.showCommonPlayPreview,
         queueRuleSettings.syncMode,
-        queueRuleSettings.machineARemark,
-        queueRuleSettings.machineBRemark,
+        queueRuleSettings.configuredMachineCount,
+        queueRuleSettings.machineRemarks,
         businessHoursStatus,
         activeClosingGracePeriod
     ) {
@@ -536,8 +608,7 @@ internal fun RegistrationApp() {
             state = snapshot,
             auditLogs = auditLogs,
             displaySettings = QueuePublicDisplaySettings(
-                machineARemark = queueRuleSettings.machineARemark,
-                machineBRemark = queueRuleSettings.machineBRemark,
+                machineRemarks = queueRuleSettings.machineRemarks,
                 websiteRemoteEnabled = queueRuleSettings.websiteSyncEnabled,
                 oneBotSyncEnabled = queueRuleSettings.websiteSyncEnabled &&
                     queueRuleSettings.oneBotSyncEnabled,
@@ -562,20 +633,22 @@ internal fun RegistrationApp() {
     }
 
     fun queueFor(machineId: MachineId): MachineQueue =
-        if (machineId == MachineId.A) machineA else machineB
+        machineStates.queue(machineId)
 
     fun statusFor(machineId: MachineId): MachineStatus =
-        if (machineId == MachineId.A) machineAStatus else machineBStatus
+        machineStates.status(machineId)
 
     fun setQueue(machineId: MachineId, queue: MachineQueue) {
-        if (machineId == MachineId.A) machineA = queue else machineB = queue
+        machineStates.setQueue(machineId, queue)
     }
 
+    fun queueOperationConfirmation(machineId: MachineId) =
+        QueueOperationConfirmationRequest(machineId, queueFor(machineId))
+
     fun currentQueueEngineState(): QueueEngineState = QueueEngineState(
-        linkedMapOf(
-            MachineId.A.name to machineA,
-            MachineId.B.name to machineB
-        )
+        configuredMachineIds.associateTo(linkedMapOf()) { machineId ->
+            machineId.name to queueFor(machineId)
+        }
     )
 
     fun currentQueueEnginePolicy(): QueueEnginePolicy = QueueEnginePolicy(
@@ -583,10 +656,9 @@ internal fun RegistrationApp() {
         allowOnlineRegistration = queueRuleSettings.allowOnlineRegistration,
         allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
         allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
-        machineStatuses = mapOf(
-            MachineId.A.name to machineAStatus,
-            MachineId.B.name to machineBStatus
-        ),
+        machineStatuses = configuredMachineIds.associate { machineId ->
+            machineId.name to statusFor(machineId)
+        },
         maxRegistrationsPerMachine = 20,
         requireOperationalForPlayerActions = true
     )
@@ -607,7 +679,7 @@ internal fun RegistrationApp() {
 
     fun appendAuditLog(entry: AuditLogEntry) {
         val enrichedEntry = entry.withAffectedPlayerContacts(
-            registrations = machineA.allRegistrations + machineB.allRegistrations,
+            registrations = configuredMachineIds.flatMap { queueFor(it).allRegistrations },
             playerProfiles = playerProfiles
         )
         val queueScopedEntry = if (enrichedEntry.queueId == null) {
@@ -621,7 +693,7 @@ internal fun RegistrationApp() {
         coroutineScope.launch { auditLogRepository.append(queueScopedEntry) }
     }
 
-    fun updateQueueRuleSettings(requestedSettings: QueueRuleSettings) {
+    fun updateQueueRuleSettings(requestedSettings: QueueRuleSettings): Boolean {
         val previousSettings = queueRuleSettings
         val requestedConnectionChanged =
             requestedSettings.queueSyncEndpoint != previousSettings.queueSyncEndpoint ||
@@ -643,7 +715,23 @@ internal fun RegistrationApp() {
             settings = guardedSettings,
             cloudSyncAvailable = cloudSyncAvailable
         )
-        if (settings == queueRuleSettings) return
+        if (settings == queueRuleSettings) return true
+        val removedMachineIds = previousSettings.configuredMachineIds
+            .filterNot(settings.configuredMachineIds::contains)
+        val blockedRemovedMachineIds = removedMachineIds.filter { machineId ->
+            val state = machineStates.state(machineId)
+            state.queue.registrationCount > 0 || !state.status.isOperational
+        }
+        if (blockedRemovedMachineIds.isNotEmpty()) {
+            Toast.makeText(
+                context,
+                panguSpacing(
+                    "请先清空并恢复${blockedRemovedMachineIds.joinToString("、") { configuredMachineName(it) }}，再减少机台数量。"
+                ),
+                Toast.LENGTH_LONG
+            ).show()
+            return false
+        }
         val connectionChanged = settings.queueSyncEndpoint != previousSettings.queueSyncEndpoint ||
             settings.queueSyncToken != previousSettings.queueSyncToken
         if (connectionChanged) {
@@ -679,6 +767,7 @@ internal fun RegistrationApp() {
                     queueRuleSettingsRepository.markClosingOccurrenceHandled(occurrenceId)
                 }
         }
+        machineStates.reset(removedMachineIds)
         queueRuleSettings = settings
         queueRuleSettingsRepository.saveSettings(settings)
         if (previousSettings.websiteSyncEnabled != settings.websiteSyncEnabled) {
@@ -700,10 +789,7 @@ internal fun RegistrationApp() {
                 val finalSnapshot = PersistedQueueState(
                     queueId = queueId,
                     revision = queueRevision.incrementAndGet(),
-                    machineA = machineA,
-                    machineB = machineB,
-                    machineAStatus = machineAStatus,
-                    machineBStatus = machineBStatus,
+                    machines = machineStates.snapshot(configuredMachineIds),
                     registrationOpen = registrationOpen,
                     nextRegistrationKey = nextKey,
                     savedAtMillis = System.currentTimeMillis()
@@ -713,8 +799,7 @@ internal fun RegistrationApp() {
                         state = finalSnapshot,
                         auditLogs = auditLogs,
                         displaySettings = QueuePublicDisplaySettings(
-                            machineARemark = settings.machineARemark,
-                            machineBRemark = settings.machineBRemark,
+                            machineRemarks = settings.machineRemarks,
                             websiteRemoteEnabled = false,
                             oneBotSyncEnabled = false,
                             syncMode = settings.syncMode,
@@ -775,11 +860,13 @@ internal fun RegistrationApp() {
                     "营业时间：${if (settings.businessHours.enabled) "已开启" else "已关闭"}"
                 )
             }
-            if (previousSettings.machineARemark != settings.machineARemark) {
-                add("机台 A 备注改为“${settings.machineARemark}”")
+            if (previousSettings.configuredMachineCount != settings.configuredMachineCount) {
+                add("机台数量改为 ${settings.configuredMachineCount} 台")
             }
-            if (previousSettings.machineBRemark != settings.machineBRemark) {
-                add("机台 B 备注改为“${settings.machineBRemark}”")
+            settings.configuredMachineIds.forEach { machineId ->
+                if (previousSettings.machineRemark(machineId) != settings.machineRemark(machineId)) {
+                    add("机台 ${machineId.name} 备注改为“${settings.machineRemark(machineId)}”")
+                }
             }
         }
         appendAuditLog(
@@ -789,14 +876,15 @@ internal fun RegistrationApp() {
                 detail = changeDescriptions.joinToString(separator = "；", postfix = "。")
             )
         )
+        return true
     }
 
-    fun auditCategoryFor(machineId: MachineId): AuditLogCategory =
-        if (machineId == MachineId.A) {
-            AuditLogCategory.MACHINE_A
-        } else {
-            AuditLogCategory.MACHINE_B
-        }
+    fun auditCategoryFor(machineId: MachineId): AuditLogCategory = when (machineId) {
+        MachineId.A -> AuditLogCategory.MACHINE_A
+        MachineId.B -> AuditLogCategory.MACHINE_B
+        MachineId.C -> AuditLogCategory.MACHINE_C
+        MachineId.D -> AuditLogCategory.MACHINE_D
+    }
 
     fun appendQueueAuditLog(
         machineId: MachineId,
@@ -992,7 +1080,7 @@ internal fun RegistrationApp() {
             classifyMissedOnlineRegistrations = true
         )
         if (changed && plan.impact.requiresAvailabilityConfirmation) {
-            enterPlayingConfirmation = machineId
+            enterPlayingConfirmation = queueOperationConfirmation(machineId)
         }
         return changed
     }
@@ -1141,8 +1229,7 @@ internal fun RegistrationApp() {
     }
 
     fun updateStatus(machineId: MachineId, transform: (MachineStatus) -> MachineStatus) {
-        if (machineId == MachineId.A) machineAStatus = transform(machineAStatus)
-        else machineBStatus = transform(machineBStatus)
+        machineStates.setStatus(machineId, transform(statusFor(machineId)))
     }
 
     fun reportMachineStopped(
@@ -1245,7 +1332,11 @@ internal fun RegistrationApp() {
     }
 
     fun transferRegistrations(request: MachineTransferRequest): Boolean {
-        val destinationMachineId = otherMachine(request.sourceMachineId)
+        val destinationMachineId = request.destinationMachineId ?: return false
+        if (
+            destinationMachineId == request.sourceMachineId ||
+            destinationMachineId !in configuredMachineIds
+        ) return false
         val registrationKeys = request.registrationKeys.toSet()
         val sourceQueue = queueFor(request.sourceMachineId)
         if (request.sourcePosition?.let(sourceQueue::matchesExactPosition) == false) return false
@@ -1295,7 +1386,7 @@ internal fun RegistrationApp() {
     }
 
     fun idAlreadyExists(displayId: String, exceptKey: Int? = null): Boolean =
-        (machineA.allRegistrations + machineB.allRegistrations).any {
+        configuredMachineIds.flatMap { queueFor(it).allRegistrations }.any {
             it.key != exceptKey && it.displayId.equals(displayId.trim(), ignoreCase = true)
         }
 
@@ -1321,7 +1412,7 @@ internal fun RegistrationApp() {
         } else {
             null
         }
-        return (machineA.allRegistrations + machineB.allRegistrations).any { registration ->
+        return configuredMachineIds.flatMap { queueFor(it).allRegistrations }.any { registration ->
             registration.key != claimRegistrationKey &&
                 registration.playerProfileId != profileId &&
                 registration.playerProfileId !in equivalentProfileIds &&
@@ -1330,7 +1421,7 @@ internal fun RegistrationApp() {
     }
 
     fun playerProfileAlreadyRegistered(profile: PlayerProfile, exceptKey: Int? = null): Boolean =
-        (machineA.allRegistrations + machineB.allRegistrations).any {
+        configuredMachineIds.flatMap { queueFor(it).allRegistrations }.any {
             it.key != exceptKey && (
                 it.playerProfileId == profile.id ||
                     it.displayId.equals(profile.nickname.trim(), ignoreCase = true)
@@ -1349,26 +1440,18 @@ internal fun RegistrationApp() {
         } else {
             playerProfiles + profile
         }
-        updateQueueByAction(
-            action = QueueAction.SyncPlayerProfileDetails(
-                MachineId.A.name,
-                profile.id,
-                profile.nickname,
-                profile.gender
-            ),
-            source = source,
-            origin = QueueActionOrigin.SYSTEM
-        )
-        updateQueueByAction(
-            action = QueueAction.SyncPlayerProfileDetails(
-                MachineId.B.name,
-                profile.id,
-                profile.nickname,
-                profile.gender
-            ),
-            source = source,
-            origin = QueueActionOrigin.SYSTEM
-        )
+        configuredMachineIds.forEach { machineId ->
+            updateQueueByAction(
+                action = QueueAction.SyncPlayerProfileDetails(
+                    machineId.name,
+                    profile.id,
+                    profile.nickname,
+                    profile.gender
+                ),
+                source = source,
+                origin = QueueActionOrigin.SYSTEM
+            )
+        }
         if (recordAudit && (
             existingProfile == null ||
             existingProfile.nickname != profile.nickname ||
@@ -1447,28 +1530,25 @@ internal fun RegistrationApp() {
             is CloudPlayerProfilePersistenceResult.Success -> {
                 cloudProfileRestoreFailureDetail = null
                 playerProfiles = result.profiles
-                val syncedMachineA = result.profiles.fold(
-                    machineA.resolvePlayerProfileAliases(
-                        result.appliedAliases,
-                        result.profiles
-                    )
-                ) { queue, profile ->
-                    queue.syncPlayerProfileDetails(profile.id, profile.nickname, profile.gender)
+                val syncedQueues = configuredMachineIds.associateWith { machineId ->
+                    result.profiles.fold(
+                        queueFor(machineId).resolvePlayerProfileAliases(
+                            result.appliedAliases,
+                            result.profiles
+                        )
+                    ) { queue, profile ->
+                        queue.syncPlayerProfileDetails(
+                            profile.id,
+                            profile.nickname,
+                            profile.gender
+                        )
+                    }
                 }
-                val syncedMachineB = result.profiles.fold(
-                    machineB.resolvePlayerProfileAliases(
-                        result.appliedAliases,
-                        result.profiles
-                    )
-                ) { queue, profile ->
-                    queue.syncPlayerProfileDetails(profile.id, profile.nickname, profile.gender)
-                }
-                if (syncedMachineA != machineA || syncedMachineB != machineB) {
+                if (syncedQueues.any { (machineId, queue) -> queue != queueFor(machineId) }) {
                     queueUndoAction = null
                     homeSidePanelFeedback = null
                 }
-                machineA = syncedMachineA
-                machineB = syncedMachineB
+                syncedQueues.forEach(::setQueue)
                 if (result.profilesChanged) {
                     val details = buildList {
                         if (result.appliedProfiles.isNotEmpty()) {
@@ -1513,12 +1593,14 @@ internal fun RegistrationApp() {
     fun closeRegistration(businessHoursTrigger: BusinessHoursCloseTrigger? = null) {
         if (!registrationOpen) return
         val automaticBusinessHours = businessHoursTrigger != null
-        val removedRegistrations = machineA.allRegistrations + machineB.allRegistrations
+        val removedRegistrations = configuredMachineIds.flatMap { queueFor(it).allRegistrations }
         val removedCount = removedRegistrations.size
         val removedRegistrationKeys = removedRegistrations.map { it.key }
         val clearExecution = QueueEngine.execute(
             state = currentQueueEngineState(),
-            action = QueueAction.ClearRegistrations(MachineId.entries.mapTo(mutableSetOf()) { it.name }),
+            action = QueueAction.ClearRegistrations(
+                configuredMachineIds.mapTo(mutableSetOf()) { it.name }
+            ),
             context = QueueActionContext(
                 origin = if (automaticBusinessHours) {
                     QueueActionOrigin.SYSTEM
@@ -1530,8 +1612,12 @@ internal fun RegistrationApp() {
         ) as? QueueActionExecution.Applied
         if (removedCount > 0 && clearExecution == null) return
         queueUndoAction = null
-        machineA = clearExecution?.state?.queue(MachineId.A.name) ?: MachineQueue()
-        machineB = clearExecution?.state?.queue(MachineId.B.name) ?: MachineQueue()
+        configuredMachineIds.forEach { machineId ->
+            setQueue(
+                machineId,
+                clearExecution?.state?.queue(machineId.name) ?: MachineQueue()
+            )
+        }
         registrationOpen = false
         queueSoundPlayer.play(QueueSoundCue.CAUTION)
         val detail = if (removedCount == 0) {
@@ -1545,11 +1631,11 @@ internal fun RegistrationApp() {
         } else {
             when (businessHoursTrigger) {
                 BusinessHoursCloseTrigger.GRACE_PERIOD_EXPIRED ->
-                    "今日营业时间结束已 20 分钟，登记排队现已关闭，并清除了两台机台剩余的 $removedCount 份登记。"
+                    "今日营业时间结束已 20 分钟，登记排队现已关闭，并清除了所有机台剩余的 $removedCount 份登记。"
                 BusinessHoursCloseTrigger.QUEUE_EMPTY_DURING_GRACE ->
-                    "今日营业时间已结束，登记排队现已关闭，并清除了两台机台的 $removedCount 份登记。"
+                    "今日营业时间已结束，登记排队现已关闭，并清除了所有机台的 $removedCount 份登记。"
                 null ->
-                    "新的排队登记已停止接收，并清除了两台机台的 $removedCount 份登记。"
+                    "新的排队登记已停止接收，并清除了所有机台的 $removedCount 份登记。"
             }
         }
         appendAuditLog(
@@ -1581,10 +1667,23 @@ internal fun RegistrationApp() {
         }
         queueId = savedState.queueId
         queueRevision.set(savedState.revision)
-        machineA = syncKnownProfiles(savedState.machineA)
-        machineB = syncKnownProfiles(savedState.machineB)
-        machineAStatus = savedState.machineAStatus
-        machineBStatus = savedState.machineBStatus
+        val restoredMachineCount = maxOf(
+            queueRuleSettings.configuredMachineCount,
+            savedState.configuredMachineIds.size
+        )
+        if (restoredMachineCount != queueRuleSettings.configuredMachineCount) {
+            queueRuleSettings = queueRuleSettings.copy(
+                configuredMachineCount = restoredMachineCount
+            )
+            queueRuleSettingsRepository.saveSettings(queueRuleSettings)
+        }
+        machineStates.replace(
+            configuredMachineIds(restoredMachineCount).associateWith { machineId ->
+                savedState.machines[machineId]?.let { machine ->
+                    machine.copy(queue = syncKnownProfiles(machine.queue))
+                } ?: PersistedMachineState()
+            }
+        )
         registrationOpen = savedState.registrationOpen
         nextKey = savedState.safeNextRegistrationKey
         queueUndoAction = null
@@ -1595,16 +1694,28 @@ internal fun RegistrationApp() {
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
                 title = "恢复上次队列",
-                detail = "已恢复${configuredMachineName(MachineId.A)} 的 ${savedState.machineA.registrationCount} 个登记和${configuredMachineName(MachineId.B)} 的 ${savedState.machineB.registrationCount} 个登记。",
+                detail = savedState.configuredMachineIds.joinToString(
+                    separator = "，",
+                    prefix = "已恢复",
+                    postfix = "。"
+                ) { machineId ->
+                    "${configuredMachineName(machineId)} 的 ${savedState.machine(machineId).queue.registrationCount} 份登记"
+                },
                 publicEventType = PublicQueueEventType.QUEUE_RESTORED,
                 affectedRegistrationKeys = (
-                    savedState.machineA.allRegistrations + savedState.machineB.allRegistrations
+                    savedState.machines.values.flatMap { it.queue.allRegistrations }
                     ).map { it.key }
             )
         )
         showHomeOperationFeedback(
             title = "上次队列已恢复",
-            detail = "已恢复 ${configuredMachineName(MachineId.A)} 的 ${savedState.machineA.registrationCount} 份登记，以及 ${configuredMachineName(MachineId.B)} 的 ${savedState.machineB.registrationCount} 份登记。",
+            detail = savedState.configuredMachineIds.joinToString(
+                separator = "，",
+                prefix = "已恢复 ",
+                postfix = "。"
+            ) { machineId ->
+                "${configuredMachineName(machineId)} 的 ${savedState.machine(machineId).queue.registrationCount} 份登记"
+            },
             contextLabel = "本机队列恢复",
             tone = HomeSidePanelFeedbackTone.INFO
         )
@@ -1613,10 +1724,15 @@ internal fun RegistrationApp() {
     fun startWithNewQueue(savedState: PersistedQueueState) {
         queueId = newQueueId()
         queueRevision.updateAndGet { current -> maxOf(current, savedState.revision) }
-        machineA = MachineQueue()
-        machineB = MachineQueue()
-        machineAStatus = MachineStatus()
-        machineBStatus = MachineStatus()
+        val newMachineCount = maxOf(
+            queueRuleSettings.configuredMachineCount,
+            savedState.configuredMachineIds.size
+        )
+        if (newMachineCount != queueRuleSettings.configuredMachineCount) {
+            queueRuleSettings = queueRuleSettings.copy(configuredMachineCount = newMachineCount)
+            queueRuleSettingsRepository.saveSettings(queueRuleSettings)
+        }
+        machineStates.reset(configuredMachineIds(newMachineCount))
         registrationOpen = true
         nextKey = 1
         queueUndoAction = null
@@ -2052,7 +2168,7 @@ internal fun RegistrationApp() {
         }
     }
 
-    fun joinableMachineIds(): List<MachineId> = MachineId.entries.filter { machineId ->
+    fun joinableMachineIds(): List<MachineId> = configuredMachineIds.filter { machineId ->
         statusFor(machineId).isOperational && queueFor(machineId).registrationCount < 20
     }
 
@@ -2268,7 +2384,7 @@ internal fun RegistrationApp() {
         if (remainingCapacity <= 0) return
         val amount = batchAmount.toIntOrNull() ?: return
         if (amount !in 1..remainingCapacity) return
-        val usedIds = (machineA.allRegistrations + machineB.allRegistrations)
+        val usedIds = configuredMachineIds.flatMap { queueFor(it).allRegistrations }
             .map { it.displayId.lowercase() }.toMutableSet()
         val registrations = buildList {
             repeat(amount) {
@@ -2321,12 +2437,11 @@ internal fun RegistrationApp() {
         nowMillis,
         queuePersistenceReady,
         pendingQueueRestore,
-        machineA.waiting,
-        machineB.waiting
+        configuredMachineStateSnapshot
     ) {
         if (!queuePersistenceReady || pendingQueueRestore != null) return@LaunchedEffect
         val removalNotices = mutableListOf<String>()
-        MachineId.entries.forEach { machineId ->
+        configuredMachineIds.forEach { machineId ->
             if (!statusFor(machineId).isOperational) return@forEach
             val queueBeforeRemoval = queueFor(machineId)
             val expiredKeys = queueBeforeRemoval.expiredOnlineRegistrationKeys(nowMillis)
@@ -2362,8 +2477,7 @@ internal fun RegistrationApp() {
         queueRuleSettings.businessHours,
         lastHandledClosingOccurrenceId,
         registrationOpen,
-        machineA.registrationCount,
-        machineB.registrationCount,
+        configuredMachineStateSnapshot,
         queuePersistenceReady,
         pendingQueueRestore
     ) {
@@ -2376,7 +2490,9 @@ internal fun RegistrationApp() {
             val trigger = businessHoursCloseTrigger(
                 status = status,
                 nowMillis = System.currentTimeMillis(),
-                registrationCount = machineA.registrationCount + machineB.registrationCount,
+                registrationCount = configuredMachineIds.sumOf {
+                    queueFor(it).registrationCount
+                },
                 lastHandledOccurrenceId = lastHandledClosingOccurrenceId
             )
             if (trigger != null) {
@@ -2426,14 +2542,12 @@ internal fun RegistrationApp() {
 
     fun currentRemoteQueueExecutionState() = RemoteQueueExecutionState(
         queueId = queueId,
-        queues = linkedMapOf(
-            MachineId.A.name to machineA,
-            MachineId.B.name to machineB
-        ),
-        machineStatuses = mapOf(
-            MachineId.A.name to machineAStatus,
-            MachineId.B.name to machineBStatus
-        ),
+        queues = configuredMachineIds.associateTo(linkedMapOf()) { machineId ->
+            machineId.name to queueFor(machineId)
+        },
+        machineStatuses = configuredMachineIds.associate { machineId ->
+            machineId.name to statusFor(machineId)
+        },
         playerProfiles = playerProfiles,
         nextRegistrationKey = nextKey,
         acceptingNewRegistrations = latestAcceptingNewRegistrations,
@@ -2641,14 +2755,14 @@ internal fun RegistrationApp() {
                                 )
                                 when (val result = decision) {
                                     is RemoteQueueOperationDecision.Apply -> {
-                                        val beforeQueues = mapOf(
-                                            MachineId.A.name to machineA,
-                                            MachineId.B.name to machineB
-                                        )
-                                        machineA = result.state.queues[MachineId.A.name]
-                                            ?: machineA
-                                        machineB = result.state.queues[MachineId.B.name]
-                                            ?: machineB
+                                        val beforeQueues = configuredMachineIds.associate {
+                                            machineId -> machineId.name to queueFor(machineId)
+                                        }
+                                        configuredMachineIds.forEach { machineId ->
+                                            result.state.queues[machineId.name]?.let { queue ->
+                                                setQueue(machineId, queue)
+                                            }
+                                        }
                                         nextKey = maxOf(
                                             nextKey,
                                             result.state.nextRegistrationKey
@@ -2851,8 +2965,8 @@ internal fun RegistrationApp() {
                                         val resultRegistrationId = if (
                                             command.operation == RemoteQueueOperation.JOIN_QUEUE
                                         ) {
-                                            sequenceOf(machineA, machineB)
-                                                .flatMap { it.allRegistrations.asSequence() }
+                                            configuredMachineIds.asSequence()
+                                                .flatMap { queueFor(it).allRegistrations.asSequence() }
                                                 .firstOrNull {
                                                     it.originatingCommandId == command.commandId
                                                 }
@@ -2916,19 +3030,20 @@ internal fun RegistrationApp() {
                                 )
                                 when (val result = decision) {
                                     is MobileDeviceRegistrationDecision.Apply -> {
-                                        val beforeQueue = result.changedMachineId.let { machineName ->
-                                            if (machineName == MachineId.A.name) machineA else machineB
+                                        val machineId = configuredMachineIds.firstOrNull {
+                                            it.name == result.changedMachineId
                                         }
-                                        machineA = result.state.queues[MachineId.A.name]
-                                            ?: machineA
-                                        machineB = result.state.queues[MachineId.B.name]
-                                            ?: machineB
+                                        val beforeQueue = machineId?.let(::queueFor)
+                                            ?: MachineQueue()
+                                        configuredMachineIds.forEach { configuredMachineId ->
+                                            result.state.queues[configuredMachineId.name]
+                                                ?.let { queue ->
+                                                    setQueue(configuredMachineId, queue)
+                                                }
+                                        }
                                         nextKey = maxOf(nextKey, result.state.nextRegistrationKey)
                                         queueUndoAction = null
                                         homeSidePanelFeedback = null
-                                        val machineId = MachineId.entries.firstOrNull {
-                                            it.name == result.changedMachineId
-                                        }
                                         val afterQueue = result.state.queues[result.changedMachineId]
                                         val addedRegistrationKey = afterQueue?.allRegistrations
                                             ?.firstOrNull { registration ->
@@ -3291,7 +3406,7 @@ internal fun RegistrationApp() {
         homeSidePanelFeedback = null
         queueUndoAction = null
         newRegistrationHighlight = request.highlight
-        enterPlayingConfirmation = request.enterPlayingConfirmation
+        enterPlayingConfirmation = request.enterPlayingConfirmation?.let(::queueOperationConfirmation)
         pendingNewRegistrationHomeRequests = pendingNewRegistrationHomeRequests.drop(1)
     }
 
@@ -3384,12 +3499,7 @@ internal fun RegistrationApp() {
                 ) { target ->
                     when (target) {
                         Screen.HOME -> HomeScreen(
-                            machineA = machineA,
-                            machineB = machineB,
-                            machineAStatus = machineAStatus,
-                            machineBStatus = machineBStatus,
-                            machineARemark = queueRuleSettings.machineARemark,
-                            machineBRemark = queueRuleSettings.machineBRemark,
+                            machines = configuredMachines,
                             registrationOpen = registrationOpen,
                             acceptingNewRegistrations = acceptingNewRegistrations,
                             businessHoursStatus = businessHoursStatus,
@@ -3442,7 +3552,9 @@ internal fun RegistrationApp() {
                                 if (reorderSession == null) moreMenuVisible = true
                             },
                             onFinishRequest = {
-                                if (reorderSession == null) finishConfirmation = it
+                                if (reorderSession == null) {
+                                    finishConfirmation = queueOperationConfirmation(it)
+                                }
                             },
                             onEnterPlaying = { machineId ->
                                 if (reorderSession == null) {
@@ -3450,7 +3562,8 @@ internal fun RegistrationApp() {
                                         QueueAction.EnterPlayingPosition(machineId.name)
                                     )
                                     if (roundPlan.impact.requiresConfirmation) {
-                                        enterPlayingConfirmation = machineId
+                                        enterPlayingConfirmation =
+                                            queueOperationConfirmation(machineId)
                                     } else {
                                         updateQueueByPlan(
                                             plan = roundPlan,
@@ -3485,8 +3598,7 @@ internal fun RegistrationApp() {
 
                         Screen.AUDIT_LOG -> AuditLogScreen(
                             logs = auditLogs,
-                            machineAName = configuredMachineName(MachineId.A),
-                            machineBName = configuredMachineName(MachineId.B),
+                            machines = configuredMachines,
                             onBack = { screen = Screen.HOME }
                         )
 
@@ -3498,12 +3610,7 @@ internal fun RegistrationApp() {
                         )
 
                         Screen.MACHINE -> MachineSelectionScreen(
-                            machineA = machineA,
-                            machineB = machineB,
-                            machineAStatus = machineAStatus,
-                            machineBStatus = machineBStatus,
-                            machineAName = configuredMachineName(MachineId.A),
-                            machineBName = configuredMachineName(MachineId.B),
+                            machines = configuredMachines,
                             batch = isBatchFlow,
                             onBack = { screen = Screen.HOME },
                             onSelect = ::selectRegistrationMachine
@@ -3837,13 +3944,29 @@ internal fun RegistrationApp() {
                         val linkedPlayerProfile = registration.playerProfileId?.let { profileId ->
                             playerProfiles.firstOrNull { it.id == profileId }
                         }
-                        val transferTargetMachineId = otherMachine(selection.machineId)
-                        val transferUnavailableReason = machineTransferUnavailableReason(
-                            machineName = configuredMachineName(transferTargetMachineId),
-                            status = statusFor(transferTargetMachineId),
-                            queue = queueFor(transferTargetMachineId),
-                            incomingRegistrationCount = 1
-                        )
+                        val transferDestinations = configuredMachines.filter {
+                            it.machineId != selection.machineId
+                        }
+                        val transferUnavailableReason = when {
+                            transferDestinations.isEmpty() -> "当前没有其他已配置的机台。"
+                            transferDestinations.size == 1 -> transferDestinations.single().let {
+                                machineTransferUnavailableReason(
+                                    machineName = it.name,
+                                    status = it.status,
+                                    queue = it.queue,
+                                    incomingRegistrationCount = 1
+                                )
+                            }
+                            transferDestinations.none {
+                                machineTransferUnavailableReason(
+                                    machineName = it.name,
+                                    status = it.status,
+                                    queue = it.queue,
+                                    incomingRegistrationCount = 1
+                                ) == null
+                            } -> "其他机台当前都不能接收这份登记。"
+                            else -> null
+                        }
                         RegistrationActions(
                             registration = registration,
                             playerProfileGender = linkedPlayerProfile?.gender ?: registration.gender,
@@ -3861,7 +3984,8 @@ internal fun RegistrationApp() {
                             canReportNoShow = queue.canMarkNoShow(registration.key),
                             allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
                             allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
-                            transferMachineName = configuredMachineName(transferTargetMachineId),
+                            transferMachineName = transferDestinations.singleOrNull()?.name
+                                ?: "其他机台",
                             transferUnavailableReason = transferUnavailableReason,
                             canEditPlayerProfile = linkedPlayerProfile != null,
                             mode = registrationActionMode,
@@ -3992,7 +4116,9 @@ internal fun RegistrationApp() {
                                     confirmationSnapshots = currentQueue
                                         .registrationConfirmationSnapshots(
                                             setOf(selection.registrationKey)
-                                        )
+                                        ),
+                                    destinationMachineId = transferDestinations
+                                        .singleOrNull()?.machineId
                                 )
                                 selectedRegistration = null
                             },
@@ -4372,8 +4498,22 @@ internal fun RegistrationApp() {
                     }
                 }
 
-                finishConfirmation?.let { machineId ->
+                finishConfirmation?.let { request ->
+                    val machineId = request.machineId
                     val sourceQueue = queueFor(machineId)
+                    if (!request.queueSnapshot.hasSameQueueOperationState(sourceQueue)) {
+                        LaunchedEffect(request, sourceQueue) {
+                            if (finishConfirmation == request) {
+                                finishConfirmation = null
+                                showQueueConfirmationNotApplied(
+                                    machineId,
+                                    operationLabel = "本轮结束",
+                                    queueChanged = true
+                                )
+                            }
+                        }
+                        return@let
+                    }
                     if (sourceQueue.playing.isEmpty()) {
                         LaunchedEffect(machineId, sourceQueue) { finishConfirmation = null }
                         return@let
@@ -4397,8 +4537,17 @@ internal fun RegistrationApp() {
                         closingGracePeriod = activeClosingGracePeriod,
                         onDismiss = { finishConfirmation = null },
                         onConfirm = {
+                            if (!request.queueSnapshot.hasSameQueueOperationState(queueFor(machineId))) {
+                                finishConfirmation = null
+                                showQueueConfirmationNotApplied(
+                                    machineId,
+                                    operationLabel = "本轮结束",
+                                    queueChanged = true
+                                )
+                                return@RoundEndConfirmation
+                            }
                             val atMillis = System.currentTimeMillis()
-                            updateQueueWithUndoByPlan(
+                            val changed = updateQueueWithUndoByPlan(
                                 plan = finishPlan,
                                 message = "${configuredMachineName(machineId)} 的本轮已结束",
                                 feedbackTitle = if (
@@ -4419,11 +4568,25 @@ internal fun RegistrationApp() {
                                     ?: "本轮已经结束，${playingPositionName(machineId)}目前为空。",
                                 executionAtMillis = atMillis
                             )
-                            if (queueFor(machineId) != sourceQueue) {
-                                finishConfirmation = null
+                            finishConfirmation = null
+                            if (!changed) {
+                                showQueueConfirmationNotApplied(
+                                    machineId,
+                                    operationLabel = "本轮结束",
+                                    queueChanged = false
+                                )
                             }
                         },
                         onEndOnly = {
+                            if (!request.queueSnapshot.hasSameQueueOperationState(queueFor(machineId))) {
+                                finishConfirmation = null
+                                showQueueConfirmationNotApplied(
+                                    machineId,
+                                    operationLabel = "仅结束本轮",
+                                    queueChanged = true
+                                )
+                                return@RoundEndConfirmation
+                            }
                             val changed = updateQueueWithUndoByPlan(
                                 plan = endOnlyPlan,
                                 message = "${configuredMachineName(machineId)} 的本轮已结束",
@@ -4431,8 +4594,13 @@ internal fun RegistrationApp() {
                                 feedbackDetail = "${playingPositionName(machineId)}已经空出，等待顺序保持不变。",
                                 executionAtMillis = System.currentTimeMillis()
                             )
-                            if (changed || queueFor(machineId) != sourceQueue) {
-                                finishConfirmation = null
+                            finishConfirmation = null
+                            if (!changed) {
+                                showQueueConfirmationNotApplied(
+                                    machineId,
+                                    operationLabel = "仅结束本轮",
+                                    queueChanged = false
+                                )
                             }
                         },
                         removalNextPlayingNames = removalPreview
@@ -4442,6 +4610,15 @@ internal fun RegistrationApp() {
                             .takeIf { it.isNotEmpty() },
                         removalNextPlayingNotice = nextPlayingChangeMessage(removalPreview),
                         onRemoveAndStartNext = {
+                            if (!request.queueSnapshot.hasSameQueueOperationState(queueFor(machineId))) {
+                                finishConfirmation = null
+                                showQueueConfirmationNotApplied(
+                                    machineId,
+                                    operationLabel = "移除本轮登记",
+                                    queueChanged = true
+                                )
+                                return@RoundEndConfirmation
+                            }
                             val changed = updateQueueByPlan(
                                 plan = removalPlan,
                                 soundCue = QueueSoundCue.CAUTION,
@@ -4451,8 +4628,13 @@ internal fun RegistrationApp() {
                                 homeFeedbackTitle = "本轮登记已移除",
                                 executionAtMillis = System.currentTimeMillis()
                             )
-                            if (changed || queueFor(machineId) != sourceQueue) {
-                                finishConfirmation = null
+                            finishConfirmation = null
+                            if (!changed) {
+                                showQueueConfirmationNotApplied(
+                                    machineId,
+                                    operationLabel = "移除本轮登记",
+                                    queueChanged = false
+                                )
                             }
                         }
                     )
@@ -4462,7 +4644,7 @@ internal fun RegistrationApp() {
                     val waitEstimateNowMillis = System.currentTimeMillis()
                     JoinClosingWarningDialog(
                         request = request,
-                        machineNames = MachineId.entries.associateWith(::configuredMachineName),
+                        machineNames = configuredMachineIds.associateWith(::configuredMachineName),
                         closingAtMillis = businessHoursStatus.activeClosingAtMillis,
                         estimatedWaitMinutes = request.lateMachineIds.associateWith { machineId ->
                             estimatedWaitForNewOpenRegistration(
@@ -4490,8 +4672,22 @@ internal fun RegistrationApp() {
                     )
                 }
 
-                enterPlayingConfirmation?.let { machineId ->
+                enterPlayingConfirmation?.let { request ->
+                    val machineId = request.machineId
                     val queue = queueFor(machineId)
+                    if (!request.queueSnapshot.hasSameQueueOperationState(queue)) {
+                        LaunchedEffect(request, queue) {
+                            if (enterPlayingConfirmation == request) {
+                                enterPlayingConfirmation = null
+                                showQueueConfirmationNotApplied(
+                                    machineId,
+                                    operationLabel = "进入游玩位置",
+                                    queueChanged = true
+                                )
+                            }
+                        }
+                        return@let
+                    }
                     if (queue.playing.isNotEmpty()) {
                         LaunchedEffect(machineId, queue) { enterPlayingConfirmation = null }
                         return@let
@@ -4507,6 +4703,15 @@ internal fun RegistrationApp() {
                             notice = notice,
                             onDismiss = { enterPlayingConfirmation = null },
                             onConfirm = {
+                                if (!request.queueSnapshot.hasSameQueueOperationState(queueFor(machineId))) {
+                                    enterPlayingConfirmation = null
+                                    showQueueConfirmationNotApplied(
+                                        machineId,
+                                        operationLabel = "进入游玩位置",
+                                        queueChanged = true
+                                    )
+                                    return@EnterPlayingConfirmation
+                                }
                                 val changed = updateQueueByPlan(
                                     plan = roundPlan,
                                     soundCue = QueueSoundCue.QUEUE_CHANGE,
@@ -4514,8 +4719,13 @@ internal fun RegistrationApp() {
                                     surfaceHomeFeedback = true,
                                     executionAtMillis = System.currentTimeMillis()
                                 )
-                                if (changed || queueFor(machineId) != queue) {
-                                    enterPlayingConfirmation = null
+                                enterPlayingConfirmation = null
+                                if (!changed) {
+                                    showQueueConfirmationNotApplied(
+                                        machineId,
+                                        operationLabel = "进入游玩位置",
+                                        queueChanged = false
+                                    )
                                 }
                             }
                         )
@@ -4528,9 +4738,10 @@ internal fun RegistrationApp() {
                     MoreMenu(
                         registrationOpen = registrationOpen,
                         canEditRegistrations =
-                            (machineAStatus.isOperational && machineA.waiting.isNotEmpty()) ||
-                                (machineBStatus.isOperational && machineB.waiting.isNotEmpty()),
-                        canReportMachineStop = machineAStatus.isOperational || machineBStatus.isOperational,
+                            configuredMachines.any {
+                                it.status.isOperational && it.queue.waiting.isNotEmpty()
+                            },
+                        canReportMachineStop = configuredMachines.any { it.status.isOperational },
                         onDismiss = { moreMenuVisible = false },
                         onEditRegistrations = {
                             moreMenuVisible = false
@@ -4582,12 +4793,7 @@ internal fun RegistrationApp() {
 
                 if (editMachineChoiceVisible) {
                     EditMachineChooser(
-                        machineA = machineA,
-                        machineB = machineB,
-                        machineAStatus = machineAStatus,
-                        machineBStatus = machineBStatus,
-                        machineAName = configuredMachineName(MachineId.A),
-                        machineBName = configuredMachineName(MachineId.B),
+                        machines = configuredMachines,
                         onDismiss = { editMachineChoiceVisible = false },
                         onSelect = { machineId ->
                             editMachineChoiceVisible = false
@@ -4598,10 +4804,7 @@ internal fun RegistrationApp() {
 
                 if (stopMachineChoiceVisible) {
                     StopMachineChooser(
-                        machineAStatus = machineAStatus,
-                        machineBStatus = machineBStatus,
-                        machineAName = configuredMachineName(MachineId.A),
-                        machineBName = configuredMachineName(MachineId.B),
+                        machines = configuredMachines,
                         onDismiss = { stopMachineChoiceVisible = false },
                         onSelect = { machineId ->
                             if (statusFor(machineId).isOperational) {
@@ -4659,18 +4862,35 @@ internal fun RegistrationApp() {
                 }
 
                 selectedPosition?.let { selection ->
-                    val transferTargetMachineId = otherMachine(selection.machineId)
-                    val transferUnavailableReason = machineTransferUnavailableReason(
-                        machineName = configuredMachineName(transferTargetMachineId),
-                        status = statusFor(transferTargetMachineId),
-                        queue = queueFor(transferTargetMachineId),
-                        incomingRegistrationCount = selection.registrationKeys.size
-                    )
+                    val transferDestinations = configuredMachines.filter {
+                        it.machineId != selection.machineId
+                    }
+                    val transferUnavailableReason = when {
+                        transferDestinations.isEmpty() -> "当前没有其他已配置的机台。"
+                        transferDestinations.size == 1 -> transferDestinations.single().let {
+                            machineTransferUnavailableReason(
+                                machineName = it.name,
+                                status = it.status,
+                                queue = it.queue,
+                                incomingRegistrationCount = selection.registrationKeys.size
+                            )
+                        }
+                        transferDestinations.none {
+                            machineTransferUnavailableReason(
+                                machineName = it.name,
+                                status = it.status,
+                                queue = it.queue,
+                                incomingRegistrationCount = selection.registrationKeys.size
+                            ) == null
+                        } -> "其他机台当前都不能接收这些登记。"
+                        else -> null
+                    }
                     PositionActions(
                         selection = selection,
                         queue = queueFor(selection.machineId),
                         machineOperational = statusFor(selection.machineId).isOperational,
-                        transferMachineName = configuredMachineName(transferTargetMachineId),
+                        transferMachineName = transferDestinations.singleOrNull()?.name
+                            ?: "其他机台",
                         transferUnavailableReason = transferUnavailableReason,
                         onDismiss = { selectedPosition = null },
                         onRegistrationClick = { registrationKey ->
@@ -4679,7 +4899,8 @@ internal fun RegistrationApp() {
                         },
                         onFinishRound = {
                             selectedPosition = null
-                            finishConfirmation = selection.machineId
+                            finishConfirmation =
+                                queueOperationConfirmation(selection.machineId)
                         },
                         onReturnToWaitingFront = {
                             returnPlayingTarget = selection
@@ -4694,7 +4915,8 @@ internal fun RegistrationApp() {
                                 QueueAction.EnterPlayingPosition(selection.machineId.name)
                             )
                             if (roundPlan.impact.requiresConfirmation) {
-                                enterPlayingConfirmation = selection.machineId
+                                enterPlayingConfirmation =
+                                    queueOperationConfirmation(selection.machineId)
                             } else {
                                 updateQueueByPlan(
                                     plan = roundPlan,
@@ -4713,7 +4935,9 @@ internal fun RegistrationApp() {
                                 confirmationSnapshots = currentQueue
                                     .registrationConfirmationSnapshots(
                                         selection.registrationKeys
-                                    )
+                                    ),
+                                destinationMachineId = transferDestinations
+                                    .singleOrNull()?.machineId
                             )
                             selectedPosition = null
                         },
@@ -4946,8 +5170,6 @@ internal fun RegistrationApp() {
 
                 machineTransferTarget?.let { request ->
                     val sourceQueue = queueFor(request.sourceMachineId)
-                    val destinationMachineId = otherMachine(request.sourceMachineId)
-                    val destinationQueue = queueFor(destinationMachineId)
                     val requestedKeys = request.registrationKeys.toSet()
                     val registrations = sourceQueue.allRegistrations
                         .filter { it.key in requestedKeys }
@@ -4958,41 +5180,74 @@ internal fun RegistrationApp() {
                             request.confirmationSnapshots
                         )
                     if (sourcePositionStillMatches && sourceStateStillMatches) {
-                        val transferUnavailableReason = when {
+                        val sourceUnavailableReason = when {
                             requestedKeys.isEmpty() || registrations.size != requestedKeys.size ->
                                 "待转移的登记已经发生变化，请关闭窗口后重试。"
                             !statusFor(request.sourceMachineId).isOperational ->
                                 "${configuredMachineName(request.sourceMachineId)} 已停止使用，暂时不能转出。"
                             sourceQueue.playing.any { it.key in requestedKeys } ->
                                 "登记已经进入${playingPositionName(request.sourceMachineId)}，不能转移。"
-                            else -> machineTransferUnavailableReason(
-                                machineName = configuredMachineName(destinationMachineId),
-                                status = statusFor(destinationMachineId),
-                                queue = destinationQueue,
-                                incomingRegistrationCount = registrations.size
-                            )
+                            else -> null
                         }
-                        MachineTransferConfirmation(
-                            registrations = registrations,
-                            sourceMachineName = configuredMachineName(request.sourceMachineId),
-                            destinationMachineName = configuredMachineName(destinationMachineId),
-                            sourcePlayingPositionLabel = playingPositionName(request.sourceMachineId),
-                            leavingPlayingPosition = sourceQueue.playing
-                                .any { it.key in request.registrationKeys },
-                            transferUnavailableReason = transferUnavailableReason,
-                            onDismiss = { machineTransferTarget = null },
-                            onConfirm = {
-                                if (!transferRegistrations(request)) {
-                                    showHomeOperationFeedback(
-                                        title = "切换机台未执行",
-                                        detail = "原位置、登记状态或目标机台状态已经变化，请核对当前队列后重试。",
-                                        contextLabel = configuredMachineName(request.sourceMachineId),
-                                        tone = HomeSidePanelFeedbackTone.WARNING
+                        val destinationMachineId = request.destinationMachineId
+                        if (destinationMachineId == null) {
+                            MachineTransferDestinationChooser(
+                                sourceMachineName = configuredMachineName(request.sourceMachineId),
+                                destinations = configuredMachines.filter {
+                                    it.machineId != request.sourceMachineId
+                                },
+                                incomingRegistrationCount = registrations.size,
+                                sourceUnavailableReason = sourceUnavailableReason,
+                                onDismiss = { machineTransferTarget = null },
+                                onSelect = { selectedDestination ->
+                                    machineTransferTarget = request.copy(
+                                        destinationMachineId = selectedDestination
                                     )
                                 }
+                            )
+                        } else if (
+                            destinationMachineId in configuredMachineIds &&
+                            destinationMachineId != request.sourceMachineId
+                        ) {
+                            val transferUnavailableReason = sourceUnavailableReason
+                                ?: machineTransferUnavailableReason(
+                                    machineName = configuredMachineName(destinationMachineId),
+                                    status = statusFor(destinationMachineId),
+                                    queue = queueFor(destinationMachineId),
+                                    incomingRegistrationCount = registrations.size
+                                )
+                            MachineTransferConfirmation(
+                                registrations = registrations,
+                                sourceMachineName = configuredMachineName(request.sourceMachineId),
+                                destinationMachineName = configuredMachineName(destinationMachineId),
+                                sourcePlayingPositionLabel = playingPositionName(request.sourceMachineId),
+                                leavingPlayingPosition = sourceQueue.playing
+                                    .any { it.key in request.registrationKeys },
+                                transferUnavailableReason = transferUnavailableReason,
+                                onDismiss = { machineTransferTarget = null },
+                                onConfirm = {
+                                    if (!transferRegistrations(request)) {
+                                        showHomeOperationFeedback(
+                                            title = "切换机台未执行",
+                                            detail = "原位置、登记状态或目标机台状态已经变化，请核对当前队列后重试。",
+                                            contextLabel = configuredMachineName(request.sourceMachineId),
+                                            tone = HomeSidePanelFeedbackTone.WARNING
+                                        )
+                                    }
+                                    machineTransferTarget = null
+                                }
+                            )
+                        } else {
+                            LaunchedEffect(request, configuredMachineIds) {
                                 machineTransferTarget = null
+                                showHomeOperationFeedback(
+                                    title = "切换机台未执行",
+                                    detail = "目标机台已经不在当前配置中，请重新选择。",
+                                    contextLabel = configuredMachineName(request.sourceMachineId),
+                                    tone = HomeSidePanelFeedbackTone.WARNING
+                                )
                             }
-                        )
+                        }
                     } else {
                         LaunchedEffect(request, sourceQueue) {
                             machineTransferTarget = null
@@ -5405,8 +5660,9 @@ internal fun RegistrationApp() {
                     pendingQueueRestore?.let { savedState ->
                         QueueRestoreDialog(
                             savedState = savedState,
-                            machineAName = configuredMachineName(MachineId.A),
-                            machineBName = configuredMachineName(MachineId.B),
+                            machineNames = savedState.configuredMachineIds.associateWith(
+                                ::configuredMachineName
+                            ),
                             onRestore = { restorePreviousQueue(savedState) },
                             onStartNew = { startWithNewQueue(savedState) }
                         )
@@ -5436,20 +5692,23 @@ internal fun RegistrationApp() {
 @Composable
 private fun AuditLogScreen(
     logs: List<AuditLogEntry>,
-    machineAName: String,
-    machineBName: String,
+    machines: List<MachineDisplayState>,
     onBack: () -> Unit
 ) {
     BackHandler(onBack = onBack)
     var selectedCategory by remember { mutableStateOf<AuditLogCategory?>(null) }
     var selectedSource by remember { mutableStateOf<AuditLogSource?>(null) }
-    val filters: List<Pair<AuditLogCategory?, String>> = listOf(
-        null to "全部",
-        AuditLogCategory.MACHINE_A to machineAName,
-        AuditLogCategory.MACHINE_B to machineBName,
-        AuditLogCategory.SYSTEM to "系统",
-        AuditLogCategory.PLAYER_PROFILE to "玩家资料"
-    )
+    val machineNamesByCategory = machines.associate { machine ->
+        auditLogCategory(machine.machineId) to machine.name
+    }
+    val filters: List<Pair<AuditLogCategory?, String>> = buildList {
+        add(null to "全部")
+        machines.forEach { machine ->
+            add(auditLogCategory(machine.machineId) to machine.name)
+        }
+        add(AuditLogCategory.SYSTEM to "系统")
+        add(AuditLogCategory.PLAYER_PROFILE to "玩家资料")
+    }
     val sourceFilters: List<Pair<AuditLogSource?, String>> = listOf(
         null to "全部来源",
         AuditLogSource.ON_SITE_TERMINAL to "现场终端",
@@ -5558,8 +5817,7 @@ private fun AuditLogScreen(
                             entry = entry,
                             categoryLabel = auditLogCategoryLabel(
                                 entry.category,
-                                machineAName,
-                                machineBName
+                                machineNamesByCategory
                             )
                         )
                     }
@@ -5573,17 +5831,18 @@ private fun AuditLogScreen(
 private fun QueueRuleSettingsScreen(
     persistedSettings: QueueRuleSettings,
     cloudSyncAvailable: Boolean,
-    onSettingsChange: (QueueRuleSettings) -> Unit,
+    onSettingsChange: (QueueRuleSettings) -> Boolean,
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
     val hostActivity = context as? MainActivity
     var settings by remember(persistedSettings) { mutableStateOf(persistedSettings) }
-    var machineARemarkDraft by remember(persistedSettings.machineARemark) {
-        mutableStateOf(persistedSettings.machineARemark)
-    }
-    var machineBRemarkDraft by remember(persistedSettings.machineBRemark) {
-        mutableStateOf(persistedSettings.machineBRemark)
+    val machineRemarkDrafts = remember(persistedSettings.machineRemarks) {
+        mutableStateMapOf<MachineId, String>().apply {
+            MachineId.entries.forEach { machineId ->
+                put(machineId, persistedSettings.machineRemark(machineId))
+            }
+        }
     }
     var queueSyncEndpointDraft by remember(persistedSettings.queueSyncEndpoint) {
         mutableStateOf(persistedSettings.queueSyncEndpoint)
@@ -5597,9 +5856,12 @@ private fun QueueRuleSettingsScreen(
         settings = updatedSettings
         hostActivity?.recordUserInteraction()
     }
-    val normalizedMachineARemark = machineARemarkDraft.trim()
-    val normalizedMachineBRemark = machineBRemarkDraft.trim()
-    val remarksValid = normalizedMachineARemark.isNotBlank() && normalizedMachineBRemark.isNotBlank()
+    val normalizedMachineRemarks = MachineId.entries.associateWith { machineId ->
+        machineRemarkDrafts[machineId].orEmpty().trim()
+    }
+    val remarksValid = settings.configuredMachineIds.all { machineId ->
+        normalizedMachineRemarks.getValue(machineId).isNotBlank()
+    }
     val normalizedQueueSyncEndpointDraft = normalizeQueueSyncEndpoint(queueSyncEndpointDraft)
     val normalizedQueueSyncTokenDraft = queueSyncTokenDraft.trim()
     val queueSyncEndpointValid = normalizedQueueSyncEndpointDraft != null
@@ -5610,8 +5872,7 @@ private fun QueueRuleSettingsScreen(
         normalizedQueueSyncEndpointDraft != persistedSettings.queueSyncEndpoint ||
             normalizedQueueSyncTokenDraft != persistedSettings.queueSyncToken
     val settingsToSave = settings.copy(
-        machineARemark = normalizedMachineARemark,
-        machineBRemark = normalizedMachineBRemark,
+        machineRemarks = settings.machineRemarks + normalizedMachineRemarks,
         queueSyncEndpoint = normalizedQueueSyncEndpointDraft ?: queueSyncEndpointDraft.trim(),
         queueSyncToken = normalizedQueueSyncTokenDraft
     )
@@ -5642,9 +5903,9 @@ private fun QueueRuleSettingsScreen(
             Spacer(Modifier.height(6.dp))
             Text(
                 if (cloudSyncAvailable) {
-                    "调整网站同步、排队规则和首页机台备注。机台 A 与机台 B 是固定标识，不能修改。"
+                    "调整网站同步、排队规则和首页机台。机台 A 至 D 是固定标识，不能修改。"
                 } else {
-                    "调整排队规则和首页机台备注。机台 A 与机台 B 是固定标识，不能修改。"
+                    "调整排队规则和首页机台。机台 A 至 D 是固定标识，不能修改。"
                 },
                 color = SecondaryText,
                 fontSize = 12.sp,
@@ -5988,31 +6249,41 @@ private fun QueueRuleSettingsScreen(
                 HorizontalDivider(color = Separator.copy(alpha = .72f))
                 Column(Modifier.fillMaxWidth().padding(16.dp)) {
                 Text(
-                    "备注用于帮助玩家辨认机台的现场位置，固定标识“机台 A”和“机台 B”始终保留。",
+                    "选择现场使用的机台数量。机台标识按 A、B、C、D 连续启用，备注用于帮助玩家辨认现场位置。",
                     color = SecondaryText,
                     fontSize = 11.sp,
                     lineHeight = 16.sp
                 )
+                Spacer(Modifier.height(12.dp))
+                MachineCountSelector(
+                    selectedCount = settings.configuredMachineCount,
+                    onSelect = { count ->
+                        updateDraft(settings.copy(configuredMachineCount = count))
+                    }
+                )
                 Spacer(Modifier.height(14.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    MachineRemarkField(
-                        machineLabel = "机台 A",
-                        value = machineARemarkDraft,
-                        onValueChange = {
-                            machineARemarkDraft = limitMachineRemarkLength(it)
-                            hostActivity?.recordUserInteraction()
-                        },
-                        modifier = Modifier.weight(1f)
-                    )
-                    MachineRemarkField(
-                        machineLabel = "机台 B",
-                        value = machineBRemarkDraft,
-                        onValueChange = {
-                            machineBRemarkDraft = limitMachineRemarkLength(it)
-                            hostActivity?.recordUserInteraction()
-                        },
-                        modifier = Modifier.weight(1f)
-                    )
+                settings.configuredMachineIds.chunked(2).forEachIndexed { rowIndex, rowIds ->
+                    if (rowIndex > 0) Spacer(Modifier.height(10.dp))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        rowIds.forEach { machineId ->
+                            MachineRemarkField(
+                                machineLabel = "机台 ${machineId.name}",
+                                value = machineRemarkDrafts[machineId].orEmpty(),
+                                onValueChange = {
+                                    machineRemarkDrafts[machineId] =
+                                        limitMachineRemarkLength(it)
+                                    hostActivity?.recordUserInteraction()
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        if (rowIds.size == 1 && settings.configuredMachineIds.size > 1) {
+                            Spacer(Modifier.weight(1f))
+                        }
+                    }
                 }
                 }
             }
@@ -6020,19 +6291,20 @@ private fun QueueRuleSettingsScreen(
             PrimaryButton(
                 text = "保存设置",
                 onClick = {
-                    onSettingsChange(settingsToSave)
-                    Toast.makeText(
-                        context,
-                        panguSpacing("应用设置已保存。"),
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    onBack()
+                    if (onSettingsChange(settingsToSave)) {
+                        Toast.makeText(
+                            context,
+                            panguSpacing("应用设置已保存。"),
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        onBack()
+                    }
                 },
                 modifier = Modifier.fillMaxWidth(),
                 enabled = settingsChanged && settingsValid,
                 disabledReason = when {
                     !settingsChanged -> "当前没有未保存的设置。"
-                    !remarksValid -> "请填写两台机台的备注。"
+                    !remarksValid -> "请填写所有已启用机台的备注。"
                     !connectionChangeValid -> "请填写有效的队列 API 地址和终端同步令牌。"
                     else -> "开启网站同步前，请先填写有效的服务器连接。"
                 }
@@ -6041,7 +6313,7 @@ private fun QueueRuleSettingsScreen(
                 Spacer(Modifier.height(7.dp))
                 Text(
                     when {
-                        !remarksValid -> "请填写两台机台的备注。"
+                        !remarksValid -> "请填写所有已启用机台的备注。"
                         !connectionChangeValid -> "请填写有效的队列 API 地址和终端同步令牌。"
                         else -> "开启网站同步前，请先填写有效的服务器连接。"
                     },
@@ -6149,6 +6421,44 @@ private fun queueSyncModeLabel(mode: QueueSyncMode): String = when (mode) {
     QueueSyncMode.UNSPECIFIED -> "沿用当前身份"
     QueueSyncMode.TEST -> "测试同步"
     QueueSyncMode.TAKEOVER -> "接管同步"
+}
+
+@Composable
+private fun MachineCountSelector(
+    selectedCount: Int,
+    onSelect: (Int) -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth().height(44.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(PageBackground)
+            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(8.dp))
+            .padding(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
+        (1..MachineId.entries.size).forEach { count ->
+            val selected = selectedCount == count
+            Box(
+                Modifier.weight(1f).fillMaxHeight()
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(if (selected) CardBackground else Color.Transparent)
+                    .border(
+                        1.dp,
+                        if (selected) Separator.copy(alpha = .9f) else Color.Transparent,
+                        RoundedCornerShape(6.dp)
+                    )
+                    .clickable(enabled = !selected) { onSelect(count) },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    "$count 台",
+                    color = if (selected) PrimaryText else SecondaryText,
+                    fontSize = 12.sp,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                )
+            }
+        }
+    }
 }
 
 @Composable
@@ -6320,6 +6630,8 @@ private fun AuditLogRow(entry: AuditLogEntry, categoryLabel: String) {
     val (categoryBackground, categoryForeground) = when (entry.category) {
         AuditLogCategory.MACHINE_A -> SoftBlue to SystemBlue
         AuditLogCategory.MACHINE_B -> Color(0xFFEAF8EF) to Color(0xFF248A4B)
+        AuditLogCategory.MACHINE_C -> Color(0xFFFFF4E5) to Color(0xFF9A5A00)
+        AuditLogCategory.MACHINE_D -> Color(0xFFF4EEFF) to Color(0xFF7444A8)
         AuditLogCategory.SYSTEM -> Color(0xFFEEEEF0) to SecondaryText
         AuditLogCategory.PLAYER_PROFILE -> Color(0xFFFFEDF3) to Color(0xFFC02D62)
     }
@@ -6383,13 +6695,31 @@ private fun AuditLogRow(entry: AuditLogEntry, categoryLabel: String) {
 
 private fun auditLogCategoryLabel(
     category: AuditLogCategory,
-    machineAName: String,
-    machineBName: String
+    machineNamesByCategory: Map<AuditLogCategory, String>
 ): String = when (category) {
-    AuditLogCategory.MACHINE_A -> machineAName
-    AuditLogCategory.MACHINE_B -> machineBName
+    AuditLogCategory.MACHINE_A,
+    AuditLogCategory.MACHINE_B,
+    AuditLogCategory.MACHINE_C,
+    AuditLogCategory.MACHINE_D -> machineNamesByCategory[category]
+        ?: "机台 ${machineIdForAuditLogCategory(category)?.name.orEmpty()}"
     AuditLogCategory.SYSTEM -> "系统"
     AuditLogCategory.PLAYER_PROFILE -> "玩家资料"
+}
+
+private fun auditLogCategory(machineId: MachineId): AuditLogCategory = when (machineId) {
+    MachineId.A -> AuditLogCategory.MACHINE_A
+    MachineId.B -> AuditLogCategory.MACHINE_B
+    MachineId.C -> AuditLogCategory.MACHINE_C
+    MachineId.D -> AuditLogCategory.MACHINE_D
+}
+
+private fun machineIdForAuditLogCategory(category: AuditLogCategory): MachineId? = when (category) {
+    AuditLogCategory.MACHINE_A -> MachineId.A
+    AuditLogCategory.MACHINE_B -> MachineId.B
+    AuditLogCategory.MACHINE_C -> MachineId.C
+    AuditLogCategory.MACHINE_D -> MachineId.D
+    AuditLogCategory.SYSTEM,
+    AuditLogCategory.PLAYER_PROFILE -> null
 }
 
 private fun auditLogSourceLabel(source: AuditLogSource): String = when (source) {
@@ -6423,12 +6753,7 @@ private fun formatAuditLogTimestamp(timestampMillis: Long): String =
 
 @Composable
 private fun HomeScreen(
-    machineA: MachineQueue,
-    machineB: MachineQueue,
-    machineAStatus: MachineStatus,
-    machineBStatus: MachineStatus,
-    machineARemark: String,
-    machineBRemark: String,
+    machines: List<MachineDisplayState>,
     registrationOpen: Boolean,
     acceptingNewRegistrations: Boolean,
     businessHoursStatus: BusinessHoursStatus,
@@ -6462,11 +6787,13 @@ private fun HomeScreen(
     onPositionClick: (PositionSelection) -> Unit,
     onPositionReorderRequest: (MachineId, MachineQueue, Int, Int) -> Unit
 ) {
-    val isEmpty = machineA.registrationCount == 0 && machineB.registrationCount == 0
-    val hasStoppedMachine = !machineAStatus.isOperational || !machineBStatus.isOperational
+    val isEmpty = machines.all { it.queue.registrationCount == 0 }
+    val hasStoppedMachine = machines.any { !it.status.isOperational }
     val nowMillis = rememberCurrentTimeMillis()
     val completedRegistration = highlightedRegistration?.let { highlight ->
-        val queue = if (highlight.machineId == MachineId.A) machineA else machineB
+        val machine = machines.firstOrNull { it.machineId == highlight.machineId }
+            ?: return@let null
+        val queue = machine.queue
         val registration = queue.allRegistrations
             .firstOrNull { it.key == highlight.registrationKey }
         val positionLabel = queue.registrationPositionName(
@@ -6479,10 +6806,7 @@ private fun HomeScreen(
                 machineId = highlight.machineId,
                 registrationKey = highlight.registrationKey,
                 displayId = registration.displayId,
-                machineName = machineName(
-                    highlight.machineId,
-                    if (highlight.machineId == MachineId.A) machineARemark else machineBRemark
-                ),
+                machineName = machine.name,
                 positionLabel = positionLabel,
                 isPlaying = queue.playing.any { it.key == highlight.registrationKey },
                 requiresOnSiteCheckIn = registration.requiresOnSiteCheckIn
@@ -6492,6 +6816,10 @@ private fun HomeScreen(
         }
     }
     var cloudSyncInfoVisible by remember { mutableStateOf(false) }
+    val machineLaneScrollState = rememberScrollState()
+    LaunchedEffect(queueScrollResetToken) {
+        if (machineLaneScrollState.value != 0) machineLaneScrollState.animateScrollTo(0)
+    }
     val hasTransientSidePanelContent = completedRegistration != null ||
         homeSidePanelFeedback != null || queueUndoAction != null
     Box(Modifier.fillMaxSize()) {
@@ -6500,7 +6828,8 @@ private fun HomeScreen(
                 nowMillis = nowMillis,
                 registrationOpen = registrationOpen,
                 outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
-                totalRegistrationCount = machineA.registrationCount + machineB.registrationCount,
+                machineCount = machines.size,
+                totalRegistrationCount = machines.sumOf { it.queue.registrationCount },
                 cloudSyncStatus = cloudSyncStatus,
                 onCloudSyncClick = { cloudSyncInfoVisible = true },
                 onMore = onMore
@@ -6528,86 +6857,74 @@ private fun HomeScreen(
                 )
             } else {
                 Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(18.dp)) {
-                    Column(Modifier.weight(1.9f).fillMaxHeight()) {
-                        MachineLane(
-                            machineId = MachineId.A,
-                            remark = machineARemark,
-                            queue = machineA,
-                            status = machineAStatus,
-                            registrationOpen = registrationOpen,
-                            acceptingNewRegistrations = acceptingNewRegistrations,
-                            businessHoursClosingSoon = businessHoursStatus.closingSoon,
-                            businessHoursClosingGrace = closingGracePeriod,
-                            showCommonPlayPreview = showCommonPlayPreview,
-                            nowMillis = nowMillis,
-                            inlineReorderSession = inlineReorderSession?.takeIf { it.machineId == MachineId.A },
-                            inlineReorderResetToken = inlineReorderResetToken,
-                            positionReorderResetToken = positionReorderResetToken,
-                            queueScrollResetToken = queueScrollResetToken,
-                            highlightedRegistrationKey = highlightedRegistration
-                                ?.takeIf { it.machineId == MachineId.A }
-                                ?.registrationKey,
-                            onInlineReorderCancel = onInlineReorderCancel,
-                            onInlineReorderProposal = { originalQueue, proposed, movedKey ->
-                                onInlineReorderProposal(MachineId.A, originalQueue, proposed, movedKey)
-                            },
-                            onFinishRequest = { onFinishRequest(MachineId.A) },
-                            onEnterPlaying = { onEnterPlaying(MachineId.A) },
-                            onRestore = { onRestoreMachine(MachineId.A) },
-                            onJoinThisMachine = { onJoinMachine(MachineId.A) },
-                            onRegistrationClick = { onRegistrationClick(MachineId.A, it) },
-                            onRegistrationLongPress = { onRegistrationLongPress(MachineId.A, it) },
-                            onPositionClick = onPositionClick,
-                            onPositionReorderRequest = { queue, sourceIndex, destinationIndex ->
-                                onPositionReorderRequest(MachineId.A, queue, sourceIndex, destinationIndex)
-                            },
-                            modifier = Modifier.weight(1f)
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        HorizontalDivider(color = Separator.copy(alpha = .64f))
-                        Spacer(Modifier.height(6.dp))
-                        MachineLane(
-                            machineId = MachineId.B,
-                            remark = machineBRemark,
-                            queue = machineB,
-                            status = machineBStatus,
-                            registrationOpen = registrationOpen,
-                            acceptingNewRegistrations = acceptingNewRegistrations,
-                            businessHoursClosingSoon = businessHoursStatus.closingSoon,
-                            businessHoursClosingGrace = closingGracePeriod,
-                            showCommonPlayPreview = showCommonPlayPreview,
-                            nowMillis = nowMillis,
-                            inlineReorderSession = inlineReorderSession?.takeIf { it.machineId == MachineId.B },
-                            inlineReorderResetToken = inlineReorderResetToken,
-                            positionReorderResetToken = positionReorderResetToken,
-                            queueScrollResetToken = queueScrollResetToken,
-                            highlightedRegistrationKey = highlightedRegistration
-                                ?.takeIf { it.machineId == MachineId.B }
-                                ?.registrationKey,
-                            onInlineReorderCancel = onInlineReorderCancel,
-                            onInlineReorderProposal = { originalQueue, proposed, movedKey ->
-                                onInlineReorderProposal(MachineId.B, originalQueue, proposed, movedKey)
-                            },
-                            onFinishRequest = { onFinishRequest(MachineId.B) },
-                            onEnterPlaying = { onEnterPlaying(MachineId.B) },
-                            onRestore = { onRestoreMachine(MachineId.B) },
-                            onJoinThisMachine = { onJoinMachine(MachineId.B) },
-                            onRegistrationClick = { onRegistrationClick(MachineId.B, it) },
-                            onRegistrationLongPress = { onRegistrationLongPress(MachineId.B, it) },
-                            onPositionClick = onPositionClick,
-                            onPositionReorderRequest = { queue, sourceIndex, destinationIndex ->
-                                onPositionReorderRequest(MachineId.B, queue, sourceIndex, destinationIndex)
-                            },
-                            modifier = Modifier.weight(1f)
-                        )
+                    val laneColumnModifier = Modifier.weight(1.9f).fillMaxHeight().let {
+                        if (machines.size > 2) it.verticalScroll(machineLaneScrollState) else it
+                    }
+                    Column(
+                        laneColumnModifier
+                    ) {
+                        machines.forEachIndexed { index, machine ->
+                            val machineId = machine.machineId
+                            MachineLane(
+                                machineId = machineId,
+                                remark = machine.remark,
+                                queue = machine.queue,
+                                status = machine.status,
+                                registrationOpen = registrationOpen,
+                                acceptingNewRegistrations = acceptingNewRegistrations,
+                                businessHoursClosingSoon = businessHoursStatus.closingSoon,
+                                businessHoursClosingGrace = closingGracePeriod,
+                                showCommonPlayPreview = showCommonPlayPreview,
+                                nowMillis = nowMillis,
+                                inlineReorderSession = inlineReorderSession
+                                    ?.takeIf { it.machineId == machineId },
+                                inlineReorderResetToken = inlineReorderResetToken,
+                                positionReorderResetToken = positionReorderResetToken,
+                                queueScrollResetToken = queueScrollResetToken,
+                                highlightedRegistrationKey = highlightedRegistration
+                                    ?.takeIf { it.machineId == machineId }
+                                    ?.registrationKey,
+                                onInlineReorderCancel = onInlineReorderCancel,
+                                onInlineReorderProposal = { originalQueue, proposed, movedKey ->
+                                    onInlineReorderProposal(
+                                        machineId,
+                                        originalQueue,
+                                        proposed,
+                                        movedKey
+                                    )
+                                },
+                                onFinishRequest = { onFinishRequest(machineId) },
+                                onEnterPlaying = { onEnterPlaying(machineId) },
+                                onRestore = { onRestoreMachine(machineId) },
+                                onJoinThisMachine = { onJoinMachine(machineId) },
+                                onRegistrationClick = { onRegistrationClick(machineId, it) },
+                                onRegistrationLongPress = {
+                                    onRegistrationLongPress(machineId, it)
+                                },
+                                onPositionClick = onPositionClick,
+                                onPositionReorderRequest = { queue, sourceIndex, destinationIndex ->
+                                    onPositionReorderRequest(
+                                        machineId,
+                                        queue,
+                                        sourceIndex,
+                                        destinationIndex
+                                    )
+                                },
+                                modifier = if (machines.size > 2) {
+                                    Modifier.height(206.dp)
+                                } else {
+                                    Modifier.weight(1f)
+                                }
+                            )
+                            if (index < machines.lastIndex) {
+                                Spacer(Modifier.height(6.dp))
+                                HorizontalDivider(color = Separator.copy(alpha = .64f))
+                                Spacer(Modifier.height(6.dp))
+                            }
+                        }
                     }
                     HomeSidePanel(
-                        machineA = machineA,
-                        machineB = machineB,
-                        machineAStatus = machineAStatus,
-                        machineBStatus = machineBStatus,
-                        machineAName = machineName(MachineId.A, machineARemark),
-                        machineBName = machineName(MachineId.B, machineBRemark),
+                        machines = machines,
                         nowMillis = nowMillis,
                         registrationOpen = registrationOpen,
                         acceptingNewRegistrations = acceptingNewRegistrations,
@@ -6641,6 +6958,7 @@ private fun AppHeader(
     nowMillis: Long,
     registrationOpen: Boolean,
     outsideBusinessHours: Boolean,
+    machineCount: Int,
     totalRegistrationCount: Int,
     cloudSyncStatus: QueueCloudSyncStatus?,
     onCloudSyncClick: () -> Unit,
@@ -6656,7 +6974,11 @@ private fun AppHeader(
         Column {
             Text("排队登记", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("两台机台的登记顺序彼此独立", color = SecondaryText, fontSize = 13.sp)
+                Text(
+                    if (machineCount == 1) "当前使用 1 台机台" else "$machineCount 台机台的登记顺序彼此独立",
+                    color = SecondaryText,
+                    fontSize = 13.sp
+                )
                 Text(" · ", color = TertiaryText, fontSize = 13.sp)
                 Text(
                     "当前共 $totalRegistrationCount 个登记",
@@ -6777,7 +7099,7 @@ private fun EmptyHome(
                     "当前不在营业时间，登记排队已由现场手动开启。"
                 }
             } else {
-                "两台机台都没有正在等待的玩家。"
+                "所有机台都没有正在等待的玩家。"
             },
             SecondaryText,
             16.sp
@@ -7145,6 +7467,31 @@ private fun MachineLane(
                         }
                     }
 
+                    fun finishPositionDrag(positionKey: String) {
+                        val originalIndex = draggedOriginalIndex
+                        val destinationIndex = visualWaitingPositions.indexOfFirst {
+                            waitingPositionKey(it.registrations) == positionKey
+                        }
+                        val validDrop = originalIndex != null &&
+                            destinationIndex >= 0 &&
+                            destinationIndex != originalIndex
+
+                        edgeScrollPerFramePx = 0f
+                        draggedPositionKey = null
+                        draggedOriginalIndex = null
+                        positionDragOffset = Offset.Zero
+                        dragPointerInRoot = null
+                        if (validDrop) {
+                            onPositionReorderRequest(
+                                displayedQueue,
+                                originalIndex,
+                                destinationIndex
+                            )
+                        } else {
+                            restoreWaitingPositionOrder()
+                        }
+                    }
+
                     LaunchedEffect(positionReorderResetToken, waitingPositionSignature) {
                         if (draggedPositionKey == null) {
                             restoreWaitingPositionOrder()
@@ -7263,38 +7610,11 @@ private fun MachineLane(
                                     reorderDraggedPosition()
                                     updatePositionEdgeScroll()
                                 },
-                                onPositionDragEnd = {
-                                    val originalIndex = draggedOriginalIndex
-                                    val destinationIndex = visualWaitingPositions.indexOfFirst {
-                                        waitingPositionKey(it.registrations) == positionKey
-                                    }
-                                    val validDrop = originalIndex != null &&
-                                        destinationIndex >= 0 &&
-                                        destinationIndex != originalIndex
-
-                                    edgeScrollPerFramePx = 0f
-                                    draggedPositionKey = null
-                                    draggedOriginalIndex = null
-                                    positionDragOffset = Offset.Zero
-                                    dragPointerInRoot = null
-                                    if (validDrop) {
-                                        onPositionReorderRequest(
-                                            displayedQueue,
-                                            originalIndex,
-                                            destinationIndex
-                                        )
-                                    } else {
-                                        restoreWaitingPositionOrder()
-                                    }
-                                },
-                                onPositionDragCancel = {
-                                    edgeScrollPerFramePx = 0f
-                                    draggedPositionKey = null
-                                    draggedOriginalIndex = null
-                                    positionDragOffset = Offset.Zero
-                                    dragPointerInRoot = null
-                                    restoreWaitingPositionOrder()
-                                },
+                                onPositionDragEnd = { finishPositionDrag(positionKey) },
+                                // A lazy item can be disposed when the pointer moves beyond the
+                                // viewport. Treat that cancellation like a release so a valid
+                                // placement still reaches the existing confirmation flow.
+                                onPositionDragCancel = { finishPositionDrag(positionKey) },
                                 onRegistrationClick = onRegistrationClick,
                                 onRegistrationLongPress = onRegistrationLongPress,
                                 onPositionClick = {
@@ -7409,6 +7729,18 @@ private fun InlineReorderContent(
         registrationDragOffset = registrationDragOffset.copy(x = update.remainingOffset)
     }
 
+    fun finishRegistrationDrag(movedKey: Int) {
+        edgeScrollPerFramePx = 0f
+        draggedKey = null
+        dragStartOrder = null
+        registrationDragOffset = Offset.Zero
+        dragPointerInRoot = null
+        val proposedOrder = registrations.toList()
+        if (hasRegistrationOrderChanged(originalOrder, proposedOrder)) {
+            onProposal(initialQueue, proposedOrder, movedKey)
+        }
+    }
+
     LaunchedEffect(initialQueue, initialRegistrationKey) {
         delay(850L)
         highlightedKey = null
@@ -7485,29 +7817,8 @@ private fun InlineReorderContent(
                     reorderDraggedRegistration()
                     updateEdgeScroll()
                 },
-                onDragEnd = {
-                    edgeScrollPerFramePx = 0f
-                    draggedKey = null
-                    dragStartOrder = null
-                    registrationDragOffset = Offset.Zero
-                    dragPointerInRoot = null
-                    val proposedOrder = registrations.toList()
-                    if (hasRegistrationOrderChanged(originalOrder, proposedOrder)) {
-                        onProposal(initialQueue, proposedOrder, registration.key)
-                    }
-                },
-                onDragCancel = {
-                    val orderToRestore = dragStartOrder
-                    edgeScrollPerFramePx = 0f
-                    draggedKey = null
-                    dragStartOrder = null
-                    registrationDragOffset = Offset.Zero
-                    dragPointerInRoot = null
-                    if (orderToRestore != null) {
-                        registrations.clear()
-                        registrations.addAll(orderToRestore)
-                    }
-                }
+                onDragEnd = { finishRegistrationDrag(registration.key) },
+                onDragCancel = { finishRegistrationDrag(registration.key) }
             )
         }
     }
@@ -8063,12 +8374,7 @@ private sealed interface HomeSidePanelContent {
 
 @Composable
 private fun HomeSidePanel(
-    machineA: MachineQueue,
-    machineB: MachineQueue,
-    machineAStatus: MachineStatus,
-    machineBStatus: MachineStatus,
-    machineAName: String,
-    machineBName: String,
+    machines: List<MachineDisplayState>,
     nowMillis: Long,
     registrationOpen: Boolean,
     acceptingNewRegistrations: Boolean,
@@ -8085,14 +8391,15 @@ private fun HomeSidePanel(
     onBatch: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val machineAJoinable = machineAStatus.isOperational && machineA.registrationCount < 20
-    val machineBJoinable = machineBStatus.isOperational && machineB.registrationCount < 20
-    val joiningEnabled = acceptingNewRegistrations && (machineAJoinable || machineBJoinable)
+    val joinableMachines = machines.filter {
+        it.status.isOperational && it.queue.registrationCount < 20
+    }
+    val joiningEnabled = acceptingNewRegistrations && joinableMachines.isNotEmpty()
     val joiningDisabledReason = when {
         closingGracePeriod -> "闭店收尾期间不再接收新的排队登记。"
         !registrationOpen -> "当前未启用登记排队，请按照现场顺序排队。"
-        !machineAStatus.isOperational && !machineBStatus.isOperational -> "两台机台均已停止使用。"
-        !machineAJoinable && !machineBJoinable -> "两台机台的登记均已达到上限。"
+        machines.all { !it.status.isOperational } -> "所有机台均已停止使用。"
+        joinableMachines.isEmpty() -> "所有机台的登记均已达到上限。"
         else -> "当前暂不接收新的排队登记。"
     }
     val panelContent = when {
@@ -8164,12 +8471,7 @@ private fun HomeSidePanel(
                 )
 
                 HomeSidePanelContent.Join -> JoinPanelContent(
-                    machineA = machineA,
-                    machineB = machineB,
-                    machineAStatus = machineAStatus,
-                    machineBStatus = machineBStatus,
-                    machineAName = machineAName,
-                    machineBName = machineBName,
+                    machines = machines,
                     nowMillis = nowMillis,
                     registrationOpen = registrationOpen,
                     acceptingNewRegistrations = acceptingNewRegistrations,
@@ -8428,12 +8730,7 @@ private fun HomeSidePanelCloseButton(
 
 @Composable
 private fun JoinPanelContent(
-    machineA: MachineQueue,
-    machineB: MachineQueue,
-    machineAStatus: MachineStatus,
-    machineBStatus: MachineStatus,
-    machineAName: String,
-    machineBName: String,
+    machines: List<MachineDisplayState>,
     nowMillis: Long,
     registrationOpen: Boolean,
     acceptingNewRegistrations: Boolean,
@@ -8444,8 +8741,9 @@ private fun JoinPanelContent(
     onBatch: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val machineAJoinable = machineAStatus.isOperational && machineA.registrationCount < 20
-    val machineBJoinable = machineBStatus.isOperational && machineB.registrationCount < 20
+    val joinableMachines = machines.filter {
+        it.status.isOperational && it.queue.registrationCount < 20
+    }
     Column(
         modifier.padding(horizontal = 22.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.Center
@@ -8456,8 +8754,8 @@ private fun JoinPanelContent(
             when {
                 closingGracePeriod -> "今日营业时间已结束，收尾期间不再接收新的排队登记。"
                 !registrationOpen -> "当前未使用登记排队，请在现场自然排队。"
-                !machineAStatus.isOperational && !machineBStatus.isOperational -> "两台机台均已停止使用。"
-                !machineAJoinable && !machineBJoinable -> "两台机台目前都无法接受新登记。"
+                machines.all { !it.status.isOperational } -> "所有机台均已停止使用。"
+                joinableMachines.isEmpty() -> "所有机台目前都无法接受新登记。"
                 else -> "创建你的登记并加入排队。"
             },
             color = SecondaryText,
@@ -8468,9 +8766,10 @@ private fun JoinPanelContent(
             Spacer(Modifier.height(17.dp))
             Text("新登记预计等待", color = TertiaryText, fontSize = 10.sp, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(7.dp))
-            JoinEstimateRow(machineAName, machineA, machineAStatus, nowMillis)
-            Spacer(Modifier.height(5.dp))
-            JoinEstimateRow(machineBName, machineB, machineBStatus, nowMillis)
+            machines.forEachIndexed { index, machine ->
+                if (index > 0) Spacer(Modifier.height(5.dp))
+                JoinEstimateRow(machine.name, machine.queue, machine.status, nowMillis)
+            }
         }
         Spacer(Modifier.height(22.dp))
         PrimaryButton(
@@ -8519,12 +8818,7 @@ private fun JoinEstimateRow(
 
 @Composable
 private fun MachineSelectionScreen(
-    machineA: MachineQueue,
-    machineB: MachineQueue,
-    machineAStatus: MachineStatus,
-    machineBStatus: MachineStatus,
-    machineAName: String,
-    machineBName: String,
+    machines: List<MachineDisplayState>,
     batch: Boolean,
     onBack: () -> Unit,
     onSelect: (MachineId) -> Unit
@@ -8533,24 +8827,30 @@ private fun MachineSelectionScreen(
         step = if (batch) "1 / 2" else "1 / 3",
         title = if (batch) "批量创建登记" else "选择机台",
         subtitle = if (batch) "选择要录入登记的机台。每一份登记仍然对应一名实际玩家。"
-        else "两台机台分别维护独立的登记顺序。",
+        else if (machines.size == 1) "当前使用 1 台机台。"
+        else "${machines.size} 台机台分别维护独立的登记顺序。",
         onBack = onBack
     ) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            MachineChoice(
-                machineAName,
-                machineA,
-                machineAStatus,
-                { onSelect(MachineId.A) },
-                Modifier.weight(1f)
-            )
-            MachineChoice(
-                machineBName,
-                machineB,
-                machineBStatus,
-                { onSelect(MachineId.B) },
-                Modifier.weight(1f)
-            )
+        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            machines.chunked(2).forEach { rowMachines ->
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    rowMachines.forEach { machine ->
+                        MachineChoice(
+                            machine.name,
+                            machine.queue,
+                            machine.status,
+                            { onSelect(machine.machineId) },
+                            Modifier.weight(1f)
+                        )
+                    }
+                    if (rowMachines.size == 1 && machines.size > 1) {
+                        Spacer(Modifier.weight(1f))
+                    }
+                }
+            }
         }
     }
 }
@@ -11309,6 +11609,51 @@ private fun EnterPlayingConfirmation(
 }
 
 @Composable
+private fun MachineTransferDestinationChooser(
+    sourceMachineName: String,
+    destinations: List<MachineDisplayState>,
+    incomingRegistrationCount: Int,
+    sourceUnavailableReason: String?,
+    onDismiss: () -> Unit,
+    onSelect: (MachineId) -> Unit
+) {
+    ModalSurface(onDismiss, width = 480.dp) {
+        Text("选择目标机台", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "选择要从 $sourceMachineName 转入的机台。确认目标后，还需要再次确认位置变化。",
+            color = SecondaryText,
+            fontSize = 12.sp,
+            lineHeight = 18.sp
+        )
+        Spacer(Modifier.height(16.dp))
+        if (destinations.isEmpty()) {
+            Text("当前没有其他已配置的机台。", color = Destructive, fontSize = 12.sp)
+        } else {
+            destinations.forEachIndexed { index, destination ->
+                if (index > 0) Spacer(Modifier.height(9.dp))
+                val unavailableReason = sourceUnavailableReason
+                    ?: machineTransferUnavailableReason(
+                        machineName = destination.name,
+                        status = destination.status,
+                        queue = destination.queue,
+                        incomingRegistrationCount = incomingRegistrationCount
+                    )
+                ActionRow(
+                    title = destination.name,
+                    description = unavailableReason
+                        ?: "转入后会加入这台机台的登记顺序末端。",
+                    enabled = unavailableReason == null,
+                    onClick = { onSelect(destination.machineId) }
+                )
+            }
+        }
+        Spacer(Modifier.height(13.dp))
+        CancelAction(onDismiss)
+    }
+}
+
+@Composable
 private fun MachineTransferConfirmation(
     registrations: List<Registration>,
     sourceMachineName: String,
@@ -12661,8 +13006,7 @@ private fun PlayerProfileWriteFailureDialog(detail: String, onDismiss: () -> Uni
 @Composable
 private fun QueueRestoreDialog(
     savedState: PersistedQueueState,
-    machineAName: String,
-    machineBName: String,
+    machineNames: Map<MachineId, String>,
     onRestore: () -> Unit,
     onStartNew: () -> Unit
 ) {
@@ -12701,17 +13045,24 @@ private fun QueueRestoreDialog(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(PageBackground)
                     .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(10.dp))
             ) {
-                QueueRestoreMachineRow(machineAName, savedState.machineA, savedState.machineAStatus)
-                HorizontalDivider(color = Separator.copy(alpha = .72f))
-                QueueRestoreMachineRow(machineBName, savedState.machineB, savedState.machineBStatus)
+                savedState.configuredMachineIds.forEachIndexed { index, machineId ->
+                    if (index > 0) HorizontalDivider(color = Separator.copy(alpha = .72f))
+                    val machine = savedState.machine(machineId)
+                    QueueRestoreMachineRow(
+                        machineNames[machineId] ?: "机台 ${machineId.name}",
+                        machine.queue,
+                        machine.status
+                    )
+                }
             }
             if (!savedState.registrationOpen) {
                 Spacer(Modifier.height(9.dp))
                 Text("上次退出时，登记排队处于关闭状态。", color = Color(0xFF9A5B00), fontSize = 11.sp)
             }
             if (
-                (savedState.machineAStatus.isOperational && savedState.machineA.playing.isNotEmpty()) ||
-                (savedState.machineBStatus.isOperational && savedState.machineB.playing.isNotEmpty())
+                savedState.machines.values.any {
+                    it.status.isOperational && it.queue.playing.isNotEmpty()
+                }
             ) {
                 Spacer(Modifier.height(9.dp))
                 Text(
@@ -12773,7 +13124,7 @@ private fun CloseRegistrationConfirmation(onDismiss: () -> Unit, onConfirm: () -
         Text("关闭登记排队？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
         Text(
-            "仅建议在无人排队，或现场已经能够自行辨认排队顺序时关闭。确认后将删除两台机台的全部登记，且无法恢复。",
+            "仅建议在无人排队，或现场已经能够自行辨认排队顺序时关闭。确认后将删除所有机台的全部登记，且无法恢复。",
             color = SecondaryText,
             fontSize = 13.sp,
             lineHeight = 20.sp
@@ -12864,7 +13215,7 @@ private fun AppDetailsDialog(
         AppDetailRow("构建编号", BuildConfig.VERSION_CODE.toString())
         Spacer(Modifier.height(15.dp))
         AppDetailSectionTitle("运行规格")
-        AppDetailRow("排队方式", "机台 A 与机台 B 独立排序")
+        AppDetailRow("排队方式", "各机台分别独立排序")
         HorizontalDivider(color = Separator.copy(alpha = .72f))
         AppDetailRow("单台上限", "20 个登记")
         HorizontalDivider(color = Separator.copy(alpha = .72f))
@@ -12899,6 +13250,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.8.0",
+            "机台扩展与拖动可靠性",
+            "机台数量现在可以连续配置为 1 至 4 台，网站、QQ Bot、日志与同步会随现场配置显示机台 A 至 D。进一步修复顺序调整时的跟手、避让和左侧边界行为；高风险确认会核对打开弹窗时的队列状态，避免现场变化后执行过期操作。旧版双机台数据会自动迁移，缩减机台前会保护仍有登记或处于停止使用状态的机台。"
+        ),
         Triple(
             "0.7.5",
             "拖动交互与跨端执行可靠性",
@@ -13348,10 +13704,7 @@ private fun AppDetailLinkRow(
 
 @Composable
 private fun StopMachineChooser(
-    machineAStatus: MachineStatus,
-    machineBStatus: MachineStatus,
-    machineAName: String,
-    machineBName: String,
+    machines: List<MachineDisplayState>,
     onDismiss: () -> Unit,
     onSelect: (MachineId) -> Unit
 ) {
@@ -13364,9 +13717,12 @@ private fun StopMachineChooser(
             fontSize = 12.sp
         )
         Spacer(Modifier.height(16.dp))
-        MachineStopChoice(machineAName, machineAStatus) { onSelect(MachineId.A) }
-        Spacer(Modifier.height(9.dp))
-        MachineStopChoice(machineBName, machineBStatus) { onSelect(MachineId.B) }
+        machines.forEachIndexed { index, machine ->
+            if (index > 0) Spacer(Modifier.height(9.dp))
+            MachineStopChoice(machine.name, machine.status) {
+                onSelect(machine.machineId)
+            }
+        }
         Spacer(Modifier.height(13.dp))
         CancelAction(onDismiss)
     }
@@ -13489,12 +13845,7 @@ private fun StopMachineReasonDialog(
 
 @Composable
 private fun EditMachineChooser(
-    machineA: MachineQueue,
-    machineB: MachineQueue,
-    machineAStatus: MachineStatus,
-    machineBStatus: MachineStatus,
-    machineAName: String,
-    machineBName: String,
+    machines: List<MachineDisplayState>,
     onDismiss: () -> Unit,
     onSelect: (MachineId) -> Unit
 ) {
@@ -13503,28 +13854,19 @@ private fun EditMachineChooser(
         Spacer(Modifier.height(6.dp))
         Text("选择需要调整的机台。", color = SecondaryText, fontSize = 12.sp)
         Spacer(Modifier.height(16.dp))
-        ActionRow(
-            machineAName,
-            when {
-                !machineAStatus.isOperational -> "这台机台已经停止使用。"
-                machineA.waiting.isEmpty() -> "当前没有可调整的等待登记。"
-                else -> "当前有 ${machineA.waiting.size} 份等待登记可以调整。"
-            },
-            enabled = machineAStatus.isOperational && machineA.waiting.isNotEmpty()
-        ) {
-            onSelect(MachineId.A)
-        }
-        Spacer(Modifier.height(9.dp))
-        ActionRow(
-            machineBName,
-            when {
-                !machineBStatus.isOperational -> "这台机台已经停止使用。"
-                machineB.waiting.isEmpty() -> "当前没有可调整的等待登记。"
-                else -> "当前有 ${machineB.waiting.size} 份等待登记可以调整。"
-            },
-            enabled = machineBStatus.isOperational && machineB.waiting.isNotEmpty()
-        ) {
-            onSelect(MachineId.B)
+        machines.forEachIndexed { index, machine ->
+            if (index > 0) Spacer(Modifier.height(9.dp))
+            ActionRow(
+                machine.name,
+                when {
+                    !machine.status.isOperational -> "这台机台已经停止使用。"
+                    machine.queue.waiting.isEmpty() -> "当前没有可调整的等待登记。"
+                    else -> "当前有 ${machine.queue.waiting.size} 份等待登记可以调整。"
+                },
+                enabled = machine.status.isOperational && machine.queue.waiting.isNotEmpty()
+            ) {
+                onSelect(machine.machineId)
+            }
         }
         Spacer(Modifier.height(13.dp))
         CancelAction(onDismiss)
@@ -13611,6 +13953,17 @@ private fun ReorderScreen(
             registrations.add(update.destinationIndex, registrations.removeAt(sourceIndex))
         }
         registrationDragOffset = registrationDragOffset.copy(y = update.remainingOffset)
+    }
+
+    fun finishRegistrationDrag(movedKey: Int) {
+        edgeScrollPerFramePx = 0f
+        draggedKey = null
+        dragStartOrder = null
+        registrationDragOffset = Offset.Zero
+        dragPointerInRoot = null
+        if (!explicitEditMode && hasRegistrationOrderChanged(originalOrder, registrations)) {
+            pendingMovedKey = movedKey
+        }
     }
 
     LaunchedEffect(draggedKey) {
@@ -13715,28 +14068,8 @@ private fun ReorderScreen(
                             reorderDraggedRegistration()
                             updateEdgeScroll()
                         },
-                        onDragEnd = {
-                            edgeScrollPerFramePx = 0f
-                            draggedKey = null
-                            dragStartOrder = null
-                            registrationDragOffset = Offset.Zero
-                            dragPointerInRoot = null
-                            if (!explicitEditMode && hasRegistrationOrderChanged(originalOrder, registrations)) {
-                                pendingMovedKey = registration.key
-                            }
-                        },
-                        onDragCancel = {
-                            val orderToRestore = dragStartOrder
-                            edgeScrollPerFramePx = 0f
-                            draggedKey = null
-                            dragStartOrder = null
-                            registrationDragOffset = Offset.Zero
-                            dragPointerInRoot = null
-                            if (orderToRestore != null) {
-                                registrations.clear()
-                                registrations.addAll(orderToRestore)
-                            }
-                        }
+                        onDragEnd = { finishRegistrationDrag(registration.key) },
+                        onDragCancel = { finishRegistrationDrag(registration.key) }
                     )
                 }
             }
@@ -14992,7 +15325,7 @@ private fun positionRelationshipDescriptions(
     return descriptions
 }
 
-private fun machineName(machineId: MachineId, remark: String): String =
+internal fun machineName(machineId: MachineId, remark: String): String =
     "$remark · 机台 ${machineId.name}"
 
 private fun MachineQueue.registrationPositionName(
@@ -15022,9 +15355,6 @@ private fun machineStopReasonLabel(
         ?: "其他原因"
     null -> "原因未记录"
 }
-
-private fun otherMachine(machineId: MachineId): MachineId =
-    if (machineId == MachineId.A) MachineId.B else MachineId.A
 
 private fun machineTransferUnavailableReason(
     machineName: String,

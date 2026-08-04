@@ -17,9 +17,12 @@ PUBLIC_SCHEMA_VERSION = 5
 SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4, 5}
 MAX_PAYLOAD_BYTES = 1024 * 1024
 MAX_REGISTRATIONS_PER_MACHINE = 20
+MAX_MACHINE_COUNT = 4
 MAX_PLAYER_PROFILES = 500
 MAX_EVENTS_PER_SNAPSHOT = 200
-MAX_PRIVATE_CONTACTS = MAX_REGISTRATIONS_PER_MACHINE * 2 + MAX_EVENTS_PER_SNAPSHOT * 2
+MAX_PRIVATE_CONTACTS = (
+    MAX_REGISTRATIONS_PER_MACHINE * MAX_MACHINE_COUNT + MAX_EVENTS_PER_SNAPSHOT * 2
+)
 MAX_STORED_EVENTS_PER_QUEUE = 2_000
 MAX_LOG_PAGE_SIZE = 100
 MAX_STOP_REASON_DETAIL_CHARACTERS = 40
@@ -63,7 +66,12 @@ TEST_SYNC_ENDED_DETAIL = "测试同步已经结束，这次修改没有执行，
 TERMINAL_INSTANCE_CONFLICT_DETAIL = "另一份终端实例正在同步，请关闭重复打开的应用后重试。"
 APPLIED_JOIN_SYNC_GUARD_SECONDS = 30
 SYNC_MODES = {"test", "takeover"}
-MACHINE_NAMES = {"A": "左侧 · 机台 A", "B": "右侧 · 机台 B"}
+MACHINE_NAMES = {
+    "A": "左侧 · 机台 A",
+    "B": "右侧 · 机台 B",
+    "C": "中间左侧 · 机台 C",
+    "D": "中间右侧 · 机台 D",
+}
 MAX_MACHINE_REMARK_CHARACTERS = 8
 PUBLIC_EVENT_TYPES = {
     "REGISTRATION_ADDED",
@@ -3861,8 +3869,12 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
     machines_source = payload.get("machines")
     if not isinstance(machines_source, dict):
         raise ValidationError("machines 必须是对象")
-    if not all(machine_id in machines_source for machine_id in MACHINE_NAMES):
-        raise ValidationError("必须同时提供机台 A 和机台 B")
+    configured_machine_ids = list(MACHINE_NAMES)[: len(machines_source)]
+    if (
+        not 1 <= len(machines_source) <= MAX_MACHINE_COUNT
+        or set(machines_source) != set(configured_machine_ids)
+    ):
+        raise ValidationError("机台必须按 A、B、C、D 的顺序连续配置 1 至 4 台")
 
     machines = {
         machine_id: normalize_machine(
@@ -3870,7 +3882,7 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
             machines_source[machine_id],
             allow_custom_name=schema_version >= 2,
         )
-        for machine_id in MACHINE_NAMES
+        for machine_id in configured_machine_ids
     }
     registration_ids = [
         registration["registration_id"]

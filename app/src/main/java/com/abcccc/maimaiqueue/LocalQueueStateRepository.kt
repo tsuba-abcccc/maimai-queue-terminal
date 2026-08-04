@@ -20,31 +20,74 @@ enum class QueueStateSaveResult {
     FAILED
 }
 
+data class PersistedMachineState(
+    val queue: MachineQueue = MachineQueue(),
+    val status: MachineStatus = MachineStatus()
+)
+
 data class PersistedQueueState(
     val queueId: String,
     val revision: Long,
-    val machineA: MachineQueue,
-    val machineB: MachineQueue,
-    val machineAStatus: MachineStatus,
-    val machineBStatus: MachineStatus,
+    val machines: Map<MachineId, PersistedMachineState>,
     val registrationOpen: Boolean,
     val nextRegistrationKey: Int,
     val savedAtMillis: Long,
     val terminalCommandReceipts: List<TerminalCommandReceipt> = emptyList()
 ) {
+    constructor(
+        queueId: String,
+        revision: Long,
+        machineA: MachineQueue,
+        machineB: MachineQueue,
+        machineAStatus: MachineStatus,
+        machineBStatus: MachineStatus,
+        registrationOpen: Boolean,
+        nextRegistrationKey: Int,
+        savedAtMillis: Long,
+        terminalCommandReceipts: List<TerminalCommandReceipt> = emptyList()
+    ) : this(
+        queueId = queueId,
+        revision = revision,
+        machines = linkedMapOf(
+            MachineId.A to PersistedMachineState(machineA, machineAStatus),
+            MachineId.B to PersistedMachineState(machineB, machineBStatus)
+        ),
+        registrationOpen = registrationOpen,
+        nextRegistrationKey = nextRegistrationKey,
+        savedAtMillis = savedAtMillis,
+        terminalCommandReceipts = terminalCommandReceipts
+    )
+
+    val configuredMachineIds: List<MachineId>
+        get() = MachineId.entries.filter(machines::containsKey)
+
+    val machineA: MachineQueue
+        get() = machine(MachineId.A).queue
+
+    val machineB: MachineQueue
+        get() = machine(MachineId.B).queue
+
+    val machineAStatus: MachineStatus
+        get() = machine(MachineId.A).status
+
+    val machineBStatus: MachineStatus
+        get() = machine(MachineId.B).status
+
+    fun machine(machineId: MachineId): PersistedMachineState =
+        machines[machineId] ?: PersistedMachineState()
+
     val totalRegistrationCount: Int
-        get() = machineA.registrationCount + machineB.registrationCount
+        get() = machines.values.sumOf { it.queue.registrationCount }
 
     val hasMeaningfulState: Boolean
         get() = totalRegistrationCount > 0 ||
-            !machineAStatus.isOperational ||
-            !machineBStatus.isOperational ||
+            machines.values.any { !it.status.isOperational } ||
             !registrationOpen
 
     val safeNextRegistrationKey: Int
         get() = maxOf(
             nextRegistrationKey,
-            (machineA.allRegistrations + machineB.allRegistrations)
+            machines.values.flatMap { it.queue.allRegistrations }
                 .maxOfOrNull { it.key + 1 } ?: 1
         )
 }
@@ -73,13 +116,16 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
     override suspend fun saveState(state: PersistedQueueState): QueueStateSaveResult =
         withContext(Dispatchers.IO) {
         saveMutex.withLock {
+            if (!isValidPersistedMachineStates(state.machines)) {
+                return@withLock QueueStateSaveResult.FAILED
+            }
             val primaryState = readStoredState(KEY_STATE)
             val backupState = readStoredState(KEY_BACKUP_STATE)
             val persistedState = newestStoredQueueState(primaryState, backupState)
             if (!shouldPersistQueueState(state, persistedState?.state)) {
                 return@withLock QueueStateSaveResult.SUPERSEDED
             }
-            val serialized = encodeState(state).toString()
+            val serialized = Codec.encodeState(state).toString()
             val previousValidSnapshot = persistedState?.serialized ?: serialized
             val saved = runCatching {
                 preferences.edit()
@@ -93,7 +139,7 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
 
     private fun readStoredState(key: String): StoredQueueState? {
         val serialized = preferences.getString(key, null) ?: return null
-        val state = decodeState(serialized) ?: return null
+        val state = Codec.decodeState(serialized) ?: return null
         return StoredQueueState(serialized, state)
     }
 
@@ -106,17 +152,26 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
         else -> null
     }
 
-    private fun encodeState(state: PersistedQueueState): JSONObject = JSONObject().apply {
+    internal object Codec {
+    internal fun encodeState(state: PersistedQueueState): JSONObject = JSONObject().apply {
         put("schemaVersion", SCHEMA_VERSION)
         put("queueId", state.queueId)
         put("revision", state.revision)
         put("savedAtMillis", state.savedAtMillis)
         put("registrationOpen", state.registrationOpen)
         put("nextRegistrationKey", state.nextRegistrationKey)
-        put("machineA", encodeQueue(state.machineA))
-        put("machineB", encodeQueue(state.machineB))
-        put("machineAStatus", encodeStatus(state.machineAStatus))
-        put("machineBStatus", encodeStatus(state.machineBStatus))
+        put(
+            "machines",
+            JSONObject().apply {
+                state.configuredMachineIds.forEach { machineId ->
+                    val machine = state.machine(machineId)
+                    put(machineId.name, JSONObject().apply {
+                        put("queue", encodeQueue(machine.queue))
+                        put("status", encodeStatus(machine.status))
+                    })
+                }
+            }
+        )
         put(
             "terminalCommandReceipts",
             JSONArray().apply {
@@ -178,16 +233,29 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
         put("stoppedAtMillis", status.stoppedAtMillis ?: JSONObject.NULL)
     }
 
-    private fun decodeState(serialized: String): PersistedQueueState? = runCatching {
+    internal fun decodeState(serialized: String): PersistedQueueState? = runCatching {
         val root = JSONObject(serialized)
         val schemaVersion = root.optInt("schemaVersion")
         if (schemaVersion !in MIN_SUPPORTED_SCHEMA_VERSION..SCHEMA_VERSION) return@runCatching null
-        val machineA = decodeQueue(root.optJSONObject("machineA")) ?: return@runCatching null
-        val machineB = decodeQueue(root.optJSONObject("machineB")) ?: return@runCatching null
-        val allRegistrations = machineA.allRegistrations + machineB.allRegistrations
+        val machines = if (schemaVersion >= 6) {
+            decodeMachines(root.optJSONObject("machines")) ?: return@runCatching null
+        } else {
+            linkedMapOf(
+                MachineId.A to PersistedMachineState(
+                    queue = decodeQueue(root.optJSONObject("machineA"))
+                        ?: return@runCatching null,
+                    status = decodeStatus(root.optJSONObject("machineAStatus"))
+                ),
+                MachineId.B to PersistedMachineState(
+                    queue = decodeQueue(root.optJSONObject("machineB"))
+                        ?: return@runCatching null,
+                    status = decodeStatus(root.optJSONObject("machineBStatus"))
+                )
+            )
+        }
+        val allRegistrations = machines.values.flatMap { it.queue.allRegistrations }
         if (
-            machineA.registrationCount > MAX_REGISTRATIONS_PER_MACHINE ||
-            machineB.registrationCount > MAX_REGISTRATIONS_PER_MACHINE ||
+            machines.values.any { it.queue.registrationCount > MAX_REGISTRATIONS_PER_MACHINE } ||
             allRegistrations.map { it.key }.distinct().size != allRegistrations.size
         ) return@runCatching null
         val savedAtMillis = root.optLong("savedAtMillis").takeIf { it > 0L }
@@ -204,10 +272,7 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
             } else {
                 0L
             },
-            machineA = machineA,
-            machineB = machineB,
-            machineAStatus = decodeStatus(root.optJSONObject("machineAStatus")),
-            machineBStatus = decodeStatus(root.optJSONObject("machineBStatus")),
+            machines = machines,
             registrationOpen = root.optBoolean("registrationOpen", true),
             nextRegistrationKey = root.optInt("nextRegistrationKey", 1).coerceAtLeast(1),
             savedAtMillis = savedAtMillis,
@@ -218,6 +283,33 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
             }
         )
     }.getOrNull()
+
+    private fun decodeMachines(value: JSONObject?): Map<MachineId, PersistedMachineState>? {
+        value ?: return null
+        val providedNames = buildSet {
+            val keys = value.keys()
+            while (keys.hasNext()) add(keys.next())
+        }
+        val configuredIds = MachineId.entries.take(providedNames.size.coerceAtMost(MachineId.entries.size))
+        if (
+            providedNames.isEmpty() ||
+            providedNames.size > MachineId.entries.size ||
+            providedNames != configuredIds.map(MachineId::name).toSet()
+        ) return null
+        return linkedMapOf<MachineId, PersistedMachineState>().apply {
+            configuredIds.forEach { machineId ->
+                val item = value.optJSONObject(machineId.name) ?: return null
+                val queue = decodeQueue(item.optJSONObject("queue")) ?: return null
+                put(
+                    machineId,
+                    PersistedMachineState(
+                        queue = queue,
+                        status = decodeStatus(item.optJSONObject("status"))
+                    )
+                )
+            }
+        }
+    }
 
     private fun decodeTerminalCommandReceipts(value: JSONArray?): List<TerminalCommandReceipt> {
         value ?: return emptyList()
@@ -335,12 +427,14 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
     private fun JSONObject.optNullableString(name: String): String? =
         if (!has(name) || isNull(name)) null else optString(name).takeIf { it.isNotBlank() }
 
+    private const val MIN_SUPPORTED_SCHEMA_VERSION = 1
+    private const val SCHEMA_VERSION = 6
+    private const val MAX_REGISTRATIONS_PER_MACHINE = 20
+    }
+
     private companion object {
         const val KEY_STATE = "latest"
         const val KEY_BACKUP_STATE = "previous_valid"
-        const val MIN_SUPPORTED_SCHEMA_VERSION = 1
-        const val SCHEMA_VERSION = 5
-        const val MAX_REGISTRATIONS_PER_MACHINE = 20
     }
 }
 
@@ -470,3 +564,14 @@ internal fun newestPersistedQueueState(
 private fun isValidQueueId(value: String): Boolean = runCatching {
     UUID.fromString(value)
 }.isSuccess
+
+internal fun isValidPersistedMachineStates(
+    machines: Map<MachineId, PersistedMachineState>
+): Boolean {
+    val configuredIds = MachineId.entries.take(machines.size.coerceAtMost(MachineId.entries.size))
+    if (machines.isEmpty() || machines.size > MachineId.entries.size) return false
+    if (machines.keys.toSet() != configuredIds.toSet()) return false
+    val registrations = machines.values.flatMap { it.queue.allRegistrations }
+    return machines.values.none { it.queue.registrationCount > 20 } &&
+        registrations.map(Registration::key).distinct().size == registrations.size
+}

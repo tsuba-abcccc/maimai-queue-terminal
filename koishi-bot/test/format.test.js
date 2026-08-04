@@ -1057,8 +1057,8 @@ test('cancels temporary leave for a fixed pair after the terminal snapshot confi
   const submitted = []
   const api = {
     getPlayers: async () => responses.shift() || responses[responses.length - 1],
-    createQueueCommand: async (_qq, operation) => {
-      submitted.push(operation)
+    createQueueCommand: async (_qq, operation, fields) => {
+      submitted.push({ operation, fields })
       return {
         command_id: 'command-fixed',
         status: 'APPLIED',
@@ -1074,7 +1074,19 @@ test('cancels temporary leave for a fixed pair after the terminal snapshot confi
     'CANCEL_TEMPORARY_LEAVE',
   )
 
-  assert.deepEqual(submitted, ['CANCEL_TEMPORARY_LEAVE'])
+  assert.deepEqual(submitted, [{
+    operation: 'CANCEL_TEMPORARY_LEAVE',
+    fields: {
+      expected_queue_id: 'queue-fixed',
+      expected_registration_id: 'registration-fixed-player',
+      expected_machine_id: 'A',
+      expected_position: 'WAITING',
+      expected_fixed_pair_id: null,
+      expected_absence_status: 'TEMPORARILY_AWAY',
+      expected_temporary_away_skipped_turns: 2,
+      expected_pending_check_in: false,
+    },
+  }])
   assert.match(text, /固定组合的两份登记已同时取消暂时离开/)
   assert.match(text, /轮空次数均已清零/)
 })
@@ -1123,15 +1135,22 @@ test('accepts concise machine letters, full names, and unique remarks', () => {
   const machines = [
     { id: 'A', name: '左侧 · 机台 A' },
     { id: 'B', name: '右侧 · 机台 B' },
+    { id: 'C', name: '靠窗 · 机台 C' },
+    { id: 'D', name: '入口 · 机台 D' },
   ]
   assert.equal(parseMachineChoice('A', machines), machines[0])
   assert.equal(parseMachineChoice('b', machines), machines[1])
+  assert.equal(parseMachineChoice('c', machines), machines[2])
+  assert.equal(parseMachineChoice('D', machines), machines[3])
   assert.equal(parseMachineChoice('  a  ', machines), machines[0])
   assert.equal(parseMachineChoice('\t右侧\n', machines), machines[1])
   assert.equal(parseMachineChoice('机台 A', machines), machines[0])
+  assert.equal(parseMachineChoice('机台c', machines), machines[2])
   assert.equal(parseMachineChoice('右侧·机台B', machines), machines[1])
+  assert.equal(parseMachineChoice('入口·机台 D', machines), machines[3])
   assert.equal(parseMachineChoice('左侧', machines), machines[0])
   assert.equal(parseMachineChoice('右侧', machines), machines[1])
+  assert.equal(parseMachineChoice('靠窗', machines), machines[2])
   assert.equal(parseMachineChoice('左边', machines), null)
   assert.equal(parseMachineChoice('入口', [
     { id: 'A', name: '入口 · 机台 A' },
@@ -1157,6 +1176,43 @@ test('presents machine choices with the short letter first', () => {
     formatMachineReplyHint(machines),
     '回复 A、B，也可以回复括号中的机台备注。',
   )
+  assert.equal(
+    formatMachineReplyHint([
+      ...machines,
+      { id: 'C', name: '靠窗 · 机台 C' },
+      { id: 'D', name: '入口 · 机台 D' },
+    ]),
+    '回复 A、B、C、D，也可以回复括号中的机台备注。',
+  )
+})
+
+test('formats every configured machine in A to D order', () => {
+  const machine = id => ({
+    id,
+    name: `${id} 区 · 机台 ${id}`,
+    operational: true,
+    stop_reason: null,
+    stop_reason_detail: null,
+    playing_started_at: null,
+    playing: [],
+    waiting_positions: [],
+  })
+  const text = formatQueue({
+    queue_id: 'queue-four-machines',
+    captured_at: Date.now(),
+    registration_open: true,
+    terminal: { online: true },
+    machines: {
+      D: machine('D'),
+      B: machine('B'),
+      A: machine('A'),
+      C: machine('C'),
+    },
+  })
+
+  const offsets = ['A', 'B', 'C', 'D'].map((id) => text.indexOf(`【${id} 区·机台 ${id}】`))
+  assert.ok(offsets.every((offset) => offset >= 0))
+  assert.deepEqual(offsets, [...offsets].sort((left, right) => left - right))
 })
 
 test('does not offer stopped or full machines for a new registration', () => {

@@ -33,7 +33,22 @@ internal enum class Screen {
     CLAIM_REGISTRATION
 }
 
-internal enum class MachineId { A, B }
+enum class MachineId { A, B, C, D }
+
+internal val DEFAULT_CONFIGURED_MACHINE_IDS: List<MachineId> = MachineId.entries.take(2)
+
+internal fun configuredMachineIds(machineCount: Int): List<MachineId> =
+    MachineId.entries.take(machineCount.coerceIn(1, MachineId.entries.size))
+
+internal data class MachineDisplayState(
+    val machineId: MachineId,
+    val queue: MachineQueue,
+    val status: MachineStatus,
+    val remark: String
+) {
+    val name: String
+        get() = machineName(machineId, remark)
+}
 
 internal enum class RegistrationActionMode { ACTIONS, PREFERENCE, RENAME }
 internal enum class QueueAbsenceChoice { DEFER_ONE_ROUND, TEMPORARILY_AWAY }
@@ -142,6 +157,11 @@ internal data class NewRegistrationHomeRequest(
     val forceImmediateHome: Boolean = false
 )
 
+internal data class QueueOperationConfirmationRequest(
+    val machineId: MachineId,
+    val queueSnapshot: MachineQueue
+)
+
 internal data class ReorderSession(
     val machineId: MachineId,
     val queueSnapshot: MachineQueue,
@@ -182,7 +202,8 @@ internal data class MachineTransferRequest(
     val sourceMachineId: MachineId,
     val registrationKeys: List<Int>,
     val sourcePosition: PositionSelection? = null,
-    val confirmationSnapshots: List<RegistrationConfirmationSnapshot>
+    val confirmationSnapshots: List<RegistrationConfirmationSnapshot>,
+    val destinationMachineId: MachineId? = null
 )
 
 internal fun MachineQueue.registrationConfirmationSnapshots(
