@@ -1941,6 +1941,89 @@ class QueueStatusApiTest(unittest.TestCase):
             {player["qq_number"] for player in all_event["affected_players"]},
         )
 
+    def test_cross_machine_event_accepts_full_capacity_and_routes_recipients(self):
+        snapshot = self.remote_ready_snapshot(revision=25)
+        snapshot["machines"]["C"] = self.machine(name="前区 · 机台 C")
+        snapshot["machines"]["D"] = self.machine(name="后区 · 机台 D")
+        registration_ids = [f"{index:024x}" for index in range(1, 81)]
+        profiles = []
+        contacts = []
+        for index, registration_id in enumerate(registration_ids, start=1):
+            profile = self.player_profile()
+            profile_id = f"00000000-0000-0000-0000-{index:012d}"
+            qq_number = str(10_000_000 + index)
+            profile.update(
+                {
+                    "profile_id": profile_id,
+                    "nickname": f"玩家{index}",
+                    "qq_number": qq_number,
+                    "notify_machine_status": True,
+                }
+            )
+            profiles.append(profile)
+            contacts.append(
+                {
+                    "registration_id": registration_id,
+                    "profile_id": profile_id,
+                    "qq_number": qq_number,
+                }
+            )
+        event = self.event(
+            "00000000-0000-0000-0000-000000000199",
+            "REGISTRATION_CLOSED",
+            1_000_200,
+        )
+        event.update(
+            {
+                "machine_id": None,
+                "title": "关闭登记排队",
+                "detail": "登记排队已关闭，并清除了所有机台的 80 份登记。",
+                "registration_ids": registration_ids,
+            }
+        )
+        snapshot["private_player_profiles"] = profiles
+        snapshot["private_player_contacts"] = contacts
+        snapshot["recent_events"] = [event]
+
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+
+        self.assertEqual(204, response.status_code)
+        public_event = self.client.get("/api/queue-logs").get_json()["logs"][0]
+        self.assertEqual(80, len(public_event["registration_ids"]))
+        filtered_events = self.client.post(
+            "/api/queue-bot/events",
+            json={"qq": "10000001", "after": 0},
+            headers=self.bot_headers,
+        ).get_json()["events"]
+        self.assertEqual(1, len(filtered_events))
+        self.assertEqual(
+            ["10000001"],
+            [
+                player["qq_number"]
+                for player in filtered_events[0]["affected_players"]
+            ],
+        )
+
+    def test_event_rejects_more_than_cross_machine_capacity(self):
+        snapshot = self.remote_ready_snapshot(revision=26)
+        event = self.event(
+            "00000000-0000-0000-0000-000000000200",
+            "REGISTRATION_CLOSED",
+            1_000_200,
+        )
+        event["machine_id"] = None
+        event["registration_ids"] = [f"{index:024x}" for index in range(1, 82)]
+        snapshot["recent_events"] = [event]
+
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("公开事件登记编号无效", response.get_json()["error"])
+
     def test_event_recipient_is_fixed_when_the_event_is_stored(self):
         event_id = "00000000-0000-0000-0000-000000000198"
         first = self.snapshot(revision=4)

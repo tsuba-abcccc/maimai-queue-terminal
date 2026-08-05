@@ -18,6 +18,7 @@ SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4, 5}
 MAX_PAYLOAD_BYTES = 1024 * 1024
 MAX_REGISTRATIONS_PER_MACHINE = 20
 MAX_MACHINE_COUNT = 4
+MAX_EVENT_REGISTRATION_IDS = MAX_REGISTRATIONS_PER_MACHINE * MAX_MACHINE_COUNT
 MAX_PLAYER_PROFILES = 500
 MAX_EVENTS_PER_SNAPSHOT = 200
 MAX_PRIVATE_CONTACTS = (
@@ -4179,7 +4180,10 @@ def normalize_public_event(source: Any) -> dict[str, Any]:
     if machine_id is not None and machine_id not in MACHINE_NAMES:
         raise ValidationError("公开事件机台编号无效")
     registration_ids = source.get("registration_ids")
-    if not isinstance(registration_ids, list) or len(registration_ids) > 20:
+    if (
+        not isinstance(registration_ids, list)
+        or len(registration_ids) > MAX_EVENT_REGISTRATION_IDS
+    ):
         raise ValidationError("公开事件登记编号无效")
     normalized_registration_ids = [
         read_public_id({"registration_id": value}, "registration_id")

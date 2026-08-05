@@ -170,6 +170,42 @@ class QueueCloudSnapshotTest {
     }
 
     @Test
+    fun publicEventKeepsAllRegistrationsAcrossFourMachines() {
+        val affectedKeys = (1..80).toList()
+        val event = AuditLogEntry(
+            id = "00000000-0000-0000-0000-000000000703",
+            timestampMillis = 2_000L,
+            category = AuditLogCategory.SYSTEM,
+            title = "关闭登记排队",
+            detail = "登记排队已关闭，并清除了所有机台的 80 份登记。",
+            queueId = queueId,
+            publicEventType = PublicQueueEventType.REGISTRATION_CLOSED,
+            affectedRegistrationKeys = affectedKeys
+        )
+        val state = PersistedQueueState(
+            queueId = queueId,
+            revision = 10L,
+            machines = configuredMachineIds(4).associateWith { PersistedMachineState() },
+            registrationOpen = false,
+            nextRegistrationKey = 81,
+            savedAtMillis = 1_000L
+        )
+
+        val registrationIds = buildPublicQueueSnapshot(
+            state = state,
+            terminalId = "terminal-1",
+            capturedAtMillis = 3_000L,
+            auditLogs = listOf(event)
+        ).getJSONArray("recent_events")
+            .getJSONObject(0)
+            .getJSONArray("registration_ids")
+
+        assertEquals(80, registrationIds.length())
+        assertEquals(publicRegistrationId(queueId, 1), registrationIds.getString(0))
+        assertEquals(publicRegistrationId(queueId, 80), registrationIds.getString(79))
+    }
+
+    @Test
     fun publicSnapshotExcludesPrivatePlayerProfileFields() {
         val privateProfileId = "private-profile-id-should-never-leave-device"
         val registration = Registration(
