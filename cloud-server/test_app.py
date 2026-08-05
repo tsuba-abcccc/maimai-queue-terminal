@@ -1826,7 +1826,12 @@ class QueueStatusApiTest(unittest.TestCase):
                 "registration_id": second_registration["registration_id"],
                 "profile_id": self.profile_id,
                 "qq_number": "12345678",
-            }
+            },
+            {
+                "registration_id": first_registration["registration_id"],
+                "profile_id": self.profile_id,
+                "qq_number": "12345678",
+            },
         ]
         removed_event = self.event(
             "00000000-0000-0000-0000-000000000195",
@@ -2237,6 +2242,36 @@ class QueueStatusApiTest(unittest.TestCase):
             self.client.post(
                 "/api/queue-status", json=temporary, headers=self.headers
             ).status_code,
+        )
+
+    def test_rejects_multiple_current_registrations_for_one_profile(self):
+        snapshot = self.snapshot(revision=4)
+        snapshot["schema_version"] = 5
+        second_registration = self.registration("b" * 24, "公开昵称")
+        snapshot["machines"]["A"]["playing"].append(second_registration)
+        snapshot["machines"]["A"]["registration_count"] = 2
+        snapshot["private_player_profiles"] = [self.player_profile()]
+        snapshot["private_player_contacts"] = [
+            {
+                "registration_id": "a" * 24,
+                "profile_id": self.profile_id,
+                "qq_number": "12345678",
+            },
+            {
+                "registration_id": "b" * 24,
+                "profile_id": self.profile_id,
+                "qq_number": "12345678",
+            },
+        ]
+
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual(
+            "同一玩家资料不能关联多份当前登记",
+            response.get_json()["error"],
         )
 
     def test_rejects_older_revision_of_same_queue(self):
@@ -3060,6 +3095,74 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("WAITING", commands[0]["payload"]["expected_position"])
         self.assertEqual("NONE", commands[0]["payload"]["expected_absence_status"])
 
+    def test_playing_registration_forwards_absence_commands_to_the_terminal(self):
+        snapshot = self.remote_ready_snapshot(with_registration=True)
+        registration = snapshot["machines"]["A"]["waiting_positions"][0][
+            "registrations"
+        ][0]
+        snapshot["machines"]["A"]["playing"] = [registration]
+        snapshot["machines"]["A"]["playing_started_at"] = 900_000
+        snapshot["machines"]["A"]["waiting_positions"] = []
+        snapshot["machines"]["A"]["waiting_position_count"] = 0
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        expected_context = {
+            "expected_queue_id": snapshot["queue_id"],
+            "expected_registration_id": registration["registration_id"],
+            "expected_machine_id": "A",
+            "expected_position": "PLAYING",
+            "expected_fixed_pair_id": None,
+            "expected_absence_status": "NONE",
+            "expected_temporary_away_skipped_turns": 0,
+            "expected_pending_check_in": False,
+        }
+
+        for request_id, operation in (
+            ("00000000-0000-0000-0000-000000000408", "DEFER_ONE_ROUND"),
+            ("00000000-0000-0000-0000-000000000409", "TEMPORARILY_LEAVE"),
+        ):
+            response = self.client.post(
+                "/api/queue-bot/queue-commands",
+                json={
+                    "request_id": request_id,
+                    "actor_qq": "12345678",
+                    "operation": operation,
+                    **expected_context,
+                },
+                headers=self.bot_headers,
+            )
+            self.assertEqual(202, response.status_code)
+            commands = self.client.get(
+                "/api/queue-terminal/commands", headers=self.headers
+            ).get_json()["commands"]
+            command = next(item for item in commands if item["command_id"] == request_id)
+            self.assertEqual(operation, command["payload"]["operation"])
+            self.assertEqual("PLAYING", command["payload"]["expected_position"])
+            completed = self.client.post(
+                f"/api/queue-terminal/commands/{request_id}/result",
+                json={"status": "APPLIED", "detail": "终端行为测试完成。"},
+                headers=self.headers,
+            )
+            self.assertEqual("APPLIED", completed.get_json()["status"])
+
+        transfer = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000410",
+                "actor_qq": "12345678",
+                "operation": "TRANSFER_MACHINE",
+                "target_machine_id": "B",
+                **expected_context,
+            },
+            headers=self.bot_headers,
+        )
+        self.assertEqual(409, transfer.status_code)
+        self.assertIn("游玩位置", transfer.get_json()["error"])
+
     def test_fixed_pair_cancel_temporary_leave_is_forwarded_for_terminal_validation(self):
         snapshot = self.remote_ready_snapshot()
         first = self.registration("a" * 24, "公开昵称")
@@ -3790,6 +3893,68 @@ class QueueStatusApiTest(unittest.TestCase):
             command["command_id"] == "00000000-0000-0000-0000-000000000851"
             for command in commands
         ))
+
+    def test_mobile_registration_rechecks_queue_closure_before_submission(self):
+        snapshot = self.remote_ready_snapshot(revision=24)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        created = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000852",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        ).get_json()
+        submission = {
+            "request_id": "00000000-0000-0000-0000-000000000853",
+            "profile_id": self.profile_id,
+            "expected_profile_revision": 3,
+        }
+
+        closed = copy.deepcopy(snapshot)
+        closed["revision"] += 1
+        closed["registration_open"] = False
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=closed, headers=self.headers
+            ).status_code,
+        )
+        rejected = self.client.post(
+            f"/api/queue-mobile/sessions/{created['session_token']}/submit",
+            json=submission,
+        )
+
+        self.assertEqual(409, rejected.status_code)
+        self.assertEqual("REGISTRATION_CLOSED", rejected.get_json()["code"])
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+        self.assertFalse(any(
+            command["command_id"] == submission["request_id"]
+            for command in commands
+        ))
+
+        reopened = copy.deepcopy(closed)
+        reopened["revision"] += 1
+        reopened["registration_open"] = True
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=reopened, headers=self.headers
+            ).status_code,
+        )
+        accepted = self.client.post(
+            f"/api/queue-mobile/sessions/{created['session_token']}/submit",
+            json=submission,
+        )
+        self.assertEqual(202, accepted.status_code)
 
     def remote_ready_snapshot(
         self,

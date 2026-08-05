@@ -1011,6 +1011,21 @@ test('changes the personal menu with absence state and queue rules', () => {
     allow_defer_one_round: false,
     allow_temporary_leave: false,
   }), ['切换机台', '修改游玩偏好', '退出排队'])
+  assert.deepEqual(formatOwnQueueActions({ ...player, position: 'PLAYING' }), [
+    '暂缓一次',
+    '暂时离开',
+    '修改游玩偏好',
+    '退出排队',
+  ])
+  assert.deepEqual(formatOwnQueueActions({
+    ...player,
+    position: 'PLAYING',
+    temporarily_away: true,
+  }), [
+    '取消暂时离开',
+    '修改游玩偏好',
+    '退出排队',
+  ])
   assert.deepEqual(formatOwnQueueActions(player, undefined, false), [])
   assert.deepEqual(formatOwnQueueActions({
     ...player,
@@ -1089,6 +1104,124 @@ test('cancels temporary leave for a fixed pair after the terminal snapshot confi
   }])
   assert.match(text, /固定组合的两份登记已同时取消暂时离开/)
   assert.match(text, /轮空次数均已清零/)
+})
+
+test('uses the terminal result when deferring from the playing position', async () => {
+  const player = {
+    registration_id: 'registration-playing-player',
+    profile_id: 'profile-playing-player',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'A',
+    position: 'PLAYING',
+    position_index: null,
+    estimated_wait_minutes: 0,
+    fixed_pair: false,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+    online_registration_pending_check_in: false,
+  }
+  let playerReads = 0
+  const submitted = []
+  const api = {
+    getPlayers: async () => {
+      playerReads += 1
+      return {
+        queue_id: 'queue-playing',
+        queue_rules: {
+          allow_defer_one_round: true,
+          allow_temporary_leave: true,
+        },
+        players: [player],
+      }
+    },
+    createQueueCommand: async (_qq, operation, fields) => {
+      submitted.push({ operation, fields })
+      return {
+        command_id: 'command-playing',
+        status: 'APPLIED',
+        result_detail: '本次游玩机会已暂缓并完成；登记已回到等待顺序前端，当前不再处于暂缓状态。',
+      }
+    },
+  }
+
+  const text = await changeAbsenceState(
+    api,
+    { commandWaitSeconds: 3 },
+    { platform: 'onebot', userId: '12345678', isDirect: true },
+    'DEFER_ONE_ROUND',
+  )
+
+  assert.equal(playerReads, 1)
+  assert.equal(
+    text,
+    '本次游玩机会已暂缓并完成；登记已回到等待顺序前端，当前不再处于暂缓状态。',
+  )
+  assert.equal(submitted[0].fields.expected_position, 'PLAYING')
+})
+
+test('keeps the complete temporary-leave rules when leaving the playing position', async () => {
+  for (const scenario of [
+    {
+      fixedPair: false,
+      terminalDetail: '登记已设为暂时离开，已离开游玩位置并累计轮空 1 次。',
+      guidance: /返回后需要手动发送“取消暂时离开”/,
+      removalRule: /第四次仍未返回将退出排队/,
+    },
+    {
+      fixedPair: true,
+      terminalDetail: '固定组合的两份登记已经设为暂时离开，已离开游玩位置并累计轮空 1 次。',
+      guidance: /可以通过其中任一份登记发送“取消暂时离开”/,
+      removalRule: /第四次仍未返回时，整组将退出排队/,
+    },
+  ]) {
+    const player = {
+      registration_id: 'registration-playing-player',
+      profile_id: 'profile-playing-player',
+      qq_number: '12345678',
+      display_id: '小雨',
+      machine_id: 'A',
+      position: 'PLAYING',
+      position_index: null,
+      estimated_wait_minutes: 0,
+      fixed_pair: scenario.fixedPair,
+      deferred_once: false,
+      temporarily_away: false,
+      temporary_away_skipped_turns: 0,
+      no_show_count: 0,
+      last_no_show_action_was_defer: false,
+      online_registration_pending_check_in: false,
+    }
+    const api = {
+      getPlayers: async () => ({
+        queue_id: 'queue-playing',
+        queue_rules: {
+          allow_defer_one_round: true,
+          allow_temporary_leave: true,
+        },
+        players: [player],
+      }),
+      createQueueCommand: async () => ({
+        command_id: 'command-playing-away',
+        status: 'APPLIED',
+        result_detail: scenario.terminalDetail,
+      }),
+    }
+
+    const text = await changeAbsenceState(
+      api,
+      { commandWaitSeconds: 3 },
+      { platform: 'onebot', userId: '12345678', isDirect: true },
+      'TEMPORARILY_LEAVE',
+    )
+
+    assert.match(text, /已离开游玩位置并累计轮空 1 次/)
+    assert.match(text, scenario.guidance)
+    assert.match(text, scenario.removalRule)
+  }
 })
 
 test('fixed-pair personal menu exposes the matching cancel action', () => {

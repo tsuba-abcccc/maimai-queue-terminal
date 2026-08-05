@@ -445,6 +445,67 @@ class RemoteQueueOperationsTest {
     }
 
     @Test
+    fun playingPositionAbsenceOperationsUseTheTerminalRotationRules() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id
+        )
+        val next = registration(3, "下一位").copy(preference = PlayPreference.SOLO)
+        val initial = state(
+            machineA = MachineQueue(
+                playing = listOf(player),
+                waiting = listOf(next),
+                playingStartedAtMillis = 1_000L
+            ),
+            nextKey = 4
+        )
+
+        val deferred = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.DEFER_ONE_ROUND, player).copy(
+                expectedPosition = RemoteRegistrationPosition.PLAYING,
+                expectedAbsenceStatus = QueueAbsenceStatus.NONE,
+                expectedTemporaryAwaySkippedTurns = 0,
+                expectedPendingCheckIn = false
+            ),
+            initial,
+            appliedAtMillis = 8_000L
+        ) as RemoteQueueOperationDecision.Apply
+        val deferredQueue = deferred.state.queues.getValue("A")
+        assertEquals(listOf(next.key), deferredQueue.playing.map { it.key })
+        assertEquals(listOf(player.key), deferredQueue.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.NONE, deferredQueue.waiting.single().absenceStatus)
+        assertEquals(8_000L, deferredQueue.playingStartedAtMillis)
+        assertEquals(
+            "本次游玩机会已暂缓并完成；登记已回到等待顺序前端，当前不再处于暂缓状态。",
+            deferred.detail
+        )
+
+        val temporarilyAway = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.TEMPORARILY_LEAVE, player).copy(
+                expectedPosition = RemoteRegistrationPosition.PLAYING,
+                expectedAbsenceStatus = QueueAbsenceStatus.NONE,
+                expectedTemporaryAwaySkippedTurns = 0,
+                expectedPendingCheckIn = false
+            ),
+            initial,
+            appliedAtMillis = 9_000L
+        ) as RemoteQueueOperationDecision.Apply
+        val awayQueue = temporarilyAway.state.queues.getValue("A")
+        assertEquals(listOf(next.key), awayQueue.playing.map { it.key })
+        assertEquals(listOf(player.key), awayQueue.waiting.map { it.key })
+        assertEquals(
+            QueueAbsenceStatus.TEMPORARILY_AWAY,
+            awayQueue.waiting.single().absenceStatus
+        )
+        assertEquals(1, awayQueue.waiting.single().temporaryAwaySkippedTurns)
+        assertEquals(9_000L, awayQueue.playingStartedAtMillis)
+        assertEquals(
+            "登记已设为暂时离开，已离开游玩位置并累计轮空 1 次。",
+            temporarilyAway.detail
+        )
+    }
+
+    @Test
     fun repeatedFixedPairAbsenceOperationReportsTheWholeGroup() {
         val player = registration(2, "资料玩家").copy(
             isTemporary = false,

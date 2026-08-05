@@ -1,6 +1,6 @@
 # maimai Q
 
-[![Version](https://img.shields.io/badge/version-0.8.0-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
+[![Version](https://img.shields.io/badge/version-0.8.1-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
 [![Android](https://img.shields.io/badge/Android-10%2B-34C759?logo=android&logoColor=white)](https://developer.android.com/about/versions/10)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-007AFF)](https://developer.android.com/compose)
@@ -16,7 +16,8 @@
 - [在线查看当前队列](https://abcccc.top/queue-status)
 - [玩家使用手册](docs/user-manual.md)
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
-- [0.1.0 至 0.8.0 更新日志](docs/update.md)
+- [0.1.0 至 0.8.1 更新日志](docs/update.md)
+- [后续版本路线](docs/roadmap.md)
 - [云端同步协议](docs/cloud-queue-sync.md)
 - [后端部署说明](cloud-server/README.md)
 
@@ -188,7 +189,7 @@ app/build/outputs/apk/local/debug/app-local-debug.apk
 .\gradlew.bat :app:packageLocalDebugApk
 ```
 
-文件会复制到 `output/apk/maimai-Q-0.8.0-local.apk`。
+文件会复制到 `output/apk/maimai-Q-0.8.1-local.apk`。
 
 macOS 或 Linux 使用：
 
@@ -263,7 +264,7 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 - 公开分发版与现场终端版应使用不同签名和不同配置。
 - 现场终端 APK 只在受控设备间传递；令牌泄漏后立即在服务端轮换。
 
-现场终端文件会复制到 `output/apk/maimai-Q-0.8.0-terminal.apk`，不得作为 GitHub 公开 Release 附件。
+现场终端文件会复制到 `output/apk/maimai-Q-0.8.1-terminal.apk`，不得作为 GitHub 公开 Release 附件。
 
 ## 部署队列 API
 

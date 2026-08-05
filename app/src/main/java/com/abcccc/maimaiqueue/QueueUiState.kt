@@ -40,6 +40,12 @@ internal val DEFAULT_CONFIGURED_MACHINE_IDS: List<MachineId> = MachineId.entries
 internal fun configuredMachineIds(machineCount: Int): List<MachineId> =
     MachineId.entries.take(machineCount.coerceIn(1, MachineId.entries.size))
 
+internal fun machineSelectionColumnCount(machineCount: Int): Int =
+    when (machineCount.coerceIn(1, MachineId.entries.size)) {
+        4 -> 2
+        else -> machineCount.coerceIn(1, 3)
+    }
+
 internal data class MachineDisplayState(
     val machineId: MachineId,
     val queue: MachineQueue,

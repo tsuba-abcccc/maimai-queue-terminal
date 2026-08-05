@@ -979,7 +979,8 @@ export async function changeAbsenceState(
   const current = await requireCurrentQueueRegistration(api, session);
   const { player, response } = current;
   requireOperationalRegistration(player);
-  requireSignedInWaitingRegistration(player);
+  requireSignedInRegistration(player);
+  const startedFromPlayingPosition = player.position === "PLAYING";
 
   if (operation === "DEFER_ONE_ROUND") {
     if (response.queue_rules?.allow_defer_one_round === false) {
@@ -1000,6 +1001,7 @@ export async function changeAbsenceState(
   );
   if (
     command.status === "APPLIED" &&
+    !startedFromPlayingPosition &&
     !stateWasAlreadyApplied &&
     !await waitForAbsenceStateConfirmation(api, current, operation)
   ) {
@@ -1009,10 +1011,31 @@ export async function changeAbsenceState(
       "最新队列状态仍在同步。稍后发送“我的排队”确认结果。",
     ].join("\n");
   }
+  const fixedPair = player.fixed_pair === true;
+  if (
+    command.status === "APPLIED" &&
+    startedFromPlayingPosition &&
+    operation === "TEMPORARILY_LEAVE"
+  ) {
+    return [
+      command.result_detail?.trim() || (fixedPair
+        ? "固定组合的两份登记已同时设为暂时离开，已离开游玩位置并累计轮空 1 次。"
+        : "登记已设为暂时离开，已离开游玩位置并累计轮空 1 次。"),
+      "",
+      temporaryLeaveGuidance(fixedPair),
+    ].join("\n");
+  }
   return formatQueueCommandResult(
     command,
-    absenceOperationSuccessMessage(operation, player.fixed_pair === true),
+    absenceOperationSuccessMessage(operation, fixedPair),
+    startedFromPlayingPosition && operation === "DEFER_ONE_ROUND",
   );
+}
+
+function temporaryLeaveGuidance(fixedPair: boolean): string {
+  return fixedPair
+    ? "返回后，可以通过其中任一份登记发送“取消暂时离开”。在此之前，排队分组会忽略整组；连续轮空 3 次后，第四次仍未返回时，整组将退出排队。"
+    : "返回后需要手动发送“取消暂时离开”。在此之前，排队分组会忽略这份登记；连续轮空 3 次后，第四次仍未返回将退出排队。";
 }
 
 export function absenceOperationSuccessMessage(
@@ -1028,7 +1051,7 @@ export function absenceOperationSuccessMessage(
       TEMPORARILY_LEAVE: [
         "登记已设为暂时离开。",
         "",
-        "返回后需要手动发送“取消暂时离开”。在此之前，排队分组会忽略这份登记；连续轮空 3 次后，第四次仍未返回将退出排队。",
+        temporaryLeaveGuidance(false),
       ].join("\n"),
       CANCEL_TEMPORARY_LEAVE:
         "登记已取消暂时离开，轮空次数已经清零，并将按照当前等待顺序正常参与游玩位置分配。",
@@ -1042,7 +1065,7 @@ export function absenceOperationSuccessMessage(
     TEMPORARILY_LEAVE: [
       "固定组合的两份登记已同时设为暂时离开。",
       "",
-      "返回后，可以通过其中任一份登记发送“取消暂时离开”。在此之前，排队分组会忽略整组；连续轮空 3 次后，第四次仍未返回时，整组将退出排队。",
+      temporaryLeaveGuidance(true),
     ].join("\n"),
     CANCEL_TEMPORARY_LEAVE:
       "固定组合的两份登记已同时取消暂时离开，轮空次数均已清零，并将按照当前等待顺序正常参与游玩位置分配。",
@@ -2355,15 +2378,15 @@ export function formatOwnQueueActions(
   if ((machineOperational ?? player.machine_operational) === false) return [];
   if (player.online_registration_pending_check_in) return ["退出排队"];
   const actions: string[] = [];
+  if (player.deferred_once) {
+    actions.push("取消暂缓一次");
+  } else if (player.temporarily_away) {
+    actions.push("取消暂时离开");
+  } else {
+    if (queueRules?.allow_defer_one_round !== false) actions.push("暂缓一次");
+    if (queueRules?.allow_temporary_leave !== false) actions.push("暂时离开");
+  }
   if (player.position === "WAITING") {
-    if (player.deferred_once) {
-      actions.push("取消暂缓一次");
-    } else if (player.temporarily_away) {
-      actions.push("取消暂时离开");
-    } else {
-      if (queueRules?.allow_defer_one_round !== false) actions.push("暂缓一次");
-      if (queueRules?.allow_temporary_leave !== false) actions.push("暂时离开");
-    }
     actions.push("切换机台");
   }
   actions.push("修改游玩偏好", "退出排队");

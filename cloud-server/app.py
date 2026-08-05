@@ -875,19 +875,47 @@ def publish_snapshot():
                 (queue_id,),
             ).fetchall()
         }
-        connection.executemany(
-            """
-            DELETE FROM queue_private_contact
-            WHERE queue_id = ? AND player_id = ? AND registration_id != ?
-            """,
-            [
-                (
-                    queue_id,
-                    contact["profile_id"],
-                    contact["registration_id"],
-                )
-                for contact in private_contacts
-            ],
+        incoming_contacts = {
+            contact["registration_id"]: {
+                "registration_id": contact["registration_id"],
+                "player_id": contact["profile_id"],
+                "qq_number": contact["qq_number"],
+            }
+            for contact in private_contacts
+        }
+        all_contacts = dict(stored_contacts)
+        all_contacts.update(incoming_contacts)
+        event_contacts = {
+            registration_id: contact
+            for registration_id, contact in all_contacts.items()
+            if registration_id not in current_registration_ids
+            or registration_id in current_contact_ids
+        }
+
+        # A snapshot may contain an old registration for a recent event and a new
+        # current registration belonging to the same profile. Keep both in
+        # event_contacts, but persist at most one contact per profile. Current
+        # registrations take priority; otherwise retain the historical contact
+        # so a later event can still be routed to its original recipient.
+        contacts_to_store = {
+            contact["player_id"]: contact
+            for registration_id, contact in stored_contacts.items()
+            if registration_id not in current_registration_ids
+            or registration_id in current_contact_ids
+        }
+        for contact in private_contacts:
+            registration_id = contact["registration_id"]
+            if registration_id not in current_registration_ids:
+                normalized_contact = incoming_contacts[registration_id]
+                contacts_to_store[normalized_contact["player_id"]] = normalized_contact
+        for contact in private_contacts:
+            registration_id = contact["registration_id"]
+            if registration_id in current_registration_ids:
+                normalized_contact = incoming_contacts[registration_id]
+                contacts_to_store[normalized_contact["player_id"]] = normalized_contact
+        connection.execute(
+            "DELETE FROM queue_private_contact WHERE queue_id = ?",
+            (queue_id,),
         )
         connection.executemany(
             """
@@ -903,29 +931,13 @@ def publish_snapshot():
                 (
                     queue_id,
                     contact["registration_id"],
-                    contact["profile_id"],
+                    contact["player_id"],
                     contact["qq_number"],
                     now,
                 )
-                for contact in private_contacts
+                for contact in contacts_to_store.values()
             ],
         )
-        stored_contacts.update(
-            {
-                contact["registration_id"]: {
-                    "registration_id": contact["registration_id"],
-                    "player_id": contact["profile_id"],
-                    "qq_number": contact["qq_number"],
-                }
-                for contact in private_contacts
-            }
-        )
-        event_contacts = {
-            registration_id: contact
-            for registration_id, contact in stored_contacts.items()
-            if registration_id not in current_registration_ids
-            or registration_id in current_contact_ids
-        }
         if private_profiles is not None:
             profile_scope_id = current_app.config["PROFILE_SCOPE_ID"]
             replace_current_player_profile_ids(
@@ -1037,14 +1049,6 @@ def publish_snapshot():
                         for contact in recipient_contacts
                     ],
                 )
-        stale_current_contact_ids = current_registration_ids - current_contact_ids
-        connection.executemany(
-            """
-            DELETE FROM queue_private_contact
-            WHERE queue_id = ? AND registration_id = ?
-            """,
-            [(queue_id, registration_id) for registration_id in stale_current_contact_ids],
-        )
         connection.execute(
             """
             DELETE FROM queue_event
@@ -4066,6 +4070,13 @@ def normalize_private_contacts(
     registration_ids = [contact["registration_id"] for contact in contacts]
     if len(registration_ids) != len(set(registration_ids)):
         raise ValidationError("QQ 绑定的登记编号不能重复")
+    current_profile_ids = [
+        contact["profile_id"]
+        for contact in contacts
+        if contact["registration_id"] in registrations
+    ]
+    if len(current_profile_ids) != len(set(current_profile_ids)):
+        raise ValidationError("同一玩家资料不能关联多份当前登记")
     return contacts
 
 

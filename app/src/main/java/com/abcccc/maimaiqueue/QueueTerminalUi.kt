@@ -6910,6 +6910,7 @@ private fun HomeScreen(
                                         destinationIndex
                                     )
                                 },
+                                centerContent = machines.size == 1,
                                 modifier = if (machines.size > 2) {
                                     Modifier.height(206.dp)
                                 } else {
@@ -7222,7 +7223,8 @@ private fun MachineLane(
     onRegistrationLongPress: (Int) -> Unit,
     onPositionClick: (PositionSelection) -> Unit,
     onPositionReorderRequest: (MachineQueue, Int, Int) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    centerContent: Boolean = false
 ) {
     val letter = machineId.name
     val displayedWaitingPositionCount = queue.waitingProjection(
@@ -7231,7 +7233,8 @@ private fun MachineLane(
     val queueCountSummary =
         "$displayedWaitingPositionCount 个等待位置 · ${queue.registrationCount} 个登记"
     Column(
-        modifier.padding(horizontal = 2.dp, vertical = 3.dp)
+        modifier.padding(horizontal = 2.dp, vertical = 3.dp),
+        verticalArrangement = if (centerContent) Arrangement.Center else Arrangement.Top
     ) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 4.dp),
@@ -7318,7 +7321,7 @@ private fun MachineLane(
         AnimatedContent(
             targetState = inlineReorderSession,
             modifier = Modifier.fillMaxWidth().height(QueueViewportHeight),
-            contentAlignment = Alignment.CenterStart,
+            contentAlignment = if (centerContent) Alignment.Center else Alignment.CenterStart,
             transitionSpec = {
                 (fadeIn(tween(240)) + scaleIn(tween(240), initialScale = .965f))
                     .togetherWith(fadeOut(tween(150)) + scaleOut(tween(180), targetScale = .96f))
@@ -7336,7 +7339,7 @@ private fun MachineLane(
                 AnimatedContent(
                     targetState = queue,
                     modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.CenterStart,
+                    contentAlignment = if (centerContent) Alignment.Center else Alignment.CenterStart,
                     transitionSpec = {
                         (fadeIn(tween(260)) + slideInHorizontally(tween(300)) { width -> width / 10 })
                             .togetherWith(
@@ -7524,7 +7527,11 @@ private fun MachineLane(
                         modifier = Modifier.fillMaxSize().onGloballyPositioned {
                             queueViewportBounds = it.boundsInRoot()
                         },
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = if (centerContent) {
+                            Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)
+                        } else {
+                            Arrangement.spacedBy(10.dp)
+                        }
                     ) {
                         item(key = "${machineId.name}-playing-position") {
                         QueuePosition(
@@ -8831,8 +8838,9 @@ private fun MachineSelectionScreen(
         else "${machines.size} 台机台分别维护独立的登记顺序。",
         onBack = onBack
     ) {
+        val columnCount = machineSelectionColumnCount(machines.size)
         Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            machines.chunked(2).forEach { rowMachines ->
+            machines.chunked(columnCount).forEach { rowMachines ->
                 Row(
                     Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
@@ -8846,7 +8854,7 @@ private fun MachineSelectionScreen(
                             Modifier.weight(1f)
                         )
                     }
-                    if (rowMachines.size == 1 && machines.size > 1) {
+                    repeat(columnCount - rowMachines.size) {
                         Spacer(Modifier.weight(1f))
                     }
                 }
@@ -13250,6 +13258,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.8.1",
+            "同步与跨端操作可靠性",
+            "修复退出排队后立即重新登记可能导致云端同步失败的问题，并分别保留历史通知与当前登记的联系方式。QQ Bot 在游玩位置执行暂缓一次、暂时离开时会采用终端的真实轮换结果；移动设备登记提交前会重新检查最新开放状态。单机台首页内容居中，三台机台的登记选择保持同排显示。"
+        ),
         Triple(
             "0.8.0",
             "机台扩展与拖动可靠性",

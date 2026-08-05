@@ -7,6 +7,14 @@ import org.junit.Test
 
 class QueueModelsTest {
     @Test
+    fun machineSelectionKeepsUpToThreeMachinesInOneRow() {
+        assertEquals(1, machineSelectionColumnCount(1))
+        assertEquals(2, machineSelectionColumnCount(2))
+        assertEquals(3, machineSelectionColumnCount(3))
+        assertEquals(2, machineSelectionColumnCount(4))
+    }
+
+    @Test
     fun playerProfileAliasUpdatesQueueReferenceAndVisibleDetails() {
         val oldId = "00000000-0000-0000-0000-000000000901"
         val currentId = "00000000-0000-0000-0000-000000000902"
