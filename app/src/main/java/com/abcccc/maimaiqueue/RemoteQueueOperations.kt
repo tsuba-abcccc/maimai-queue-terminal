@@ -43,7 +43,8 @@ internal data class RemoteQueueOperationCommand(
     val expectedFixedPairId: String? = null,
     val expectedAbsenceStatus: QueueAbsenceStatus? = null,
     val expectedTemporaryAwaySkippedTurns: Int? = null,
-    val expectedPendingCheckIn: Boolean? = null
+    val expectedPendingCheckIn: Boolean? = null,
+    val machineConfigurationRevision: Long? = null
 ) : RemoteTerminalCommand
 
 internal data class RemoteQueueExecutionState(
@@ -57,8 +58,31 @@ internal data class RemoteQueueExecutionState(
     val oneBotSyncEnabled: Boolean,
     val allowOnlineRegistration: Boolean,
     val allowDeferOneRound: Boolean,
-    val allowTemporaryLeave: Boolean
+    val allowTemporaryLeave: Boolean,
+    val machineCapacities: Map<String, Int> = emptyMap(),
+    val machineConfigurationRevision: Long = 1L
 )
+
+internal fun RemoteQueueExecutionState.machineCapacity(machineId: String): Int =
+    machineCapacities[machineId]?.takeIf { it == 1 || it == 2 } ?: 2
+
+internal fun QueueAction.normalizedForMachineCapacities(
+    machineCapacities: Map<String, Int>
+): QueueAction = when (this) {
+    is QueueAction.AddRegistrations -> if (machineCapacities[machineId] == 1) {
+        copy(
+            registrations = registrations.map { registration ->
+                registration.copy(
+                    preference = PlayPreference.SOLO,
+                    fixedPartnerKey = null
+                )
+            }
+        )
+    } else {
+        this
+    }
+    else -> this
+}
 
 internal fun RemoteQueueExecutionState.executeQueueAction(
     action: QueueAction,
@@ -66,7 +90,7 @@ internal fun RemoteQueueExecutionState.executeQueueAction(
     atMillis: Long
 ): QueueActionExecution = QueueEngine.execute(
     state = QueueEngineState(queues),
-    action = action,
+    action = action.normalizedForMachineCapacities(machineCapacities),
     context = QueueActionContext(
         atMillis = atMillis,
         origin = origin,
@@ -76,6 +100,7 @@ internal fun RemoteQueueExecutionState.executeQueueAction(
             allowDeferOneRound = allowDeferOneRound,
             allowTemporaryLeave = allowTemporaryLeave,
             machineStatuses = machineStatuses,
+            machineCapacities = machineCapacities,
             maxRegistrationsPerMachine = MAX_REGISTRATIONS_PER_MACHINE,
             requireOperationalForPlayerActions = true
         )
@@ -152,6 +177,12 @@ internal fun decideRemoteQueueOperation(
             }
         )
     }
+    if (
+        command.machineConfigurationRevision != null &&
+        command.machineConfigurationRevision != state.machineConfigurationRevision
+    ) {
+        return reject("机台配置已经更新，请重新查询后再操作。")
+    }
     when (command.source) {
         RemoteQueueOperationSource.WEBSITE_REMOTE -> if (!state.websiteRemoteEnabled) {
             return reject("现场终端已关闭网站同步，暂不能在线操作。")
@@ -191,13 +222,19 @@ internal fun decideRemoteQueueOperation(
         if (alreadyRegistered) {
             return reject("你已经有一份正在排队的登记，不能重复加入。")
         }
-        val resolvedPreference = when (profile.defaultPreference) {
-            ProfilePlayPreference.ASK_EVERY_TIME -> command.preference
-                ?: return reject("请选择本次游玩偏好。")
-            ProfilePlayPreference.SOLO -> PlayPreference.SOLO
-            ProfilePlayPreference.OPEN_TO_JOIN -> PlayPreference.OPEN_TO_JOIN
+        val singlePlayerMachine = state.machineCapacity(machineId) == 1
+        val resolvedPreference = if (singlePlayerMachine) {
+            PlayPreference.SOLO
+        } else {
+            when (profile.defaultPreference) {
+                ProfilePlayPreference.ASK_EVERY_TIME -> command.preference
+                    ?: return reject("请选择本次游玩偏好。")
+                ProfilePlayPreference.SOLO -> PlayPreference.SOLO
+                ProfilePlayPreference.OPEN_TO_JOIN -> PlayPreference.OPEN_TO_JOIN
+            }
         }
         if (
+            !singlePlayerMachine &&
             profile.defaultPreference != ProfilePlayPreference.ASK_EVERY_TIME &&
             command.preference != null && command.preference != resolvedPreference
         ) {
@@ -242,7 +279,13 @@ internal fun decideRemoteQueueOperation(
                 queues = execution.state.queues,
                 nextRegistrationKey = state.nextRegistrationKey + 1
             ),
-            detail = "线上登记已加入机台 $machineId 的等待顺序。请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。",
+            detail = buildString {
+                append("线上登记已加入机台 $machineId 的等待顺序。")
+                if (singlePlayerMachine) {
+                    append("该机台仅能容纳一人游玩，本次已使用“单人游玩”。")
+                }
+                append("请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。")
+            },
             changedMachineIds = setOf(machineId),
             action = queueAction,
             updatedProfile = usedProfile
@@ -399,6 +442,17 @@ internal fun decideRemoteQueueOperation(
             state = state.copy(queues = execution.state.queues),
             detail = buildString {
                 append("登记已转至机台 $targetMachineId 的等待顺序末端。")
+                if (state.machineCapacity(targetMachineId) == 1) {
+                    append("目标机台仅能容纳一人游玩，")
+                    append(
+                        if (registration.preference == PlayPreference.SOLO) {
+                            "本次登记继续使用“单人游玩”"
+                        } else {
+                            "本次登记已改为“单人游玩”"
+                        }
+                    )
+                    append("；玩家资料中的默认游玩偏好不会改变。")
+                }
                 if (registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND) {
                     if (fixedPartner != null) {
                         append("转入登记不再暂缓；留在原机台的登记仍会暂缓一次。")
@@ -498,6 +552,9 @@ internal fun decideRemoteQueueOperation(
             QueueAction.CancelTemporaryLeave(actualMachineId, registration.key)
         }
         RemoteQueueOperation.CHANGE_PLAY_PREFERENCE -> {
+            if (state.machineCapacity(actualMachineId) == 1) {
+                return reject("机台 $actualMachineId 仅能容纳一人游玩，本次登记不能修改游玩偏好。")
+            }
             val preference = command.preference ?: return reject("请选择本次游玩偏好。")
             if (registration.preference == preference && registration.fixedPartnerKey == null) {
                 return already("这份登记已经使用所选游玩偏好。")

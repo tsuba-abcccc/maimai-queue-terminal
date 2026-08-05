@@ -85,6 +85,84 @@ class QueueCloudSnapshotTest {
     }
 
     @Test
+    fun publicSnapshotPublishesMachineConfigurationRevisionAndPlannedDuration() {
+        val nowMillis = 1_000_000L
+        val machineConfiguration = MachineConfiguration(
+            remark = "入口侧",
+            gameType = MachineGameType.OTHER,
+            customGameType = "其他音游",
+            server = MachineServer.HIDDEN,
+            gameVersion = "1.2",
+            showGameVersion = true,
+            capacity = 1,
+            soloRoundMinutes = 20,
+            sharedRoundMinutes = 30
+        )
+        val snapshot = buildPublicQueueSnapshot(
+            state = state(
+                machineA = MachineQueue(
+                    playing = listOf(registration(1, "正在游玩")),
+                    waiting = listOf(registration(2, "等待玩家")),
+                    playingStartedAtMillis = nowMillis - 5 * 60_000L
+                )
+            ),
+            terminalId = "terminal-1",
+            capturedAtMillis = nowMillis,
+            displaySettings = QueuePublicDisplaySettings(
+                machineConfigurations = mapOf(MachineId.A to machineConfiguration),
+                machineConfigurationRevision = 7L
+            )
+        )
+        val machine = snapshot.getJSONObject("machines").getJSONObject("A")
+        val configuration = machine.getJSONObject("configuration")
+
+        assertEquals(6, snapshot.getInt("schema_version"))
+        assertEquals(7L, snapshot.getLong("machine_configuration_revision"))
+        assertEquals("入口侧", machine.getString("remark"))
+        assertEquals("OTHER", configuration.getString("game_type"))
+        assertEquals("其他音游", configuration.getString("custom_game_type"))
+        assertEquals("HIDDEN", configuration.getString("server"))
+        assertEquals("1.2", configuration.getString("game_version"))
+        assertTrue(configuration.getBoolean("game_version_visible"))
+        assertEquals(1, configuration.getInt("capacity"))
+        assertEquals(20, configuration.getInt("solo_round_minutes"))
+        assertEquals(30, configuration.getInt("shared_round_minutes"))
+        assertEquals(
+            15L,
+            machine.getJSONArray("waiting_positions").getJSONObject(0)
+                .getLong("estimated_wait_minutes")
+        )
+    }
+
+    @Test
+    fun authenticatedSyncSnapshotKeepsSchemaSixMachineConfiguration() {
+        val configuration = MachineConfiguration(
+            remark = "入口侧",
+            capacity = 1,
+            soloRoundMinutes = 18,
+            sharedRoundMinutes = 24
+        )
+
+        val snapshot = buildQueueSyncSnapshot(
+            state = state(),
+            terminalId = "terminal-1",
+            capturedAtMillis = 1_000L,
+            displaySettings = QueuePublicDisplaySettings(
+                machineConfigurations = mapOf(MachineId.A to configuration),
+                machineConfigurationRevision = 9L
+            )
+        )
+        val published = snapshot.getJSONObject("machines").getJSONObject("A")
+            .getJSONObject("configuration")
+
+        assertEquals(6, snapshot.getInt("schema_version"))
+        assertEquals(9L, snapshot.getLong("machine_configuration_revision"))
+        assertEquals(1, published.getInt("capacity"))
+        assertEquals(18, published.getInt("solo_round_minutes"))
+        assertEquals(24, published.getInt("shared_round_minutes"))
+    }
+
+    @Test
     fun publicSnapshotPublishesExactlyOneToFourConfiguredMachines() {
         (1..MachineId.entries.size).forEach { machineCount ->
             val machineIds = configuredMachineIds(machineCount)
@@ -519,7 +597,7 @@ class QueueCloudSnapshotTest {
         )
         val events = snapshot.getJSONArray("recent_events")
 
-        assertEquals(5, snapshot.getInt("schema_version"))
+        assertEquals(6, snapshot.getInt("schema_version"))
         assertEquals(1, events.length())
         assertEquals("NO_SHOW_MOVED_TO_TAIL", events.getJSONObject(0).getString("type"))
         assertEquals(
@@ -589,7 +667,7 @@ class QueueCloudSnapshotTest {
         val profiles = snapshot.getJSONArray("private_player_profiles")
         val contact = contacts.getJSONObject(0)
 
-        assertEquals(5, snapshot.getInt("schema_version"))
+        assertEquals(6, snapshot.getInt("schema_version"))
         assertEquals(1, contacts.length())
         assertEquals(3, profiles.length())
         assertEquals(publicRegistrationId(queueId, 10), contact.getString("registration_id"))

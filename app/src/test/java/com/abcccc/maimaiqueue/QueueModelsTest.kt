@@ -2115,6 +2115,65 @@ class QueueModelsTest {
     }
 
     @Test
+    fun waitEstimateUsesConfiguredSoloAndSharedRoundDurations() {
+        val nowMillis = 4_100_000L
+        val soloQueue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO)),
+            waiting = listOf(registration(2, PlayPreference.SOLO)),
+            playingStartedAtMillis = nowMillis - 3 * 60_000L
+        )
+        val sharedQueue = MachineQueue(
+            playing = listOf(registration(1), registration(2)),
+            waiting = listOf(registration(3, PlayPreference.SOLO)),
+            playingStartedAtMillis = nowMillis - 4 * 60_000L
+        )
+
+        assertEquals(
+            5L,
+            estimatedMinutesUntilPlaying(
+                soloQueue,
+                setOf(2),
+                nowMillis,
+                machineCapacity = 2,
+                soloRoundMinutes = 8,
+                sharedRoundMinutes = 20
+            )
+        )
+        assertEquals(
+            16L,
+            estimatedMinutesUntilPlaying(
+                sharedQueue,
+                setOf(3),
+                nowMillis,
+                machineCapacity = 2,
+                soloRoundMinutes = 8,
+                sharedRoundMinutes = 20
+            )
+        )
+    }
+
+    @Test
+    fun singlePlayerMachineEstimateNeverPairsOpenRegistrations() {
+        val nowMillis = 4_200_000L
+        val queue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO)),
+            waiting = listOf(registration(2, PlayPreference.OPEN_TO_JOIN)),
+            playingStartedAtMillis = nowMillis
+        )
+
+        assertEquals(
+            20L,
+            estimatedWaitForNewOpenRegistration(
+                queue,
+                nowMillis,
+                machineCapacity = 1,
+                soloRoundMinutes = 10,
+                sharedRoundMinutes = 99
+            )
+        )
+    }
+
+    @Test
     fun overtimeCurrentRoundDoesNotAddNegativeWaitingTime() {
         val nowMillis = 5_000_000L
         val queue = MachineQueue(

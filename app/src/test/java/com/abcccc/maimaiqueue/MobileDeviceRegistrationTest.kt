@@ -38,6 +38,43 @@ class MobileDeviceRegistrationTest {
     }
 
     @Test
+    fun staleMachineConfigurationRevisionRejectsMobileRegistration() {
+        val current = state().copy(machineConfigurationRevision = 12L)
+
+        val result = decideMobileDeviceRegistration(
+            command().copy(machineConfigurationRevision = 11L),
+            current
+        )
+
+        assertTrue(result is MobileDeviceRegistrationDecision.Reject)
+        assertEquals(
+            "机台配置已经更新，请在终端重新打开移动设备登记。",
+            (result as MobileDeviceRegistrationDecision.Reject).detail
+        )
+        assertTrue(current.queues.values.all { it.allRegistrations.isEmpty() })
+    }
+
+    @Test
+    fun singlePlayerMachineUsesSoloWithoutChangingTheProfileDefault() {
+        val current = state().copy(
+            machineCapacities = mapOf("A" to 1, "B" to 2),
+            machineConfigurationRevision = 3L
+        )
+
+        val result = decideMobileDeviceRegistration(
+            command().copy(machineConfigurationRevision = 3L),
+            current,
+            appliedAtMillis = 5_000L
+        ) as MobileDeviceRegistrationDecision.Apply
+
+        val registration = result.state.queues.getValue("A").playing.single()
+        assertEquals(PlayPreference.SOLO, registration.preference)
+        assertEquals(ProfilePlayPreference.OPEN_TO_JOIN, current.playerProfiles.single().defaultPreference)
+        assertTrue(result.detail.contains("仅能容纳一人游玩"))
+        assertTrue(result.detail.contains("本次已使用“单人游玩”"))
+    }
+
+    @Test
     fun configuredMachinesCAndDAreHandledLikeTheOriginalMachines() {
         val queues = linkedMapOf(
             "A" to MachineQueue(),

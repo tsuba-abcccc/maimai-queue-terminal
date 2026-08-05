@@ -7,6 +7,28 @@ import org.junit.Test
 
 class RemoteQueueOperationsTest {
     @Test
+    fun terminalRegistrationInputsAreNormalizedBeforeSinglePlayerCapacityValidation() {
+        val action = QueueAction.AddRegistrations(
+            machineId = "A",
+            registrations = listOf(
+                registration(1, "临时玩家"),
+                registration(2, "资料玩家").copy(
+                    fixedPartnerKey = 1,
+                    preference = PlayPreference.OPEN_TO_JOIN
+                )
+            ),
+            placement = RegistrationPlacement.WAITING_TAIL
+        )
+
+        val normalized = action.normalizedForMachineCapacities(mapOf("A" to 1))
+            as QueueAction.AddRegistrations
+
+        assertEquals(listOf(1, 2), normalized.registrations.map { it.key })
+        assertTrue(normalized.registrations.all { it.preference == PlayPreference.SOLO })
+        assertTrue(normalized.registrations.all { it.fixedPartnerKey == null })
+    }
+
+    @Test
     fun onlineJoinCreatesPendingRegistrationAtWaitingTail() {
         val existing = registration(1, "现场玩家")
         val state = state(
@@ -29,6 +51,43 @@ class RemoteQueueOperationsTest {
         assertEquals(joinCommand().commandId, joined.originatingCommandId)
         assertEquals(3, result.state.nextRegistrationKey)
         assertEquals(1, result.updatedProfile?.usageCount)
+    }
+
+    @Test
+    fun staleMachineConfigurationRevisionRejectsRemoteCommandsBeforeApplyingThem() {
+        val current = state().copy(machineConfigurationRevision = 8L)
+
+        val result = decideRemoteQueueOperation(
+            joinCommand().copy(machineConfigurationRevision = 7L),
+            current
+        )
+
+        assertTrue(result is RemoteQueueOperationDecision.Reject)
+        assertEquals(
+            "机台配置已经更新，请重新查询后再操作。",
+            (result as RemoteQueueOperationDecision.Reject).detail
+        )
+        assertTrue(current.queues.values.all { it.allRegistrations.isEmpty() })
+    }
+
+    @Test
+    fun onlineJoinToSinglePlayerMachineForcesSoloWithoutChangingProfileDefault() {
+        val current = state().copy(
+            machineCapacities = mapOf("A" to 1, "B" to 2),
+            machineConfigurationRevision = 4L
+        )
+
+        val result = decideRemoteQueueOperation(
+            joinCommand().copy(machineConfigurationRevision = 4L),
+            current,
+            appliedAtMillis = 5_000L
+        ) as RemoteQueueOperationDecision.Apply
+
+        val registration = result.state.queues.getValue("A").waiting.single()
+        assertEquals(PlayPreference.SOLO, registration.preference)
+        assertEquals(ProfilePlayPreference.OPEN_TO_JOIN, current.playerProfiles.single().defaultPreference)
+        assertTrue(result.detail.contains("仅能容纳一人游玩"))
+        assertTrue(result.detail.contains("本次已使用“单人游玩”"))
     }
 
     @Test
@@ -137,6 +196,105 @@ class RemoteQueueOperationsTest {
         assertEquals(0, applied.state.queues.getValue("A").registrationCount)
         assertEquals(1, applied.state.queues.getValue("B").registrationCount)
         assertTrue(repeated is RemoteQueueOperationDecision.AlreadyApplied)
+    }
+
+    @Test
+    fun singlePlayerMachineRejectsPreferenceChangesAndFixedPairTransfers() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id
+        )
+        val singlePlayerRegistration = player.copy(preference = PlayPreference.SOLO)
+        val preferenceResult = decideRemoteQueueOperation(
+            operationCommand(
+                RemoteQueueOperation.CHANGE_PLAY_PREFERENCE,
+                singlePlayerRegistration,
+                preference = PlayPreference.OPEN_TO_JOIN
+            ),
+            state(
+                machineA = MachineQueue(waiting = listOf(singlePlayerRegistration)),
+                nextKey = 3
+            ).copy(
+                machineCapacities = mapOf("A" to 1, "B" to 2)
+            )
+        )
+
+        val partner = registration(3, "固定搭档")
+        val pairedQueue = MachineQueue(waiting = listOf(player, partner)).let { queue ->
+            queue.applyFriendPair(requireNotNull(queue.planFriendPair(player.key, partner.key)))
+        }
+        val pairedPlayer = pairedQueue.waiting.first { it.key == player.key }
+        val transferResult = decideRemoteQueueOperation(
+            operationCommand(
+                RemoteQueueOperation.TRANSFER_MACHINE,
+                pairedPlayer,
+                targetMachineId = "B"
+            ),
+            state(machineA = pairedQueue, nextKey = 4).copy(
+                machineCapacities = mapOf("A" to 2, "B" to 1)
+            )
+        )
+
+        assertTrue(preferenceResult is RemoteQueueOperationDecision.Reject)
+        assertEquals(
+            "机台 A 仅能容纳一人游玩，本次登记不能修改游玩偏好。",
+            (preferenceResult as RemoteQueueOperationDecision.Reject).detail
+        )
+        assertTrue(transferResult is RemoteQueueOperationDecision.Reject)
+        assertEquals(listOf(player.key, partner.key), pairedQueue.waiting.map { it.key })
+    }
+
+    @Test
+    fun transferToSinglePlayerMachineUsesSoloAndExplainsTheResult() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id,
+            preference = PlayPreference.OPEN_TO_JOIN
+        )
+        val result = decideRemoteQueueOperation(
+            operationCommand(
+                RemoteQueueOperation.TRANSFER_MACHINE,
+                player,
+                targetMachineId = "B"
+            ),
+            state(machineA = MachineQueue(waiting = listOf(player)), nextKey = 3).copy(
+                machineCapacities = mapOf("A" to 2, "B" to 1)
+            )
+        ) as RemoteQueueOperationDecision.Apply
+
+        assertEquals(
+            PlayPreference.SOLO,
+            result.state.queues.getValue("B").waiting.single().preference
+        )
+        assertTrue(result.detail.contains("本次登记已改为“单人游玩”"))
+        assertTrue(result.detail.contains("默认游玩偏好不会改变"))
+    }
+
+    @Test
+    fun transferToSinglePlayerMachineDoesNotClaimAnExistingSoloPreferenceChanged() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id,
+            preference = PlayPreference.SOLO
+        )
+        val result = decideRemoteQueueOperation(
+            operationCommand(
+                RemoteQueueOperation.TRANSFER_MACHINE,
+                player,
+                targetMachineId = "B"
+            ),
+            state(machineA = MachineQueue(waiting = listOf(player)), nextKey = 3).copy(
+                machineCapacities = mapOf("A" to 2, "B" to 1)
+            )
+        ) as RemoteQueueOperationDecision.Apply
+
+        assertEquals(
+            PlayPreference.SOLO,
+            result.state.queues.getValue("B").waiting.single().preference
+        )
+        assertTrue(result.detail.contains("本次登记继续使用“单人游玩”"))
+        assertFalse(result.detail.contains("本次登记已改为“单人游玩”"))
+        assertTrue(result.detail.contains("默认游玩偏好不会改变"))
     }
 
     @Test

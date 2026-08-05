@@ -662,7 +662,7 @@ class QueueStatusApiTest(unittest.TestCase):
         )
 
         self.assertEqual(204, published.status_code)
-        self.assertEqual(5, public_response.get_json()["schema_version"])
+        self.assertEqual(6, public_response.get_json()["schema_version"])
         public_registration = public_response.get_json()["machines"]["A"]["playing"][0]
         public_companion = public_response.get_json()["machines"]["A"]["playing"][1]
         self.assertEqual("12345678", public_registration["qq_number"])
@@ -2649,6 +2649,74 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(400, mismatched_response.status_code)
         self.assertEqual(400, overlong_response.status_code)
 
+    def test_schema_v6_preserves_configuration_and_rejects_single_player_violations(self):
+        valid = self.remote_ready_snapshot(revision=40)
+        self.upgrade_snapshot_to_schema_v6(
+            valid,
+            capacities={"A": 1, "B": 2},
+            configuration_revision=7,
+        )
+        valid["machines"]["A"]["configuration"].update(
+            game_type="OTHER",
+            custom_game_type="其他音游",
+            game_version="1.2",
+            game_version_visible=True,
+            solo_round_minutes=20,
+            shared_round_minutes=30,
+        )
+
+        accepted = self.client.post(
+            "/api/queue-status", json=valid, headers=self.headers
+        )
+        current = self.client.get("/api/queue-status").get_json()
+
+        self.assertEqual(204, accepted.status_code)
+        self.assertEqual(7, current["machine_configuration_revision"])
+        self.assertEqual(1, current["machines"]["A"]["configuration"]["capacity"])
+        self.assertEqual(
+            "其他音游",
+            current["machines"]["A"]["configuration"]["custom_game_type"],
+        )
+        self.assertEqual(
+            20, current["machines"]["A"]["configuration"]["solo_round_minutes"]
+        )
+
+        open_preference = copy.deepcopy(valid)
+        open_preference["revision"] = 41
+        open_registration = self.registration("c" * 24, "开放玩家")
+        open_registration["preference"] = "OPEN_TO_JOIN"
+        open_preference["machines"]["A"]["waiting_positions"] = [
+            {
+                "index": 1,
+                "position_id": "d" * 24,
+                "fixed_pair": False,
+                "estimated_wait_minutes": 0,
+                "registrations": [open_registration],
+            }
+        ]
+        open_preference["machines"]["A"]["registration_count"] = 1
+        open_preference["machines"]["A"]["waiting_position_count"] = 1
+
+        double_playing = copy.deepcopy(valid)
+        double_playing["revision"] = 42
+        double_playing["machines"]["A"]["playing"] = [
+            self.registration("e" * 24, "玩家一"),
+            self.registration("f" * 24, "玩家二"),
+        ]
+        double_playing["machines"]["A"]["playing_started_at"] = 900_000
+        double_playing["machines"]["A"]["registration_count"] = 2
+
+        for label, snapshot in (
+            ("开放偏好", open_preference),
+            ("双人游玩位置", double_playing),
+        ):
+            with self.subTest(label=label):
+                response = self.client.post(
+                    "/api/queue-status", json=snapshot, headers=self.headers
+                )
+                self.assertEqual(400, response.status_code)
+                self.assertIn("游玩容量为 1", response.get_json()["error"])
+
     def test_preserves_maintenance_and_optional_other_stop_detail(self):
         maintenance = self.snapshot(revision=7)
         maintenance["machines"]["A"].update(
@@ -2725,6 +2793,183 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("QUEUE_OPERATION", commands[0]["type"])
         self.assertEqual("JOIN_QUEUE", commands[0]["payload"]["operation"])
         self.assertEqual("WEBSITE_REMOTE", commands[0]["payload"]["operation_source"])
+
+    def test_single_player_remote_join_forces_solo_and_carries_configuration_revision(self):
+        snapshot = self.remote_ready_snapshot(
+            revision=43,
+            default_preference="ASK_EVERY_TIME",
+        )
+        self.upgrade_snapshot_to_schema_v6(
+            snapshot,
+            capacities={"A": 1, "B": 2},
+            configuration_revision=11,
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+
+        joined = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000454",
+                "actor_qq": "12345678",
+                "operation": "JOIN_QUEUE",
+                "machine_id": "A",
+                "expected_queue_id": snapshot["queue_id"],
+                "expected_machine_configuration_revision": 11,
+            },
+            headers=self.bot_headers,
+        )
+        command = joined.get_json()
+
+        self.assertEqual(202, joined.status_code)
+        self.assertEqual("SOLO", command["payload"]["preference"])
+        self.assertEqual(11, command["payload"]["machine_configuration_revision"])
+
+    def test_remote_join_confirmation_rejects_changed_queue_or_machine_configuration(self):
+        snapshot = self.remote_ready_snapshot(revision=44)
+        self.upgrade_snapshot_to_schema_v6(
+            snapshot,
+            configuration_revision=9,
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+
+        matching = {
+            "request_id": "00000000-0000-0000-0000-000000000461",
+            "qq": "12345678",
+            "machine_id": "A",
+            "expected_queue_id": snapshot["queue_id"],
+            "expected_machine_configuration_revision": 9,
+        }
+        changed_queue = {
+            **matching,
+            "request_id": "00000000-0000-0000-0000-000000000462",
+            "expected_queue_id": "00000000-0000-0000-0000-000000000099",
+        }
+        changed_configuration = {
+            **matching,
+            "request_id": "00000000-0000-0000-0000-000000000463",
+            "expected_machine_configuration_revision": 8,
+        }
+        incomplete = {
+            key: value
+            for key, value in matching.items()
+            if key != "expected_machine_configuration_revision"
+        }
+        incomplete["request_id"] = "00000000-0000-0000-0000-000000000464"
+
+        queue_response = self.client.post(
+            "/api/queue-online/join", json=changed_queue
+        )
+        configuration_response = self.client.post(
+            "/api/queue-online/join", json=changed_configuration
+        )
+        incomplete_response = self.client.post(
+            "/api/queue-online/join", json=incomplete
+        )
+        accepted = self.client.post("/api/queue-online/join", json=matching)
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+
+        self.assertEqual(409, queue_response.status_code)
+        self.assertEqual("QUEUE_CONTEXT_CHANGED", queue_response.get_json()["code"])
+        self.assertEqual(409, configuration_response.status_code)
+        self.assertEqual(
+            "QUEUE_CONTEXT_CHANGED", configuration_response.get_json()["code"]
+        )
+        self.assertEqual(400, incomplete_response.status_code)
+        self.assertIn("确认字段不完整", incomplete_response.get_json()["error"])
+        self.assertEqual(202, accepted.status_code)
+        self.assertEqual(1, len(commands))
+        self.assertEqual(9, commands[0]["payload"]["machine_configuration_revision"])
+
+    def test_single_player_machine_rejects_preference_change_and_fixed_pair_transfer(self):
+        single = self.remote_ready_snapshot(revision=44, with_registration=True)
+        self.upgrade_snapshot_to_schema_v6(
+            single,
+            capacities={"A": 1, "B": 2},
+            configuration_revision=12,
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=single, headers=self.headers
+            ).status_code,
+        )
+
+        preference = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000455",
+                "actor_qq": "12345678",
+                "operation": "CHANGE_PLAY_PREFERENCE",
+                "preference": "OPEN_TO_JOIN",
+            },
+            headers=self.bot_headers,
+        )
+        self.assertEqual(409, preference.status_code)
+        self.assertIn("仅能容纳一人游玩", preference.get_json()["error"])
+
+        paired = self.remote_ready_snapshot(revision=45)
+        first = self.registration("a" * 24, "公开昵称")
+        second = self.registration("c" * 24, "固定搭档")
+        for registration in (first, second):
+            registration.update(
+                preference="OPEN_TO_JOIN",
+                fixed_pair=True,
+                fixed_pair_id="f" * 24,
+            )
+        paired["machines"]["A"]["waiting_positions"] = [
+            {
+                "index": 1,
+                "position_id": "b" * 24,
+                "fixed_pair": True,
+                "estimated_wait_minutes": 0,
+                "registrations": [first, second],
+            }
+        ]
+        paired["machines"]["A"]["registration_count"] = 2
+        paired["machines"]["A"]["waiting_position_count"] = 1
+        paired["private_player_contacts"] = [
+            {
+                "registration_id": first["registration_id"],
+                "profile_id": self.profile_id,
+                "qq_number": "12345678",
+            }
+        ]
+        self.upgrade_snapshot_to_schema_v6(
+            paired,
+            capacities={"A": 2, "B": 1},
+            configuration_revision=13,
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=paired, headers=self.headers
+            ).status_code,
+        )
+
+        transfer = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000456",
+                "actor_qq": "12345678",
+                "operation": "TRANSFER_MACHINE",
+                "target_machine_id": "B",
+            },
+            headers=self.bot_headers,
+        )
+        self.assertEqual(409, transfer.status_code)
+        self.assertIn("先释放固定组合", transfer.get_json()["error"])
 
     def test_four_machine_profile_lookup_and_website_join_target_machine_c(self):
         snapshot = self.remote_ready_snapshot(revision=31)
@@ -3977,6 +4222,58 @@ class QueueStatusApiTest(unittest.TestCase):
             for command in commands
         ))
 
+    def test_single_player_mobile_registration_skips_preference_and_carries_revision(self):
+        snapshot = self.remote_ready_snapshot(
+            revision=46,
+            default_preference="ASK_EVERY_TIME",
+        )
+        self.upgrade_snapshot_to_schema_v6(
+            snapshot,
+            capacities={"A": 1, "B": 2},
+            configuration_revision=14,
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        created = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000854",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        ).get_json()
+        opened = self.client.get(
+            f"/api/queue-mobile/sessions/{created['session_token']}"
+        ).get_json()
+
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{created['session_token']}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000855",
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+            },
+        )
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+        command = next(
+            value
+            for value in commands
+            if value["command_id"] == "00000000-0000-0000-0000-000000000855"
+        )
+
+        self.assertEqual(1, opened["session"]["machine_configuration"]["capacity"])
+        self.assertEqual(14, opened["session"]["machine_configuration_revision"])
+        self.assertEqual(202, submitted.status_code)
+        self.assertEqual("SOLO", command["payload"]["preference"])
+        self.assertEqual(14, command["payload"]["machine_configuration_revision"])
+
     def test_mobile_registration_rechecks_queue_closure_before_submission(self):
         snapshot = self.remote_ready_snapshot(revision=24)
         self.assertEqual(
@@ -4088,6 +4385,35 @@ class QueueStatusApiTest(unittest.TestCase):
                 }
             ]
         return snapshot
+
+    @staticmethod
+    def upgrade_snapshot_to_schema_v6(
+        snapshot,
+        capacities=None,
+        configuration_revision=1,
+    ):
+        capacities = capacities or {}
+        snapshot["schema_version"] = 6
+        snapshot["machine_configuration_revision"] = configuration_revision
+        for machine_id, machine in snapshot["machines"].items():
+            suffix = f" · 机台 {machine_id}"
+            remark = (
+                machine["name"][: -len(suffix)]
+                if machine["name"].endswith(suffix)
+                else machine["name"]
+            )
+            machine["remark"] = remark
+            machine["configuration"] = {
+                "game_type": "MAIMAI_DX",
+                "custom_game_type": None,
+                "server": "HIDDEN",
+                "custom_server": None,
+                "game_version": None,
+                "game_version_visible": False,
+                "capacity": capacities.get(machine_id, 2),
+                "solo_round_minutes": 12,
+                "shared_round_minutes": 15,
+            }
 
     def snapshot(
         self,

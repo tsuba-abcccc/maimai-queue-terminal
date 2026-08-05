@@ -101,10 +101,28 @@ interface QueueMachine {
   waiting_positions: WaitingPosition[];
   registration_count?: number;
   new_registration_estimated_wait_minutes?: number | null;
+  capacity?: 1 | 2;
+  configuration?: MachineConfiguration;
+}
+
+interface MachineConfiguration {
+  remark?: string;
+  game_type: "MAIMAI_DX" | "CHUNITHM" | "ONGEKI" | "DANCE_CUBE" |
+    "TAIKO_NO_TATSUJIN" | "OTHER";
+  custom_game_type?: string | null;
+  server: "CHINA" | "INTERNATIONAL" | "JAPAN" | "DABING" | "RINNET" |
+    "OTHER" | "HIDDEN";
+  custom_server?: string | null;
+  game_version?: string | null;
+  game_version_visible?: boolean;
+  capacity: 1 | 2;
+  solo_round_minutes: number;
+  shared_round_minutes: number;
 }
 
 interface QueueStatus {
   queue_id: string;
+  machine_configuration_revision?: number;
   captured_at: number;
   registration_open: boolean;
   test_data?: boolean;
@@ -155,6 +173,7 @@ interface BotPlayer {
 
 interface BotPlayersResponse {
   queue_id: string;
+  machine_configuration_revision?: number;
   received_at?: number;
   registration_open?: boolean;
   test_data?: boolean;
@@ -236,6 +255,7 @@ interface QueueCommandFields {
   expected_absence_status?: "NONE" | "DEFER_ONE_ROUND" | "TEMPORARILY_AWAY";
   expected_temporary_away_skipped_turns?: number;
   expected_pending_check_in?: boolean;
+  expected_machine_configuration_revision?: number;
 }
 
 interface EventCursor {
@@ -867,7 +887,7 @@ export function onlineRegistrationProfileCompletionNotice(
     : null;
 }
 
-async function joinQueueFromBot(
+export async function joinQueueFromBot(
   api: QueueApi,
   config: Config,
   session: Session | undefined,
@@ -923,7 +943,8 @@ async function joinQueueFromBot(
   }
 
   let preference: PlayPreference | undefined;
-  if (profile.default_preference === "ASK_EVERY_TIME") {
+  const singlePlayerMachine = machineCapacity(machine) === 1;
+  if (profile.default_preference === "ASK_EVERY_TIME" && !singlePlayerMachine) {
     const preferenceInput = await resolveQueueCommandInput(
       session,
       [
@@ -949,6 +970,9 @@ async function joinQueueFromBot(
     {
       machine_id: machine.id,
       preference,
+      expected_queue_id: queue.queue_id,
+      expected_machine_configuration_revision:
+        queue.machine_configuration_revision ?? 1,
     },
   );
   if (command.status === "REJECTED") {
@@ -958,6 +982,9 @@ async function joinQueueFromBot(
     return [
       "线上登记已经提交，正在等待现场终端确认。",
       "",
+      ...(singlePlayerMachine
+        ? [`${compactMachineName(machine.name)} 仅能容纳一人游玩，本次将使用“单人游玩”。玩家资料中的默认游玩偏好不会改变。`, ""]
+        : []),
       "终端确认创建后，请在 30 分钟内到达现场，并在终端点击自己的登记，再点击“已到场”完成签到。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。",
       ...(profileCompletionNotice ? ["", profileCompletionNotice] : []),
     ].join("\n");
@@ -965,6 +992,9 @@ async function joinQueueFromBot(
   return [
     `已经加入${compactMachineName(machine.name)} 的等待顺序。`,
     "",
+    ...(singlePlayerMachine
+      ? [`${compactMachineName(machine.name)} 仅能容纳一人游玩，本次已使用“单人游玩”。玩家资料中的默认游玩偏好不会改变。`, ""]
+      : []),
     "这是一份线上登记。请在创建登记后的 30 分钟内到达现场，并在终端点击自己的登记，再点击“已到场”完成签到。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。",
     ...(profileCompletionNotice ? ["", profileCompletionNotice] : []),
   ].join("\n");
@@ -1113,10 +1143,19 @@ async function transferQueueMachine(
   requireOperationalRegistration(current.player);
   requireSignedInWaitingRegistration(current.player);
   const queue = await api.getQueue();
-  const candidates = sortedMachines(queue).filter((machine) =>
+  const otherwiseAvailableMachines = sortedMachines(queue).filter((machine) =>
     machine.id !== current.player.machine_id && machineCanAcceptRegistration(machine)
   );
+  const candidates = otherwiseAvailableMachines.filter((machine) =>
+    !(current.player.fixed_pair && machineCapacity(machine) === 1)
+  );
   if (!candidates.length) {
+    if (
+      current.player.fixed_pair &&
+      otherwiseAvailableMachines.some((machine) => machineCapacity(machine) === 1)
+    ) {
+      throw new Error("可转入的机台仅能容纳一人游玩。请先发送“修改游玩偏好”解除固定组合，再切换机台。");
+    }
     throw new Error("当前没有其他可以转入的机台。请发送“查看队列”确认机台状态，稍后再试。");
   }
   let target = candidates[0];
@@ -1156,6 +1195,9 @@ async function transferQueueMachine(
       ...(current.player.fixed_pair
         ? ["原固定组合会解除；两份登记都会恢复为允许他人加入，另一份登记保留原位。"]
         : []),
+      ...(machineCapacity(target) === 1
+        ? [`${compactMachineName(target.name)} 仅能容纳一人游玩。转入后，本次登记将使用“单人游玩”，玩家资料中的默认游玩偏好不会改变。`]
+        : []),
     ].join("\n"),
     "确认切换机台",
   );
@@ -1176,6 +1218,11 @@ async function changeCurrentPreference(
   const current = await requireCurrentQueueRegistration(api, session);
   requireOperationalRegistration(current.player);
   requireSignedInRegistration(current.player);
+  const queue = await api.getQueue();
+  const machine = queue.machines[current.player.machine_id];
+  if (machine && machineCapacity(machine) === 1) {
+    throw new Error(`${compactMachineName(machine.name)} 仅能容纳一人游玩，本次登记不能修改游玩偏好。`);
+  }
   const fixedPairNotice = current.player.fixed_pair
     ? [
       "",
@@ -1442,10 +1489,16 @@ export function machineCanAcceptRegistration(machine: QueueMachine): boolean {
   return machine.operational && registrationCount < 20;
 }
 
+export function machineCapacity(machine: QueueMachine): 1 | 2 {
+  const capacity = machine.configuration?.capacity ?? machine.capacity;
+  return capacity === 1 ? 1 : 2;
+}
+
 export function formatMachineChoice(machine: QueueMachine): string {
   const details: string[] = [];
   const remark = machineRemark(machine);
   if (remark) details.push(remark);
+  if (machineCapacity(machine) === 1) details.push("仅单人游玩");
   if (typeof machine.new_registration_estimated_wait_minutes === "number") {
     details.push(
       machine.new_registration_estimated_wait_minutes <= 0
@@ -2359,11 +2412,13 @@ export function formatOwnQueue(
   if (notices.length) blocks.push(notices.join("\n"));
   blocks.push(status);
   if (players.length === 1 && terminalOnline !== false) {
-    const playerMachineOperational = queue?.machines[players[0].machine_id]?.operational;
+    const playerMachine = queue?.machines[players[0].machine_id];
+    const playerMachineOperational = playerMachine?.operational;
     const actions = formatOwnQueueActions(
       players[0],
       queueRules,
       playerMachineOperational,
+      playerMachine ? machineCapacity(playerMachine) : undefined,
     );
     if (actions.length) blocks.push(actions.map((action) => ` - ${action}`).join("\n"));
   }
@@ -2374,6 +2429,7 @@ export function formatOwnQueueActions(
   player: BotPlayer,
   queueRules?: QueueRules,
   machineOperational?: boolean,
+  machineCapacityValue?: 1 | 2,
 ): string[] {
   if ((machineOperational ?? player.machine_operational) === false) return [];
   if (player.online_registration_pending_check_in) return ["退出排队"];
@@ -2389,7 +2445,8 @@ export function formatOwnQueueActions(
   if (player.position === "WAITING") {
     actions.push("切换机台");
   }
-  actions.push("修改游玩偏好", "退出排队");
+  if (machineCapacityValue !== 1) actions.push("修改游玩偏好");
+  actions.push("退出排队");
   return actions;
 }
 

@@ -210,6 +210,8 @@ internal interface QueueStatePublisher {
 
 internal data class QueuePublicDisplaySettings(
     val machineRemarks: Map<MachineId, String> = DEFAULT_MACHINE_REMARKS,
+    val machineConfigurations: Map<MachineId, MachineConfiguration> = emptyMap(),
+    val machineConfigurationRevision: Long = 1L,
     val websiteRemoteEnabled: Boolean = true,
     val oneBotSyncEnabled: Boolean = true,
     val syncMode: QueueSyncMode = QueueSyncMode.UNSPECIFIED,
@@ -219,10 +221,18 @@ internal data class QueuePublicDisplaySettings(
     val showCommonPlayPreview: Boolean = true,
     val businessHours: QueuePublicBusinessHours = QueuePublicBusinessHours()
 ) {
-    fun machineRemark(machineId: MachineId): String = normalizeMachineRemark(
-        machineRemarks[machineId],
-        DEFAULT_MACHINE_REMARKS.getValue(machineId)
-    )
+    fun machineConfiguration(machineId: MachineId): MachineConfiguration =
+        machineConfigurations[machineId]?.let { configuration ->
+            normalizeMachineConfiguration(machineId, configuration)
+        } ?: normalizeMachineConfiguration(
+            machineId,
+            DEFAULT_MACHINE_CONFIGURATIONS.getValue(machineId).copy(
+                remark = machineRemarks[machineId]
+                    ?: DEFAULT_MACHINE_REMARKS.getValue(machineId)
+            )
+        )
+
+    fun machineRemark(machineId: MachineId): String = machineConfiguration(machineId).remark
 }
 
 internal data class QueuePublicBusinessHours(
@@ -780,7 +790,10 @@ private fun parseQueueOperation(command: JSONObject?): RemoteQueueOperationComma
                 payload.getBoolean("expected_pending_check_in")
             } else {
                 null
-            }
+            },
+            machineConfigurationRevision = payload.optionalPositiveLong(
+                "machine_configuration_revision"
+            )
         )
     }.getOrNull()?.takeIf(::isValidQueueOperationCommand)
 }
@@ -829,7 +842,10 @@ private fun parseMobileDeviceRegistration(
                 profileSource.optLong("expected_profile_revision").takeIf { it > 0L }
             },
             completion = completion,
-            newProfile = newProfile
+            newProfile = newProfile,
+            machineConfigurationRevision = payload.optionalPositiveLong(
+                "machine_configuration_revision"
+            )
         ).also { parsed ->
             check((mode == "NEW") == (parsed.newProfile != null))
             check((mode == "EXISTING") == (parsed.newProfile == null))
@@ -873,6 +889,9 @@ private fun parseNotificationPreferences(source: JSONObject): QueueNotificationP
 
 private fun JSONObject.optionalNonBlankString(name: String): String? =
     if (!has(name) || isNull(name)) null else optString(name).trim().takeIf { it.isNotEmpty() }
+
+private fun JSONObject.optionalPositiveLong(name: String): Long? =
+    if (!has(name) || isNull(name)) null else getLong(name).also { require(it > 0L) }
 
 private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): Boolean {
     val validUuid = { value: String -> runCatching { UUID.fromString(value) }.isSuccess }
@@ -1297,6 +1316,10 @@ internal fun buildPublicQueueSnapshot(
     put("schema_version", PUBLIC_SCHEMA_VERSION)
     put("queue_id", state.queueId)
     put("revision", state.revision)
+    put(
+        "machine_configuration_revision",
+        displaySettings.machineConfigurationRevision.coerceAtLeast(1L)
+    )
     put("captured_at", capturedAtMillis)
     put(
         "registration_open",
@@ -1340,18 +1363,20 @@ internal fun buildPublicQueueSnapshot(
         JSONObject().apply {
             state.configuredMachineIds.forEach { machineId ->
                 val machine = state.machine(machineId)
+                val configuration = displaySettings.machineConfiguration(machineId)
                 put(
                     machineId.name,
                     buildPublicMachine(
                     queueId = state.queueId,
                     machineId = machineId.name,
                     machineName = publicMachineName(
-                        displaySettings.machineRemark(machineId),
+                        configuration.remark,
                         DEFAULT_MACHINE_REMARKS.getValue(machineId),
                         machineId.name
                     ),
                     queue = machine.queue,
                     status = machine.status,
+                    configuration = configuration,
                     showCommonPlayPreview = displaySettings.showCommonPlayPreview,
                     capturedAtMillis = capturedAtMillis
                 )
@@ -1418,15 +1443,47 @@ private fun buildPublicMachine(
     machineName: String,
     queue: MachineQueue,
     status: MachineStatus,
+    configuration: MachineConfiguration,
     showCommonPlayPreview: Boolean,
     capturedAtMillis: Long
 ): JSONObject {
     val waitingProjection = queue.waitingProjection(
-        includeCommonPlayPreview = showCommonPlayPreview && status.isOperational
+        includeCommonPlayPreview = showCommonPlayPreview &&
+            status.isOperational &&
+            configuration.capacity == 2
     ).positions
     return JSONObject().apply {
         put("id", machineId)
         put("name", machineName)
+        put("remark", configuration.remark)
+        put(
+            "configuration",
+            JSONObject().apply {
+                put("game_type", configuration.gameType.name)
+                put(
+                    "custom_game_type",
+                    configuration.customGameType.takeIf {
+                        configuration.gameType == MachineGameType.OTHER
+                    } ?: JSONObject.NULL
+                )
+                put("server", configuration.server.name)
+                put(
+                    "custom_server",
+                    configuration.customServer.takeIf {
+                        configuration.server == MachineServer.OTHER
+                    } ?: JSONObject.NULL
+                )
+                put(
+                    "game_version",
+                    configuration.gameVersion.takeIf { configuration.showGameVersion }
+                        ?: JSONObject.NULL
+                )
+                put("game_version_visible", configuration.showGameVersion)
+                put("capacity", configuration.capacity)
+                put("solo_round_minutes", configuration.soloRoundMinutes)
+                put("shared_round_minutes", configuration.sharedRoundMinutes)
+            }
+        )
         put("operational", status.isOperational)
         put("stop_reason", status.stopReason?.name ?: JSONObject.NULL)
         put("stop_reason_detail", status.stopReasonDetail ?: JSONObject.NULL)
@@ -1440,7 +1497,11 @@ private fun buildPublicMachine(
         put(
             "new_registration_estimated_wait_minutes",
             if (status.isOperational && queue.registrationCount < 20) {
-                estimatedWaitForNewOpenRegistration(queue, capturedAtMillis) ?: JSONObject.NULL
+                estimatedWaitForNewOpenRegistration(
+                    queue,
+                    capturedAtMillis,
+                    configuration
+                ) ?: JSONObject.NULL
             } else {
                 JSONObject.NULL
             }
@@ -1472,7 +1533,8 @@ private fun buildPublicMachine(
                                     estimatedMinutesUntilPlaying(
                                         queue = queue,
                                         targetRegistrationKeys = registrationKeys,
-                                        nowMillis = capturedAtMillis
+                                        nowMillis = capturedAtMillis,
+                                        configuration = configuration
                                     ) ?: JSONObject.NULL
                                 } else {
                                     JSONObject.NULL
@@ -1604,8 +1666,8 @@ private class LocalTerminalIdentity(context: Context) {
     }
 }
 
-private const val PUBLIC_SCHEMA_VERSION = 5
-private const val SYNC_SCHEMA_VERSION = 5
+private const val PUBLIC_SCHEMA_VERSION = 6
+private const val SYNC_SCHEMA_VERSION = 6
 private const val MAX_PUBLIC_EVENTS_PER_SNAPSHOT = 200
 private const val MAX_PRIVATE_CONTACTS_PER_SNAPSHOT = 480
 private const val MAX_PUBLIC_EVENT_TITLE_LENGTH = 120

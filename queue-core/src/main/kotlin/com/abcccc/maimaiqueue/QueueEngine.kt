@@ -39,6 +39,7 @@ enum class QueueActionFailureCode {
     PLAYING_POSITION_NOT_ALLOWED,
     INVALID_POSITION,
     INVALID_FIXED_PAIR,
+    SINGLE_PLAYER_MACHINE_ONLY,
     WOULD_DELAY_OTHER_REGISTRATIONS,
     STALE_STATE,
     NO_STATE_CHANGE,
@@ -56,11 +57,15 @@ data class QueueEnginePolicy(
     val allowDeferOneRound: Boolean = true,
     val allowTemporaryLeave: Boolean = true,
     val machineStatuses: Map<String, MachineStatus> = emptyMap(),
+    val machineCapacities: Map<String, Int> = emptyMap(),
     val maxRegistrationsPerMachine: Int = 20,
     val requireOperationalForPlayerActions: Boolean = false
 ) {
     fun isOperational(machineId: String): Boolean =
         machineStatuses[machineId]?.isOperational != false
+
+    fun machineCapacity(machineId: String): Int =
+        machineCapacities[machineId]?.takeIf { it == 1 || it == 2 } ?: 2
 }
 
 data class QueueActionContext(
@@ -460,6 +465,14 @@ object QueueEngine {
                 if (queue.registrationCount + action.registrations.size > policy.maxRegistrationsPerMachine) {
                     return QueueActionFailure(QueueActionFailureCode.MACHINE_FULL)
                 }
+                if (
+                    policy.machineCapacity(action.machineId) == 1 &&
+                    action.registrations.any {
+                        it.preference != PlayPreference.SOLO || it.fixedPartnerKey != null
+                    }
+                ) {
+                    return QueueActionFailure(QueueActionFailureCode.SINGLE_PLAYER_MACHINE_ONLY)
+                }
                 val incomingKeys = action.registrations.map(Registration::key)
                 val incomingIds = action.registrations.map { it.displayId.trim().lowercase() }
                 val incomingProfileIds = action.registrations.mapNotNull(Registration::playerProfileId)
@@ -537,6 +550,9 @@ object QueueEngine {
 
             is QueueAction.ChangePreference -> {
                 registrationFailure(queue, action.registrationKey)?.let { return it }
+                if (policy.machineCapacity(action.machineId) == 1) {
+                    return QueueActionFailure(QueueActionFailureCode.SINGLE_PLAYER_MACHINE_ONLY)
+                }
                 if (queue.allRegistrations.first { it.key == action.registrationKey }.requiresOnSiteCheckIn) {
                     return QueueActionFailure(QueueActionFailureCode.PENDING_CHECK_IN)
                 }
@@ -583,6 +599,14 @@ object QueueEngine {
                 ) {
                     return QueueActionFailure(QueueActionFailureCode.MACHINE_FULL)
                 }
+                if (
+                    policy.machineCapacity(action.destinationMachineId) == 1 &&
+                    queue.allRegistrations.any {
+                        it.key in action.registrationKeys && it.fixedPartnerKey != null
+                    }
+                ) {
+                    return QueueActionFailure(QueueActionFailureCode.SINGLE_PLAYER_MACHINE_ONLY)
+                }
             }
 
             is QueueAction.ReturnPlayingToWaitingFront -> {
@@ -595,6 +619,9 @@ object QueueEngine {
             }
 
             is QueueAction.MoveWaitingRegistrationIntoCurrentRound -> {
+                if (policy.machineCapacity(action.machineId) == 1) {
+                    return QueueActionFailure(QueueActionFailureCode.SINGLE_PLAYER_MACHINE_ONLY)
+                }
                 val firstAvailable = queue.waitingPositions()
                     .getOrNull(queue.firstAvailableWaitingPositionIndex() ?: -1)
                 if (
@@ -648,6 +675,9 @@ object QueueEngine {
             }
 
             is QueueAction.CreateFixedPair -> {
+                if (policy.machineCapacity(action.machineId) == 1) {
+                    return QueueActionFailure(QueueActionFailureCode.SINGLE_PLAYER_MACHINE_ONLY)
+                }
                 val pairPlan = action.expectedPlan ?: queue.planFriendPair(
                     action.firstRegistrationKey,
                     action.secondRegistrationKey
@@ -672,6 +702,9 @@ object QueueEngine {
             }
 
             is QueueAction.CreateFixedPairWithRegistration -> {
+                if (policy.machineCapacity(action.machineId) == 1) {
+                    return QueueActionFailure(QueueActionFailureCode.SINGLE_PLAYER_MACHINE_ONLY)
+                }
                 if (!policy.registrationOpen) {
                     return QueueActionFailure(QueueActionFailureCode.REGISTRATION_CLOSED)
                 }
@@ -710,6 +743,12 @@ object QueueEngine {
             is QueueAction.ClaimWithPlayerProfile -> {
                 registrationFailure(queue, action.registrationKey)?.let { return it }
                 val registration = queue.allRegistrations.first { it.key == action.registrationKey }
+                if (
+                    policy.machineCapacity(action.machineId) == 1 &&
+                    action.preferenceOverride?.let { it != PlayPreference.SOLO } == true
+                ) {
+                    return QueueActionFailure(QueueActionFailureCode.SINGLE_PLAYER_MACHINE_ONLY)
+                }
                 if (
                     !registration.isTemporary ||
                     registration.requiresOnSiteCheckIn ||
@@ -976,7 +1015,11 @@ object QueueEngine {
                 playerProfileId = action.playerProfileId,
                 playerNickname = action.nickname,
                 gender = action.gender,
-                preferenceOverride = action.preferenceOverride
+                preferenceOverride = if (context.policy.machineCapacity(action.machineId) == 1) {
+                    PlayPreference.SOLO
+                } else {
+                    action.preferenceOverride
+                }
             )
             is QueueAction.MarkNoShow -> {
                 val staged = when (action.resolution) {
@@ -1024,10 +1067,15 @@ object QueueEngine {
             is QueueAction.MoveWaitingPosition ->
                 queue.moveWaitingPosition(action.sourceIndex, action.destinationIndex)
             is QueueAction.ReplaceOrder -> queue.replaceOrder(action.registrations)
-            is QueueAction.TransferRegistrations -> return applyTransfer(state, action)
+            is QueueAction.TransferRegistrations -> return applyTransfer(
+                state,
+                action,
+                context.policy
+            )
             is QueueAction.ClearRegistrations -> error("handled before queue lookup")
-            is QueueAction.RestoreSnapshot -> action.restoredQueue.removeAll(
-                action.excludedRegistrationKeys
+            is QueueAction.RestoreSnapshot -> normalizeQueueForCapacity(
+                action.restoredQueue.removeAll(action.excludedRegistrationKeys),
+                context.policy.machineCapacity(action.machineId)
             )
         }
         return AppliedBehavior(
@@ -1041,11 +1089,23 @@ object QueueEngine {
 
     private fun applyTransfer(
         state: QueueEngineState,
-        action: QueueAction.TransferRegistrations
+        action: QueueAction.TransferRegistrations,
+        policy: QueueEnginePolicy
     ): AppliedBehavior {
         val source = state.queue(action.sourceMachineId) ?: return AppliedBehavior(state)
         val destination = state.queue(action.destinationMachineId) ?: return AppliedBehavior(state)
-        val registrations = source.allRegistrations.filter { it.key in action.registrationKeys }
+        val registrations = source.allRegistrations
+            .filter { it.key in action.registrationKeys }
+            .map { registration ->
+                if (policy.machineCapacity(action.destinationMachineId) == 1) {
+                    registration.copy(
+                        preference = PlayPreference.SOLO,
+                        fixedPartnerKey = null
+                    )
+                } else {
+                    registration
+                }
+            }
         if (registrations.size != action.registrationKeys.size) return AppliedBehavior(state)
         val updatedSource = source.removeAll(action.registrationKeys)
         val updatedDestination = destination.receiveAtWaitingTail(registrations)
@@ -1062,6 +1122,25 @@ object QueueEngine {
                     (action.destinationMachineId to updatedDestination)
             ),
             requiresConfirmation = true
+        )
+    }
+
+    fun normalizeQueueForCapacity(queue: MachineQueue, capacity: Int): MachineQueue {
+        if (capacity != 1) return queue
+        val normalizeRegistration: (Registration) -> Registration = { registration ->
+            registration.copy(
+                preference = PlayPreference.SOLO,
+                fixedPartnerKey = null
+            )
+        }
+        val normalizedPlaying = queue.playing.take(1).map(normalizeRegistration)
+        val overflowPlaying = queue.playing.drop(1).map(normalizeRegistration)
+        return queue.copy(
+            playing = normalizedPlaying,
+            waiting = overflowPlaying + queue.waiting.map(normalizeRegistration),
+            playingStartedAtMillis = queue.playingStartedAtMillis.takeIf {
+                normalizedPlaying.isNotEmpty()
+            }
         )
     }
 

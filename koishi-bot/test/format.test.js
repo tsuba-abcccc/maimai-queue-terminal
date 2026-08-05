@@ -14,6 +14,7 @@ const {
   onlineRegistrationProfileCompletionNotice,
   formatQueue,
   formatQueueNotification,
+  joinQueueFromBot,
   nicknameValidationError,
   parseGender,
   parseMachineChoice,
@@ -1031,6 +1032,89 @@ test('changes the personal menu with absence state and queue rules', () => {
     ...player,
     machine_operational: false,
   }), [])
+  assert.deepEqual(formatOwnQueueActions(player, undefined, true, 1), [
+    '暂缓一次',
+    '暂时离开',
+    '切换机台',
+    '退出排队',
+  ])
+})
+
+test('single-player machine join skips preference prompt and explains the override', async () => {
+  const prompts = ['A']
+  const sent = []
+  let submittedFields
+  const session = {
+    platform: 'onebot',
+    userId: '12345678',
+    isDirect: true,
+    send: async message => sent.push(message),
+    prompt: async () => prompts.shift() ?? '',
+  }
+  const api = {
+    getProfiles: async () => ({
+      profiles: [{
+        profile_id: 'profile-1',
+        nickname: '小雨',
+        default_preference: 'ASK_EVERY_TIME',
+        setup_version: 1,
+      }],
+    }),
+    getPlayers: async () => ({ players: [] }),
+    getQueue: async () => ({
+      queue_id: 'queue-1',
+      machine_configuration_revision: 7,
+      captured_at: 1,
+      registration_open: true,
+      onebot_sync_enabled: true,
+      queue_rules: { allow_online_registration: true },
+      terminal: { online: true },
+      machines: {
+        A: {
+          id: 'A',
+          name: '左侧日框 · 机台 A',
+          operational: true,
+          playing_started_at: null,
+          playing: [],
+          waiting_positions: [],
+          registration_count: 0,
+          new_registration_estimated_wait_minutes: 0,
+          configuration: {
+            game_type: 'MAIMAI_DX',
+            server: 'HIDDEN',
+            capacity: 1,
+            solo_round_minutes: 12,
+            shared_round_minutes: 15,
+          },
+        },
+      },
+    }),
+    createQueueCommand: async (_qq, _operation, fields) => {
+      submittedFields = fields
+      return {
+        command_id: 'command-1',
+        status: 'APPLIED',
+      }
+    },
+  }
+
+  const text = await joinQueueFromBot(
+    api,
+    { commandWaitSeconds: 0 },
+    session,
+  )
+
+  assert.equal(sent.length, 1)
+  assert.equal(prompts.length, 0)
+  assert.deepEqual(submittedFields, {
+    machine_id: 'A',
+    preference: undefined,
+    expected_queue_id: 'queue-1',
+    expected_machine_configuration_revision: 7,
+  })
+  assert.match(text, /仅能容纳一人游玩/)
+  assert.match(text, /本次已使用“单人游玩”/)
+  assert.match(text, /默认游玩偏好不会改变/)
 })
 
 test('cancels temporary leave for a fixed pair after the terminal snapshot confirms it', async () => {
@@ -1301,6 +1385,21 @@ test('presents machine choices with the short letter first', () => {
   ]
   assert.equal(formatMachineChoice(machines[0]), 'A（左侧日框，约 12 分钟后）')
   assert.equal(formatMachineChoice(machines[1]), 'B（预计很快可以游玩）')
+  assert.equal(
+    formatMachineChoice({
+      id: 'D',
+      name: '入口 · 机台 D',
+      configuration: {
+        game_type: 'CHUNITHM',
+        server: 'CHINA',
+        capacity: 1,
+        solo_round_minutes: 12,
+        shared_round_minutes: 15,
+      },
+      new_registration_estimated_wait_minutes: 6,
+    }),
+    'D（入口，仅单人游玩，约 6 分钟后）',
+  )
   assert.equal(
     formatMachineChoice({ id: 'C', name: '机台 C' }),
     'C（暂时无法估算）',

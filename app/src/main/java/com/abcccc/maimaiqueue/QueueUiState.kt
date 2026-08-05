@@ -50,8 +50,11 @@ internal data class MachineDisplayState(
     val machineId: MachineId,
     val queue: MachineQueue,
     val status: MachineStatus,
-    val remark: String
+    val configuration: MachineConfiguration
 ) {
+    val remark: String
+        get() = configuration.remark
+
     val name: String
         get() = machineName(machineId, remark)
 }

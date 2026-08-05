@@ -13,8 +13,8 @@ from uuid import UUID, uuid4
 from flask import Flask, current_app, jsonify, request
 
 
-PUBLIC_SCHEMA_VERSION = 5
-SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4, 5}
+PUBLIC_SCHEMA_VERSION = 6
+SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4, 5, 6}
 MAX_PAYLOAD_BYTES = 1024 * 1024
 MAX_REGISTRATIONS_PER_MACHINE = 20
 MAX_MACHINE_COUNT = 4
@@ -74,6 +74,27 @@ MACHINE_NAMES = {
     "D": "中间右侧 · 机台 D",
 }
 MAX_MACHINE_REMARK_CHARACTERS = 8
+MAX_MACHINE_TYPE_CHARACTERS = 24
+MAX_MACHINE_SERVER_CHARACTERS = 24
+MAX_GAME_VERSION_CHARACTERS = 40
+MACHINE_GAME_TYPES = {
+    "MAIMAI_DX",
+    "CHUNITHM",
+    "ONGEKI",
+    "DANCE_CUBE",
+    "TAIKO_NO_TATSUJIN",
+    "OTHER",
+}
+SERVER_CONFIGURABLE_GAME_TYPES = {"MAIMAI_DX", "CHUNITHM", "ONGEKI"}
+MACHINE_SERVERS = {
+    "CHINA",
+    "INTERNATIONAL",
+    "JAPAN",
+    "DABING",
+    "RINNET",
+    "OTHER",
+    "HIDDEN",
+}
 PUBLIC_EVENT_TYPES = {
     "REGISTRATION_ADDED",
     "REGISTRATION_REMOVED",
@@ -1523,6 +1544,9 @@ def read_bot_players():
     return jsonify(
         {
             "queue_id": snapshot_row["queue_id"],
+            "machine_configuration_revision": snapshot.get(
+                "machine_configuration_revision", 1
+            ),
             "revision": snapshot_row["revision"],
             "received_at": snapshot_row["received_at"] * 1000,
             "registration_open": snapshot.get("registration_open", True),
@@ -1849,6 +1873,9 @@ def read_online_profile():
     return jsonify(
         {
             "queue_id": snapshot_row["queue_id"],
+            "machine_configuration_revision": snapshot.get(
+                "machine_configuration_revision", 1
+            ),
             "profile": serialize_player_profile(profile),
             "existing_registration": serialize_registration_context(registrations[0])
             if registrations
@@ -1877,7 +1904,14 @@ def create_website_join_command():
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
         return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
-    allowed_fields = {"request_id", "qq", "machine_id", "preference"}
+    allowed_fields = {
+        "request_id",
+        "qq",
+        "machine_id",
+        "preference",
+        "expected_queue_id",
+        "expected_machine_configuration_revision",
+    }
     if set(source) - allowed_fields:
         return jsonify({"ok": False, "error": "请求包含不支持的线上登记字段"}), 400
     normalized = dict(source)
@@ -1905,6 +1939,7 @@ def create_bot_queue_operation_command():
         "expected_absence_status",
         "expected_temporary_away_skipped_turns",
         "expected_pending_check_in",
+        "expected_machine_configuration_revision",
     }
     if set(source) - allowed_fields:
         return jsonify({"ok": False, "error": "请求包含不支持的排队操作字段"}), 400
@@ -1929,11 +1964,42 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
             "expected_temporary_away_skipped_turns",
             "expected_pending_check_in",
         }
-        supplied_expected_fields = expected_field_names.intersection(source)
-        if supplied_expected_fields and supplied_expected_fields != expected_field_names:
-            raise ValidationError("确认状态字段不完整")
+        expected_join_field_names = {
+            "expected_queue_id",
+            "expected_machine_configuration_revision",
+        }
         expected_context = None
-        if supplied_expected_fields:
+        expected_join_context = None
+        supplied_expected_fields: set[str] = set()
+        if operation == "JOIN_QUEUE":
+            supplied_join_fields = expected_join_field_names.intersection(source)
+            registration_detail_fields = expected_field_names - {"expected_queue_id"}
+            if registration_detail_fields.intersection(source):
+                raise ValidationError("加入排队不接受登记确认状态")
+            if supplied_join_fields and supplied_join_fields != expected_join_field_names:
+                raise ValidationError("加入排队确认字段不完整")
+            if supplied_join_fields:
+                expected_join_context = {
+                    "queue_id": read_uuid(source, "expected_queue_id"),
+                    "machine_configuration_revision": read_integer(
+                        source,
+                        "expected_machine_configuration_revision",
+                        minimum=1,
+                        maximum=2**63 - 1,
+                    ),
+                }
+        else:
+            if "expected_machine_configuration_revision" in source:
+                raise ValidationError(
+                    "expected_machine_configuration_revision 仅用于加入排队"
+                )
+            supplied_expected_fields = expected_field_names.intersection(source)
+            if (
+                supplied_expected_fields
+                and supplied_expected_fields != expected_field_names
+            ):
+                raise ValidationError("确认状态字段不完整")
+        if operation != "JOIN_QUEUE" and supplied_expected_fields:
             expected_context = {
                 "queue_id": read_uuid(source, "expected_queue_id"),
                 "registration_id": read_public_id(source, "expected_registration_id"),
@@ -1968,6 +2034,7 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
         "target_machine_id": target_machine_id,
         "preference": preference,
         "expected_context": expected_context,
+        "expected_join_context": expected_join_context,
     }
 
     with open_database() as connection:
@@ -1995,6 +2062,18 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
         if snapshot_row is None:
             return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
         snapshot = json.loads(snapshot_row["payload"])
+        if expected_join_context is not None and (
+            expected_join_context["queue_id"] != snapshot_row["queue_id"]
+            or expected_join_context["machine_configuration_revision"]
+            != snapshot.get("machine_configuration_revision", 1)
+        ):
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "QUEUE_CONTEXT_CHANGED",
+                    "error": "现场队列或机台配置已更新，请重新查询玩家资料后再提交。",
+                }
+            ), 409
         availability_error = remote_operation_availability_error(
             snapshot_row, snapshot, operation_source, operation
         )
@@ -2123,6 +2202,9 @@ def build_queue_operation_payload(
 ):
     payload = {
         "queue_id": queue_id,
+        "machine_configuration_revision": snapshot.get(
+            "machine_configuration_revision", 1
+        ),
         "profile_id": profile["profile_id"],
         "actor_qq": actor_qq,
         "operation": operation,
@@ -2148,15 +2230,18 @@ def build_queue_operation_payload(
             return None, (f"{machine['name']}已停止使用，暂不能加入", 409)
         if machine.get("registration_count", 0) >= MAX_REGISTRATIONS_PER_MACHINE:
             return None, (f"{machine['name']}的登记已满，请选择其他机台", 409)
-        default_preference = profile["default_preference"]
-        if default_preference == "ASK_EVERY_TIME":
-            if preference not in PREFERENCES:
-                return None, ("请选择本次游玩偏好", 400)
-            resolved_preference = preference
+        if machine_capacity(machine) == 1:
+            resolved_preference = "SOLO"
         else:
-            if preference is not None and preference != default_preference:
-                return None, ("这份玩家资料使用固定的默认游玩偏好", 409)
-            resolved_preference = default_preference
+            default_preference = profile["default_preference"]
+            if default_preference == "ASK_EVERY_TIME":
+                if preference not in PREFERENCES:
+                    return None, ("请选择本次游玩偏好", 400)
+                resolved_preference = preference
+            else:
+                if preference is not None and preference != default_preference:
+                    return None, ("这份玩家资料使用固定的默认游玩偏好", 409)
+                resolved_preference = default_preference
         payload.update(
             {
                 "machine_id": machine_id,
@@ -2225,8 +2310,12 @@ def build_queue_operation_payload(
             return None, (f"{target_machine['name']}已停止使用，暂不能转入", 409)
         if target_machine.get("registration_count", 0) >= MAX_REGISTRATIONS_PER_MACHINE:
             return None, (f"{target_machine['name']}的登记已满，暂不能转入", 409)
+        if machine_capacity(target_machine) == 1 and registration.get("fixed_pair"):
+            return None, (f"{target_machine['name']}仅能容纳一人游玩，请先释放固定组合", 409)
         payload["target_machine_id"] = target_machine_id
     elif operation == "CHANGE_PLAY_PREFERENCE":
+        if machine_capacity(source_machine) == 1:
+            return None, (f"{source_machine['name']}仅能容纳一人游玩，不能修改游玩偏好", 409)
         if preference not in PREFERENCES:
             return None, ("请选择本次游玩偏好", 400)
         payload["preference"] = preference
@@ -2515,6 +2604,11 @@ def read_mobile_registration_session(session_token: str):
                 "queue_id": session["queue_id"],
                 "machine_id": session["machine_id"],
                 "machine_name": machine["name"],
+                "machine_configuration_revision": snapshot.get(
+                    "machine_configuration_revision", 1
+                ),
+                "machine_configuration": machine.get("configuration")
+                or default_machine_configuration(machine),
                 "expires_at": session["expires_at"] * 1000,
             },
             "profiles": [serialize_mobile_profile(row) for row in profiles],
@@ -2705,7 +2799,8 @@ def submit_mobile_registration_session(session_token: str):
             detail, status_code, code = validation
             connection.commit()
             return jsonify({"ok": False, "code": code, "error": detail}), status_code
-        snapshot_row, snapshot, _machine = validation
+        snapshot_row, snapshot, machine = validation
+        single_player_machine = machine_capacity(machine) == 1
 
         try:
             profile_scope_id = current_app.config["PROFILE_SCOPE_ID"]
@@ -2761,8 +2856,12 @@ def submit_mobile_registration_session(session_token: str):
                         existing_qq=profile["qq_number"],
                     )
                     actor_qq = profile_settings["qq_number"]
-                resolved_preference = resolve_mobile_registration_preference(
-                    profile["default_preference"], source.get("preference")
+                resolved_preference = (
+                    "SOLO"
+                    if single_player_machine
+                    else resolve_mobile_registration_preference(
+                        profile["default_preference"], source.get("preference")
+                    )
                 )
                 nickname = profile["nickname"]
                 command_profile = {
@@ -2782,8 +2881,12 @@ def submit_mobile_registration_session(session_token: str):
                 )
                 actor_qq = profile_settings["qq_number"]
                 nickname = profile_settings["nickname"]
-                resolved_preference = resolve_mobile_registration_preference(
-                    profile_settings["default_preference"], source.get("preference")
+                resolved_preference = (
+                    "SOLO"
+                    if single_player_machine
+                    else resolve_mobile_registration_preference(
+                        profile_settings["default_preference"], source.get("preference")
+                    )
                 )
                 profile_id = str(uuid4())
                 command_profile = {
@@ -2897,6 +3000,9 @@ def submit_mobile_registration_session(session_token: str):
 
         payload = {
             "queue_id": session["queue_id"],
+            "machine_configuration_revision": snapshot.get(
+                "machine_configuration_revision", 1
+            ),
             "machine_id": session["machine_id"],
             "actor_qq": actor_qq,
             "preference": resolved_preference,
@@ -3098,9 +3204,34 @@ def serialize_remote_machine(machine_id: str, machine: dict[str, Any]) -> dict[s
         "estimated_wait_minutes": machine.get(
             "new_registration_estimated_wait_minutes"
         ),
+        "configuration": machine.get("configuration")
+        or default_machine_configuration(machine),
+        "capacity": machine_capacity(machine),
         "available": unavailable_reason is None,
         "unavailable_reason": unavailable_reason,
     }
+
+
+def default_machine_configuration(machine: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "remark": machine.get("remark") or machine.get("name", "").split(" · ", 1)[0],
+        "game_type": "MAIMAI_DX",
+        "custom_game_type": None,
+        "server": "HIDDEN",
+        "custom_server": None,
+        "game_version": None,
+        "game_version_visible": False,
+        "capacity": 2,
+        "solo_round_minutes": 12,
+        "shared_round_minutes": 15,
+    }
+
+
+def machine_capacity(machine: dict[str, Any]) -> int:
+    configuration = machine.get("configuration")
+    if isinstance(configuration, dict) and configuration.get("capacity") in {1, 2}:
+        return configuration["capacity"]
+    return 2
 
 
 def snapshot_is_online(snapshot_row: sqlite3.Row) -> bool:
@@ -3856,6 +3987,16 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
 
     queue_id = read_uuid(payload, "queue_id")
     revision = read_integer(payload, "revision", minimum=1, maximum=2**63 - 1)
+    machine_configuration_revision = (
+        read_integer(
+            payload,
+            "machine_configuration_revision",
+            minimum=1,
+            maximum=2**63 - 1,
+        )
+        if schema_version >= 6
+        else 1
+    )
     captured_at = read_integer(payload, "captured_at", minimum=1)
     registration_open = read_boolean(payload, "registration_open")
     website_remote_enabled = payload.get("website_remote_enabled", False)
@@ -3886,6 +4027,7 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
             machine_id,
             machines_source[machine_id],
             allow_custom_name=schema_version >= 2,
+            schema_version=schema_version,
         )
         for machine_id in configured_machine_ids
     }
@@ -3918,6 +4060,7 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
         "schema_version": PUBLIC_SCHEMA_VERSION,
         "queue_id": queue_id,
         "revision": revision,
+        "machine_configuration_revision": machine_configuration_revision,
         "captured_at": captured_at,
         "registration_open": registration_open,
         "website_remote_enabled": website_remote_enabled,
@@ -4224,11 +4367,22 @@ def normalize_public_event(source: Any) -> dict[str, Any]:
 
 
 def normalize_machine(
-    machine_id: str, source: Any, *, allow_custom_name: bool = False
+    machine_id: str,
+    source: Any,
+    *,
+    allow_custom_name: bool = False,
+    schema_version: int = 1,
 ) -> dict[str, Any]:
     if not isinstance(source, dict):
         raise ValidationError(f"机台 {machine_id} 必须是对象")
 
+    name = normalize_machine_name(machine_id, source, allow_custom_name)
+    configuration = normalize_machine_configuration(
+        machine_id,
+        source,
+        name=name,
+        schema_version=schema_version,
+    )
     operational = read_boolean(source, "operational")
     stop_reason = read_optional_choice(source, "stop_reason", STOP_REASONS)
     stop_reason_detail = read_optional_string(
@@ -4247,6 +4401,8 @@ def normalize_machine(
     if any(registration["online_registration_pending_check_in"] for registration in playing):
         raise ValidationError(f"机台 {machine_id} 的待签到登记不能处于游玩位置")
     validate_registration_group(playing, f"机台 {machine_id} 游玩位置")
+    if configuration["capacity"] == 1 and len(playing) > 1:
+        raise ValidationError(f"机台 {machine_id} 的游玩容量为 1，游玩位置不能超过 1 个登记")
 
     positions_source = source.get("waiting_positions")
     if not isinstance(positions_source, list):
@@ -4301,6 +4457,27 @@ def normalize_machine(
         ):
             raise ValidationError(f"机台 {machine_id} 的共同游玩预览与游玩偏好不一致")
 
+    if configuration["capacity"] == 1:
+        registrations = [
+            *playing,
+            *[
+                registration
+                for position in waiting_positions
+                for registration in position["registrations"]
+            ],
+        ]
+        if any(
+            registration["preference"] != "SOLO" or registration["fixed_pair"]
+            for registration in registrations
+        ):
+            raise ValidationError(
+                f"机台 {machine_id} 的游玩容量为 1，登记必须使用单人游玩且不能组成固定组合"
+            )
+        if any(len(position["registrations"]) != 1 for position in waiting_positions):
+            raise ValidationError(f"机台 {machine_id} 的游玩容量为 1，等待位置只能包含 1 个登记")
+        if any(position["common_play_preview"] is not None for position in waiting_positions):
+            raise ValidationError(f"机台 {machine_id} 的游玩容量为 1，不能包含共同游玩预览")
+
     playing_started_at = read_optional_integer(
         source, "playing_started_at", minimum=1
     )
@@ -4320,7 +4497,9 @@ def normalize_machine(
 
     return {
         "id": machine_id,
-        "name": normalize_machine_name(machine_id, source, allow_custom_name),
+        "name": name,
+        "remark": configuration["remark"],
+        "configuration": configuration,
         "operational": operational,
         "stop_reason": stop_reason,
         "stop_reason_detail": stop_reason_detail,
@@ -4331,6 +4510,110 @@ def normalize_machine(
         "new_registration_estimated_wait_minutes": new_registration_estimated_wait_minutes,
         "playing": playing,
         "waiting_positions": waiting_positions,
+    }
+
+
+def normalize_machine_configuration(
+    machine_id: str,
+    source: dict[str, Any],
+    *,
+    name: str,
+    schema_version: int,
+) -> dict[str, Any]:
+    suffix = f" · 机台 {machine_id}"
+    remark = name[: -len(suffix)] if name.endswith(suffix) else name
+    if schema_version < 6:
+        return {
+            "remark": remark,
+            "game_type": "MAIMAI_DX",
+            "custom_game_type": None,
+            "server": "HIDDEN",
+            "custom_server": None,
+            "game_version": None,
+            "game_version_visible": False,
+            "capacity": 2,
+            "solo_round_minutes": 12,
+            "shared_round_minutes": 15,
+        }
+
+    submitted_remark = read_string(
+        source,
+        "remark",
+        maximum_length=MAX_MACHINE_REMARK_CHARACTERS,
+    )
+    if submitted_remark != remark:
+        raise ValidationError(f"机台 {machine_id} 的备注与名称不一致")
+    configuration = source.get("configuration")
+    if not isinstance(configuration, dict):
+        raise ValidationError(f"机台 {machine_id} 的 configuration 必须是对象")
+    allowed_fields = {
+        "game_type",
+        "custom_game_type",
+        "server",
+        "custom_server",
+        "game_version",
+        "game_version_visible",
+        "capacity",
+        "solo_round_minutes",
+        "shared_round_minutes",
+    }
+    if set(configuration) != allowed_fields:
+        raise ValidationError(f"机台 {machine_id} 的 configuration 字段不完整")
+
+    game_type = read_choice(configuration, "game_type", MACHINE_GAME_TYPES)
+    custom_game_type = read_optional_string(
+        configuration,
+        "custom_game_type",
+        MAX_MACHINE_TYPE_CHARACTERS,
+    )
+    if game_type == "OTHER" and custom_game_type is None:
+        raise ValidationError(f"机台 {machine_id} 选择其他游戏类型时必须填写名称")
+    if game_type != "OTHER" and custom_game_type is not None:
+        raise ValidationError(f"机台 {machine_id} 仅能为其他游戏类型填写自定义名称")
+
+    server = read_choice(configuration, "server", MACHINE_SERVERS)
+    custom_server = read_optional_string(
+        configuration,
+        "custom_server",
+        MAX_MACHINE_SERVER_CHARACTERS,
+    )
+    if game_type not in SERVER_CONFIGURABLE_GAME_TYPES and server != "HIDDEN":
+        raise ValidationError(f"机台 {machine_id} 的游戏类型不支持配置服务器")
+    if server == "OTHER" and custom_server is None:
+        raise ValidationError(f"机台 {machine_id} 选择其他服务器时必须填写名称")
+    if server != "OTHER" and custom_server is not None:
+        raise ValidationError(f"机台 {machine_id} 仅能为其他服务器填写自定义名称")
+
+    game_version = read_optional_string(
+        configuration,
+        "game_version",
+        MAX_GAME_VERSION_CHARACTERS,
+    )
+    game_version_visible = read_boolean(configuration, "game_version_visible")
+    if game_version_visible and game_version is None:
+        raise ValidationError(f"机台 {machine_id} 显示游戏版本前必须填写版本")
+    capacity = read_integer(configuration, "capacity", minimum=1, maximum=2)
+    return {
+        "remark": remark,
+        "game_type": game_type,
+        "custom_game_type": custom_game_type,
+        "server": server,
+        "custom_server": custom_server,
+        "game_version": game_version if game_version_visible else None,
+        "game_version_visible": game_version_visible,
+        "capacity": capacity,
+        "solo_round_minutes": read_integer(
+            configuration,
+            "solo_round_minutes",
+            minimum=1,
+            maximum=120,
+        ),
+        "shared_round_minutes": read_integer(
+            configuration,
+            "shared_round_minutes",
+            minimum=1,
+            maximum=120,
+        ),
     }
 
 

@@ -728,6 +728,7 @@ fun createMachineTransferAuditLog(
     destinationMachineLabel: String,
     registrations: List<Registration>,
     releasedPartnerRegistrations: List<Registration> = emptyList(),
+    destinationMachineCapacity: Int = DEFAULT_MACHINE_CAPACITY,
     source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
     timestampMillis: Long = System.currentTimeMillis()
 ): AuditLogEntry? {
@@ -756,6 +757,22 @@ fun createMachineTransferAuditLog(
         }
         if (releasedPartnerRegistrations.isNotEmpty()) {
             add("原固定组合已解除，双方均恢复为允许他人加入")
+        }
+        if (destinationMachineCapacity == 1) {
+            val preferenceChangedRegistrations = registrations.filter {
+                it.preference != PlayPreference.SOLO
+            }
+            val unchangedSoloRegistrations = registrations.filter {
+                it.preference == PlayPreference.SOLO
+            }
+            add("目标机台仅能容纳一人游玩")
+            if (preferenceChangedRegistrations.isNotEmpty()) {
+                add("${quotedNames(preferenceChangedRegistrations)}的本次登记已改为“单人游玩”")
+            }
+            if (unchangedSoloRegistrations.isNotEmpty()) {
+                add("${quotedNames(unchangedSoloRegistrations)}的本次登记继续使用“单人游玩”")
+            }
+            add("玩家资料中的默认游玩偏好不会改变")
         }
     }
     return createAuditLogEntry(

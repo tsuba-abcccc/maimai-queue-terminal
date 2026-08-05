@@ -270,6 +270,35 @@ class AuditLogsTest {
             )
         )
         assertTrue(temporarilyAwayLog.detail.contains("暂时离开状态和已轮空 2 次会在转入后保留"))
+
+        val singlePlayerMachineLog = requireNotNull(
+            createMachineTransferAuditLog(
+                category = AuditLogCategory.MACHINE_A,
+                sourceMachineLabel = "左侧 · 机台 A",
+                destinationMachineLabel = "右侧 · 机台 B",
+                registrations = listOf(registration(3, "北川")),
+                destinationMachineCapacity = 1
+            )
+        )
+        assertTrue(singlePlayerMachineLog.detail.contains("目标机台仅能容纳一人游玩"))
+        assertTrue(singlePlayerMachineLog.detail.contains("“北川”的本次登记已改为“单人游玩”"))
+        assertTrue(singlePlayerMachineLog.detail.contains("默认游玩偏好不会改变"))
+
+        val unchangedSoloLog = requireNotNull(
+            createMachineTransferAuditLog(
+                category = AuditLogCategory.MACHINE_A,
+                sourceMachineLabel = "左侧 · 机台 A",
+                destinationMachineLabel = "右侧 · 机台 B",
+                registrations = listOf(
+                    registration(4, "南风").copy(preference = PlayPreference.SOLO)
+                ),
+                destinationMachineCapacity = 1
+            )
+        )
+        assertTrue(unchangedSoloLog.detail.contains("目标机台仅能容纳一人游玩"))
+        assertTrue(unchangedSoloLog.detail.contains("“南风”的本次登记继续使用“单人游玩”"))
+        assertFalse(unchangedSoloLog.detail.contains("本次登记已改为"))
+        assertTrue(unchangedSoloLog.detail.contains("默认游玩偏好不会改变"))
     }
 
     @Test

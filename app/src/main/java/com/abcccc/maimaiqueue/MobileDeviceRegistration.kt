@@ -28,7 +28,8 @@ internal data class MobileDeviceRegistrationCommand(
     val profileId: String,
     val expectedProfileRevision: Long?,
     val completion: MobileProfileCompletion?,
-    val newProfile: MobileNewPlayerProfile?
+    val newProfile: MobileNewPlayerProfile?,
+    val machineConfigurationRevision: Long? = null
 ) : RemoteTerminalCommand {
     val createsProfile: Boolean
         get() = newProfile != null
@@ -81,6 +82,12 @@ internal fun decideMobileDeviceRegistration(
     }
     if (command.queueId != state.queueId) {
         return reject("排队批次已经变化，请在终端重新打开移动设备登记。")
+    }
+    if (
+        command.machineConfigurationRevision != null &&
+        command.machineConfigurationRevision != state.machineConfigurationRevision
+    ) {
+        return reject("机台配置已经更新，请在终端重新打开移动设备登记。")
     }
     if (!state.websiteRemoteEnabled) {
         return reject("网站同步已关闭，暂不能使用移动设备登记。")
@@ -197,9 +204,13 @@ internal fun decideMobileDeviceRegistration(
     if (alreadyRegistered) {
         return reject("这名玩家已经有一份正在排队的登记。")
     }
-    val expectedPreference = profileBeforeUsage.defaultPreference.toPlayPreferenceOrNull()
-        ?: command.preference
-    if (command.preference != expectedPreference) {
+    val singlePlayerMachine = state.machineCapacity(command.machineId) == 1
+    val expectedPreference = if (singlePlayerMachine) {
+        PlayPreference.SOLO
+    } else {
+        profileBeforeUsage.defaultPreference.toPlayPreferenceOrNull() ?: command.preference
+    }
+    if (!singlePlayerMachine && command.preference != expectedPreference) {
         return reject("玩家资料的默认游玩偏好已经变化，请重新确认。")
     }
 
@@ -218,7 +229,7 @@ internal fun decideMobileDeviceRegistration(
     val registration = Registration(
         key = state.nextRegistrationKey,
         displayId = usedProfile.nickname,
-        preference = command.preference,
+        preference = expectedPreference,
         isTemporary = false,
         createdAtMillis = command.createdAtMillis,
         gender = usedProfile.gender,
@@ -250,7 +261,11 @@ internal fun decideMobileDeviceRegistration(
         profileToPersist = usedProfile.takeIf { it != existingProfile },
         changedMachineId = command.machineId,
         needsAvailabilityConfirmation = execution.impact.requiresAvailabilityConfirmation,
-        detail = "已通过移动设备加入排队。"
+        detail = if (singlePlayerMachine) {
+            "已通过移动设备加入排队。该机台仅能容纳一人游玩，本次已使用“单人游玩”。"
+        } else {
+            "已通过移动设备加入排队。"
+        }
     )
 }
 
