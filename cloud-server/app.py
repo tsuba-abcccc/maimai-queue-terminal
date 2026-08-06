@@ -18,6 +18,10 @@ SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4, 5, 6}
 MAX_PAYLOAD_BYTES = 1024 * 1024
 MAX_REGISTRATIONS_PER_MACHINE = 20
 MAX_MACHINE_COUNT = 4
+MAX_PLANNED_ROUND_MINUTES = 120
+MAX_ESTIMATED_WAIT_MINUTES = (
+    MAX_REGISTRATIONS_PER_MACHINE * MAX_PLANNED_ROUND_MINUTES
+)
 MAX_EVENT_REGISTRATION_IDS = MAX_REGISTRATIONS_PER_MACHINE * MAX_MACHINE_COUNT
 MAX_PLAYER_PROFILES = 500
 MAX_EVENTS_PER_SNAPSHOT = 200
@@ -4485,7 +4489,7 @@ def normalize_machine(
         source,
         "new_registration_estimated_wait_minutes",
         minimum=0,
-        maximum=24 * 60,
+        maximum=MAX_ESTIMATED_WAIT_MINUTES,
     )
     if not operational:
         playing_started_at = None
@@ -4606,13 +4610,13 @@ def normalize_machine_configuration(
             configuration,
             "solo_round_minutes",
             minimum=1,
-            maximum=120,
+            maximum=MAX_PLANNED_ROUND_MINUTES,
         ),
         "shared_round_minutes": read_integer(
             configuration,
             "shared_round_minutes",
             minimum=1,
-            maximum=120,
+            maximum=MAX_PLANNED_ROUND_MINUTES,
         ),
     }
 
@@ -4657,7 +4661,10 @@ def normalize_waiting_position(machine_id: str, index: int, source: Any) -> dict
         "position_id": read_public_id(source, "position_id"),
         "fixed_pair": fixed_pair,
         "estimated_wait_minutes": read_optional_integer(
-            source, "estimated_wait_minutes", minimum=0, maximum=24 * 60
+            source,
+            "estimated_wait_minutes",
+            minimum=0,
+            maximum=MAX_ESTIMATED_WAIT_MINUTES,
         ),
         "registrations": registrations,
         "common_play_preview": normalize_common_play_preview(

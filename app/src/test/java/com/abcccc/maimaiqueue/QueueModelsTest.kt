@@ -2174,6 +2174,31 @@ class QueueModelsTest {
     }
 
     @Test
+    fun maximumPlannedRoundTimeCanPublishEstimateAboveOneDay() {
+        val nowMillis = 4_300_000L
+        val deferredTarget = registration(20, PlayPreference.SOLO).copy(
+            absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+        )
+        val queue = MachineQueue(
+            playing = listOf(registration(1, PlayPreference.SOLO)),
+            waiting = (2..19).map { registration(it, PlayPreference.SOLO) } + deferredTarget,
+            playingStartedAtMillis = nowMillis
+        )
+
+        assertEquals(
+            2400L,
+            estimatedMinutesUntilPlaying(
+                queue = queue,
+                targetRegistrationKeys = setOf(deferredTarget.key),
+                nowMillis = nowMillis,
+                machineCapacity = 1,
+                soloRoundMinutes = MAX_PLANNED_ROUND_MINUTES,
+                sharedRoundMinutes = MAX_PLANNED_ROUND_MINUTES
+            )
+        )
+    }
+
+    @Test
     fun overtimeCurrentRoundDoesNotAddNegativeWaitingTime() {
         val nowMillis = 5_000_000L
         val queue = MachineQueue(

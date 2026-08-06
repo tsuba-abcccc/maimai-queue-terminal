@@ -2717,6 +2717,29 @@ class QueueStatusApiTest(unittest.TestCase):
                 self.assertEqual(400, response.status_code)
                 self.assertIn("游玩容量为 1", response.get_json()["error"])
 
+    def test_schema_v6_accepts_wait_estimates_from_maximum_planned_round_time(self):
+        snapshot = self.remote_ready_snapshot(revision=43, with_registration=True)
+        self.upgrade_snapshot_to_schema_v6(snapshot, capacities={"A": 1})
+        snapshot["machines"]["A"]["configuration"]["solo_round_minutes"] = 120
+        snapshot["machines"]["A"]["new_registration_estimated_wait_minutes"] = 2400
+        snapshot["machines"]["A"]["waiting_positions"][0][
+            "estimated_wait_minutes"
+        ] = 2400
+
+        accepted = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+
+        too_large = copy.deepcopy(snapshot)
+        too_large["revision"] += 1
+        too_large["machines"]["A"]["new_registration_estimated_wait_minutes"] = 2401
+        rejected = self.client.post(
+            "/api/queue-status", json=too_large, headers=self.headers
+        )
+
+        self.assertEqual(204, accepted.status_code)
+        self.assertEqual(400, rejected.status_code)
+
     def test_preserves_maintenance_and_optional_other_stop_detail(self):
         maintenance = self.snapshot(revision=7)
         maintenance["machines"]["A"].update(

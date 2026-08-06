@@ -68,7 +68,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
@@ -550,8 +549,11 @@ internal fun RegistrationApp() {
                 savedState.configuredMachineIds.size
             )
             if (restoredMachineCount != queueRuleSettings.configuredMachineCount) {
-                queueRuleSettings = queueRuleSettings.copy(
-                    configuredMachineCount = restoredMachineCount
+                queueRuleSettings = withUpdatedMachineConfigurationRevision(
+                    previous = queueRuleSettings,
+                    updated = queueRuleSettings.copy(
+                        configuredMachineCount = restoredMachineCount
+                    )
                 )
                 queueRuleSettingsRepository.saveSettings(queueRuleSettings)
             }
@@ -1735,8 +1737,11 @@ internal fun RegistrationApp() {
             savedState.configuredMachineIds.size
         )
         if (restoredMachineCount != queueRuleSettings.configuredMachineCount) {
-            queueRuleSettings = queueRuleSettings.copy(
-                configuredMachineCount = restoredMachineCount
+            queueRuleSettings = withUpdatedMachineConfigurationRevision(
+                previous = queueRuleSettings,
+                updated = queueRuleSettings.copy(
+                    configuredMachineCount = restoredMachineCount
+                )
             )
             queueRuleSettingsRepository.saveSettings(queueRuleSettings)
         }
@@ -1797,7 +1802,10 @@ internal fun RegistrationApp() {
             savedState.configuredMachineIds.size
         )
         if (newMachineCount != queueRuleSettings.configuredMachineCount) {
-            queueRuleSettings = queueRuleSettings.copy(configuredMachineCount = newMachineCount)
+            queueRuleSettings = withUpdatedMachineConfigurationRevision(
+                previous = queueRuleSettings,
+                updated = queueRuleSettings.copy(configuredMachineCount = newMachineCount)
+            )
             queueRuleSettingsRepository.saveSettings(queueRuleSettings)
         }
         machineStates.reset(configuredMachineIds(newMachineCount))
@@ -7851,12 +7859,7 @@ private fun MachineLane(
                         fontSize = 17.sp
                     )
                     Spacer(Modifier.width(2.dp))
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                        contentDescription = "查看机台 $letter 详情",
-                        tint = TertiaryText,
-                        modifier = Modifier.size(18.dp)
-                    )
+                    Text("›", color = TertiaryText, fontSize = 17.sp)
                 }
                 Spacer(Modifier.height(2.dp))
                 Text(
@@ -14063,6 +14066,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.9.1",
+            "同步边界与应用图标",
+            "修复较长队列配合最大计划时间时，合法预计等待时间可能被服务器拒绝，以及恢复更多机台后配置修订号未更新的问题。机台名称使用与游玩位置一致的 › 详情提示；应用启动器图标启用已有的 Q 形电子排卡 Logo 概念，并补齐自适应、圆形和单色主题资源。"
+        ),
         Triple(
             "0.9.0",
             "完整机台配置",
