@@ -283,6 +283,7 @@ class AuditLogsTest {
         assertTrue(singlePlayerMachineLog.detail.contains("目标机台仅能容纳一人游玩"))
         assertTrue(singlePlayerMachineLog.detail.contains("“北川”的本次登记已改为“单人游玩”"))
         assertTrue(singlePlayerMachineLog.detail.contains("默认游玩偏好不会改变"))
+        assertTrue(singlePlayerMachineLog.detail.contains("转回支持共同游玩的机台时"))
 
         val unchangedSoloLog = requireNotNull(
             createMachineTransferAuditLog(
@@ -299,6 +300,22 @@ class AuditLogsTest {
         assertTrue(unchangedSoloLog.detail.contains("“南风”的本次登记继续使用“单人游玩”"))
         assertFalse(unchangedSoloLog.detail.contains("本次登记已改为"))
         assertTrue(unchangedSoloLog.detail.contains("默认游玩偏好不会改变"))
+        assertTrue(unchangedSoloLog.detail.contains("仍会保持“单人游玩”"))
+
+        val groupLog = requireNotNull(
+            createMachineTransferAuditLog(
+                category = AuditLogCategory.MACHINE_A,
+                sourceMachineLabel = "左侧·机台 A",
+                destinationMachineLabel = "右侧·机台 B",
+                registrations = listOf(
+                    registration(4, "青空", preference = PlayPreference.OPEN_TO_JOIN),
+                    registration(5, "北川", preference = PlayPreference.SOLO)
+                ),
+                destinationMachineCapacity = 1
+            )
+        )
+        assertTrue(groupLog.detail.contains("这些登记仍会保持“单人游玩”"))
+        assertFalse(groupLog.detail.contains("本次登记仍会保持“单人游玩”"))
     }
 
     @Test

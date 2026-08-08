@@ -38,16 +38,23 @@ class QueueRuleSettingsTest {
     }
 
     @Test
-    fun machineConfigurationRevisionOnlyAdvancesForConfigurationChanges() {
+    fun machineConfigurationRevisionOnlyAdvancesForRiskSensitiveChanges() {
         val original = QueueRuleSettings(machineConfigurationRevision = 7L)
         val ruleOnly = original.copy(allowTemporaryLeave = false)
         val metadataChange = original.copy(
             machineConfigurations = original.machineConfigurations +
                 (MachineId.A to original.machineConfiguration(MachineId.A).copy(gameVersion = "1.50"))
         )
+        val capacityChange = original.copy(
+            machineConfigurations = original.machineConfigurations +
+                (MachineId.A to original.machineConfiguration(MachineId.A).copy(capacity = 1))
+        )
+        val machineCountChange = original.copy(configuredMachineCount = 3)
 
         assertEquals(7L, withUpdatedMachineConfigurationRevision(original, ruleOnly).machineConfigurationRevision)
-        assertEquals(8L, withUpdatedMachineConfigurationRevision(original, metadataChange).machineConfigurationRevision)
+        assertEquals(7L, withUpdatedMachineConfigurationRevision(original, metadataChange).machineConfigurationRevision)
+        assertEquals(8L, withUpdatedMachineConfigurationRevision(original, capacityChange).machineConfigurationRevision)
+        assertEquals(8L, withUpdatedMachineConfigurationRevision(original, machineCountChange).machineConfigurationRevision)
     }
 
     @Test

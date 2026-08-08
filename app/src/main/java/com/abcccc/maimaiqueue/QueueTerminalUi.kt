@@ -4197,6 +4197,7 @@ internal fun RegistrationApp() {
                             allowsSharedPlay = queueRuleSettings.machineConfiguration(
                                 selection.machineId
                             ).capacity == 2,
+                            machineOperational = statusFor(selection.machineId).isOperational,
                             transferMachineName = transferDestinations.singleOrNull()?.name
                                 ?: "其他机台",
                             transferUnavailableReason = transferUnavailableReason,
@@ -5805,6 +5806,9 @@ internal fun RegistrationApp() {
 
                 if (closeQueueConfirmation) {
                     CloseRegistrationConfirmation(
+                        registrationCount = configuredMachineIds.sumOf {
+                            queueFor(it).registrationCount
+                        },
                         onDismiss = { closeQueueConfirmation = false },
                         onConfirm = {
                             closeRegistration()
@@ -7752,7 +7756,7 @@ private fun ClosedHome(
             16.sp
         )
         Spacer(Modifier.height(30.dp))
-        PrimaryButton("启用登记排队", onEnableRegistration, Modifier.width(260.dp))
+        PrimaryButton("重新开放登记排队", onEnableRegistration, Modifier.width(260.dp))
     }
 }
 
@@ -11367,13 +11371,15 @@ private fun FriendPairFlowDialog(
                 MenuActionButton(
                     MenuAction(
                         "选择现有登记",
-                        if (candidates.isNotEmpty()) {
+                        if (!machineOperational) {
+                            "当前机台已停止使用，恢复正常使用后才能组成固定组合。"
+                        } else if (candidates.isNotEmpty()) {
                             "从当前机台的等待登记中选择朋友，并检查顺序变化。"
                         } else {
                             "当前没有可用于组成固定组合的其他等待登记。"
                         },
                         { step = FriendPairStep.SELECT_EXISTING },
-                        enabled = candidates.isNotEmpty()
+                        enabled = machineOperational && candidates.isNotEmpty()
                     ),
                     Modifier.widthIn(max = 340.dp).fillMaxWidth().align(Alignment.CenterHorizontally)
                 )
@@ -11417,12 +11423,17 @@ private fun FriendPairFlowDialog(
                         MenuActionButton(
                             MenuAction(
                                 candidate.displayId,
-                                "${positionLabels[candidate.key] ?: "等待顺序"} · ${playPreferenceLabel(candidate)}。",
+                                if (machineOperational) {
+                                    "${positionLabels[candidate.key] ?: "等待顺序"} · ${playPreferenceLabel(candidate)}。"
+                                } else {
+                                    "当前机台已停止使用，恢复正常使用后才能组成固定组合。"
+                                },
                                 {
                                     selectedPlan = queue.planFriendPair(registration.key, candidate.key)
                                     friendConsentConfirmed = false
                                     step = FriendPairStep.CONFIRM_EXISTING
-                                }
+                                },
+                                enabled = machineOperational
                             ),
                             Modifier.fillMaxWidth()
                         )
@@ -11532,8 +11543,12 @@ private fun FriendPairFlowDialog(
                         "确认组成固定组合",
                         { onPairExisting(plan) },
                         Modifier.fillMaxWidth(),
-                        enabled = friendConsentConfirmed,
-                        disabledReason = "请先确认两位玩家都同意组成固定组合。"
+                        enabled = machineOperational && friendConsentConfirmed,
+                        disabledReason = if (machineOperational) {
+                            "请先确认两位玩家都同意组成固定组合。"
+                        } else {
+                            "当前机台已停止使用，恢复正常使用后才能组成固定组合。"
+                        }
                     )
                 }
                 Spacer(Modifier.height(8.dp))
@@ -11699,6 +11714,7 @@ private fun RegistrationActions(
     allowDeferOneRound: Boolean,
     allowTemporaryLeave: Boolean,
     allowsSharedPlay: Boolean,
+    machineOperational: Boolean,
     transferMachineName: String,
     transferUnavailableReason: String?,
     canEditPlayerProfile: Boolean,
@@ -11724,6 +11740,8 @@ private fun RegistrationActions(
     onCheckIn: () -> Unit,
     onExit: () -> Unit
 ) {
+    val context = LocalContext.current
+    val stoppedActionReason = "当前机台已停止使用，恢复正常使用后才能操作这份登记。"
     ModalSurface(onDismiss, width = 560.dp) {
         when (mode) {
             RegistrationActionMode.PREFERENCE -> {
@@ -11762,6 +11780,8 @@ private fun RegistrationActions(
                         title = "单人游玩",
                         description = "这份登记将独自占用一个等待位置。",
                         selected = !isFixedPair && registration.preference == PlayPreference.SOLO,
+                        enabled = machineOperational,
+                        disabledReason = stoppedActionReason,
                         onClick = { onPreferenceSelected(PlayPreference.SOLO) }
                     )
                     HorizontalDivider(color = Separator.copy(alpha = .72f))
@@ -11769,6 +11789,8 @@ private fun RegistrationActions(
                         title = "允许他人加入",
                         description = "这份登记可以与相邻的开放登记组成共同游玩位置。",
                         selected = !isFixedPair && registration.preference == PlayPreference.OPEN_TO_JOIN,
+                        enabled = machineOperational,
+                        disabledReason = stoppedActionReason,
                         onClick = { onPreferenceSelected(PlayPreference.OPEN_TO_JOIN) }
                     )
                     HorizontalDivider(color = Separator.copy(alpha = .72f))
@@ -11776,6 +11798,8 @@ private fun RegistrationActions(
                         title = "与朋友共同游玩",
                         description = "与指定玩家形成固定组合，并在不延后其他玩家的前提下调整顺序。",
                         selected = isFixedPair,
+                        enabled = machineOperational,
+                        disabledReason = stoppedActionReason,
                         onClick = onFriendPair
                     )
                 }
@@ -11801,8 +11825,11 @@ private fun RegistrationActions(
                     "保存昵称",
                     onRenameConfirm,
                     Modifier.fillMaxWidth(),
-                    enabled = renameDraft.isNotBlank() && !renameAlreadyExists,
-                    disabledReason = if (renameDraft.isBlank()) {
+                    enabled = machineOperational && renameDraft.isNotBlank() &&
+                        !renameAlreadyExists,
+                    disabledReason = if (!machineOperational) {
+                        stoppedActionReason
+                    } else if (renameDraft.isBlank()) {
                         "请先填写新的登记昵称。"
                     } else {
                         "当前队列中已经有相同昵称的登记。"
@@ -11824,11 +11851,24 @@ private fun RegistrationActions(
                     )
                     Spacer(Modifier.width(8.dp))
                     if (!registration.requiresOnSiteCheckIn) {
-                        IconButton(onClick = onRename, modifier = Modifier.size(48.dp)) {
+                        IconButton(
+                            onClick = {
+                                if (machineOperational) {
+                                    onRename()
+                                } else {
+                                    showDisabledActionReason(
+                                        context,
+                                        "修改登记昵称",
+                                        stoppedActionReason
+                                    )
+                                }
+                            },
+                            modifier = Modifier.size(48.dp)
+                        ) {
                             Icon(
                                 imageVector = Icons.Default.Edit,
                                 contentDescription = "编辑登记昵称",
-                                tint = SystemBlue,
+                                tint = if (machineOperational) SystemBlue else TertiaryText,
                                 modifier = Modifier.size(18.dp)
                             )
                         }
@@ -11928,12 +11968,15 @@ private fun RegistrationActions(
                         MenuActionButton(
                             MenuAction(
                                 "已到场",
-                                if (registration.hasRestartedOnSiteCheckInWindow) {
+                                if (!machineOperational) {
+                                    stoppedActionReason
+                                } else if (registration.hasRestartedOnSiteCheckInWindow) {
                                     "完成签到后，这份登记会保持当前顺序，并开始参与后续游玩位置分配。请在机台恢复正常使用后重新获得的 30 分钟内操作。"
                                 } else {
                                     "完成签到后，这份登记会保持当前顺序，并开始参与后续游玩位置分配。请在创建登记后的 30 分钟内操作。"
                                 },
                                 onCheckIn,
+                                enabled = machineOperational,
                                 accented = true,
                                 accentColor = OnlineRegistrationStatusColor,
                                 accentBackgroundColor = OnlineRegistrationStatusBackground
@@ -11943,9 +11986,14 @@ private fun RegistrationActions(
                         MenuActionButton(
                             MenuAction(
                                 "退出排队",
-                                "移除这份线上登记；继续游玩时需要重新加入排队。",
+                                if (machineOperational) {
+                                    "移除这份线上登记；继续游玩时需要重新加入排队。"
+                                } else {
+                                    stoppedActionReason
+                                },
                                 onExit,
-                                destructive = true
+                                destructive = true,
+                                enabled = machineOperational
                             ),
                             Modifier.weight(1f)
                         )
@@ -11956,8 +12004,13 @@ private fun RegistrationActions(
                         add(
                             MenuAction(
                                 "应处于游玩位置",
-                                "现场实际为共同游玩时，将这份登记移入$playingPositionLabel，并同步修正相关游玩偏好。",
+                                if (machineOperational) {
+                                    "现场实际为共同游玩时，将这份登记移入$playingPositionLabel，并同步修正相关游玩偏好。"
+                                } else {
+                                    stoppedActionReason
+                                },
                                 onMoveIntoPlaying,
+                                enabled = machineOperational,
                                 accented = true
                             )
                         )
@@ -11966,29 +12019,42 @@ private fun RegistrationActions(
                         QueueAbsenceStatus.DEFER_ONE_ROUND -> add(
                             MenuAction(
                                 "取消暂缓一次",
-                                "恢复下一次游玩机会；登记保持当前顺序。",
+                                if (machineOperational) {
+                                    "恢复下一次游玩机会；登记保持当前顺序。"
+                                } else {
+                                    stoppedActionReason
+                                },
                                 onCancelDeferOneRound,
+                                enabled = machineOperational,
                                 accented = false
                             )
                         )
                         QueueAbsenceStatus.TEMPORARILY_AWAY -> add(
                             MenuAction(
                                 "取消暂时离开",
-                                "恢复正常轮候，并将已轮空次数清零。",
+                                if (machineOperational) {
+                                    "恢复正常轮候，并将已轮空次数清零。"
+                                } else {
+                                    stoppedActionReason
+                                },
                                 onCancelTemporaryLeave,
+                                enabled = machineOperational,
                                 accented = false
                             )
                         )
                         QueueAbsenceStatus.NONE -> add(
                             MenuAction(
                                 "暂缓一次或暂时离开",
-                                if (allowDeferOneRound || allowTemporaryLeave) {
+                                if (!machineOperational) {
+                                    stoppedActionReason
+                                } else if (allowDeferOneRound || allowTemporaryLeave) {
                                     "选择只跳过下一次进入游玩位置的机会，或在返回前持续轮空。"
                                 } else {
                                     "系统规则不允许。"
                                 },
                                 onPauseOrLeave,
-                                enabled = allowDeferOneRound || allowTemporaryLeave,
+                                enabled = machineOperational &&
+                                    (allowDeferOneRound || allowTemporaryLeave),
                                 accented = false
                             )
                         )
@@ -11996,15 +12062,18 @@ private fun RegistrationActions(
                     add(
                         MenuAction(
                             "转至 $transferMachineName",
-                            if (isPlayingPosition) {
-                                ""
+                            if (!machineOperational) {
+                                stoppedActionReason
+                            } else if (isPlayingPosition) {
+                                "处于游玩位置的登记不能切换机台。"
                             } else if (transferUnavailableReason == null) {
                                 "离开当前机台，并在 $transferMachineName 的登记顺序末端重新排队。"
                             } else {
                                 transferUnavailableReason
                             },
                             onTransfer,
-                            enabled = !isPlayingPosition && transferUnavailableReason == null,
+                            enabled = machineOperational && !isPlayingPosition &&
+                                transferUnavailableReason == null,
                             accented = false
                         )
                     )
@@ -12014,17 +12083,31 @@ private fun RegistrationActions(
                         add(
                             MenuAction(
                                 "更改游玩偏好",
-                                if (registration.playerProfileId != null) {
+                                if (!machineOperational) {
+                                    stoppedActionReason
+                                } else if (registration.playerProfileId != null) {
                                     "只调整本次排队的偏好，不会修改玩家资料中的默认偏好。"
                                 } else {
                                     "调整为单人游玩、允许他人加入或与朋友共同游玩。"
                                 },
-                                onChangePreference
+                                onChangePreference,
+                                enabled = machineOperational
                             )
                         )
                     }
                     if (registration.isTemporary) {
-                        add(MenuAction("认领登记", "通过登录将这份临时登记关联到你的身份。", onClaim))
+                        add(
+                            MenuAction(
+                                "认领登记",
+                                if (machineOperational) {
+                                    "通过登录将这份临时登记关联到你的身份。"
+                                } else {
+                                    stoppedActionReason
+                                },
+                                onClaim,
+                                enabled = machineOperational
+                            )
+                        )
                     }
                     if (canEditPlayerProfile) {
                         add(
@@ -12045,6 +12128,7 @@ private fun RegistrationActions(
                         MenuAction(
                             "撤回至等待顺序前端",
                             when {
+                                !machineOperational -> stoppedActionReason
                                 fixedPartnerDisplayId != null ->
                                     "只撤回这份登记；确认后会解除固定组合，另一份登记继续留在$playingPositionLabel。"
                                 playingPartnerDisplayId != null ->
@@ -12052,7 +12136,8 @@ private fun RegistrationActions(
                                 else ->
                                     "将这份登记撤回等待顺序前端；$playingPositionLabel 会保持空缺。"
                             },
-                            onReturnToWaitingFront
+                            onReturnToWaitingFront,
+                            enabled = machineOperational
                         ),
                         Modifier.fillMaxWidth()
                     )
@@ -12069,6 +12154,7 @@ private fun RegistrationActions(
                         MenuAction(
                             "未到场",
                             when {
+                                !machineOperational -> stoppedActionReason
                                 registration.absenceStatus != QueueAbsenceStatus.NONE ->
                                     unavailableNoShowExplanation(listOf(registration))
                                 !canReportNoShow ->
@@ -12079,12 +12165,22 @@ private fun RegistrationActions(
                             },
                             onNoShow,
                             destructive = true,
-                            enabled = canReportNoShow
+                            enabled = machineOperational && canReportNoShow
                         ),
                         Modifier.weight(1f)
                     )
                     MenuActionButton(
-                        MenuAction("退出排队", "移除这份登记；继续游玩时需要重新排队。", onExit, destructive = true),
+                        MenuAction(
+                            "退出排队",
+                            if (machineOperational) {
+                                "移除这份登记；继续游玩时需要重新排队。"
+                            } else {
+                                stoppedActionReason
+                            },
+                            onExit,
+                            destructive = true,
+                            enabled = machineOperational
+                        ),
                         Modifier.weight(1f)
                     )
                 }
@@ -12148,18 +12244,37 @@ private fun PreferenceSelectionRow(
     title: String,
     description: String,
     selected: Boolean,
+    enabled: Boolean = true,
+    disabledReason: String? = null,
     onClick: () -> Unit
 ) {
+    val context = LocalContext.current
     Row(
         Modifier.fillMaxWidth().heightIn(min = 70.dp)
-            .clickable(enabled = !selected, onClick = onClick)
+            .clickable {
+                when {
+                    !enabled -> showDisabledActionReason(context, title, disabledReason)
+                    !selected -> onClick()
+                    else -> Unit
+                }
+            }
             .padding(horizontal = 16.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(Modifier.weight(1f)) {
-            Text(title, color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Text(
+                title,
+                color = if (enabled) PrimaryText else TertiaryText,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium
+            )
             Spacer(Modifier.height(3.dp))
-            Text(description, color = SecondaryText, fontSize = 10.sp, lineHeight = 15.sp)
+            Text(
+                if (enabled) description else disabledReason.orEmpty(),
+                color = if (enabled) SecondaryText else TertiaryText,
+                fontSize = 10.sp,
+                lineHeight = 15.sp
+            )
         }
         Spacer(Modifier.width(16.dp))
         Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) {
@@ -12528,9 +12643,9 @@ private fun MachineTransferConfirmation(
             Spacer(Modifier.height(10.dp))
             Text(
                 if (isGroup) {
-                    "$destinationMachineName 仅能容纳一人游玩。转入后，这些登记会分别使用“单人游玩”；玩家资料中的默认游玩偏好不会改变。"
+                    "$destinationMachineName 仅能容纳一人游玩。转入后，这些登记会分别使用“单人游玩”；玩家资料中的默认游玩偏好不会改变。之后转回支持共同游玩的机台时，这些登记仍会保持“单人游玩”；如需更改，请手动修改本次游玩偏好。"
                 } else {
-                    "$destinationMachineName 仅能容纳一人游玩。转入后，这份登记会使用“单人游玩”；玩家资料中的默认游玩偏好不会改变。"
+                    "$destinationMachineName 仅能容纳一人游玩。转入后，这份登记会使用“单人游玩”；玩家资料中的默认游玩偏好不会改变。之后转回支持共同游玩的机台时，这份登记仍会保持“单人游玩”；如需更改，请手动修改本次游玩偏好。"
                 },
                 color = SecondaryText,
                 fontSize = 12.sp,
@@ -12590,6 +12705,7 @@ private fun PositionActions(
     val registrations = queue.allRegistrations.filter { it.key in selection.registrationKeys }
     val playingPositionLabel = playingPositionName(selection.machineId)
     val nowMillis = rememberCurrentTimeMillis()
+    val stoppedActionReason = "当前机台已停止使用，恢复正常使用后才能调整这个位置。"
     val isFixedPair = registrations.size == 2 &&
         registrations[0].fixedPartnerKey == registrations[1].key &&
         registrations[1].fixedPartnerKey == registrations[0].key
@@ -12624,16 +12740,25 @@ private fun PositionActions(
             selection.isPlayingPosition && registrations.isNotEmpty() -> add(
                 MenuAction(
                     "本轮结束",
-                    "结束当前游玩，并选择登记与下一轮的处理方式。",
-                    onFinishRound
+                    if (machineOperational) {
+                        "结束当前游玩，并选择登记与下一轮的处理方式。"
+                    } else {
+                        stoppedActionReason
+                    },
+                    onFinishRound,
+                    enabled = machineOperational
                 )
             )
             selection.isPlayingPosition -> add(
                 MenuAction(
                     "进入$playingPositionLabel",
-                    "将第一个可以进入游玩位置的队列位置移入$playingPositionLabel。",
+                    if (machineOperational) {
+                        "将第一个可以进入游玩位置的队列位置移入$playingPositionLabel。"
+                    } else {
+                        stoppedActionReason
+                    },
                     onEnterPlaying,
-                    enabled = firstAvailablePositionIndex != null
+                    enabled = machineOperational && firstAvailablePositionIndex != null
                 )
             )
         }
@@ -12641,8 +12766,13 @@ private fun PositionActions(
             add(
                 MenuAction(
                     "本轮结束",
-                    "结束$playingPositionLabel 中的本轮游玩，并选择本轮登记与下一轮的处理方式。此位置中的登记不会被视为本轮玩家。",
-                    onFinishRound
+                    if (machineOperational) {
+                        "结束$playingPositionLabel 中的本轮游玩，并选择本轮登记与下一轮的处理方式。此位置中的登记不会被视为本轮玩家。"
+                    } else {
+                        stoppedActionReason
+                    },
+                    onFinishRound,
+                    enabled = machineOperational
                 )
             )
         }
@@ -12650,8 +12780,13 @@ private fun PositionActions(
             add(
                 MenuAction(
                     "应处于游玩位置",
-                    "现场已经推进到此位置，而此前只是连续忘记结束轮次时，按实际进度补记并调整整个队列。",
-                    onAdvanceToPlaying
+                    if (machineOperational) {
+                        "现场已经推进到此位置，而此前只是连续忘记结束轮次时，按实际进度补记并调整整个队列。"
+                    } else {
+                        stoppedActionReason
+                    },
+                    onAdvanceToPlaying,
+                    enabled = machineOperational
                 )
             )
         }
@@ -12661,13 +12796,15 @@ private fun PositionActions(
             add(
                 MenuAction(
                     "转至 $transferMachineName",
-                    if (transferUnavailableReason == null) {
+                    if (!machineOperational) {
+                        stoppedActionReason
+                    } else if (transferUnavailableReason == null) {
                         "将此位置中的登记移至 $transferMachineName 的登记顺序末端。"
                     } else {
                         transferUnavailableReason
                     },
                     onTransfer,
-                    enabled = transferUnavailableReason == null
+                    enabled = machineOperational && transferUnavailableReason == null
                 )
             )
         }
@@ -12675,8 +12812,13 @@ private fun PositionActions(
             add(
                 MenuAction(
                     "释放组合",
-                    "解除两份登记的固定共同游玩关系，并将双方的游玩偏好都改为允许他人加入。",
-                    onReleaseFixedPair
+                    if (machineOperational) {
+                        "解除两份登记的固定共同游玩关系，并将双方的游玩偏好都改为允许他人加入。"
+                    } else {
+                        stoppedActionReason
+                    },
+                    onReleaseFixedPair,
+                    enabled = machineOperational
                 )
             )
         }
@@ -12805,8 +12947,13 @@ private fun PositionActions(
                 MenuActionButton(
                     MenuAction(
                         "撤回至等待顺序前端",
-                        "$playingPositionLabel 与现场不一致时，将整组按原顺序撤回等待顺序前端，再调整登记顺序或游玩偏好。$playingPositionLabel 会保持空缺。",
-                        onReturnToWaitingFront
+                        if (machineOperational) {
+                            "$playingPositionLabel 与现场不一致时，将整组按原顺序撤回等待顺序前端，再调整登记顺序或游玩偏好。$playingPositionLabel 会保持空缺。"
+                        } else {
+                            stoppedActionReason
+                        },
+                        onReturnToWaitingFront,
+                        enabled = machineOperational
                     ),
                     Modifier.fillMaxWidth()
                 )
@@ -12829,6 +12976,7 @@ private fun PositionActions(
                     MenuAction(
                         if (registrations.size > 1) "这组玩家未到场" else "未到场",
                         when {
+                            !machineOperational -> stoppedActionReason
                             registrations.any {
                                 it.absenceStatus != QueueAbsenceStatus.NONE
                             } -> unavailableNoShowExplanation(registrations)
@@ -12846,17 +12994,23 @@ private fun PositionActions(
                         },
                         onNoShow,
                         destructive = true,
-                        enabled = canReportNoShow
+                        enabled = machineOperational && canReportNoShow
                     ),
                     Modifier.weight(1f)
                 )
                 MenuActionButton(
                     MenuAction(
                         if (registrations.size > 1) "移除这组登记" else "移除登记",
-                        if (registrations.size > 1) "同时移除此位置中的全部登记。"
-                        else "移除这份登记；继续游玩时需要重新排队。",
+                        if (!machineOperational) {
+                            stoppedActionReason
+                        } else if (registrations.size > 1) {
+                            "同时移除此位置中的全部登记。"
+                        } else {
+                            "移除这份登记；继续游玩时需要重新排队。"
+                        },
                         onRemove,
-                        destructive = true
+                        destructive = true,
+                        enabled = machineOperational
                     ),
                     Modifier.weight(1f)
                 )
@@ -13935,18 +14089,30 @@ private fun formatQueueSnapshotTime(timestampMillis: Long): String =
     SimpleDateFormat("M 月 d 日 HH:mm:ss", Locale.CHINA).format(Date(timestampMillis))
 
 @Composable
-private fun CloseRegistrationConfirmation(onDismiss: () -> Unit, onConfirm: () -> Unit) {
+private fun CloseRegistrationConfirmation(
+    registrationCount: Int,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
     ModalSurface(onDismiss, width = 450.dp) {
         Text("关闭登记排队？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
         Text(
-            "仅建议在无人排队，或现场已经能够自行辨认排队顺序时关闭。确认后将删除所有机台的全部登记，且无法恢复。",
+            if (registrationCount > 0) {
+                "当前共有 $registrationCount 份登记。仅建议在现场已经能够自行辨认排队顺序时关闭；确认后将删除所有机台的全部登记，且无法恢复。"
+            } else {
+                "当前没有登记。确认后仍会结束当前排队批次；重新开放时将载入最新机台配置和状态，并开始新的空队列。"
+            },
             color = SecondaryText,
             fontSize = 13.sp,
             lineHeight = 20.sp
         )
         Spacer(Modifier.height(18.dp))
-        DestructiveButton("关闭登记排队", onConfirm, Modifier.fillMaxWidth())
+        DestructiveButton(
+            if (registrationCount > 0) "清空并关闭登记排队" else "关闭登记排队",
+            onConfirm,
+            Modifier.fillMaxWidth()
+        )
         Spacer(Modifier.height(8.dp))
         CancelAction(onDismiss)
     }
@@ -13976,7 +14142,12 @@ private fun MoreMenu(
         )
         Spacer(Modifier.height(7.dp))
         ActionRow(
-            title = if (registrationOpen) "关闭登记排队" else "启用登记排队",
+            title = if (registrationOpen) "关闭登记排队" else "重新开放登记排队",
+            description = if (registrationOpen) {
+                "删除所有机台的当前登记，并结束本次排队批次。"
+            } else {
+                "载入最新机台配置和状态，并开始新的空队列。"
+            },
             destructive = registrationOpen,
             onClick = onToggleRegistration
         )
@@ -13985,6 +14156,7 @@ private fun MoreMenu(
         MenuSectionHeader("机台管理")
         ActionRow(
             title = "报告机台停止使用",
+            description = "保留所选机台的登记顺序，并暂停该机台的队列操作与计时。",
             destructive = true,
             enabled = canReportMachineStop,
             onClick = onReportMachineStop
@@ -14066,6 +14238,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.9.2",
+            "操作边界与提示一致性",
+            "待签到登记和转至当前机台会在统一动作边界被拒绝；QQ Bot 只在确有目标机台时显示切换操作。停机期间的终端队列操作统一置灰并说明原因，玩家资料仍可编辑。转入单人机台后的本次偏好、关闭登记的清空范围和风险配置修订规则也增加了跨端一致说明与行为测试。"
+        ),
         Triple(
             "0.9.1",
             "同步边界与应用图标",
@@ -16296,6 +16473,8 @@ private fun machineTransferUnavailableReason(
 ): String? = when {
     !status.isOperational -> "$machineName 已停止使用，暂时不能转入。"
     incomingRegistrations.isEmpty() -> "当前没有可以转移的登记。"
+    incomingRegistrations.any(Registration::requiresOnSiteCheckIn) ->
+        "此位置中有待签到的线上登记，完成现场签到后才能切换机台。"
     machineCapacity == 1 && incomingRegistrations.any { it.fixedPartnerKey != null } ->
         "$machineName 仅能容纳一人游玩，请先释放固定组合再转入。"
     queue.registrationCount + incomingRegistrations.size > 20 ->

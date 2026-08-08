@@ -439,11 +439,7 @@ internal fun withUpdatedMachineConfigurationRevision(
     previous: QueueRuleSettings,
     updated: QueueRuleSettings
 ): QueueRuleSettings {
-    val configurationChanged =
-        previous.configuredMachineCount != updated.configuredMachineCount ||
-            MachineId.entries.any { machineId ->
-                previous.machineConfiguration(machineId) != updated.machineConfiguration(machineId)
-            }
+    val configurationChanged = hasRiskSensitiveMachineConfigurationChange(previous, updated)
     return updated.copy(
         machineConfigurationRevision = if (configurationChanged) {
             (previous.machineConfigurationRevision + 1L).coerceAtLeast(1L)

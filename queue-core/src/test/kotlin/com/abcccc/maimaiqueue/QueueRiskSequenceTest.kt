@@ -142,4 +142,141 @@ class QueueRiskSequenceTest {
         )
         assertEquals(listOf(3), rotated.queue("A")!!.playing.map(Registration::key))
     }
+
+    @Test
+    fun registrationKeepsOneIdentityAcrossAbsenceTransferRotationAndUndo() {
+        var state = QueueEngineState(
+            linkedMapOf(
+                "A" to MachineQueue(),
+                "B" to MachineQueue()
+            )
+        )
+        state = apply(
+            state,
+            QueueAction.AddRegistrations(
+                "A",
+                listOf(registration(1, PlayPreference.SOLO)),
+                RegistrationPlacement.AUTO_ADVANCE
+            ),
+            atMillis = 10_000L
+        )
+        state = apply(
+            state,
+            QueueAction.AddRegistrations(
+                "A",
+                listOf(registration(2, PlayPreference.SOLO)),
+                RegistrationPlacement.WAITING_TAIL
+            )
+        )
+        state = apply(state, QueueAction.DeferOneRound("A", 2))
+        state = apply(state, QueueAction.CancelDeferOneRound("A", 2))
+        state = apply(state, QueueAction.TemporarilyLeave("A", 2))
+        state = apply(state, QueueAction.CancelTemporaryLeave("A", 2))
+        state = apply(state, QueueAction.TransferRegistrations("A", "B", setOf(2)))
+        state = apply(
+            state,
+            QueueAction.AddRegistrations(
+                "B",
+                listOf(registration(3, PlayPreference.SOLO)),
+                RegistrationPlacement.WAITING_TAIL
+            )
+        )
+        state = apply(state, QueueAction.EnterPlayingPosition("B"), atMillis = 20_000L)
+
+        val beforeFinish = state.queue("B")!!
+        state = apply(state, QueueAction.FinishRound("B"), atMillis = 30_000L)
+        val afterFinish = state.queue("B")!!
+        assertEquals(listOf(3), afterFinish.playing.map(Registration::key))
+        assertEquals(listOf(2), afterFinish.waiting.map(Registration::key))
+
+        state = apply(
+            state,
+            QueueAction.RestoreSnapshot(
+                machineId = "B",
+                expectedCurrentQueue = afterFinish,
+                restoredQueue = beforeFinish
+            )
+        )
+
+        assertEquals(beforeFinish, state.queue("B"))
+        assertEquals(listOf(1), state.queue("A")!!.playing.map(Registration::key))
+        assertEquals(setOf(1, 2, 3), state.allRegistrations.map(Registration::key).toSet())
+        assertEquals(3, state.allRegistrations.size)
+    }
+
+    @Test
+    fun stoppedPendingCheckInRestartsItsWindowThenLeavesByTurnOrTimeout() {
+        val pending = registration(2, PlayPreference.SOLO, pendingCheckIn = true)
+        val available = registration(3, PlayPreference.SOLO)
+        val source = QueueEngineState.single(
+            "A",
+            MachineQueue(
+                playing = listOf(registration(1, PlayPreference.SOLO)),
+                waiting = listOf(pending, available),
+                playingStartedAtMillis = 5_000L
+            )
+        )
+        val stoppedPolicy = QueueEnginePolicy(
+            machineStatuses = mapOf(
+                "A" to MachineStatus().stop(MachineStopReason.MAINTENANCE, 50_000L)
+            ),
+            requireOperationalForPlayerActions = true
+        )
+        val rejectedCheckIn = QueueEngine.execute(
+            source,
+            QueueAction.CheckIn("A", pending.key),
+            QueueActionContext(
+                atMillis = 60_000L,
+                origin = QueueActionOrigin.ON_SITE_TERMINAL,
+                policy = stoppedPolicy
+            )
+        )
+        assertEquals(
+            QueueActionFailureCode.MACHINE_STOPPED,
+            (rejectedCheckIn as QueueActionExecution.Rejected).failure.code
+        )
+
+        val restarted = QueueEngine.execute(
+            source,
+            QueueAction.RestartMachineTimers("A"),
+            QueueActionContext(
+                atMillis = 100_000L,
+                origin = QueueActionOrigin.SYSTEM,
+                policy = stoppedPolicy
+            )
+        ) as QueueActionExecution.Applied
+        val restartedQueue = restarted.state.queue("A")!!
+        assertEquals(100_000L, restartedQueue.playingStartedAtMillis)
+        assertEquals(
+            100_000L,
+            restartedQueue.waiting.first { it.key == pending.key }.onSiteCheckInStartedAtMillis
+        )
+
+        val restoredPolicy = stoppedPolicy.copy(
+            machineStatuses = mapOf("A" to MachineStatus())
+        )
+        val reachedTurn = QueueEngine.execute(
+            restarted.state,
+            QueueAction.FinishRound("A"),
+            QueueActionContext(atMillis = 110_000L, policy = restoredPolicy)
+        ) as QueueActionExecution.Applied
+        assertFalse(reachedTurn.state.allRegistrations.any { it.key == pending.key })
+        assertEquals(
+            listOf(available.key),
+            reachedTurn.state.queue("A")!!.playing.map(Registration::key)
+        )
+
+        val timedOut = QueueEngine.execute(
+            restarted.state,
+            QueueAction.RemoveExpiredOnlineRegistrations("A"),
+            QueueActionContext(
+                atMillis = 100_000L + ONLINE_REGISTRATION_CHECK_IN_TIMEOUT_MILLIS,
+                origin = QueueActionOrigin.SYSTEM,
+                policy = restoredPolicy
+            )
+        ) as QueueActionExecution.Applied
+        assertFalse(timedOut.state.allRegistrations.any { it.key == pending.key })
+        assertEquals(listOf(1), timedOut.state.queue("A")!!.playing.map(Registration::key))
+        assertEquals(listOf(available.key), timedOut.state.queue("A")!!.waiting.map(Registration::key))
+    }
 }

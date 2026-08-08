@@ -1014,6 +1014,37 @@ class QueueEngineDifferentialTest {
     }
 
     @Test
+    fun transferRejectsPendingCheckInAndSameMachineTargetsAtTheCoreBoundary() {
+        val pending = registration(1, pendingCheckIn = true)
+        val state = QueueEngineState(
+            mapOf(
+                machineA to MachineQueue(waiting = listOf(pending)),
+                machineB to MachineQueue()
+            )
+        )
+
+        val pendingTransfer = QueueEngine.execute(
+            state,
+            QueueAction.TransferRegistrations(machineA, machineB, setOf(pending.key))
+        )
+        val sameMachineTransfer = QueueEngine.execute(
+            state,
+            QueueAction.TransferRegistrations(machineA, machineA, setOf(pending.key))
+        )
+
+        assertEquals(
+            QueueActionFailureCode.PENDING_CHECK_IN,
+            (pendingTransfer as QueueActionExecution.Rejected).failure.code
+        )
+        assertEquals(
+            QueueActionFailureCode.INVALID_POSITION,
+            (sameMachineTransfer as QueueActionExecution.Rejected).failure.code
+        )
+        assertEquals(listOf(pending.key), state.queue(machineA)!!.waiting.map(Registration::key))
+        assertTrue(state.queue(machineB)!!.allRegistrations.isEmpty())
+    }
+
+    @Test
     fun rejectedPlanCannotBecomeExecutableOnlyBecauseItsTimestampChanges() {
         val queue = MachineQueue(waiting = listOf(registration(1, PlayPreference.SOLO)))
         val state = QueueEngineState.single(machineA, queue)

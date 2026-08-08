@@ -579,6 +579,9 @@ object QueueEngine {
             is QueueAction.TransferRegistrations -> {
                 val destination = state.queue(action.destinationMachineId)
                     ?: return QueueActionFailure(QueueActionFailureCode.MACHINE_NOT_FOUND)
+                if (action.sourceMachineId == action.destinationMachineId) {
+                    return QueueActionFailure(QueueActionFailureCode.INVALID_POSITION)
+                }
                 if (
                     !policy.isOperational(action.sourceMachineId) ||
                     !policy.isOperational(action.destinationMachineId)
@@ -592,6 +595,11 @@ object QueueEngine {
                 }
                 if (queue.playing.any { it.key in action.registrationKeys }) {
                     return QueueActionFailure(QueueActionFailureCode.PLAYING_POSITION_NOT_ALLOWED)
+                }
+                if (queue.allRegistrations.any {
+                        it.key in action.registrationKeys && it.requiresOnSiteCheckIn
+                    }) {
+                    return QueueActionFailure(QueueActionFailureCode.PENDING_CHECK_IN)
                 }
                 if (
                     destination.registrationCount + action.registrationKeys.size >

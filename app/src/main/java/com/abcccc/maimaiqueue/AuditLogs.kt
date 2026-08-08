@@ -773,6 +773,13 @@ fun createMachineTransferAuditLog(
                 add("${quotedNames(unchangedSoloRegistrations)}的本次登记继续使用“单人游玩”")
             }
             add("玩家资料中的默认游玩偏好不会改变")
+            add(
+                if (registrations.size > 1) {
+                    "之后转回支持共同游玩的机台时，这些登记仍会保持“单人游玩”"
+                } else {
+                    "之后转回支持共同游玩的机台时，这份登记仍会保持“单人游玩”"
+                }
+            )
         }
     }
     return createAuditLogEntry(

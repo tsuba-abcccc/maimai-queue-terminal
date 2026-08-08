@@ -22,6 +22,7 @@ const {
   parsePreference,
   parseNotificationPreference,
   queueConfirmationContextFields,
+  transferQueueMachine,
 } = require('../lib')
 
 test('locks the Bot confirmation to the registration state shown before the reply', () => {
@@ -1038,6 +1039,41 @@ test('changes the personal menu with absence state and queue rules', () => {
     '切换机台',
     '退出排队',
   ])
+  assert.deepEqual(formatOwnQueueActions(player, undefined, true, 2, false), [
+    '暂缓一次',
+    '暂时离开',
+    '修改游玩偏好',
+    '退出排队',
+  ])
+})
+
+test('does not offer machine transfer when the queue overview is unavailable', () => {
+  const text = formatOwnQueue([{
+    registration_id: 'registration-1',
+    profile_id: 'profile-1',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'A',
+    machine_operational: true,
+    position: 'WAITING',
+    position_index: 1,
+    estimated_wait_minutes: 8,
+    fixed_pair: false,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+    online_registration_pending_check_in: false,
+    preference: 'OPEN_TO_JOIN',
+  }], undefined, {
+    terminal: { online: true },
+    registration_open: true,
+  })
+
+  assert.doesNotMatch(text, /切换机台/)
+  assert.match(text, /修改游玩偏好/)
+  assert.match(text, /退出排队/)
 })
 
 test('single-player machine join skips preference prompt and explains the override', async () => {
@@ -1115,6 +1151,85 @@ test('single-player machine join skips preference prompt and explains the overri
   assert.match(text, /仅能容纳一人游玩/)
   assert.match(text, /本次已使用“单人游玩”/)
   assert.match(text, /默认游玩偏好不会改变/)
+})
+
+test('explains the persistent solo preference before transferring to a single-player machine', async () => {
+  const sent = []
+  let submittedOperation
+  let submittedFields
+  const player = {
+    registration_id: 'registration-1',
+    profile_id: 'profile-1',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'A',
+    machine_operational: true,
+    position: 'WAITING',
+    position_index: 1,
+    estimated_wait_minutes: 8,
+    fixed_pair: false,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+    online_registration_pending_check_in: false,
+    preference: 'OPEN_TO_JOIN',
+  }
+  const api = {
+    getPlayers: async () => ({ queue_id: 'queue-1', players: [player] }),
+    getQueue: async () => ({
+      queue_id: 'queue-1',
+      captured_at: 1,
+      registration_open: true,
+      terminal: { online: true },
+      machines: {
+        A: {
+          id: 'A',
+          name: '左侧·机台 A',
+          operational: true,
+          playing: [],
+          waiting_positions: [],
+          registration_count: 1,
+          configuration: { capacity: 2 },
+        },
+        B: {
+          id: 'B',
+          name: '右侧·机台 B',
+          operational: true,
+          playing: [],
+          waiting_positions: [],
+          registration_count: 0,
+          configuration: { capacity: 1 },
+        },
+      },
+    }),
+    createQueueCommand: async (_qq, operation, fields) => {
+      submittedOperation = operation
+      submittedFields = fields
+      return { command_id: 'command-1', status: 'APPLIED' }
+    },
+  }
+  const session = {
+    platform: 'onebot',
+    userId: '12345678',
+    isDirect: true,
+    send: async message => sent.push(message),
+    prompt: async () => '确认切换机台',
+  }
+
+  const text = await transferQueueMachine(
+    api,
+    { commandWaitSeconds: 0 },
+    session,
+  )
+
+  assert.equal(submittedOperation, 'TRANSFER_MACHINE')
+  assert.equal(submittedFields.target_machine_id, 'B')
+  assert.match(sent[0], /本次登记将使用“单人游玩”/)
+  assert.match(sent[0], /默认游玩偏好不会改变/)
+  assert.match(sent[0], /转回支持共同游玩的机台时，本次登记仍会保持“单人游玩”/)
+  assert.match(text, /登记已转至右侧·机台 B/)
 })
 
 test('cancels temporary leave for a fixed pair after the terminal snapshot confirms it', async () => {

@@ -1134,7 +1134,7 @@ async function waitForAbsenceStateConfirmation(
   }
 }
 
-async function transferQueueMachine(
+export async function transferQueueMachine(
   api: QueueApi,
   config: Config,
   session: Session | undefined,
@@ -1147,7 +1147,7 @@ async function transferQueueMachine(
     machine.id !== current.player.machine_id && machineCanAcceptRegistration(machine)
   );
   const candidates = otherwiseAvailableMachines.filter((machine) =>
-    !(current.player.fixed_pair && machineCapacity(machine) === 1)
+    machineCanReceiveTransfer(machine, current.player)
   );
   if (!candidates.length) {
     if (
@@ -1196,7 +1196,7 @@ async function transferQueueMachine(
         ? ["原固定组合会解除；两份登记都会恢复为允许他人加入，另一份登记保留原位。"]
         : []),
       ...(machineCapacity(target) === 1
-        ? [`${compactMachineName(target.name)} 仅能容纳一人游玩。转入后，本次登记将使用“单人游玩”，玩家资料中的默认游玩偏好不会改变。`]
+        ? [`${compactMachineName(target.name)} 仅能容纳一人游玩。转入后，本次登记将使用“单人游玩”，玩家资料中的默认游玩偏好不会改变。之后转回支持共同游玩的机台时，本次登记仍会保持“单人游玩”；如需更改，请手动修改本次游玩偏好。`]
         : []),
     ].join("\n"),
     "确认切换机台",
@@ -1487,6 +1487,15 @@ export function machineCanAcceptRegistration(machine: QueueMachine): boolean {
       0,
     );
   return machine.operational && registrationCount < 20;
+}
+
+function machineCanReceiveTransfer(
+  machine: QueueMachine,
+  player: Pick<BotPlayer, "machine_id" | "fixed_pair">,
+): boolean {
+  return machine.id !== player.machine_id &&
+    machineCanAcceptRegistration(machine) &&
+    !(player.fixed_pair && machineCapacity(machine) === 1);
 }
 
 export function machineCapacity(machine: QueueMachine): 1 | 2 {
@@ -2414,11 +2423,17 @@ export function formatOwnQueue(
   if (players.length === 1 && terminalOnline !== false) {
     const playerMachine = queue?.machines[players[0].machine_id];
     const playerMachineOperational = playerMachine?.operational;
+    const transferAvailable = queue
+      ? sortedMachines(queue).some((machine) =>
+        machineCanReceiveTransfer(machine, players[0])
+      )
+      : false;
     const actions = formatOwnQueueActions(
       players[0],
       queueRules,
       playerMachineOperational,
       playerMachine ? machineCapacity(playerMachine) : undefined,
+      transferAvailable,
     );
     if (actions.length) blocks.push(actions.map((action) => ` - ${action}`).join("\n"));
   }
@@ -2430,6 +2445,7 @@ export function formatOwnQueueActions(
   queueRules?: QueueRules,
   machineOperational?: boolean,
   machineCapacityValue?: 1 | 2,
+  transferAvailable?: boolean,
 ): string[] {
   if ((machineOperational ?? player.machine_operational) === false) return [];
   if (player.online_registration_pending_check_in) return ["退出排队"];
@@ -2442,7 +2458,7 @@ export function formatOwnQueueActions(
     if (queueRules?.allow_defer_one_round !== false) actions.push("暂缓一次");
     if (queueRules?.allow_temporary_leave !== false) actions.push("暂时离开");
   }
-  if (player.position === "WAITING") {
+  if (player.position === "WAITING" && transferAvailable !== false) {
     actions.push("切换机台");
   }
   if (machineCapacityValue !== 1) actions.push("修改游玩偏好");

@@ -268,6 +268,7 @@ class RemoteQueueOperationsTest {
         )
         assertTrue(result.detail.contains("本次登记已改为“单人游玩”"))
         assertTrue(result.detail.contains("默认游玩偏好不会改变"))
+        assertTrue(result.detail.contains("转回支持共同游玩的机台时"))
     }
 
     @Test
@@ -295,6 +296,7 @@ class RemoteQueueOperationsTest {
         assertTrue(result.detail.contains("本次登记继续使用“单人游玩”"))
         assertFalse(result.detail.contains("本次登记已改为“单人游玩”"))
         assertTrue(result.detail.contains("默认游玩偏好不会改变"))
+        assertTrue(result.detail.contains("仍会保持“单人游玩”"))
     }
 
     @Test

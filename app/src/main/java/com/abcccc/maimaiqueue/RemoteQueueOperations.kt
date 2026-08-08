@@ -452,6 +452,7 @@ internal fun decideRemoteQueueOperation(
                         }
                     )
                     append("；玩家资料中的默认游玩偏好不会改变。")
+                    append("之后转回支持共同游玩的机台时，本次登记仍会保持“单人游玩”；如需更改，请手动修改本次游玩偏好。")
                 }
                 if (registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND) {
                     if (fixedPartner != null) {
