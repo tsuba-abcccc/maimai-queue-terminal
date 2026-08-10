@@ -146,6 +146,24 @@ OPERATION_SOURCES = {
     "MOBILE_DEVICE",
 }
 
+REQUIRED_DATABASE_COLUMNS = {
+    "queue_snapshot": {"instance_id", "instance_generation"},
+    "terminal_command": {
+        "claimed_at",
+        "claimed_terminal",
+        "claimed_instance",
+        "result_registration_id",
+        "result_source",
+    },
+    "queue_event": {
+        "operation_source",
+        "notification_categories",
+        "machine_stable_id",
+        "machine_name",
+    },
+    "queue_event_recipient": {"stored_at"},
+}
+
 
 class ValidationError(ValueError):
     pass
@@ -609,8 +627,32 @@ def register_routes(app: Flask) -> None:
 
     @app.get("/healthz")
     def health():
-        with open_database() as connection:
-            connection.execute("SELECT 1").fetchone()
+        try:
+            with open_database() as connection:
+                connection.execute("SELECT 1").fetchone()
+                for table_name, required_columns in REQUIRED_DATABASE_COLUMNS.items():
+                    actual_columns = {
+                        row[1]
+                        for row in connection.execute(
+                            f"PRAGMA table_info({table_name})"
+                        )
+                    }
+                    if not required_columns <= actual_columns:
+                        return jsonify(
+                            {
+                                "status": "error",
+                                "service": "maimai-queue-status",
+                                "error": "database_schema_not_ready",
+                            }
+                        ), 503
+        except sqlite3.Error:
+            return jsonify(
+                {
+                    "status": "error",
+                    "service": "maimai-queue-status",
+                    "error": "database_unavailable",
+                }
+            ), 503
         return jsonify({"status": "ok", "service": "maimai-queue-status"})
 
     @app.route("/api/queue-status", methods=["GET", "POST", "OPTIONS"])
@@ -2489,7 +2531,7 @@ def create_mobile_registration_session():
             return jsonify({"ok": False, "error": "排队批次已经变化，请重新打开登记页面"}), 409
         snapshot = json.loads(snapshot_row["payload"])
         if not snapshot.get("website_remote_enabled", False):
-            return jsonify({"ok": False, "error": "网站同步已关闭，暂不能使用移动设备登记"}), 409
+            return jsonify({"ok": False, "error": "与服务端同步已关闭，暂不能使用移动设备登记"}), 409
         if snapshot_in_closing_grace(snapshot):
             return jsonify({"ok": False, "error": "闭店收尾期间不再接收新的排队登记"}), 409
         if not snapshot.get("registration_open", True):
@@ -2577,7 +2619,7 @@ def validate_open_mobile_session(
         return "现场终端暂时离线，请稍后重试", 503, "TERMINAL_OFFLINE"
     snapshot = json.loads(snapshot_row["payload"])
     if not snapshot.get("website_remote_enabled", False):
-        return "网站同步已关闭，暂不能使用移动设备登记", 503, "WEBSITE_SYNC_DISABLED"
+        return "与服务端同步已关闭，暂不能使用移动设备登记", 503, "WEBSITE_SYNC_DISABLED"
     if snapshot_in_closing_grace(snapshot):
         return "闭店收尾期间不再接收新的排队登记", 409, "REGISTRATION_CLOSED"
     if not snapshot.get("registration_open", True):
@@ -3315,7 +3357,7 @@ def remote_operation_availability_error(
     if operation_source == "WEBSITE_REMOTE" and not snapshot.get(
         "website_remote_enabled", False
     ):
-        return "现场终端已关闭网站同步，暂不能在线操作", 503
+        return "现场终端已关闭与服务端同步，暂不能在线操作", 503
     if operation_source == "QQ_BOT" and not snapshot.get("onebot_sync_enabled", True):
         return "现场终端已关闭 QQ Bot 联动", 503
     if operation == "JOIN_QUEUE" and snapshot_in_closing_grace(snapshot):

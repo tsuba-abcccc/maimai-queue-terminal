@@ -96,6 +96,35 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(200, bot_with_missing_sync.status_code)
         self.assertEqual(503, missing_sync.status_code)
 
+    def test_health_rejects_an_incomplete_database_migration(self):
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute("ALTER TABLE queue_event RENAME TO queue_event_current")
+            connection.execute(
+                """
+                CREATE TABLE queue_event (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    queue_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    occurred_at INTEGER NOT NULL,
+                    machine_id TEXT,
+                    event_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    registration_ids TEXT NOT NULL,
+                    UNIQUE(queue_id, event_id)
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        response = self.client.get("/healthz")
+
+        self.assertEqual(503, response.status_code)
+        self.assertEqual("database_schema_not_ready", response.get_json()["error"])
+
     def test_identical_terminal_and_bot_tokens_disable_both_private_roles(self):
         shared_token = "x" * 32
         self.app.config["SYNC_TOKEN"] = shared_token

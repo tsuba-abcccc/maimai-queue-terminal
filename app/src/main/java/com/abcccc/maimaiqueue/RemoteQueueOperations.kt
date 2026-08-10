@@ -185,7 +185,7 @@ internal fun decideRemoteQueueOperation(
     }
     when (command.source) {
         RemoteQueueOperationSource.WEBSITE_REMOTE -> if (!state.websiteRemoteEnabled) {
-            return reject("现场终端已关闭网站同步，暂不能在线操作。")
+            return reject("现场终端已关闭与服务端同步，暂不能在线操作。")
         }
         RemoteQueueOperationSource.QQ_BOT -> if (!state.oneBotSyncEnabled) {
             return reject("现场终端已关闭 QQ Bot 联动。")

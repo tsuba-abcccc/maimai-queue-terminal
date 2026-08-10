@@ -342,6 +342,7 @@ export const HELP_TEXT = [
   " - 加入排队",
   " - 我的排队",
   " - 查看队列",
+  " - 查询人数",
   " - 我的资料",
   " - 修改资料",
   " - 排队通知",
@@ -648,6 +649,18 @@ export function apply(ctx: Context, config: Config) {
         if (!session || messages.length === 1) return messages[0];
         for (const message of messages) await session.send(message);
         return "";
+      })
+    );
+
+  ctx.command("maimaiq.count", "查询当前登记人数")
+    .alias("查询人数")
+    .action(() =>
+      withCommandError(async () => {
+        const queue = await api.getQueue();
+        if (queue.onebot_sync_enabled === false) {
+          throw new Error("现场终端已关闭 QQ Bot 联动。请联系现场工作人员开启后再试。");
+        }
+        return formatRegistrationCount(queue, api.url("/queue-status"));
       })
     );
 
@@ -2191,6 +2204,57 @@ export function formatQueue(queue: QueueStatus): string {
     );
   }
   return sections.filter(Boolean).join("\n\n");
+}
+
+export function formatRegistrationCount(
+  queue: QueueStatus,
+  publicQueueUrl = "https://abcccc.top/queue-status",
+): string {
+  const machines = sortedMachines(queue);
+  const registrationCounts = machines.map((machine) =>
+    machine.playing.length + machine.waiting_positions.reduce(
+      (total, position) => total + position.registrations.length,
+      0,
+    )
+  );
+  const sections = [
+    `当前共 ${registrationCounts.reduce((total, count) => total + count, 0)} 个登记。`,
+  ];
+  if (queue.test_data) sections.push("当前数据是测试数据。");
+  if (!queue.terminal.online) {
+    sections.push("现场终端当前离线，以下为最近一次同步数据。");
+  }
+  sections.push(
+    ...machines.map((machine, index) => {
+      const estimate = formatNewRegistrationEstimate(queue, machine);
+      return `${compactMachineName(machine.name)} 有 ${registrationCounts[index]} 个登记，${estimate}`;
+    }),
+  );
+  sections.push(
+    `请发送「查看队列」，或者访问 ${publicQueueUrl}，来查看详细的排队状态。`,
+  );
+  return sections.join("\n\n");
+}
+
+function formatNewRegistrationEstimate(
+  queue: QueueStatus,
+  machine: QueueMachine,
+): string {
+  if (!queue.terminal.online) return "新登记等待时间暂时无法估算。";
+  if (!machine.operational) {
+    return "机台当前停止使用，新登记等待时间暂时无法估算。";
+  }
+  if (!queue.registration_open || queue.business_hours?.closing_grace) {
+    return "当前不接收新登记。";
+  }
+  const estimate = machine.new_registration_estimated_wait_minutes;
+  if (typeof estimate !== "number" || !Number.isFinite(estimate)) {
+    return "新登记等待时间暂时无法估算。";
+  }
+  const minutes = Math.max(0, Math.trunc(estimate));
+  return minutes === 0
+    ? "新登记预计很快可以游玩。"
+    : `新登记估计等待 ${minutes} 分钟。`;
 }
 
 export function formatQueueMessages(

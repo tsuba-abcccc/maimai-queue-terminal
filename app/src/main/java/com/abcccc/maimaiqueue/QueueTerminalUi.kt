@@ -914,7 +914,7 @@ internal fun RegistrationApp() {
                 )
             }
             if (cloudSyncAvailable && previousSettings.websiteSyncEnabled != settings.websiteSyncEnabled) {
-                add("网站同步：${if (settings.websiteSyncEnabled) "已开启" else "已关闭"}")
+                add("与服务端同步：${if (settings.websiteSyncEnabled) "已开启" else "已关闭"}")
             }
             if (
                 cloudSyncAvailable &&
@@ -6179,7 +6179,7 @@ private fun QueueRuleSettingsScreen(
             Spacer(Modifier.height(6.dp))
             Text(
                 if (cloudSyncAvailable) {
-                    "调整网站同步、排队规则和机台配置。机台编号按 A 至 J 连续排列，删除中间机台后会自动重排。"
+                    "调整与服务端同步、排队规则和机台配置。机台编号按 A 至 J 连续排列，删除中间机台后会自动重排。"
                 } else {
                     "调整排队规则和机台配置。机台编号按 A 至 J 连续排列，删除中间机台后会自动重排。"
                 },
@@ -6206,7 +6206,7 @@ private fun QueueRuleSettingsScreen(
                             if (queueConnectionEditable) {
                                 "终端版可以连接自建服务器。连接设置仅保存在本机，令牌不会写入日志。"
                             } else {
-                                "如需更换服务器，请先关闭网站同步。"
+                                "如需更换服务器，请先关闭与服务端同步。"
                             },
                             color = SecondaryText,
                             fontSize = 11.sp,
@@ -6282,10 +6282,10 @@ private fun QueueRuleSettingsScreen(
                     }
                     HorizontalDivider(color = Separator.copy(alpha = .72f))
                     QueueRuleSettingRow(
-                        title = "网站同步",
+                        title = "与服务端同步",
                         description = when {
                             !queueConnectionConfigured && settings.websiteSyncEnabled ->
-                                "请先关闭网站同步并保存有效的服务器地址与终端同步令牌。"
+                                "请先关闭与服务端同步，并保存有效的服务器地址与终端同步令牌。"
                             !queueConnectionConfigured ->
                                 "请先填写有效的服务器地址与终端同步令牌。"
                             settings.websiteSyncEnabled ->
@@ -6321,7 +6321,7 @@ private fun QueueRuleSettingsScreen(
                         title = "允许线上登记",
                         description = when {
                             !settings.websiteSyncEnabled ->
-                                "网站同步关闭期间不会接收新的线上登记；重新开启后将按照此设置执行。"
+                                "与服务端同步关闭期间不会接收新的线上登记；重新开启后将按照此设置执行。"
                             settings.allowOnlineRegistration ->
                                 "允许玩家通过网站和 QQ Bot 创建线上登记；到场后仍需在终端完成签到。"
                             else ->
@@ -6337,7 +6337,7 @@ private fun QueueRuleSettingsScreen(
                         title = "QQ Bot 联动",
                         description = when {
                             !settings.websiteSyncEnabled ->
-                                "需要先开启网站同步，QQ Bot 才能读取队列、修改玩家资料和发送通知。"
+                                "需要先开启与服务端同步，QQ Bot 才能读取队列、修改玩家资料和发送通知。"
                             settings.oneBotSyncEnabled ->
                                 "允许 QQ Bot 读取队列、修改玩家资料，并发送与玩家有关的通知。"
                             else ->
@@ -6609,7 +6609,7 @@ private fun QueueRuleSettingsScreen(
                     !machineDetailsValid -> "请填写选择为“其他”的机台类型或服务器名称。"
                     !machineGroupsValid -> "请填写所有机台分组的名称。"
                     !connectionChangeValid -> "请填写有效的队列 API 地址和终端同步令牌。"
-                    else -> "开启网站同步前，请先填写有效的服务器连接。"
+                    else -> "开启与服务端同步前，请先填写有效的服务器连接。"
                 }
             )
             if (settingsChanged && !settingsValid) {
@@ -6620,7 +6620,7 @@ private fun QueueRuleSettingsScreen(
                         !machineDetailsValid -> "请填写选择为“其他”的机台类型或服务器名称。"
                         !machineGroupsValid -> "请填写所有机台分组的名称。"
                         !connectionChangeValid -> "请填写有效的队列 API 地址和终端同步令牌。"
-                        else -> "开启网站同步前，请先填写有效的服务器连接。"
+                        else -> "开启与服务端同步前，请先填写有效的服务器连接。"
                     },
                     color = Destructive,
                     fontSize = 11.sp,
@@ -6632,7 +6632,7 @@ private fun QueueRuleSettingsScreen(
     }
     if (showTakeoverConfirmation) {
         RemoveRegistrationConfirmation(
-            title = "接管网站同步？",
+            title = "接管同步身份？",
             message = "接管后，网站和 QQ Bot 将以本机队列作为正式数据。请仅在确实需要用本机替代当前同步终端时继续；后台重试不会自行完成接管。",
             confirmText = "确认接管",
             onDismiss = { showTakeoverConfirmation = false },
@@ -10174,11 +10174,11 @@ private fun CreateRegistrationScreen(
                 },
                 selected = false,
                 enabled = mobileRegistrationEnabled && !mobileRegistrationLoading,
-                badge = if (mobileRegistrationEnabled) null else "需要网站同步",
+                badge = if (mobileRegistrationEnabled) null else "需要与服务端同步",
                 disabledReason = if (mobileRegistrationLoading) {
                     "登记二维码正在创建，请稍候。"
                 } else {
-                    "请先在应用设置中配置并开启网站同步。"
+                    "请先在应用设置中配置并开启与服务端同步。"
                 },
                 onClick = onMobileRegistration,
                 modifier = Modifier.weight(1f)
@@ -14663,12 +14663,12 @@ private fun AppDetailsDialog(
         AppDetailRow("队列恢复", "保留当前及上一份有效状态")
         if (cloudSyncStatus != null) {
             HorizontalDivider(color = Separator.copy(alpha = .72f))
-            AppDetailRow("网站同步", queueCloudSyncStatusLabel(cloudSyncStatus))
+            AppDetailRow("与服务端同步", queueCloudSyncStatusLabel(cloudSyncStatus))
         }
         Spacer(Modifier.height(13.dp))
         Text(
             if (cloudSyncStatus != null) {
-                "队列、玩家资料和日志始终先保存在本机。开启网站同步后，只有玩家选择允许公开时，当前登记的 QQ 才会显示在网页详情中；完整玩家资料、性别、默认偏好和资料内部编号仍通过私有接口保存。"
+                "队列、玩家资料和日志始终先保存在本机。开启与服务端同步后，只有玩家选择允许公开时，当前登记的 QQ 才会显示在网页详情中；完整玩家资料、性别、默认偏好和资料内部编号仍通过私有接口保存。"
             } else {
                 "这是不连接网站的纯本地版本。队列、玩家资料和日志只保存在本机，不会上传到服务器。"
             },
@@ -14882,7 +14882,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.2.17",
             "玩家资料持久化",
-            "资料只有在本机保存成功后才参与队列和网站同步，写入失败时可以明确重试。"
+            "资料只有在本机保存成功后才参与队列和服务端同步，写入失败时可以明确重试。"
         ),
         Triple(
             "0.2.16",
@@ -14944,10 +14944,10 @@ private fun CloudSyncInfoDialog(
 ) {
     val currentStatusColor = queueCloudSyncStatusColor(status.phase)
     ModalSurface(onDismiss, width = 540.dp) {
-        Text("网站同步状态", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+        Text("与服务端同步状态", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(7.dp))
         Text(
-            "开启网站同步后，每次变动会先保存在本机，再尝试上传。终端也会接收服务器待执行的资料修改，并按本地规则校验后应用。关闭同步或网络不可用时，不会阻止现场排队。",
+            "开启与服务端同步后，每次变动会先保存在本机，再尝试上传。终端也会接收服务器待执行的资料修改，并按本地规则校验后应用。关闭同步或网络不可用时，不会阻止现场排队。",
             color = SecondaryText,
             fontSize = 12.sp,
             lineHeight = 18.sp
@@ -15006,7 +15006,7 @@ private fun CloudSyncInfoDialog(
         MenuSectionHeader("各状态的含义")
         CloudSyncMeaningRow(
             phase = QueueCloudSyncPhase.DISABLED,
-            description = "网站同步已在设置中关闭；新的队列变动只保存在本机。"
+            description = "与服务端同步已在设置中关闭；新的队列变动只保存在本机。"
         )
         HorizontalDivider(color = Separator.copy(alpha = .6f))
         CloudSyncMeaningRow(
@@ -15031,7 +15031,7 @@ private fun CloudSyncInfoDialog(
         HorizontalDivider(color = Separator.copy(alpha = .6f))
         CloudSyncMeaningRow(
             phase = QueueCloudSyncPhase.NOT_CONFIGURED,
-            description = "当前版本没有网站同步配置，队列状态只保存在本机。"
+            description = "当前版本没有服务端同步配置，队列状态只保存在本机。"
         )
 
         Spacer(Modifier.height(13.dp))
@@ -15077,7 +15077,7 @@ private fun CloudSyncMeaningRow(
 }
 
 private fun queueCloudSyncStatusLabel(status: QueueCloudSyncStatus): String = when (status.phase) {
-    QueueCloudSyncPhase.DISABLED -> "网站同步已关闭"
+    QueueCloudSyncPhase.DISABLED -> "与服务端同步已关闭"
     QueueCloudSyncPhase.NOT_CONFIGURED -> "等待服务器配置"
     QueueCloudSyncPhase.CONFIGURED -> "已配置，等待首次同步"
     QueueCloudSyncPhase.SYNCING -> if (status.syncMode == QueueSyncMode.TEST) {

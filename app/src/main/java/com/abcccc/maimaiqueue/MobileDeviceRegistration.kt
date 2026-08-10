@@ -90,7 +90,7 @@ internal fun decideMobileDeviceRegistration(
         return reject("机台配置已经更新，请在终端重新打开移动设备登记。")
     }
     if (!state.websiteRemoteEnabled) {
-        return reject("网站同步已关闭，暂不能使用移动设备登记。")
+        return reject("与服务端同步已关闭，暂不能使用移动设备登记。")
     }
     if (!state.acceptingNewRegistrations) {
         return reject("现场当前没有使用登记排队。")

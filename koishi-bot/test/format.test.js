@@ -8,6 +8,7 @@ const {
   formatMachineChoice,
   formatMachineChoiceLines,
   formatMachineReplyHint,
+  formatRegistrationCount,
   formatOwnQueue,
   formatOwnQueueActions,
   formatNotificationQueueStatus,
@@ -66,6 +67,78 @@ test('help text uses a message-safe profile menu', () => {
   assert.match(HELP_TEXT, /加入排队/)
   assert.match(HELP_TEXT, /排队通知/)
   assert.match(HELP_TEXT, /设置 QQ 后才能使用/)
+  assert.ok(HELP_TEXT.indexOf('查询人数') > HELP_TEXT.indexOf('查看队列'))
+  assert.ok(HELP_TEXT.indexOf('查询人数') < HELP_TEXT.indexOf('我的资料'))
+})
+
+test('formats registration totals and per-machine new-registration estimates', () => {
+  const registration = (id) => ({ registration_id: id })
+  const queue = {
+    registration_open: true,
+    terminal: { online: true },
+    machines: {
+      B: {
+        id: 'B',
+        name: '右侧国框 · 机台 B',
+        operational: true,
+        playing: [registration('b1'), registration('b2')],
+        waiting_positions: [{ registrations: [registration('b3'), registration('b4')] }],
+        new_registration_estimated_wait_minutes: 35,
+      },
+      A: {
+        id: 'A',
+        name: '左侧日框 · 机台 A',
+        operational: true,
+        playing: [registration('a1'), registration('a2')],
+        waiting_positions: [{ registrations: [
+          registration('a3'), registration('a4'), registration('a5'), registration('a6'),
+        ] }],
+        new_registration_estimated_wait_minutes: 50,
+      },
+    },
+  }
+
+  assert.equal(
+    formatRegistrationCount(queue, 'https://abcccc.top/queue-status'),
+    [
+      '当前共 10 个登记。',
+      '左侧日框·机台 A 有 6 个登记，新登记估计等待 50 分钟。',
+      '右侧国框·机台 B 有 4 个登记，新登记估计等待 35 分钟。',
+      '请发送「查看队列」，或者访问 https://abcccc.top/queue-status，来查看详细的排队状态。',
+    ].join('\n\n'),
+  )
+})
+
+test('does not present a live new-registration estimate when it cannot apply', () => {
+  const baseMachine = {
+    id: 'A',
+    name: '机台 A',
+    operational: true,
+    playing: [],
+    waiting_positions: [],
+    new_registration_estimated_wait_minutes: 0,
+  }
+  const baseQueue = {
+    registration_open: true,
+    terminal: { online: true },
+    machines: { A: baseMachine },
+  }
+  assert.match(formatRegistrationCount(baseQueue), /新登记预计很快可以游玩/)
+  assert.match(
+    formatRegistrationCount({ ...baseQueue, registration_open: false }),
+    /当前不接收新登记/,
+  )
+  assert.match(
+    formatRegistrationCount({ ...baseQueue, terminal: { online: false } }),
+    /最近一次同步数据[\s\S]*新登记等待时间暂时无法估算/,
+  )
+  assert.match(
+    formatRegistrationCount({
+      ...baseQueue,
+      machines: { A: { ...baseMachine, operational: false } },
+    }),
+    /机台当前停止使用/,
+  )
 })
 
 test('does not present a wait estimate while the current QQ is temporarily away', () => {
