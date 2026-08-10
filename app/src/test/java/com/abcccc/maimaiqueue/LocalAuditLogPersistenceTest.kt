@@ -29,7 +29,9 @@ class LocalAuditLogPersistenceTest {
                     profileId = "00000000-0000-0000-0000-000000000901",
                     qqNumber = "12345678"
                 )
-            )
+            ),
+            machineStableId = "10000000000000000000000000000001",
+            machineName = "入口侧 · 机台 A"
         )
 
         assertEquals(listOf(entry), deserializeAuditLogs(serializeAuditLogs(listOf(entry))))
@@ -61,6 +63,25 @@ class LocalAuditLogPersistenceTest {
         assertEquals(
             setOf(PublicQueueNotificationCategory.ONLINE_CHECK_IN),
             deserializeAuditLogs(serialized).single().notificationCategories
+        )
+    }
+
+    @Test
+    fun legacyLogWithoutMachineIdentityRemainsReadable() {
+        val entry = deserializeAuditLogs(JSONArray().put(validLogJson()).toString()).single()
+
+        assertEquals(null, entry.machineStableId)
+        assertEquals(null, entry.machineName)
+        assertEquals(
+            AuditLogEntry(
+                id = "legacy-event",
+                timestampMillis = 1_000L,
+                category = AuditLogCategory.MACHINE_A,
+                title = "旧日志",
+                detail = "测试。",
+                affectedRegistrationKeys = listOf(1)
+            ),
+            entry
         )
     }
 

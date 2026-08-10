@@ -116,7 +116,7 @@ class QueueCloudSnapshotTest {
         val machine = snapshot.getJSONObject("machines").getJSONObject("A")
         val configuration = machine.getJSONObject("configuration")
 
-        assertEquals(6, snapshot.getInt("schema_version"))
+        assertEquals(7, snapshot.getInt("schema_version"))
         assertEquals(7L, snapshot.getLong("machine_configuration_revision"))
         assertEquals("入口侧", machine.getString("remark"))
         assertEquals("OTHER", configuration.getString("game_type"))
@@ -135,7 +135,7 @@ class QueueCloudSnapshotTest {
     }
 
     @Test
-    fun authenticatedSyncSnapshotKeepsSchemaSixMachineConfiguration() {
+    fun authenticatedSyncSnapshotKeepsSchemaSevenMachineConfiguration() {
         val configuration = MachineConfiguration(
             remark = "入口侧",
             capacity = 1,
@@ -155,7 +155,7 @@ class QueueCloudSnapshotTest {
         val published = snapshot.getJSONObject("machines").getJSONObject("A")
             .getJSONObject("configuration")
 
-        assertEquals(6, snapshot.getInt("schema_version"))
+        assertEquals(7, snapshot.getInt("schema_version"))
         assertEquals(9L, snapshot.getLong("machine_configuration_revision"))
         assertEquals(1, published.getInt("capacity"))
         assertEquals(18, published.getInt("solo_round_minutes"))
@@ -163,7 +163,7 @@ class QueueCloudSnapshotTest {
     }
 
     @Test
-    fun publicSnapshotPublishesExactlyOneToFourConfiguredMachines() {
+    fun publicSnapshotPublishesExactlyOneToTenConfiguredMachines() {
         (1..MachineId.entries.size).forEach { machineCount ->
             val machineIds = configuredMachineIds(machineCount)
             val state = PersistedQueueState(
@@ -206,23 +206,66 @@ class QueueCloudSnapshotTest {
     }
 
     @Test
-    fun publicEventsKeepMachineCAndDMappings() {
+    fun publicSnapshotPublishesStableMachineAndGroupMetadata() {
+        val secondGroup = MachineGroupConfiguration(
+            id = "10000000000000000000000000000002",
+            name = "二楼"
+        )
+        val machineIds = configuredMachineIds(5)
+        val state = PersistedQueueState(
+            queueId = queueId,
+            revision = 10L,
+            machines = machineIds.associateWith { PersistedMachineState() },
+            registrationOpen = true,
+            nextRegistrationKey = 1,
+            savedAtMillis = 900L
+        )
+        val machineEStableId = "20000000000000000000000000000005"
+
+        val snapshot = buildPublicQueueSnapshot(
+            state = state,
+            terminalId = "terminal-1",
+            capturedAtMillis = 1_000L,
+            displaySettings = QueuePublicDisplaySettings(
+                machineStableIds = DEFAULT_MACHINE_STABLE_IDS +
+                    (MachineId.E to machineEStableId),
+                machineGroupAssignments = DEFAULT_MACHINE_GROUP_ASSIGNMENTS +
+                    (MachineId.E to secondGroup.id),
+                machineGroups = DEFAULT_MACHINE_GROUPS + secondGroup,
+                defaultMachineGroupId = secondGroup.id
+            )
+        )
+        val groups = snapshot.getJSONArray("machine_groups")
+        val machineE = snapshot.getJSONObject("machines").getJSONObject("E")
+
+        assertEquals(2, groups.length())
+        assertEquals(DEFAULT_MACHINE_GROUP_ID, groups.getJSONObject(0).getString("id"))
+        assertEquals("二楼", groups.getJSONObject(1).getString("name"))
+        assertEquals(secondGroup.id, snapshot.getString("default_machine_group_id"))
+        assertEquals(machineEStableId, machineE.getString("stable_id"))
+        assertEquals(secondGroup.id, machineE.getString("group_id"))
+    }
+
+    @Test
+    fun publicEventsKeepMachineEThroughJMappings() {
         val events = listOf(
             AuditLogEntry(
                 id = "00000000-0000-0000-0000-000000000701",
                 timestampMillis = 1_000L,
-                category = AuditLogCategory.MACHINE_C,
-                title = "机台 C · 新增登记",
-                detail = "已加入机台 C。",
+                category = AuditLogCategory.MACHINE_E,
+                title = "机台 E · 新增登记",
+                detail = "已加入机台 E。",
                 queueId = queueId,
-                publicEventType = PublicQueueEventType.REGISTRATION_ADDED
+                publicEventType = PublicQueueEventType.REGISTRATION_ADDED,
+                machineStableId = "20000000000000000000000000000005",
+                machineName = "二楼 · 机台 E"
             ),
             AuditLogEntry(
                 id = "00000000-0000-0000-0000-000000000702",
                 timestampMillis = 2_000L,
-                category = AuditLogCategory.MACHINE_D,
-                title = "机台 D · 机台停止使用",
-                detail = "机台 D 已停止使用。",
+                category = AuditLogCategory.MACHINE_J,
+                title = "机台 J · 机台停止使用",
+                detail = "机台 J 已停止使用。",
                 queueId = queueId,
                 publicEventType = PublicQueueEventType.MACHINE_STOPPED
             )
@@ -230,7 +273,7 @@ class QueueCloudSnapshotTest {
         val state = PersistedQueueState(
             queueId = queueId,
             revision = 9L,
-            machines = configuredMachineIds(4).associateWith { PersistedMachineState() },
+            machines = configuredMachineIds(10).associateWith { PersistedMachineState() },
             registrationOpen = true,
             nextRegistrationKey = 1,
             savedAtMillis = 900L
@@ -243,19 +286,28 @@ class QueueCloudSnapshotTest {
             auditLogs = events
         ).getJSONArray("recent_events")
 
-        assertEquals("D", published.getJSONObject(0).getString("machine_id"))
-        assertEquals("C", published.getJSONObject(1).getString("machine_id"))
+        assertEquals("J", published.getJSONObject(0).getString("machine_id"))
+        assertEquals("E", published.getJSONObject(1).getString("machine_id"))
+        assertEquals(
+            defaultMachineStableId(MachineId.J),
+            published.getJSONObject(0).getString("machine_stable_id")
+        )
+        assertEquals(
+            "20000000000000000000000000000005",
+            published.getJSONObject(1).getString("machine_stable_id")
+        )
+        assertEquals("二楼 · 机台 E", published.getJSONObject(1).getString("machine_name"))
     }
 
     @Test
-    fun publicEventKeepsAllRegistrationsAcrossFourMachines() {
-        val affectedKeys = (1..80).toList()
+    fun publicEventKeepsAllRegistrationsAcrossTenMachines() {
+        val affectedKeys = (1..200).toList()
         val event = AuditLogEntry(
             id = "00000000-0000-0000-0000-000000000703",
             timestampMillis = 2_000L,
             category = AuditLogCategory.SYSTEM,
             title = "关闭登记排队",
-            detail = "登记排队已关闭，并清除了所有机台的 80 份登记。",
+            detail = "登记排队已关闭，并清除了所有机台的 200 份登记。",
             queueId = queueId,
             publicEventType = PublicQueueEventType.REGISTRATION_CLOSED,
             affectedRegistrationKeys = affectedKeys
@@ -263,9 +315,9 @@ class QueueCloudSnapshotTest {
         val state = PersistedQueueState(
             queueId = queueId,
             revision = 10L,
-            machines = configuredMachineIds(4).associateWith { PersistedMachineState() },
+            machines = configuredMachineIds(10).associateWith { PersistedMachineState() },
             registrationOpen = false,
-            nextRegistrationKey = 81,
+            nextRegistrationKey = 201,
             savedAtMillis = 1_000L
         )
 
@@ -278,9 +330,9 @@ class QueueCloudSnapshotTest {
             .getJSONObject(0)
             .getJSONArray("registration_ids")
 
-        assertEquals(80, registrationIds.length())
+        assertEquals(200, registrationIds.length())
         assertEquals(publicRegistrationId(queueId, 1), registrationIds.getString(0))
-        assertEquals(publicRegistrationId(queueId, 80), registrationIds.getString(79))
+        assertEquals(publicRegistrationId(queueId, 200), registrationIds.getString(199))
     }
 
     @Test
@@ -597,7 +649,7 @@ class QueueCloudSnapshotTest {
         )
         val events = snapshot.getJSONArray("recent_events")
 
-        assertEquals(6, snapshot.getInt("schema_version"))
+        assertEquals(7, snapshot.getInt("schema_version"))
         assertEquals(1, events.length())
         assertEquals("NO_SHOW_MOVED_TO_TAIL", events.getJSONObject(0).getString("type"))
         assertEquals(
@@ -667,7 +719,7 @@ class QueueCloudSnapshotTest {
         val profiles = snapshot.getJSONArray("private_player_profiles")
         val contact = contacts.getJSONObject(0)
 
-        assertEquals(6, snapshot.getInt("schema_version"))
+        assertEquals(7, snapshot.getInt("schema_version"))
         assertEquals(1, contacts.length())
         assertEquals(3, profiles.length())
         assertEquals(publicRegistrationId(queueId, 10), contact.getString("registration_id"))

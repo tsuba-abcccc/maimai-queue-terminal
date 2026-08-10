@@ -92,6 +92,8 @@ interface WaitingPosition {
 
 interface QueueMachine {
   id: string;
+  stable_id?: string;
+  group_id?: string;
   name: string;
   operational: boolean;
   stop_reason: string | null;
@@ -103,6 +105,11 @@ interface QueueMachine {
   new_registration_estimated_wait_minutes?: number | null;
   capacity?: 1 | 2;
   configuration?: MachineConfiguration;
+}
+
+interface MachineGroup {
+  id: string;
+  name: string;
 }
 
 interface MachineConfiguration {
@@ -137,6 +144,8 @@ interface QueueStatus {
     registration_closes_at?: number | null;
   };
   terminal: { online: boolean };
+  machine_groups?: MachineGroup[];
+  default_machine_group_id?: string;
   machines: Record<string, QueueMachine>;
 }
 
@@ -277,6 +286,7 @@ const ABSENCE_STATE_CONFIRMATION_TIMEOUT_MS = 5_000;
 const ABSENCE_STATE_CONFIRMATION_INTERVAL_MS = 500;
 const BOT_IDENTITY_RETRY_INTERVAL_MS = 30_000;
 const BOT_IDENTITY_REFRESH_INTERVAL_MS = 60 * 60 * 1_000;
+const MAX_QUEUE_MESSAGE_CHARACTERS = 3_000;
 
 const NOTIFICATION_OPTIONS: ReadonlyArray<{
   field: Exclude<NotificationPreferenceField, "notification_enabled">;
@@ -628,13 +638,16 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.command("maimaiq.queue", "查看完整队列")
     .alias("查看队列")
-    .action(async () =>
+    .action(async ({ session }) =>
       withCommandError(async () => {
         const queue = await api.getQueue();
         if (queue.onebot_sync_enabled === false) {
           throw new Error("现场终端已关闭 QQ Bot 联动。请联系现场工作人员开启后再试。");
         }
-        return formatQueue(queue);
+        const messages = formatQueueMessages(queue);
+        if (!session || messages.length === 1) return messages[0];
+        for (const message of messages) await session.send(message);
+        return "";
       })
     );
 
@@ -932,7 +945,7 @@ export async function joinQueueFromBot(
       "",
       "请选择要加入排队的机台：",
       "",
-      ...machines.map((machine) => ` - ${formatMachineChoice(machine)}`),
+      ...formatMachineChoiceLines(queue, machines),
       "",
       formatMachineReplyHint(machines),
     ].join("\n"),
@@ -1165,7 +1178,7 @@ export async function transferQueueMachine(
       [
         "请选择要转入的机台：",
         "",
-        ...candidates.map((machine) => ` - ${formatMachineChoice(machine)}`),
+        ...formatMachineChoiceLines(queue, candidates),
         "",
         formatMachineReplyHint(candidates),
       ].join("\n"),
@@ -1479,6 +1492,46 @@ function sortedMachines(queue: QueueStatus): QueueMachine[] {
   );
 }
 
+interface GroupedQueueMachines {
+  id: string;
+  name: string;
+  machines: QueueMachine[];
+}
+
+function groupedMachines(
+  queue: QueueStatus,
+  machines: QueueMachine[] = sortedMachines(queue),
+): GroupedQueueMachines[] {
+  const configuredGroups = (queue.machine_groups ?? []).filter((group) =>
+    Boolean(group?.id && group?.name?.trim())
+  );
+  if (!configuredGroups.length) {
+    return [{ id: "", name: "", machines }];
+  }
+
+  const groupIds = new Set(configuredGroups.map((group) => group.id));
+  const requestedDefaultGroupId = queue.default_machine_group_id ?? "";
+  const fallbackGroupId = groupIds.has(requestedDefaultGroupId)
+    ? requestedDefaultGroupId
+    : configuredGroups[0].id;
+  const machinesByGroup = new Map<string, QueueMachine[]>(
+    configuredGroups.map((group) => [group.id, []]),
+  );
+  for (const machine of machines) {
+    const groupId = machine.group_id && groupIds.has(machine.group_id)
+      ? machine.group_id
+      : fallbackGroupId;
+    machinesByGroup.get(groupId)!.push(machine);
+  }
+  return configuredGroups
+    .map((group) => ({
+      id: group.id,
+      name: group.name.trim(),
+      machines: machinesByGroup.get(group.id) ?? [],
+    }))
+    .filter((group) => group.machines.length > 0);
+}
+
 export function machineCanAcceptRegistration(machine: QueueMachine): boolean {
   const registrationCount = typeof machine.registration_count === "number"
     ? machine.registration_count
@@ -1527,6 +1580,21 @@ export function formatMachineReplyHint(machines: QueueMachine[]): string {
   return machines.some((machine) => machineRemark(machine))
     ? `回复 ${ids}，也可以回复括号中的机台备注。`
     : `回复 ${ids}。`;
+}
+
+export function formatMachineChoiceLines(
+  queue: QueueStatus,
+  machines: QueueMachine[],
+): string[] {
+  const groups = groupedMachines(queue, machines);
+  if (groups.length <= 1) {
+    return machines.map((machine) => ` - ${formatMachineChoice(machine)}`);
+  }
+  return groups.flatMap((group, index) => [
+    ...(index > 0 ? [""] : []),
+    group.name,
+    ...group.machines.map((machine) => ` - ${formatMachineChoice(machine)}`),
+  ]);
 }
 
 function machineRemark(machine: QueueMachine): string | null {
@@ -2111,6 +2179,69 @@ export function isOnlyBotMention(
 }
 
 export function formatQueue(queue: QueueStatus): string {
+  const groups = groupedMachines(queue);
+  const showGroupNames = groups.length > 1;
+  const sections = [formatQueueHeader(queue)];
+  for (const group of groups) {
+    if (showGroupNames) sections.push(`分组：${group.name}`);
+    sections.push(
+      ...group.machines.map((machine) =>
+        formatMachine(machine, queue.terminal.online)
+      ),
+    );
+  }
+  return sections.filter(Boolean).join("\n\n");
+}
+
+export function formatQueueMessages(
+  queue: QueueStatus,
+  maximumCharacters = MAX_QUEUE_MESSAGE_CHARACTERS,
+): string[] {
+  const completeMessage = formatQueue(queue);
+  if (completeMessage.length <= maximumCharacters) return [completeMessage];
+
+  const groups = groupedMachines(queue);
+  const showGroupNames = groups.length > 1;
+  const messages: string[] = [];
+  let current = formatQueueHeader(queue);
+
+  const flush = () => {
+    const message = current.trimEnd();
+    if (message) messages.push(message);
+    current = "当前队列（续）";
+  };
+  const appendSection = (section: string) => {
+    current = current ? `${current}\n\n${section}` : section;
+  };
+
+  for (const group of groups) {
+    let groupStartedInCurrentMessage = false;
+    for (const machine of group.machines) {
+      const groupHeading = showGroupNames && !groupStartedInCurrentMessage
+        ? `分组：${group.name}`
+        : null;
+      const machineText = formatMachine(machine, queue.terminal.online);
+      const block = [groupHeading, machineText].filter(Boolean).join("\n\n");
+      const candidate = current ? `${current}\n\n${block}` : block;
+      if (
+        candidate.length > maximumCharacters &&
+        current !== "当前队列（续）"
+      ) {
+        flush();
+        groupStartedInCurrentMessage = false;
+        if (showGroupNames) appendSection(`分组：${group.name}`);
+        appendSection(machineText);
+      } else {
+        appendSection(block);
+      }
+      groupStartedInCurrentMessage = true;
+    }
+  }
+  flush();
+  return messages;
+}
+
+function formatQueueHeader(queue: QueueStatus): string {
   const terminalStatus = queue.terminal.online ? "终端在线" : "终端离线";
   const outsideBusinessHours = queue.business_hours?.enabled &&
     queue.business_hours.outside;
@@ -2144,9 +2275,6 @@ export function formatQueue(queue: QueueStatus): string {
       "请留意后续队列安排。",
       "",
     );
-  }
-  for (const machine of sortedMachines(queue)) {
-    lines.push(formatMachine(machine, queue.terminal.online), "");
   }
   return lines.join("\n").trimEnd();
 }

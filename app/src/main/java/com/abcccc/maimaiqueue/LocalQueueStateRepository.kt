@@ -92,6 +92,20 @@ data class PersistedQueueState(
         )
 }
 
+internal fun machineCountNeededToRestore(
+    configuredMachineCount: Int,
+    savedState: PersistedQueueState
+): Int {
+    val highestMeaningfulMachineIndex = savedState.machines.entries
+        .filter { (_, state) ->
+            state.queue.registrationCount > 0 || !state.status.isOperational
+        }
+        .maxOfOrNull { (machineId, _) -> machineId.ordinal }
+        ?: -1
+    return maxOf(configuredMachineCount, highestMeaningfulMachineIndex + 1)
+        .coerceIn(1, MachineId.entries.size)
+}
+
 class LocalQueueStateRepository(context: Context) : QueueStateRepository {
     private data class StoredQueueState(
         val serialized: String,
@@ -428,7 +442,7 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
         if (!has(name) || isNull(name)) null else optString(name).takeIf { it.isNotBlank() }
 
     private const val MIN_SUPPORTED_SCHEMA_VERSION = 1
-    private const val SCHEMA_VERSION = 6
+    private const val SCHEMA_VERSION = 7
     private const val MAX_REGISTRATIONS_PER_MACHINE = 20
     }
 

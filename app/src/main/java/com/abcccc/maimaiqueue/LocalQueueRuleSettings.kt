@@ -3,6 +3,9 @@ package com.abcccc.maimaiqueue
 import android.content.Context
 import java.net.URI
 import java.time.DayOfWeek
+import java.util.UUID
+import org.json.JSONArray
+import org.json.JSONObject
 
 enum class QueueSyncMode(val headerValue: String?) {
     UNSPECIFIED(null),
@@ -45,6 +48,11 @@ data class MachineConfiguration(
     val sharedRoundMinutes: Int = DEFAULT_SHARED_ROUND_MINUTES
 )
 
+data class MachineGroupConfiguration(
+    val id: String,
+    val name: String
+)
+
 data class QueueRuleSettings(
     val allowDeferOneRound: Boolean = true,
     val allowTemporaryLeave: Boolean = true,
@@ -58,6 +66,10 @@ data class QueueRuleSettings(
     val configuredMachineCount: Int = DEFAULT_CONFIGURED_MACHINE_IDS.size,
     val machineConfigurations: Map<MachineId, MachineConfiguration> =
         DEFAULT_MACHINE_CONFIGURATIONS,
+    val machineStableIds: Map<MachineId, String> = DEFAULT_MACHINE_STABLE_IDS,
+    val machineGroupAssignments: Map<MachineId, String> = DEFAULT_MACHINE_GROUP_ASSIGNMENTS,
+    val machineGroups: List<MachineGroupConfiguration> = DEFAULT_MACHINE_GROUPS,
+    val defaultMachineGroupId: String = DEFAULT_MACHINE_GROUP_ID,
     val machineConfigurationRevision: Long = 1L,
     val businessHours: BusinessHoursSettings = BusinessHoursSettings()
 ) {
@@ -85,6 +97,30 @@ data class QueueRuleSettings(
             machineConfigurations[machineId]
                 ?: DEFAULT_MACHINE_CONFIGURATIONS.getValue(machineId)
         )
+
+    fun machineStableId(machineId: MachineId): String =
+        normalizeMachineInternalId(
+            machineStableIds[machineId],
+            defaultMachineStableId(machineId)
+        )
+
+    fun machineGroupId(machineId: MachineId): String {
+        val validGroupIds = machineGroups.mapTo(mutableSetOf()) { it.id }
+        return machineGroupAssignments[machineId]
+            ?.takeIf(validGroupIds::contains)
+            ?: defaultMachineGroupId.takeIf(validGroupIds::contains)
+            ?: machineGroups.firstOrNull()?.id
+            ?: DEFAULT_MACHINE_GROUP_ID
+    }
+
+    val configuredMachineGroups: List<MachineGroupConfiguration>
+        get() {
+            val usedGroupIds = configuredMachineIds.mapTo(linkedSetOf(), ::machineGroupId)
+            return machineGroups.filter { it.id in usedGroupIds }
+        }
+
+    fun machinesInGroup(groupId: String): List<MachineId> =
+        configuredMachineIds.filter { machineGroupId(it) == groupId }
 }
 
 class LocalQueueRuleSettingsRepository(
@@ -99,7 +135,8 @@ class LocalQueueRuleSettingsRepository(
 
     fun getSettings(): QueueRuleSettings {
         val websiteSyncEnabled = preferences.getBoolean(KEY_WEBSITE_SYNC_ENABLED, true)
-        return QueueRuleSettings(
+        val storedGroups = readMachineGroups()
+        val settings = QueueRuleSettings(
             allowDeferOneRound = preferences.getBoolean(KEY_ALLOW_DEFER_ONE_ROUND, true),
             allowTemporaryLeave = preferences.getBoolean(KEY_ALLOW_TEMPORARY_LEAVE, true),
             allowOnlineRegistration = preferences.getBoolean(
@@ -186,6 +223,23 @@ class LocalQueueRuleSettingsRepository(
                     )
                 )
             },
+            machineStableIds = MachineId.entries.associateWith { machineId ->
+                normalizeMachineInternalId(
+                    preferences.getString(machineConfigurationKey(machineId, "stable_id"), null),
+                    defaultMachineStableId(machineId)
+                )
+            },
+            machineGroupAssignments = MachineId.entries.associateWith { machineId ->
+                preferences.getString(
+                    machineConfigurationKey(machineId, "group_id"),
+                    null
+                ).orEmpty()
+            },
+            machineGroups = storedGroups,
+            defaultMachineGroupId = preferences.getString(
+                KEY_DEFAULT_MACHINE_GROUP_ID,
+                storedGroups.firstOrNull()?.id ?: DEFAULT_MACHINE_GROUP_ID
+            ).orEmpty(),
             machineConfigurationRevision = preferences.getLong(
                 KEY_MACHINE_CONFIGURATION_REVISION,
                 1L
@@ -202,35 +256,49 @@ class LocalQueueRuleSettingsRepository(
                 }
             ).normalized()
         )
+        return normalizeMachineLayoutSettings(settings)
     }
 
     fun saveSettings(settings: QueueRuleSettings) {
-        val oneBotSyncEnabled = settings.websiteSyncEnabled && settings.oneBotSyncEnabled
+        val normalizedSettings = normalizeMachineLayoutSettings(settings)
+        val oneBotSyncEnabled = normalizedSettings.websiteSyncEnabled &&
+            normalizedSettings.oneBotSyncEnabled
         preferences.edit()
-            .putBoolean(KEY_ALLOW_DEFER_ONE_ROUND, settings.allowDeferOneRound)
-            .putBoolean(KEY_ALLOW_TEMPORARY_LEAVE, settings.allowTemporaryLeave)
-            .putBoolean(KEY_ALLOW_ONLINE_REGISTRATION, settings.allowOnlineRegistration)
-            .putBoolean(KEY_SHOW_COMMON_PLAY_PREVIEW, settings.showCommonPlayPreview)
-            .putBoolean(KEY_WEBSITE_SYNC_ENABLED, settings.websiteSyncEnabled)
+            .putBoolean(KEY_ALLOW_DEFER_ONE_ROUND, normalizedSettings.allowDeferOneRound)
+            .putBoolean(KEY_ALLOW_TEMPORARY_LEAVE, normalizedSettings.allowTemporaryLeave)
+            .putBoolean(KEY_ALLOW_ONLINE_REGISTRATION, normalizedSettings.allowOnlineRegistration)
+            .putBoolean(KEY_SHOW_COMMON_PLAY_PREVIEW, normalizedSettings.showCommonPlayPreview)
+            .putBoolean(KEY_WEBSITE_SYNC_ENABLED, normalizedSettings.websiteSyncEnabled)
             .putBoolean(KEY_ONEBOT_SYNC_ENABLED, oneBotSyncEnabled)
-            .putString(KEY_SYNC_MODE, settings.syncMode.name)
-            .putString(KEY_QUEUE_SYNC_ENDPOINT, settings.queueSyncEndpoint.trim())
-            .putString(KEY_QUEUE_SYNC_TOKEN, settings.queueSyncToken.trim())
+            .putString(KEY_SYNC_MODE, normalizedSettings.syncMode.name)
+            .putString(KEY_QUEUE_SYNC_ENDPOINT, normalizedSettings.queueSyncEndpoint.trim())
+            .putString(KEY_QUEUE_SYNC_TOKEN, normalizedSettings.queueSyncToken.trim())
             .putInt(
                 KEY_CONFIGURED_MACHINE_COUNT,
-                settings.configuredMachineCount.coerceIn(1, MachineId.entries.size)
+                normalizedSettings.configuredMachineCount
             )
             .putLong(
                 KEY_MACHINE_CONFIGURATION_REVISION,
-                settings.machineConfigurationRevision.coerceAtLeast(1L)
+                normalizedSettings.machineConfigurationRevision.coerceAtLeast(1L)
             )
-            .putBoolean(KEY_BUSINESS_HOURS_ENABLED, settings.businessHours.enabled)
-            .putBoolean(KEY_WEEKLY_BUSINESS_HOURS_ENABLED, settings.businessHours.useWeeklySchedule)
-            .putInt(KEY_DEFAULT_OPENING_MINUTES, settings.businessHours.defaultHours.openingMinutes)
-            .putInt(KEY_DEFAULT_CLOSING_MINUTES, settings.businessHours.defaultHours.closingMinutes)
+            .putString(KEY_MACHINE_GROUPS, encodeMachineGroups(normalizedSettings.machineGroups))
+            .putString(KEY_DEFAULT_MACHINE_GROUP_ID, normalizedSettings.defaultMachineGroupId)
+            .putBoolean(KEY_BUSINESS_HOURS_ENABLED, normalizedSettings.businessHours.enabled)
+            .putBoolean(
+                KEY_WEEKLY_BUSINESS_HOURS_ENABLED,
+                normalizedSettings.businessHours.useWeeklySchedule
+            )
+            .putInt(
+                KEY_DEFAULT_OPENING_MINUTES,
+                normalizedSettings.businessHours.defaultHours.openingMinutes
+            )
+            .putInt(
+                KEY_DEFAULT_CLOSING_MINUTES,
+                normalizedSettings.businessHours.defaultHours.closingMinutes
+            )
             .also { editor ->
                 MachineId.entries.forEach { machineId ->
-                    val configuration = settings.machineConfiguration(machineId)
+                    val configuration = normalizedSettings.machineConfiguration(machineId)
                     editor.putString(
                         machineRemarkKey(machineId),
                         configuration.remark
@@ -271,9 +339,17 @@ class LocalQueueRuleSettingsRepository(
                         machineConfigurationKey(machineId, "shared_round_minutes"),
                         configuration.sharedRoundMinutes
                     )
+                    editor.putString(
+                        machineConfigurationKey(machineId, "stable_id"),
+                        normalizedSettings.machineStableId(machineId)
+                    )
+                    editor.putString(
+                        machineConfigurationKey(machineId, "group_id"),
+                        normalizedSettings.machineGroupId(machineId)
+                    )
                 }
                 DayOfWeek.entries.forEach { day ->
-                    val hours = settings.businessHours.hoursFor(day).normalized()
+                    val hours = normalizedSettings.businessHours.hoursFor(day).normalized()
                     editor.putInt(weekdayKey(day, "opening"), hours.openingMinutes)
                     editor.putInt(weekdayKey(day, "closing"), hours.closingMinutes)
                 }
@@ -295,6 +371,25 @@ class LocalQueueRuleSettingsRepository(
             openingMinutes = preferences.getInt(openingKey, DEFAULT_OPENING_MINUTES),
             closingMinutes = preferences.getInt(closingKey, DEFAULT_CLOSING_MINUTES)
         ).normalized()
+
+    private fun readMachineGroups(): List<MachineGroupConfiguration> {
+        val source = preferences.getString(KEY_MACHINE_GROUPS, null)
+            ?: return DEFAULT_MACHINE_GROUPS
+        return runCatching {
+            val array = JSONArray(source)
+            buildList {
+                for (index in 0 until array.length()) {
+                    val item = array.optJSONObject(index) ?: continue
+                    add(
+                        MachineGroupConfiguration(
+                            id = item.optString("id"),
+                            name = item.optString("name")
+                        )
+                    )
+                }
+            }
+        }.getOrDefault(DEFAULT_MACHINE_GROUPS)
+    }
 
     private fun weekdayKey(day: DayOfWeek, suffix: String): String =
         "business_hours_${day.name.lowercase()}_$suffix"
@@ -332,6 +427,8 @@ class LocalQueueRuleSettingsRepository(
         const val KEY_QUEUE_SYNC_TOKEN = "queue_sync_token"
         const val KEY_CONFIGURED_MACHINE_COUNT = "configured_machine_count"
         const val KEY_MACHINE_CONFIGURATION_REVISION = "machine_configuration_revision"
+        const val KEY_MACHINE_GROUPS = "machine_groups"
+        const val KEY_DEFAULT_MACHINE_GROUP_ID = "default_machine_group_id"
         const val KEY_MACHINE_A_REMARK = "machine_a_remark"
         const val KEY_MACHINE_B_REMARK = "machine_b_remark"
         const val KEY_BUSINESS_HOURS_ENABLED = "business_hours_enabled"
@@ -346,12 +443,24 @@ internal const val DEFAULT_MACHINE_A_REMARK = "左侧"
 internal const val DEFAULT_MACHINE_B_REMARK = "右侧"
 internal const val DEFAULT_MACHINE_C_REMARK = "中间左侧"
 internal const val DEFAULT_MACHINE_D_REMARK = "中间右侧"
-internal val DEFAULT_MACHINE_REMARKS: Map<MachineId, String> = linkedMapOf(
-    MachineId.A to DEFAULT_MACHINE_A_REMARK,
-    MachineId.B to DEFAULT_MACHINE_B_REMARK,
-    MachineId.C to DEFAULT_MACHINE_C_REMARK,
-    MachineId.D to DEFAULT_MACHINE_D_REMARK
+internal const val DEFAULT_MACHINE_GROUP_ID = "00000000000000000000000000000001"
+internal const val DEFAULT_MACHINE_GROUP_NAME = "分组 1"
+internal val DEFAULT_MACHINE_GROUPS = listOf(
+    MachineGroupConfiguration(DEFAULT_MACHINE_GROUP_ID, DEFAULT_MACHINE_GROUP_NAME)
 )
+internal val DEFAULT_MACHINE_REMARKS: Map<MachineId, String> = MachineId.entries.associateWith {
+    when (it) {
+        MachineId.A -> DEFAULT_MACHINE_A_REMARK
+        MachineId.B -> DEFAULT_MACHINE_B_REMARK
+        MachineId.C -> DEFAULT_MACHINE_C_REMARK
+        MachineId.D -> DEFAULT_MACHINE_D_REMARK
+        else -> "第 ${it.ordinal + 1} 台"
+    }
+}
+internal val DEFAULT_MACHINE_STABLE_IDS: Map<MachineId, String> =
+    MachineId.entries.associateWith(::defaultMachineStableId)
+internal val DEFAULT_MACHINE_GROUP_ASSIGNMENTS: Map<MachineId, String> =
+    MachineId.entries.associateWith { DEFAULT_MACHINE_GROUP_ID }
 internal const val DEFAULT_MACHINE_CAPACITY = 2
 internal const val DEFAULT_SOLO_ROUND_MINUTES = 12
 internal const val DEFAULT_SHARED_ROUND_MINUTES = 15
@@ -360,6 +469,7 @@ internal const val MAX_PLANNED_ROUND_MINUTES = 120
 internal const val MAX_MACHINE_TYPE_CHARACTERS = 24
 internal const val MAX_MACHINE_SERVER_CHARACTERS = 24
 internal const val MAX_GAME_VERSION_CHARACTERS = 40
+internal const val MAX_MACHINE_GROUP_NAME_CHARACTERS = 12
 internal val DEFAULT_MACHINE_CONFIGURATIONS: Map<MachineId, MachineConfiguration> =
     MachineId.entries.associateWith { machineId ->
         MachineConfiguration(remark = DEFAULT_MACHINE_REMARKS.getValue(machineId))
@@ -368,6 +478,212 @@ internal const val MAX_MACHINE_REMARK_CHARACTERS = 8
 internal const val MIN_QUEUE_SYNC_TOKEN_BYTES = 32
 internal const val MAX_QUEUE_SYNC_TOKEN_CHARACTERS = 256
 internal const val MAX_QUEUE_SYNC_ENDPOINT_CHARACTERS = 500
+
+private val MACHINE_INTERNAL_ID_PATTERN = Regex("^[0-9a-f]{32}$")
+
+internal fun defaultMachineStableId(machineId: MachineId): String =
+    (machineId.ordinal + 1).toString(16).padStart(32, '0')
+
+internal fun newMachineInternalId(): String = UUID.randomUUID().toString().replace("-", "")
+
+internal fun normalizeMachineInternalId(value: String?, fallback: String): String {
+    val normalized = value?.trim()?.lowercase().orEmpty()
+    return normalized.takeIf(MACHINE_INTERNAL_ID_PATTERN::matches) ?: fallback
+}
+
+internal fun limitMachineGroupNameLength(value: String): String =
+    limitTextCodePoints(value, MAX_MACHINE_GROUP_NAME_CHARACTERS)
+
+internal fun normalizeMachineGroupName(value: String?, fallbackIndex: Int): String {
+    val normalized = value?.trim().orEmpty()
+    return limitMachineGroupNameLength(normalized).ifBlank { "分组 ${fallbackIndex + 1}" }
+}
+
+internal fun encodeMachineGroups(groups: List<MachineGroupConfiguration>): String =
+    JSONArray().apply {
+        groups.forEach { group ->
+            put(JSONObject().put("id", group.id).put("name", group.name))
+        }
+    }.toString()
+
+internal fun normalizeMachineLayoutSettings(settings: QueueRuleSettings): QueueRuleSettings {
+    val machineCount = settings.configuredMachineCount.coerceIn(1, MachineId.entries.size)
+    val configuredIds = configuredMachineIds(machineCount)
+    val normalizedStableIds = linkedMapOf<MachineId, String>()
+    val usedStableIds = mutableSetOf<String>()
+    MachineId.entries.forEach { machineId ->
+        var candidate = normalizeMachineInternalId(
+            settings.machineStableIds[machineId],
+            defaultMachineStableId(machineId)
+        )
+        if (machineId in configuredIds && !usedStableIds.add(candidate)) {
+            candidate = newMachineInternalId().also(usedStableIds::add)
+        }
+        normalizedStableIds[machineId] = candidate
+    }
+
+    val normalizedGroups = buildList {
+        val seenIds = mutableSetOf<String>()
+        settings.machineGroups.forEachIndexed { index, group ->
+            val fallbackId = if (index == 0) DEFAULT_MACHINE_GROUP_ID else newMachineInternalId()
+            val id = normalizeMachineInternalId(group.id, fallbackId)
+            if (seenIds.add(id)) {
+                add(
+                    MachineGroupConfiguration(
+                        id = id,
+                        name = normalizeMachineGroupName(group.name, size)
+                    )
+                )
+            }
+        }
+    }.ifEmpty { DEFAULT_MACHINE_GROUPS }
+    val validGroupIds = normalizedGroups.mapTo(mutableSetOf()) { it.id }
+    val requestedDefaultGroupId = normalizeMachineInternalId(
+        settings.defaultMachineGroupId,
+        normalizedGroups.first().id
+    ).takeIf(validGroupIds::contains) ?: normalizedGroups.first().id
+    val normalizedAssignments = MachineId.entries.associateWith { machineId ->
+        normalizeMachineInternalId(
+            settings.machineGroupAssignments[machineId],
+            requestedDefaultGroupId
+        ).takeIf(validGroupIds::contains) ?: requestedDefaultGroupId
+    }
+    val usedGroupIds = configuredIds.mapTo(linkedSetOf()) { normalizedAssignments.getValue(it) }
+    val retainedGroups = normalizedGroups.filter { it.id in usedGroupIds }.ifEmpty {
+        DEFAULT_MACHINE_GROUPS
+    }
+    val retainedGroupIds = retainedGroups.mapTo(mutableSetOf()) { it.id }
+    val fallbackGroupId = retainedGroups.first().id
+    val finalAssignments = MachineId.entries.associateWith { machineId ->
+        normalizedAssignments.getValue(machineId).takeIf(retainedGroupIds::contains)
+            ?: fallbackGroupId
+    }
+    val defaultGroupId = requestedDefaultGroupId.takeIf(retainedGroupIds::contains)
+        ?: fallbackGroupId
+
+    return settings.copy(
+        configuredMachineCount = machineCount,
+        machineConfigurations = MachineId.entries.associateWith(settings::machineConfiguration),
+        machineStableIds = normalizedStableIds,
+        machineGroupAssignments = finalAssignments,
+        machineGroups = retainedGroups,
+        defaultMachineGroupId = defaultGroupId,
+        machineConfigurationRevision = settings.machineConfigurationRevision.coerceAtLeast(1L)
+    )
+}
+
+internal fun appendMachineConfiguration(
+    settings: QueueRuleSettings,
+    groupId: String = settings.defaultMachineGroupId
+): QueueRuleSettings? {
+    val normalized = normalizeMachineLayoutSettings(settings)
+    if (normalized.configuredMachineCount >= MachineId.entries.size) return null
+    val machineId = MachineId.entries[normalized.configuredMachineCount]
+    val targetGroupId = groupId.takeIf { requested ->
+        normalized.machineGroups.any { it.id == requested }
+    } ?: normalized.defaultMachineGroupId
+    return normalizeMachineLayoutSettings(
+        normalized.copy(
+            configuredMachineCount = normalized.configuredMachineCount + 1,
+            machineConfigurations = normalized.machineConfigurations +
+                (machineId to DEFAULT_MACHINE_CONFIGURATIONS.getValue(machineId)),
+            machineStableIds = normalized.machineStableIds +
+                (machineId to newMachineInternalId()),
+            machineGroupAssignments = normalized.machineGroupAssignments +
+                (machineId to targetGroupId)
+        )
+    )
+}
+
+internal fun removeMachineConfiguration(
+    settings: QueueRuleSettings,
+    machineId: MachineId
+): QueueRuleSettings? {
+    val normalized = normalizeMachineLayoutSettings(settings)
+    val configuredIds = normalized.configuredMachineIds
+    val removalIndex = configuredIds.indexOf(machineId)
+    if (removalIndex < 0 || configuredIds.size <= 1) return null
+    val retainedIds = configuredIds.filterNot { it == machineId }
+    val shiftedConfigurations = MachineId.entries.associateWith { targetId ->
+        val sourceId = retainedIds.getOrNull(targetId.ordinal)
+        sourceId?.let(normalized::machineConfiguration)
+            ?: DEFAULT_MACHINE_CONFIGURATIONS.getValue(targetId)
+    }
+    val shiftedStableIds = MachineId.entries.associateWith { targetId ->
+        retainedIds.getOrNull(targetId.ordinal)?.let(normalized::machineStableId)
+            ?: defaultMachineStableId(targetId)
+    }
+    val shiftedAssignments = MachineId.entries.associateWith { targetId ->
+        retainedIds.getOrNull(targetId.ordinal)?.let(normalized::machineGroupId)
+            ?: normalized.defaultMachineGroupId
+    }
+    return normalizeMachineLayoutSettings(
+        normalized.copy(
+            configuredMachineCount = configuredIds.size - 1,
+            machineConfigurations = shiftedConfigurations,
+            machineStableIds = shiftedStableIds,
+            machineGroupAssignments = shiftedAssignments
+        )
+    )
+}
+
+internal fun moveMachineToGroup(
+    settings: QueueRuleSettings,
+    machineId: MachineId,
+    groupId: String
+): QueueRuleSettings {
+    val normalized = normalizeMachineLayoutSettings(settings)
+    if (machineId !in normalized.configuredMachineIds ||
+        normalized.machineGroups.none { it.id == groupId }
+    ) {
+        return normalized
+    }
+    return normalizeMachineLayoutSettings(
+        normalized.copy(
+            machineGroupAssignments = normalized.machineGroupAssignments + (machineId to groupId)
+        )
+    )
+}
+
+internal fun createMachineGroupForMachine(
+    settings: QueueRuleSettings,
+    machineId: MachineId,
+    requestedName: String = ""
+): QueueRuleSettings {
+    val normalized = normalizeMachineLayoutSettings(settings)
+    if (machineId !in normalized.configuredMachineIds ||
+        normalized.machinesInGroup(normalized.machineGroupId(machineId)).size <= 1
+    ) {
+        return normalized
+    }
+    val groupId = newMachineInternalId()
+    val newGroup = MachineGroupConfiguration(
+        id = groupId,
+        name = normalizeMachineGroupName(requestedName, normalized.machineGroups.size)
+    )
+    return normalizeMachineLayoutSettings(
+        normalized.copy(
+            machineGroups = normalized.machineGroups + newGroup,
+            machineGroupAssignments = normalized.machineGroupAssignments + (machineId to groupId)
+        )
+    )
+}
+
+internal fun renameMachineGroup(
+    settings: QueueRuleSettings,
+    groupId: String,
+    requestedName: String
+): QueueRuleSettings {
+    val normalized = normalizeMachineLayoutSettings(settings)
+    val index = normalized.machineGroups.indexOfFirst { it.id == groupId }
+    if (index < 0) return normalized
+    val updatedGroups = normalized.machineGroups.toMutableList().apply {
+        this[index] = this[index].copy(
+            name = limitMachineGroupNameLength(requestedName)
+        )
+    }
+    return normalized.copy(machineGroups = updatedGroups)
+}
 
 internal fun normalizeQueueSyncEndpoint(value: String): String? {
     val raw = value.trim()
@@ -397,11 +713,7 @@ internal fun normalizeQueueRuleSettingsForRuntime(
     settings: QueueRuleSettings,
     cloudSyncAvailable: Boolean
 ): QueueRuleSettings {
-    val normalizedSettings = settings.copy(
-        configuredMachineCount = settings.configuredMachineCount.coerceIn(1, MachineId.entries.size),
-        machineConfigurations = MachineId.entries.associateWith(settings::machineConfiguration),
-        machineConfigurationRevision = settings.machineConfigurationRevision.coerceAtLeast(1L)
-    )
+    val normalizedSettings = normalizeMachineLayoutSettings(settings)
     if (!cloudSyncAvailable) {
         return normalizedSettings.copy(
             websiteSyncEnabled = false,
@@ -428,10 +740,21 @@ internal fun hasRiskSensitiveMachineConfigurationChange(
     previous: QueueRuleSettings,
     updated: QueueRuleSettings
 ): Boolean {
-    if (previous.configuredMachineCount != updated.configuredMachineCount) return true
-    return MachineId.entries.any { machineId ->
-        previous.machineConfiguration(machineId).capacity !=
-            updated.machineConfiguration(machineId).capacity
+    val normalizedPrevious = normalizeMachineLayoutSettings(previous)
+    val normalizedUpdated = normalizeMachineLayoutSettings(updated)
+    if (normalizedPrevious.configuredMachineCount != normalizedUpdated.configuredMachineCount) {
+        return true
+    }
+    if (normalizedPrevious.configuredMachineIds.any { machineId ->
+            normalizedPrevious.machineStableId(machineId) !=
+                normalizedUpdated.machineStableId(machineId)
+        }
+    ) {
+        return true
+    }
+    return normalizedPrevious.configuredMachineIds.any { machineId ->
+        normalizedPrevious.machineConfiguration(machineId).capacity !=
+            normalizedUpdated.machineConfiguration(machineId).capacity
     }
 }
 

@@ -6,6 +6,7 @@ const {
   absenceOperationSuccessMessage,
   changeAbsenceState,
   formatMachineChoice,
+  formatMachineChoiceLines,
   formatMachineReplyHint,
   formatOwnQueue,
   formatOwnQueueActions,
@@ -13,6 +14,7 @@ const {
   machineCanAcceptRegistration,
   onlineRegistrationProfileCompletionNotice,
   formatQueue,
+  formatQueueMessages,
   formatQueueNotification,
   joinQueueFromBot,
   nicknameValidationError,
@@ -1469,11 +1471,13 @@ test('accepts concise machine letters, full names, and unique remarks', () => {
     { id: 'B', name: '右侧 · 机台 B' },
     { id: 'C', name: '靠窗 · 机台 C' },
     { id: 'D', name: '入口 · 机台 D' },
+    { id: 'J', name: '楼上 · 机台 J' },
   ]
   assert.equal(parseMachineChoice('A', machines), machines[0])
   assert.equal(parseMachineChoice('b', machines), machines[1])
   assert.equal(parseMachineChoice('c', machines), machines[2])
   assert.equal(parseMachineChoice('D', machines), machines[3])
+  assert.equal(parseMachineChoice('j', machines), machines[4])
   assert.equal(parseMachineChoice('  a  ', machines), machines[0])
   assert.equal(parseMachineChoice('\t右侧\n', machines), machines[1])
   assert.equal(parseMachineChoice('机台 A', machines), machines[0])
@@ -1483,6 +1487,7 @@ test('accepts concise machine letters, full names, and unique remarks', () => {
   assert.equal(parseMachineChoice('左侧', machines), machines[0])
   assert.equal(parseMachineChoice('右侧', machines), machines[1])
   assert.equal(parseMachineChoice('靠窗', machines), machines[2])
+  assert.equal(parseMachineChoice('楼上', machines), machines[4])
   assert.equal(parseMachineChoice('左边', machines), null)
   assert.equal(parseMachineChoice('入口', [
     { id: 'A', name: '入口 · 机台 A' },
@@ -1533,9 +1538,10 @@ test('presents machine choices with the short letter first', () => {
   )
 })
 
-test('formats every configured machine in A to D order', () => {
+test('formats every configured machine in A to J order and preserves groups', () => {
   const machine = id => ({
     id,
+    group_id: id < 'F' ? 'group-1' : 'group-2',
     name: `${id} 区 · 机台 ${id}`,
     operational: true,
     stop_reason: null,
@@ -1545,21 +1551,78 @@ test('formats every configured machine in A to D order', () => {
     waiting_positions: [],
   })
   const text = formatQueue({
-    queue_id: 'queue-four-machines',
+    queue_id: 'queue-ten-machines',
     captured_at: Date.now(),
     registration_open: true,
     terminal: { online: true },
+    machine_groups: [
+      { id: 'group-1', name: '一楼' },
+      { id: 'group-2', name: '二楼' },
+    ],
+    default_machine_group_id: 'group-1',
     machines: {
-      D: machine('D'),
-      B: machine('B'),
-      A: machine('A'),
-      C: machine('C'),
+      ...Object.fromEntries([..."ABCDEFGHIJ"].reverse().map((id) => [id, machine(id)])),
     },
   })
 
-  const offsets = ['A', 'B', 'C', 'D'].map((id) => text.indexOf(`【${id} 区·机台 ${id}】`))
+  const offsets = [..."ABCDEFGHIJ"].map((id) => text.indexOf(`【${id} 区·机台 ${id}】`))
   assert.ok(offsets.every((offset) => offset >= 0))
   assert.deepEqual(offsets, [...offsets].sort((left, right) => left - right))
+  assert.match(text, /分组：一楼[\s\S]*机台 E[\s\S]*分组：二楼[\s\S]*机台 F/)
+})
+
+test('groups long machine choices and splits a full ten-machine queue without truncation', () => {
+  const groups = [
+    { id: 'group-1', name: '一楼' },
+    { id: 'group-2', name: '二楼' },
+  ]
+  const machines = Object.fromEntries([..."ABCDEFGHIJ"].map((id, machineIndex) => [id, {
+    id,
+    group_id: machineIndex < 5 ? groups[0].id : groups[1].id,
+    name: `${id} 区 · 机台 ${id}`,
+    operational: true,
+    stop_reason: null,
+    stop_reason_detail: null,
+    playing_started_at: null,
+    playing: [],
+    waiting_positions: Array.from({ length: 20 }, (_, index) => ({
+      index: index + 1,
+      estimated_wait_minutes: index * 12,
+      registrations: [{
+        registration_id: `${id}-${index}`,
+        display_id: `玩家${id}-${index}`,
+        preference: 'SOLO',
+        deferred_once: false,
+        temporarily_away: false,
+        temporary_away_skipped_turns: 0,
+        fixed_pair: false,
+        no_show_count: 0,
+      }],
+    })),
+  }]))
+  const queue = {
+    queue_id: 'queue-full-ten-machines',
+    captured_at: Date.now(),
+    registration_open: true,
+    terminal: { online: true },
+    machine_groups: groups,
+    default_machine_group_id: groups[0].id,
+    machines,
+  }
+
+  assert.deepEqual(
+    formatMachineChoiceLines(queue, [machines.A, machines.F]),
+    ['一楼', ' - A（A 区，暂时无法估算）', '', '二楼', ' - F（F 区，暂时无法估算）'],
+  )
+  const messages = formatQueueMessages(queue, 1_000)
+  assert.ok(messages.length > 1)
+  assert.ok(messages.every((message) => message.length <= 1_000))
+  const complete = messages.join('\n')
+  for (const id of [..."ABCDEFGHIJ"]) {
+    for (let index = 0; index < 20; index += 1) {
+      assert.equal(complete.split(`玩家${id}-${index} (`).length - 1, 1)
+    }
+  }
 })
 
 test('does not offer stopped or full machines for a new registration', () => {

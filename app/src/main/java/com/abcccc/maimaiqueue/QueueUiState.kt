@@ -33,7 +33,7 @@ internal enum class Screen {
     CLAIM_REGISTRATION
 }
 
-enum class MachineId { A, B, C, D }
+enum class MachineId { A, B, C, D, E, F, G, H, I, J }
 
 internal val DEFAULT_CONFIGURED_MACHINE_IDS: List<MachineId> = MachineId.entries.take(2)
 
@@ -42,12 +42,33 @@ internal fun configuredMachineIds(machineCount: Int): List<MachineId> =
 
 internal fun machineSelectionColumnCount(machineCount: Int): Int =
     when (machineCount.coerceIn(1, MachineId.entries.size)) {
+        1 -> 1
+        2 -> 2
+        3 -> 3
         4 -> 2
-        else -> machineCount.coerceIn(1, 3)
+        else -> 3
     }
+
+internal fun remapMachineStatesByStableIdentity(
+    previousSettings: QueueRuleSettings,
+    updatedSettings: QueueRuleSettings,
+    previousStates: Map<MachineId, PersistedMachineState>
+): Map<MachineId, PersistedMachineState> {
+    val normalizedPrevious = normalizeMachineLayoutSettings(previousSettings)
+    val normalizedUpdated = normalizeMachineLayoutSettings(updatedSettings)
+    val statesByStableId = normalizedPrevious.configuredMachineIds.associate { machineId ->
+        normalizedPrevious.machineStableId(machineId) to
+            (previousStates[machineId] ?: PersistedMachineState())
+    }
+    return normalizedUpdated.configuredMachineIds.associateWith { machineId ->
+        statesByStableId[normalizedUpdated.machineStableId(machineId)]
+            ?: PersistedMachineState()
+    }
+}
 
 internal data class MachineDisplayState(
     val machineId: MachineId,
+    val stableId: String,
     val queue: MachineQueue,
     val status: MachineStatus,
     val configuration: MachineConfiguration

@@ -13,11 +13,11 @@ from uuid import UUID, uuid4
 from flask import Flask, current_app, jsonify, request
 
 
-PUBLIC_SCHEMA_VERSION = 6
-SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4, 5, 6}
+PUBLIC_SCHEMA_VERSION = 7
+SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4, 5, 6, 7}
 MAX_PAYLOAD_BYTES = 1024 * 1024
 MAX_REGISTRATIONS_PER_MACHINE = 20
-MAX_MACHINE_COUNT = 4
+MAX_MACHINE_COUNT = 10
 MAX_PLANNED_ROUND_MINUTES = 120
 MAX_ESTIMATED_WAIT_MINUTES = (
     MAX_REGISTRATIONS_PER_MACHINE * MAX_PLANNED_ROUND_MINUTES
@@ -32,6 +32,7 @@ MAX_STORED_EVENTS_PER_QUEUE = 2_000
 MAX_LOG_PAGE_SIZE = 100
 MAX_STOP_REASON_DETAIL_CHARACTERS = 40
 PUBLIC_ID_PATTERN = re.compile(r"^[0-9a-f]{24}$")
+MACHINE_INTERNAL_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 QQ_NUMBER_PATTERN = re.compile(r"^[0-9]{5,12}$")
 MOBILE_SESSION_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 PREFERENCES = {"SOLO", "OPEN_TO_JOIN"}
@@ -76,7 +77,15 @@ MACHINE_NAMES = {
     "B": "右侧 · 机台 B",
     "C": "中间左侧 · 机台 C",
     "D": "中间右侧 · 机台 D",
+    "E": "第 5 台 · 机台 E",
+    "F": "第 6 台 · 机台 F",
+    "G": "第 7 台 · 机台 G",
+    "H": "第 8 台 · 机台 H",
+    "I": "第 9 台 · 机台 I",
+    "J": "第 10 台 · 机台 J",
 }
+DEFAULT_MACHINE_GROUP_ID = "00000000000000000000000000000001"
+MAX_MACHINE_GROUP_NAME_CHARACTERS = 12
 MAX_MACHINE_REMARK_CHARACTERS = 8
 MAX_MACHINE_TYPE_CHARACTERS = 24
 MAX_MACHINE_SERVER_CHARACTERS = 24
@@ -461,6 +470,8 @@ def initialize_database(database_path: str) -> None:
                 event_id TEXT NOT NULL,
                 occurred_at INTEGER NOT NULL,
                 machine_id TEXT,
+                machine_stable_id TEXT,
+                machine_name TEXT,
                 event_type TEXT NOT NULL,
                 title TEXT NOT NULL,
                 detail TEXT NOT NULL,
@@ -486,6 +497,20 @@ def initialize_database(database_path: str) -> None:
                 """
                 ALTER TABLE queue_event
                 ADD COLUMN notification_categories TEXT NOT NULL DEFAULT '[]'
+                """
+            )
+        if "machine_stable_id" not in queue_event_columns:
+            connection.execute(
+                """
+                ALTER TABLE queue_event
+                ADD COLUMN machine_stable_id TEXT
+                """
+            )
+        if "machine_name" not in queue_event_columns:
+            connection.execute(
+                """
+                ALTER TABLE queue_event
+                ADD COLUMN machine_name TEXT
                 """
             )
         connection.execute(
@@ -1020,16 +1045,19 @@ def publish_snapshot():
             inserted_event = connection.execute(
                 """
                 INSERT OR IGNORE INTO queue_event
-                    (queue_id, event_id, occurred_at, machine_id, event_type,
+                    (queue_id, event_id, occurred_at, machine_id,
+                     machine_stable_id, machine_name, event_type,
                      title, detail, operation_source, notification_categories,
                      registration_ids)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     queue_id,
                     event["event_id"],
                     event["occurred_at"],
                     event["machine_id"],
+                    event["machine_stable_id"],
+                    event["machine_name"],
                     event["type"],
                     event["title"],
                     event["detail"],
@@ -1038,7 +1066,26 @@ def publish_snapshot():
                     json.dumps(event_registration_ids, separators=(",", ":")),
                 ),
             )
-            if inserted_event.rowcount == 1 and onebot_sync_enabled:
+            is_new_event = inserted_event.rowcount == 1
+            if not is_new_event and (
+                event["machine_stable_id"] is not None
+                or event["machine_name"] is not None
+            ):
+                connection.execute(
+                    """
+                    UPDATE queue_event
+                    SET machine_stable_id = COALESCE(machine_stable_id, ?),
+                        machine_name = COALESCE(machine_name, ?)
+                    WHERE queue_id = ? AND event_id = ?
+                    """,
+                    (
+                        event["machine_stable_id"],
+                        event["machine_name"],
+                        queue_id,
+                        event["event_id"],
+                    ),
+                )
+            if is_new_event and onebot_sync_enabled:
                 if event["type"] == "QUEUE_RESET" and previous_queue_contacts:
                     recipient_contacts = previous_queue_contacts.values()
                 else:
@@ -1417,7 +1464,8 @@ def read_queue_logs():
                 return jsonify({"ok": False, "error": "queue_id 必须是 UUID"}), 400
 
         query = """
-            SELECT id, event_id, occurred_at, machine_id, event_type,
+            SELECT id, event_id, occurred_at, machine_id, machine_stable_id,
+                   machine_name, event_type,
                    title, detail, operation_source, notification_categories,
                    registration_ids
             FROM queue_event
@@ -1439,6 +1487,8 @@ def read_queue_logs():
             "event_id": row["event_id"],
             "occurred_at": row["occurred_at"],
             "machine_id": row["machine_id"],
+            "machine_stable_id": row["machine_stable_id"],
+            "machine_name": row["machine_name"],
             "type": row["event_type"],
             "title": row["title"],
             "detail": row["detail"],
@@ -1612,7 +1662,8 @@ def read_bot_events():
         ).fetchall()
         event_rows = connection.execute(
             """
-            SELECT id, event_id, occurred_at, machine_id, event_type,
+            SELECT id, event_id, occurred_at, machine_id, machine_stable_id,
+                   machine_name, event_type,
                    title, detail, operation_source, notification_categories,
                    registration_ids
             FROM queue_event
@@ -1653,6 +1704,8 @@ def read_bot_events():
                 "event_id": row["event_id"],
                 "occurred_at": row["occurred_at"],
                 "machine_id": row["machine_id"],
+                "machine_stable_id": row["machine_stable_id"],
+                "machine_name": row["machine_name"],
                 "type": row["event_type"],
                 "title": row["title"],
                 "detail": row["detail"],
@@ -1888,6 +1941,11 @@ def read_online_profile():
             "business_hours": snapshot.get("business_hours")
             or normalize_public_business_hours(None),
             "terminal": {"online": terminal_online},
+            "machine_groups": snapshot.get("machine_groups")
+            or [{"id": DEFAULT_MACHINE_GROUP_ID, "name": "分组 1"}],
+            "default_machine_group_id": snapshot.get(
+                "default_machine_group_id", DEFAULT_MACHINE_GROUP_ID
+            ),
             "machines": [
                 serialize_remote_machine(machine_id, machine)
                 for machine_id, machine in snapshot.get("machines", {}).items()
@@ -3202,6 +3260,8 @@ def serialize_remote_machine(machine_id: str, machine: dict[str, Any]) -> dict[s
         unavailable_reason = "登记已满"
     return {
         "id": machine_id,
+        "stable_id": machine.get("stable_id") or default_machine_stable_id(machine_id),
+        "group_id": machine.get("group_id") or DEFAULT_MACHINE_GROUP_ID,
         "name": machine["name"],
         "operational": machine["operational"],
         "registration_count": machine.get("registration_count", 0),
@@ -4024,7 +4084,14 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
         not 1 <= len(machines_source) <= MAX_MACHINE_COUNT
         or set(machines_source) != set(configured_machine_ids)
     ):
-        raise ValidationError("机台必须按 A、B、C、D 的顺序连续配置 1 至 4 台")
+        raise ValidationError("机台必须按 A 至 J 的顺序连续配置 1 至 10 台")
+
+    machine_groups, default_machine_group_id = normalize_machine_groups(
+        payload,
+        configured_machine_ids=configured_machine_ids,
+        schema_version=schema_version,
+    )
+    valid_machine_group_ids = {group["id"] for group in machine_groups}
 
     machines = {
         machine_id: normalize_machine(
@@ -4032,9 +4099,16 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
             machines_source[machine_id],
             allow_custom_name=schema_version >= 2,
             schema_version=schema_version,
+            valid_machine_group_ids=valid_machine_group_ids,
         )
         for machine_id in configured_machine_ids
     }
+    stable_machine_ids = [machine["stable_id"] for machine in machines.values()]
+    if len(stable_machine_ids) != len(set(stable_machine_ids)):
+        raise ValidationError("机台稳定标识不能重复")
+    used_machine_group_ids = {machine["group_id"] for machine in machines.values()}
+    if used_machine_group_ids != valid_machine_group_ids:
+        raise ValidationError("每个机台分组都必须至少包含一台机台")
     registration_ids = [
         registration["registration_id"]
         for machine in machines.values()
@@ -4077,6 +4151,8 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
             "app_version": app_version,
             "last_seen_at": captured_at,
         },
+        "machine_groups": machine_groups,
+        "default_machine_group_id": default_machine_group_id,
         "machines": machines,
         "recent_events": recent_events,
         "private_player_contacts": private_player_contacts,
@@ -4326,6 +4402,15 @@ def normalize_public_event(source: Any) -> dict[str, Any]:
     machine_id = source.get("machine_id")
     if machine_id is not None and machine_id not in MACHINE_NAMES:
         raise ValidationError("公开事件机台编号无效")
+    machine_stable_id = source.get("machine_stable_id")
+    if machine_stable_id is not None and (
+        not isinstance(machine_stable_id, str)
+        or MACHINE_INTERNAL_ID_PATTERN.fullmatch(machine_stable_id) is None
+    ):
+        raise ValidationError("公开事件机台稳定标识无效")
+    machine_name = read_optional_string(source, "machine_name", 120)
+    if machine_id is None and (machine_stable_id is not None or machine_name is not None):
+        raise ValidationError("系统事件不能包含机台身份")
     registration_ids = source.get("registration_ids")
     if (
         not isinstance(registration_ids, list)
@@ -4361,6 +4446,8 @@ def normalize_public_event(source: Any) -> dict[str, Any]:
         "event_id": read_uuid(source, "event_id"),
         "occurred_at": read_integer(source, "occurred_at", minimum=1),
         "machine_id": machine_id,
+        "machine_stable_id": machine_stable_id,
+        "machine_name": machine_name,
         "type": event_type,
         "title": read_string(source, "title", maximum_length=120),
         "detail": read_string(source, "detail", maximum_length=2_000),
@@ -4370,12 +4457,50 @@ def normalize_public_event(source: Any) -> dict[str, Any]:
     }
 
 
+def normalize_machine_groups(
+    payload: dict[str, Any],
+    *,
+    configured_machine_ids: list[str],
+    schema_version: int,
+) -> tuple[list[dict[str, str]], str]:
+    if schema_version < 7:
+        return (
+            [{"id": DEFAULT_MACHINE_GROUP_ID, "name": "分组 1"}],
+            DEFAULT_MACHINE_GROUP_ID,
+        )
+
+    source = payload.get("machine_groups")
+    if not isinstance(source, list) or not 1 <= len(source) <= len(configured_machine_ids):
+        raise ValidationError("机台分组数量必须为 1 至当前机台数量")
+    groups: list[dict[str, str]] = []
+    for index, item in enumerate(source):
+        if not isinstance(item, dict) or set(item) != {"id", "name"}:
+            raise ValidationError(f"第 {index + 1} 个机台分组字段不完整")
+        group_id = read_machine_internal_id(item, "id")
+        name = read_string(item, "name", MAX_MACHINE_GROUP_NAME_CHARACTERS)
+        if not name.isprintable():
+            raise ValidationError(f"第 {index + 1} 个机台分组名称内容无效")
+        groups.append({"id": group_id, "name": name})
+    group_ids = [group["id"] for group in groups]
+    if len(group_ids) != len(set(group_ids)):
+        raise ValidationError("机台分组标识不能重复")
+    default_group_id = read_machine_internal_id(payload, "default_machine_group_id")
+    if default_group_id not in set(group_ids):
+        raise ValidationError("默认机台分组不存在")
+    return groups, default_group_id
+
+
+def default_machine_stable_id(machine_id: str) -> str:
+    return f"{list(MACHINE_NAMES).index(machine_id) + 1:032x}"
+
+
 def normalize_machine(
     machine_id: str,
     source: Any,
     *,
     allow_custom_name: bool = False,
     schema_version: int = 1,
+    valid_machine_group_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(source, dict):
         raise ValidationError(f"机台 {machine_id} 必须是对象")
@@ -4387,6 +4512,18 @@ def normalize_machine(
         name=name,
         schema_version=schema_version,
     )
+    stable_id = (
+        read_machine_internal_id(source, "stable_id")
+        if schema_version >= 7
+        else default_machine_stable_id(machine_id)
+    )
+    group_id = (
+        read_machine_internal_id(source, "group_id")
+        if schema_version >= 7
+        else DEFAULT_MACHINE_GROUP_ID
+    )
+    if valid_machine_group_ids is not None and group_id not in valid_machine_group_ids:
+        raise ValidationError(f"机台 {machine_id} 引用了不存在的机台分组")
     operational = read_boolean(source, "operational")
     stop_reason = read_optional_choice(source, "stop_reason", STOP_REASONS)
     stop_reason_detail = read_optional_string(
@@ -4501,6 +4638,8 @@ def normalize_machine(
 
     return {
         "id": machine_id,
+        "stable_id": stable_id,
+        "group_id": group_id,
         "name": name,
         "remark": configuration["remark"],
         "configuration": configuration,
@@ -4887,6 +5026,13 @@ def read_public_id(source: dict[str, Any], key: str) -> str:
     value = source.get(key)
     if not isinstance(value, str) or PUBLIC_ID_PATTERN.fullmatch(value) is None:
         raise ValidationError(f"{key} 公开编号无效")
+    return value
+
+
+def read_machine_internal_id(source: dict[str, Any], key: str) -> str:
+    value = source.get(key)
+    if not isinstance(value, str) or MACHINE_INTERNAL_ID_PATTERN.fullmatch(value) is None:
+        raise ValidationError(f"{key} 机台内部标识无效")
     return value
 
 

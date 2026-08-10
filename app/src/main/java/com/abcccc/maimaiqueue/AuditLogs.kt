@@ -7,6 +7,12 @@ enum class AuditLogCategory {
     MACHINE_B,
     MACHINE_C,
     MACHINE_D,
+    MACHINE_E,
+    MACHINE_F,
+    MACHINE_G,
+    MACHINE_H,
+    MACHINE_I,
+    MACHINE_J,
     SYSTEM,
     PLAYER_PROFILE
 }
@@ -57,6 +63,11 @@ data class AuditPlayerContact(
     val qqNumber: String
 )
 
+data class AuditMachineIdentity(
+    val stableId: String,
+    val name: String
+)
+
 data class AuditLogEntry(
     val id: String,
     val timestampMillis: Long,
@@ -68,8 +79,18 @@ data class AuditLogEntry(
     val publicEventType: PublicQueueEventType? = null,
     val notificationCategories: Set<PublicQueueNotificationCategory> = emptySet(),
     val affectedRegistrationKeys: List<Int> = emptyList(),
-    val affectedPlayerContacts: List<AuditPlayerContact> = emptyList()
+    val affectedPlayerContacts: List<AuditPlayerContact> = emptyList(),
+    val machineStableId: String? = null,
+    val machineName: String? = null
 )
+
+internal fun AuditLogEntry.withMachineIdentity(identity: AuditMachineIdentity?): AuditLogEntry {
+    if (identity == null || (machineStableId != null && machineName != null)) return this
+    return copy(
+        machineStableId = machineStableId ?: identity.stableId,
+        machineName = machineName ?: identity.name
+    )
+}
 
 internal fun AuditLogEntry.withAffectedPlayerContacts(
     registrations: Collection<Registration>,

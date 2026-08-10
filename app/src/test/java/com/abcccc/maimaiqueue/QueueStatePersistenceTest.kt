@@ -142,6 +142,51 @@ class QueueStatePersistenceTest {
     }
 
     @Test
+    fun staleEmptyMachineSlotsDoNotRestoreDeletedMachines() {
+        val saved = state().copy(
+            machines = configuredMachineIds(10).associateWith { PersistedMachineState() },
+            registrationOpen = false
+        )
+
+        assertEquals(2, machineCountNeededToRestore(2, saved))
+    }
+
+    @Test
+    fun restoreExpandsOnlyFarEnoughToPreserveMeaningfulMachineState() {
+        val saved = state().copy(
+            machines = configuredMachineIds(10).associateWith { machineId ->
+                when (machineId) {
+                    MachineId.F -> PersistedMachineState(
+                        queue = MachineQueue(
+                            waiting = listOf(
+                                Registration(9, "待恢复玩家", PlayPreference.SOLO)
+                            )
+                        )
+                    )
+                    MachineId.J -> PersistedMachineState(
+                        status = MachineStatus().stop(
+                            MachineStopReason.MAINTENANCE,
+                            atMillis = 500L
+                        )
+                    )
+                    else -> PersistedMachineState()
+                }
+            }
+        )
+
+        assertEquals(10, machineCountNeededToRestore(2, saved))
+        assertEquals(
+            6,
+            machineCountNeededToRestore(
+                2,
+                saved.copy(
+                    machines = saved.machines + (MachineId.J to PersistedMachineState())
+                )
+            )
+        )
+    }
+
+    @Test
     fun schemaSixRoundTripsEverySupportedMachineCount() {
         (1..MachineId.entries.size).forEach { machineCount ->
             val machines = configuredMachineIds(machineCount).associateWith { machineId ->

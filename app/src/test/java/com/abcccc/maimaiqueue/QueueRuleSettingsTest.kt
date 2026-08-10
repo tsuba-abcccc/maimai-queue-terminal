@@ -108,13 +108,169 @@ class QueueRuleSettingsTest {
     }
 
     @Test
-    fun configuredMachineIdsAreAlwaysContiguousFromAThroughD() {
+    fun configuredMachineIdsAreAlwaysContiguousFromAThroughJ() {
         assertEquals(listOf(MachineId.A), configuredMachineIds(0))
         assertEquals(listOf(MachineId.A), configuredMachineIds(1))
         assertEquals(listOf(MachineId.A, MachineId.B), configuredMachineIds(2))
         assertEquals(listOf(MachineId.A, MachineId.B, MachineId.C), configuredMachineIds(3))
-        assertEquals(MachineId.entries, configuredMachineIds(4))
-        assertEquals(MachineId.entries, configuredMachineIds(5))
+        assertEquals(listOf(MachineId.A, MachineId.B, MachineId.C, MachineId.D), configuredMachineIds(4))
+        assertEquals(MachineId.entries.take(5), configuredMachineIds(5))
+        assertEquals(MachineId.entries, configuredMachineIds(10))
+        assertEquals(MachineId.entries, configuredMachineIds(11))
+    }
+
+    @Test
+    fun legacySettingsNormalizeToStableMachinesAndOneDefaultGroup() {
+        val settings = normalizeMachineLayoutSettings(
+            QueueRuleSettings(
+                configuredMachineCount = 4,
+                machineStableIds = emptyMap(),
+                machineGroupAssignments = emptyMap(),
+                machineGroups = emptyList(),
+                defaultMachineGroupId = ""
+            )
+        )
+
+        assertEquals(MachineId.entries.take(4).map(::defaultMachineStableId), settings.configuredMachineIds.map(settings::machineStableId))
+        assertEquals(DEFAULT_MACHINE_GROUPS, settings.configuredMachineGroups)
+        assertEquals(DEFAULT_MACHINE_GROUP_ID, settings.defaultMachineGroupId)
+        assertTrue(settings.configuredMachineIds.all { settings.machineGroupId(it) == DEFAULT_MACHINE_GROUP_ID })
+    }
+
+    @Test
+    fun addingMachinesAppendsFreshStableIdentitiesUpToJ() {
+        var settings = QueueRuleSettings(configuredMachineCount = 1)
+
+        repeat(9) {
+            settings = appendMachineConfiguration(settings)!!
+        }
+
+        assertEquals(10, settings.configuredMachineCount)
+        assertEquals(MachineId.entries, settings.configuredMachineIds)
+        assertEquals(10, settings.configuredMachineIds.map(settings::machineStableId).toSet().size)
+        assertNull(appendMachineConfiguration(settings))
+    }
+
+    @Test
+    fun removingMiddleMachineShiftsConfigurationIdentityAndGroupTogether() {
+        val secondGroup = MachineGroupConfiguration(
+            id = "10000000000000000000000000000002",
+            name = "楼上"
+        )
+        val original = normalizeMachineLayoutSettings(
+            QueueRuleSettings(
+                configuredMachineCount = 4,
+                machineConfigurations = DEFAULT_MACHINE_CONFIGURATIONS +
+                    (MachineId.C to MachineConfiguration(remark = "后侧", capacity = 1)),
+                machineStableIds = DEFAULT_MACHINE_STABLE_IDS +
+                    (MachineId.C to "20000000000000000000000000000003"),
+                machineGroups = DEFAULT_MACHINE_GROUPS + secondGroup,
+                machineGroupAssignments = DEFAULT_MACHINE_GROUP_ASSIGNMENTS +
+                    (MachineId.C to secondGroup.id)
+            )
+        )
+
+        val removed = removeMachineConfiguration(original, MachineId.B)!!
+
+        assertEquals(3, removed.configuredMachineCount)
+        assertEquals("后侧", removed.machineRemark(MachineId.B))
+        assertEquals(1, removed.machineConfiguration(MachineId.B).capacity)
+        assertEquals("20000000000000000000000000000003", removed.machineStableId(MachineId.B))
+        assertEquals(secondGroup.id, removed.machineGroupId(MachineId.B))
+        assertEquals(original.machineStableId(MachineId.D), removed.machineStableId(MachineId.C))
+    }
+
+    @Test
+    fun machineLayoutLogsDeletionAndReindexingWithoutInventingConfigurationChanges() {
+        val original = QueueRuleSettings(
+            configuredMachineCount = 4,
+            machineConfigurations = DEFAULT_MACHINE_CONFIGURATIONS + mapOf(
+                MachineId.B to MachineConfiguration(remark = "墙侧"),
+                MachineId.C to MachineConfiguration(remark = "后侧", capacity = 1),
+                MachineId.D to MachineConfiguration(remark = "窗侧")
+            )
+        )
+        val removed = removeMachineConfiguration(original, MachineId.B)!!
+
+        val descriptions = machineLayoutChangeDescriptions(original, removed)
+
+        assertTrue(descriptions.contains("删除机台：原机台 B（墙侧）"))
+        assertTrue(
+            descriptions.contains(
+                "后续机台编号已重排：原机台 C 改为机台 B、原机台 D 改为机台 C"
+            )
+        )
+        assertFalse(descriptions.any { "备注改为" in it || "游玩容量改为" in it })
+    }
+
+    @Test
+    fun machineLayoutLogsAddedMachinesAndEveryGroupChange() {
+        val original = QueueRuleSettings(configuredMachineCount = 3)
+        val grouped = createMachineGroupForMachine(original, MachineId.C, "二楼")
+        val secondGroup = grouped.configuredMachineGroups.last()
+        val updated = normalizeMachineLayoutSettings(
+            grouped.copy(defaultMachineGroupId = secondGroup.id)
+        )
+
+        val groupDescriptions = machineLayoutChangeDescriptions(original, updated)
+
+        assertTrue(groupDescriptions.contains("新增首页分组“二楼”"))
+        assertTrue(groupDescriptions.contains("机台 C 移至首页分组“二楼”"))
+        assertTrue(groupDescriptions.contains("本终端默认分组改为“二楼”"))
+
+        val appended = appendMachineConfiguration(updated, secondGroup.id)!!
+        val appendDescriptions = machineLayoutChangeDescriptions(updated, appended)
+        assertEquals(1, appendDescriptions.count { it.startsWith("添加机台：") })
+        assertTrue(appendDescriptions.single { it.startsWith("添加机台：") }.contains("机台 D"))
+    }
+
+    @Test
+    fun machineGroupsRemainNonEmptyAndDefaultAlwaysReferencesAVisibleGroup() {
+        val original = QueueRuleSettings(configuredMachineCount = 3)
+        val withSecondGroup = createMachineGroupForMachine(original, MachineId.C, "二楼")
+        val secondGroup = withSecondGroup.configuredMachineGroups.last()
+        val defaulted = normalizeMachineLayoutSettings(
+            withSecondGroup.copy(defaultMachineGroupId = secondGroup.id)
+        )
+        val movedBack = moveMachineToGroup(defaulted, MachineId.C, DEFAULT_MACHINE_GROUP_ID)
+
+        assertEquals(listOf(DEFAULT_MACHINE_GROUP_ID), movedBack.configuredMachineGroups.map { it.id })
+        assertEquals(DEFAULT_MACHINE_GROUP_ID, movedBack.defaultMachineGroupId)
+        assertTrue(movedBack.configuredMachineGroups.all { movedBack.machinesInGroup(it.id).isNotEmpty() })
+    }
+
+    @Test
+    fun groupChangesAreDisplayOnlyButStableSlotChangesAreRiskSensitive() {
+        val original = QueueRuleSettings(configuredMachineCount = 3)
+        val grouped = createMachineGroupForMachine(original, MachineId.C, "二楼")
+        val swappedIdentity = original.copy(
+            machineStableIds = original.machineStableIds +
+                (MachineId.B to original.machineStableId(MachineId.C))
+        )
+
+        assertFalse(hasRiskSensitiveMachineConfigurationChange(original, grouped))
+        assertTrue(hasRiskSensitiveMachineConfigurationChange(original, swappedIdentity))
+    }
+
+    @Test
+    fun runtimeStatesFollowStableMachineIdentityAfterReindexing() {
+        val original = QueueRuleSettings(configuredMachineCount = 3)
+        val states = mapOf(
+            MachineId.A to PersistedMachineState(),
+            MachineId.B to PersistedMachineState(
+                status = MachineStatus().stop(MachineStopReason.MAINTENANCE, atMillis = 100L)
+            ),
+            MachineId.C to PersistedMachineState(
+                queue = MachineQueue(waiting = listOf(Registration(7, "青空", PlayPreference.SOLO)))
+            )
+        )
+        val removed = removeMachineConfiguration(original, MachineId.A)!!
+
+        val remapped = remapMachineStatesByStableIdentity(original, removed, states)
+
+        assertFalse(remapped.getValue(MachineId.A).status.isOperational)
+        assertEquals(listOf("青空"), remapped.getValue(MachineId.B).queue.waiting.map { it.displayId })
+        assertEquals(setOf(MachineId.A, MachineId.B), remapped.keys)
     }
 
     @Test

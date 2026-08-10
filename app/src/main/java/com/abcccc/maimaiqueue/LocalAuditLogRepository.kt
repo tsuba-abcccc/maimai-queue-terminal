@@ -11,6 +11,9 @@ import org.json.JSONObject
 interface AuditLogRepository {
     suspend fun getLogs(): List<AuditLogEntry>
     suspend fun append(entry: AuditLogEntry)
+    suspend fun backfillMachineIdentities(
+        identities: Map<AuditLogCategory, AuditMachineIdentity>
+    )
 }
 
 class LocalAuditLogRepository(context: Context) : AuditLogRepository {
@@ -27,6 +30,18 @@ class LocalAuditLogRepository(context: Context) : AuditLogRepository {
     override suspend fun append(entry: AuditLogEntry) = withContext(Dispatchers.IO) {
         writeMutex.withLock {
             saveLogs((listOf(entry) + loadLogs().filterNot { it.id == entry.id }).take(MAX_LOGS))
+        }
+    }
+
+    override suspend fun backfillMachineIdentities(
+        identities: Map<AuditLogCategory, AuditMachineIdentity>
+    ) = withContext(Dispatchers.IO) {
+        writeMutex.withLock {
+            val existing = loadLogs()
+            val updated = existing.map { entry ->
+                entry.withMachineIdentity(identities[entry.category])
+            }
+            if (updated != existing) saveLogs(updated)
         }
     }
 
@@ -121,7 +136,12 @@ internal fun deserializeAuditLogs(serialized: String, maxLogs: Int = 1_000): Lis
                                     }
                                 }.distinctBy(AuditPlayerContact::registrationKey)
                             }
-                            .orEmpty()
+                            .orEmpty(),
+                        machineStableId = item.optString("machineStableId")
+                            .lowercase()
+                            .takeIf { MACHINE_STABLE_ID_PATTERN.matches(it) },
+                        machineName = item.optString("machineName")
+                            .takeIf { it.isNotBlank() }
                     )
                 )
             }
@@ -139,6 +159,8 @@ internal fun serializeAuditLogs(logs: List<AuditLogEntry>): String = JSONArray()
                 put("detail", entry.detail)
                 put("source", entry.source.name)
                 put("queueId", entry.queueId ?: JSONObject.NULL)
+                put("machineStableId", entry.machineStableId ?: JSONObject.NULL)
+                put("machineName", entry.machineName ?: JSONObject.NULL)
                 put("publicEventType", entry.publicEventType?.name ?: JSONObject.NULL)
                 put(
                     "notificationCategories",
@@ -170,3 +192,5 @@ internal fun serializeAuditLogs(logs: List<AuditLogEntry>): String = JSONArray()
         )
     }
 }.toString()
+
+private val MACHINE_STABLE_ID_PATTERN = Regex("^[0-9a-f]{32}$")

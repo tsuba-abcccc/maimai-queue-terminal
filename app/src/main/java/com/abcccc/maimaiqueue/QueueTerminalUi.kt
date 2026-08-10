@@ -61,6 +61,8 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
@@ -304,6 +306,7 @@ internal fun RegistrationApp() {
         val state = configuredMachineStateSnapshot.getValue(machineId)
         MachineDisplayState(
             machineId = machineId,
+            stableId = queueRuleSettings.machineStableId(machineId),
             queue = state.queue,
             status = state.status,
             configuration = queueRuleSettings.machineConfiguration(machineId)
@@ -520,7 +523,11 @@ internal fun RegistrationApp() {
     }
 
     LaunchedEffect(auditLogRepository) {
-        auditLogs = auditLogRepository.getLogs()
+        val machineIdentities = auditMachineIdentities(initialQueueRuleSettings)
+        auditLogs = auditLogRepository.getLogs().map { entry ->
+            entry.withMachineIdentity(machineIdentities[entry.category])
+        }
+        auditLogRepository.backfillMachineIdentities(machineIdentities)
     }
 
     LaunchedEffect(queueStateRepository, terminalCommandReceiptRepository) {
@@ -544,9 +551,9 @@ internal fun RegistrationApp() {
             queueId = savedState.queueId
             queueRevision.set(savedState.revision)
             nextKey = savedState.safeNextRegistrationKey
-            val restoredMachineCount = maxOf(
-                queueRuleSettings.configuredMachineCount,
-                savedState.configuredMachineIds.size
+            val restoredMachineCount = machineCountNeededToRestore(
+                configuredMachineCount = queueRuleSettings.configuredMachineCount,
+                savedState = savedState
             )
             if (restoredMachineCount != queueRuleSettings.configuredMachineCount) {
                 queueRuleSettings = withUpdatedMachineConfigurationRevision(
@@ -590,6 +597,10 @@ internal fun RegistrationApp() {
         queueRuleSettings.syncMode,
         queueRuleSettings.configuredMachineCount,
         queueRuleSettings.machineConfigurations,
+        queueRuleSettings.machineStableIds,
+        queueRuleSettings.machineGroupAssignments,
+        queueRuleSettings.machineGroups,
+        queueRuleSettings.defaultMachineGroupId,
         queueRuleSettings.machineConfigurationRevision,
         businessHoursStatus,
         activeClosingGracePeriod
@@ -615,6 +626,10 @@ internal fun RegistrationApp() {
             auditLogs = auditLogs,
             displaySettings = QueuePublicDisplaySettings(
                 machineConfigurations = queueRuleSettings.machineConfigurations,
+                machineStableIds = queueRuleSettings.machineStableIds,
+                machineGroupAssignments = queueRuleSettings.machineGroupAssignments,
+                machineGroups = queueRuleSettings.machineGroups,
+                defaultMachineGroupId = queueRuleSettings.defaultMachineGroupId,
                 machineConfigurationRevision =
                     queueRuleSettings.machineConfigurationRevision,
                 websiteRemoteEnabled = queueRuleSettings.websiteSyncEnabled,
@@ -693,7 +708,9 @@ internal fun RegistrationApp() {
     )
 
     fun appendAuditLog(entry: AuditLogEntry) {
-        val enrichedEntry = entry.withAffectedPlayerContacts(
+        val enrichedEntry = entry
+            .withMachineIdentity(auditMachineIdentities(queueRuleSettings)[entry.category])
+            .withAffectedPlayerContacts(
             registrations = configuredMachineIds.flatMap { queueFor(it).allRegistrations },
             playerProfiles = playerProfiles
         )
@@ -755,8 +772,11 @@ internal fun RegistrationApp() {
             updated = normalizedSettings
         )
         if (settings == queueRuleSettings) return true
-        val removedMachineIds = previousSettings.configuredMachineIds
-            .filterNot(settings.configuredMachineIds::contains)
+        val newStableIds = settings.configuredMachineIds
+            .mapTo(mutableSetOf(), settings::machineStableId)
+        val removedMachineIds = previousSettings.configuredMachineIds.filter { machineId ->
+            previousSettings.machineStableId(machineId) !in newStableIds
+        }
         val blockedRemovedMachineIds = removedMachineIds.filter { machineId ->
             val state = machineStates.state(machineId)
             state.queue.registrationCount > 0 || !state.status.isOperational
@@ -806,7 +826,21 @@ internal fun RegistrationApp() {
                     queueRuleSettingsRepository.markClosingOccurrenceHandled(occurrenceId)
                 }
         }
-        machineStates.reset(removedMachineIds)
+        val previousMachineStates = machineStates.snapshot(previousSettings.configuredMachineIds)
+        val machineRosterChanged = previousSettings.configuredMachineIds.map(
+            previousSettings::machineStableId
+        ) != settings.configuredMachineIds.map(settings::machineStableId)
+        if (machineRosterChanged) {
+            machineStates.replace(
+                remapMachineStatesByStableIdentity(
+                    previousSettings = previousSettings,
+                    updatedSettings = settings,
+                    previousStates = previousMachineStates
+                )
+            )
+        } else {
+            machineStates.reset(removedMachineIds)
+        }
         queueRuleSettings = settings
         queueRuleSettingsRepository.saveSettings(settings)
         if (previousSettings.websiteSyncEnabled != settings.websiteSyncEnabled) {
@@ -828,7 +862,7 @@ internal fun RegistrationApp() {
                 val finalSnapshot = PersistedQueueState(
                     queueId = queueId,
                     revision = queueRevision.incrementAndGet(),
-                    machines = machineStates.snapshot(configuredMachineIds),
+                    machines = machineStates.snapshot(settings.configuredMachineIds),
                     registrationOpen = registrationOpen,
                     nextRegistrationKey = nextKey,
                     savedAtMillis = System.currentTimeMillis()
@@ -839,6 +873,10 @@ internal fun RegistrationApp() {
                         auditLogs = auditLogs,
                         displaySettings = QueuePublicDisplaySettings(
                             machineConfigurations = settings.machineConfigurations,
+                            machineStableIds = settings.machineStableIds,
+                            machineGroupAssignments = settings.machineGroupAssignments,
+                            machineGroups = settings.machineGroups,
+                            defaultMachineGroupId = settings.defaultMachineGroupId,
                             machineConfigurationRevision = settings.machineConfigurationRevision,
                             websiteRemoteEnabled = false,
                             oneBotSyncEnabled = false,
@@ -900,35 +938,21 @@ internal fun RegistrationApp() {
                     "营业时间：${if (settings.businessHours.enabled) "已开启" else "已关闭"}"
                 )
             }
-            if (previousSettings.configuredMachineCount != settings.configuredMachineCount) {
-                add("机台数量改为 ${settings.configuredMachineCount} 台")
-            }
-            settings.configuredMachineIds.forEach { machineId ->
-                addAll(
-                    machineConfigurationChangeDescriptions(
-                        machineId = machineId,
-                        previous = previousSettings.machineConfiguration(machineId),
-                        updated = settings.machineConfiguration(machineId)
-                    )
-                )
-            }
+            addAll(machineLayoutChangeDescriptions(previousSettings, settings))
         }
         appendAuditLog(
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
                 title = "更新应用设置",
-                detail = changeDescriptions.joinToString(separator = "；", postfix = "。")
+                detail = changeDescriptions.takeIf { it.isNotEmpty() }
+                    ?.joinToString(separator = "；", postfix = "。")
+                    ?: "应用设置已更新。"
             )
         )
         return true
     }
 
-    fun auditCategoryFor(machineId: MachineId): AuditLogCategory = when (machineId) {
-        MachineId.A -> AuditLogCategory.MACHINE_A
-        MachineId.B -> AuditLogCategory.MACHINE_B
-        MachineId.C -> AuditLogCategory.MACHINE_C
-        MachineId.D -> AuditLogCategory.MACHINE_D
-    }
+    fun auditCategoryFor(machineId: MachineId): AuditLogCategory = auditLogCategory(machineId)
 
     fun appendQueueAuditLog(
         machineId: MachineId,
@@ -1732,9 +1756,9 @@ internal fun RegistrationApp() {
         }
         queueId = savedState.queueId
         queueRevision.set(savedState.revision)
-        val restoredMachineCount = maxOf(
-            queueRuleSettings.configuredMachineCount,
-            savedState.configuredMachineIds.size
+        val restoredMachineCount = machineCountNeededToRestore(
+            configuredMachineCount = queueRuleSettings.configuredMachineCount,
+            savedState = savedState
         )
         if (restoredMachineCount != queueRuleSettings.configuredMachineCount) {
             queueRuleSettings = withUpdatedMachineConfigurationRevision(
@@ -1797,17 +1821,7 @@ internal fun RegistrationApp() {
     fun startWithNewQueue(savedState: PersistedQueueState) {
         queueId = newQueueId()
         queueRevision.updateAndGet { current -> maxOf(current, savedState.revision) }
-        val newMachineCount = maxOf(
-            queueRuleSettings.configuredMachineCount,
-            savedState.configuredMachineIds.size
-        )
-        if (newMachineCount != queueRuleSettings.configuredMachineCount) {
-            queueRuleSettings = withUpdatedMachineConfigurationRevision(
-                previous = queueRuleSettings,
-                updated = queueRuleSettings.copy(configuredMachineCount = newMachineCount)
-            )
-            queueRuleSettingsRepository.saveSettings(queueRuleSettings)
-        }
+        val newMachineCount = queueRuleSettings.configuredMachineCount
         machineStates.reset(configuredMachineIds(newMachineCount))
         registrationOpen = true
         nextKey = 1
@@ -3674,6 +3688,10 @@ internal fun RegistrationApp() {
                     when (target) {
                         Screen.HOME -> HomeScreen(
                             machines = configuredMachines,
+                            machineGroups = queueRuleSettings.configuredMachineGroups,
+                            machineGroupAssignments = queueRuleSettings.configuredMachineIds
+                                .associateWith(queueRuleSettings::machineGroupId),
+                            defaultMachineGroupId = queueRuleSettings.defaultMachineGroupId,
                             registrationOpen = registrationOpen,
                             acceptingNewRegistrations = acceptingNewRegistrations,
                             businessHoursStatus = businessHoursStatus,
@@ -5941,18 +5959,16 @@ private fun AuditLogScreen(
     onBack: () -> Unit
 ) {
     BackHandler(onBack = onBack)
-    var selectedCategory by remember { mutableStateOf<AuditLogCategory?>(null) }
+    var selectedFilter by remember { mutableStateOf(AuditLogFilter()) }
     var selectedSource by remember { mutableStateOf<AuditLogSource?>(null) }
-    val machineNamesByCategory = machines.associate { machine ->
-        auditLogCategory(machine.machineId) to machine.name
-    }
-    val filters: List<Pair<AuditLogCategory?, String>> = buildList {
-        add(null to "全部")
+    val machinesByStableId = machines.associateBy(MachineDisplayState::stableId)
+    val filters = buildList {
+        add(AuditLogFilter(label = "全部"))
         machines.forEach { machine ->
-            add(auditLogCategory(machine.machineId) to machine.name)
+            add(AuditLogFilter(machineStableId = machine.stableId, label = machine.name))
         }
-        add(AuditLogCategory.SYSTEM to "系统")
-        add(AuditLogCategory.PLAYER_PROFILE to "玩家资料")
+        add(AuditLogFilter(category = AuditLogCategory.SYSTEM, label = "系统"))
+        add(AuditLogFilter(category = AuditLogCategory.PLAYER_PROFILE, label = "玩家资料"))
     }
     val sourceFilters: List<Pair<AuditLogSource?, String>> = listOf(
         null to "全部来源",
@@ -5963,7 +5979,9 @@ private fun AuditLogScreen(
         AuditLogSource.MOBILE_DEVICE to "移动设备"
     )
     val displayedLogs = logs.filter { entry ->
-        (selectedCategory == null || entry.category == selectedCategory) &&
+        (selectedFilter.machineStableId?.let { it == entry.machineStableId }
+            ?: selectedFilter.category?.let { it == entry.category }
+            ?: true) &&
             (selectedSource == null || entry.source == selectedSource)
     }
 
@@ -5985,8 +6003,8 @@ private fun AuditLogScreen(
                 Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                filters.forEach { (category, label) ->
-                    val selected = selectedCategory == category
+                filters.forEach { filter ->
+                    val selected = selectedFilter == filter
                     Box(
                         Modifier.height(40.dp).widthIn(min = 112.dp, max = 220.dp)
                             .clip(RoundedCornerShape(8.dp))
@@ -5996,12 +6014,12 @@ private fun AuditLogScreen(
                                 if (selected) PrimaryText else Separator,
                                 RoundedCornerShape(8.dp)
                             )
-                            .clickable(enabled = !selected) { selectedCategory = category }
+                            .clickable(enabled = !selected) { selectedFilter = filter }
                             .padding(horizontal = 16.dp),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            label,
+                            filter.label,
                             color = if (selected) Color.White else PrimaryText,
                             fontSize = 12.sp,
                             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
@@ -6061,8 +6079,8 @@ private fun AuditLogScreen(
                         AuditLogRow(
                             entry = entry,
                             categoryLabel = auditLogCategoryLabel(
-                                entry.category,
-                                machineNamesByCategory
+                                entry,
+                                machinesByStableId
                             )
                         )
                     }
@@ -6083,14 +6101,8 @@ private fun QueueRuleSettingsScreen(
     val context = LocalContext.current
     val hostActivity = context as? MainActivity
     var settings by remember(persistedSettings) { mutableStateOf(persistedSettings) }
-    val machineConfigurationDrafts = remember(persistedSettings.machineConfigurations) {
-        mutableStateMapOf<MachineId, MachineConfiguration>().apply {
-            MachineId.entries.forEach { machineId ->
-                put(machineId, persistedSettings.machineConfiguration(machineId))
-            }
-        }
-    }
     var selectedMachineConfigurationId by remember { mutableStateOf(MachineId.A) }
+    var machineDeletionTarget by remember { mutableStateOf<MachineId?>(null) }
     var queueSyncEndpointDraft by remember(persistedSettings.queueSyncEndpoint) {
         mutableStateOf(persistedSettings.queueSyncEndpoint)
     }
@@ -6106,21 +6118,23 @@ private fun QueueRuleSettingsScreen(
     val normalizedMachineConfigurations = MachineId.entries.associateWith { machineId ->
         normalizeMachineConfiguration(
             machineId,
-            machineConfigurationDrafts[machineId]
+            settings.machineConfigurations[machineId]
                 ?: persistedSettings.machineConfiguration(machineId)
         )
     }
     val remarksValid = settings.configuredMachineIds.all { machineId ->
-        machineConfigurationDrafts[machineId]?.remark?.trim()?.isNotBlank() == true
+        settings.machineConfigurations[machineId]?.remark?.trim()?.isNotBlank() == true
     }
     val machineDetailsValid = settings.configuredMachineIds.all { machineId ->
-        val configuration = machineConfigurationDrafts[machineId] ?: return@all false
+        val configuration = settings.machineConfigurations[machineId] ?: return@all false
         (configuration.gameType != MachineGameType.OTHER ||
             configuration.customGameType.trim().isNotBlank()) &&
             (!configuration.gameType.supportsServerConfiguration ||
                 configuration.server != MachineServer.OTHER ||
-                configuration.customServer.trim().isNotBlank())
+            configuration.customServer.trim().isNotBlank())
     }
+    val machineGroupsValid = settings.configuredMachineGroups.isNotEmpty() &&
+        settings.configuredMachineGroups.all { it.name.trim().isNotBlank() }
     val normalizedQueueSyncEndpointDraft = normalizeQueueSyncEndpoint(queueSyncEndpointDraft)
     val normalizedQueueSyncTokenDraft = queueSyncTokenDraft.trim()
     val queueSyncEndpointValid = normalizedQueueSyncEndpointDraft != null
@@ -6130,15 +6144,18 @@ private fun QueueRuleSettingsScreen(
     val queueConnectionChanged =
         normalizedQueueSyncEndpointDraft != persistedSettings.queueSyncEndpoint ||
             normalizedQueueSyncTokenDraft != persistedSettings.queueSyncToken
-    val settingsToSave = settings.copy(
-        machineConfigurations = normalizedMachineConfigurations,
-        queueSyncEndpoint = normalizedQueueSyncEndpointDraft ?: queueSyncEndpointDraft.trim(),
-        queueSyncToken = normalizedQueueSyncTokenDraft
+    val settingsToSave = normalizeMachineLayoutSettings(
+        settings.copy(
+            machineConfigurations = normalizedMachineConfigurations,
+            queueSyncEndpoint = normalizedQueueSyncEndpointDraft ?: queueSyncEndpointDraft.trim(),
+            queueSyncToken = normalizedQueueSyncTokenDraft
+        )
     )
     val settingsChanged = settingsToSave != persistedSettings
     val connectionChangeValid = !queueConnectionChanged ||
         (queueSyncEndpointValid && queueSyncTokenValid)
-    val settingsValid = remarksValid && machineDetailsValid && connectionChangeValid &&
+    val settingsValid = remarksValid && machineDetailsValid && machineGroupsValid &&
+        connectionChangeValid &&
         (!settings.websiteSyncEnabled || queueConnectionConfigured)
     val requestBack = {
         if (settingsChanged) showDiscardConfirmation = true else onBack()
@@ -6162,9 +6179,9 @@ private fun QueueRuleSettingsScreen(
             Spacer(Modifier.height(6.dp))
             Text(
                 if (cloudSyncAvailable) {
-                    "调整网站同步、排队规则和机台配置。机台 A 至 D 是固定标识，不能修改。"
+                    "调整网站同步、排队规则和机台配置。机台编号按 A 至 J 连续排列，删除中间机台后会自动重排。"
                 } else {
-                    "调整排队规则和机台配置。机台 A 至 D 是固定标识，不能修改。"
+                    "调整排队规则和机台配置。机台编号按 A 至 J 连续排列，删除中间机台后会自动重排。"
                 },
                 color = SecondaryText,
                 fontSize = 12.sp,
@@ -6508,7 +6525,7 @@ private fun QueueRuleSettingsScreen(
                 HorizontalDivider(color = Separator.copy(alpha = .72f))
                 Column(Modifier.fillMaxWidth().padding(16.dp)) {
                 Text(
-                    "选择现场使用的机台数量。机台标识按 A、B、C、D 连续启用，备注用于帮助玩家辨认现场位置。",
+                    "按现场实际情况添加或删除机台。机台编号始终从 A 开始连续排列，最多支持到 J；分组只改变首页显示，不改变各机台的独立队列。",
                     color = SecondaryText,
                     fontSize = 11.sp,
                     lineHeight = 16.sp
@@ -6516,37 +6533,57 @@ private fun QueueRuleSettingsScreen(
                 if (registrationOpen) {
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "关闭登记排队后才能修改机台数量和游玩容量。备注与机台详情仍可直接更新。",
+                        "关闭登记排队后才能添加、删除机台或修改游玩容量。分组、备注与机台详情仍可直接更新。",
                         color = Color(0xFF9A5B00),
                         fontSize = 11.sp,
                         lineHeight = 16.sp
                     )
                 }
                 Spacer(Modifier.height(12.dp))
-                MachineCountSelector(
-                    selectedCount = settings.configuredMachineCount,
-                    enabled = !registrationOpen,
-                    onSelect = { count ->
-                        updateDraft(settings.copy(configuredMachineCount = count))
-                    }
-                )
-                Spacer(Modifier.height(14.dp))
                 val activeMachineId = selectedMachineConfigurationId.takeIf {
                     it in settings.configuredMachineIds
                 } ?: settings.configuredMachineIds.first()
-                MachineConfigurationSelector(
+                MachineRosterSelector(
                     machineIds = settings.configuredMachineIds,
                     selectedMachineId = activeMachineId,
-                    onSelect = { selectedMachineConfigurationId = it }
+                    canAdd = !registrationOpen &&
+                        settings.configuredMachineCount < MachineId.entries.size,
+                    canDelete = !registrationOpen && settings.configuredMachineCount > 1,
+                    structureDisabledReason = if (registrationOpen) {
+                        "请先关闭登记排队，再修改机台数量。"
+                    } else {
+                        "最多支持 10 台机台。"
+                    },
+                    onSelect = { selectedMachineConfigurationId = it },
+                    onAdd = {
+                        appendMachineConfiguration(
+                            settings,
+                            settings.machineGroupId(activeMachineId)
+                        )?.let { updated ->
+                            updateDraft(updated)
+                            selectedMachineConfigurationId = updated.configuredMachineIds.last()
+                        }
+                    },
+                    onDelete = { machineDeletionTarget = activeMachineId }
                 )
                 Spacer(Modifier.height(14.dp))
+                MachineGroupingEditor(
+                    settings = settings,
+                    machineId = activeMachineId,
+                    onSettingsChange = ::updateDraft
+                )
+                Spacer(Modifier.height(18.dp))
                 MachineConfigurationEditor(
                     machineId = activeMachineId,
-                    configuration = machineConfigurationDrafts.getValue(activeMachineId),
+                    configuration = settings.machineConfiguration(activeMachineId),
                     capacityEditable = !registrationOpen,
                     onConfigurationChange = { updated ->
-                        machineConfigurationDrafts[activeMachineId] = updated
-                        hostActivity?.recordUserInteraction()
+                        updateDraft(
+                            settings.copy(
+                                machineConfigurations = settings.machineConfigurations +
+                                    (activeMachineId to updated)
+                            )
+                        )
                     }
                 )
                 }
@@ -6570,6 +6607,7 @@ private fun QueueRuleSettingsScreen(
                     !settingsChanged -> "当前没有未保存的设置。"
                     !remarksValid -> "请填写所有已启用机台的备注。"
                     !machineDetailsValid -> "请填写选择为“其他”的机台类型或服务器名称。"
+                    !machineGroupsValid -> "请填写所有机台分组的名称。"
                     !connectionChangeValid -> "请填写有效的队列 API 地址和终端同步令牌。"
                     else -> "开启网站同步前，请先填写有效的服务器连接。"
                 }
@@ -6580,6 +6618,7 @@ private fun QueueRuleSettingsScreen(
                     when {
                         !remarksValid -> "请填写所有已启用机台的备注。"
                         !machineDetailsValid -> "请填写选择为“其他”的机台类型或服务器名称。"
+                        !machineGroupsValid -> "请填写所有机台分组的名称。"
                         !connectionChangeValid -> "请填写有效的队列 API 地址和终端同步令牌。"
                         else -> "开启网站同步前，请先填写有效的服务器连接。"
                     },
@@ -6600,6 +6639,38 @@ private fun QueueRuleSettingsScreen(
             onConfirm = {
                 updateDraft(settings.copy(syncMode = QueueSyncMode.TAKEOVER))
                 showTakeoverConfirmation = false
+            }
+        )
+    }
+    machineDeletionTarget?.let { target ->
+        val configuredIds = settings.configuredMachineIds
+        val targetIndex = configuredIds.indexOf(target)
+        val reindexedIds = configuredIds.drop(targetIndex + 1)
+        RemoveRegistrationConfirmation(
+            title = "删除${machineName(target, settings.machineRemark(target))}？",
+            message = buildString {
+                append("这台机台将从当前配置中移除。")
+                if (reindexedIds.isNotEmpty()) {
+                    append("删除后，")
+                    append(
+                        reindexedIds.joinToString("、") { machineId ->
+                            "原机台 ${machineId.name} 改为机台 ${MachineId.entries[machineId.ordinal - 1].name}"
+                        }
+                    )
+                    append("。机台详情、分组和运行状态会一同移动。")
+                }
+                append("本次修改仍需点击“保存设置”后才会生效。")
+            },
+            confirmText = "删除机台",
+            onDismiss = { machineDeletionTarget = null },
+            onConfirm = {
+                removeMachineConfiguration(settings, target)?.let { updated ->
+                    updateDraft(updated)
+                    selectedMachineConfigurationId = updated.configuredMachineIds[
+                        targetIndex.coerceAtMost(updated.configuredMachineIds.lastIndex)
+                    ]
+                }
+                machineDeletionTarget = null
             }
         )
     }
@@ -6690,66 +6761,57 @@ private fun queueSyncModeLabel(mode: QueueSyncMode): String = when (mode) {
 }
 
 @Composable
-private fun MachineCountSelector(
-    selectedCount: Int,
-    enabled: Boolean,
-    onSelect: (Int) -> Unit
-) {
-    Row(
-        Modifier.fillMaxWidth().height(44.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(PageBackground)
-            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(8.dp))
-            .padding(3.dp),
-        horizontalArrangement = Arrangement.spacedBy(3.dp)
-    ) {
-        (1..MachineId.entries.size).forEach { count ->
-            val selected = selectedCount == count
-            Box(
-                Modifier.weight(1f).fillMaxHeight()
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(if (selected) CardBackground else Color.Transparent)
-                    .border(
-                        1.dp,
-                        if (selected) Separator.copy(alpha = .9f) else Color.Transparent,
-                        RoundedCornerShape(6.dp)
-                    )
-                    .clickable(enabled = enabled && !selected) { onSelect(count) },
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    "$count 台",
-                    color = when {
-                        !enabled -> TertiaryText
-                        selected -> PrimaryText
-                        else -> SecondaryText
-                    },
-                    fontSize = 12.sp,
-                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun MachineConfigurationSelector(
+private fun MachineRosterSelector(
     machineIds: List<MachineId>,
     selectedMachineId: MachineId,
-    onSelect: (MachineId) -> Unit
+    canAdd: Boolean,
+    canDelete: Boolean,
+    structureDisabledReason: String,
+    onSelect: (MachineId) -> Unit,
+    onAdd: () -> Unit,
+    onDelete: () -> Unit
 ) {
+    val context = LocalContext.current
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            "当前配置 ${machineIds.size} 台机台",
+            color = PrimaryText,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium
+        )
+        Spacer(Modifier.weight(1f))
+        SmallActionButton(
+            text = "添加机台",
+            onClick = onAdd,
+            enabled = canAdd,
+            disabledReason = structureDisabledReason
+        )
+        Spacer(Modifier.width(8.dp))
+        SmallActionButton(
+            text = "删除当前机台",
+            onClick = onDelete,
+            enabled = canDelete,
+            disabledReason = if (machineIds.size <= 1) {
+                "现场至少需要保留一台机台。"
+            } else {
+                structureDisabledReason
+            }
+        )
+    }
+    Spacer(Modifier.height(9.dp))
     Row(
-        Modifier.fillMaxWidth().height(44.dp)
+        Modifier.fillMaxWidth().height(46.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(PageBackground)
             .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(8.dp))
+            .horizontalScroll(rememberScrollState())
             .padding(3.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp)
     ) {
         machineIds.forEach { machineId ->
             val selected = machineId == selectedMachineId
             Box(
-                Modifier.weight(1f).fillMaxHeight()
+                Modifier.width(86.dp).fillMaxHeight()
                     .clip(RoundedCornerShape(6.dp))
                     .background(if (selected) CardBackground else Color.Transparent)
                     .border(
@@ -6768,7 +6830,163 @@ private fun MachineConfigurationSelector(
                 )
             }
         }
+        if (machineIds.size < MachineId.entries.size) {
+            Box(
+                Modifier.width(92.dp).fillMaxHeight()
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable {
+                        if (canAdd) onAdd()
+                        else showDisabledActionReason(
+                            context,
+                            "添加机台",
+                            structureDisabledReason
+                        )
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.Add,
+                        contentDescription = null,
+                        tint = if (canAdd) SystemBlue else TertiaryText,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    Text(
+                        "添加",
+                        color = if (canAdd) SystemBlue else TertiaryText,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
     }
+}
+
+@Composable
+private fun MachineGroupingEditor(
+    settings: QueueRuleSettings,
+    machineId: MachineId,
+    onSettingsChange: (QueueRuleSettings) -> Unit
+) {
+    val groups = settings.configuredMachineGroups
+    val activeGroupId = settings.machineGroupId(machineId)
+    val activeGroup = groups.firstOrNull { it.id == activeGroupId } ?: groups.first()
+    val canCreateGroup = settings.machinesInGroup(activeGroup.id).size > 1 &&
+        groups.size < settings.configuredMachineCount
+    MachineConfigurationFieldLabel("首页分组")
+    Spacer(Modifier.height(7.dp))
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(7.dp)
+    ) {
+        groups.forEach { group ->
+            val selected = group.id == activeGroup.id
+            Box(
+                Modifier.height(40.dp).widthIn(min = 92.dp, max = 180.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (selected) SoftBlue else PageBackground)
+                    .border(
+                        1.dp,
+                        if (selected) SystemBlue.copy(alpha = .34f) else Separator,
+                        RoundedCornerShape(8.dp)
+                    )
+                    .clickable(enabled = !selected) {
+                        onSettingsChange(moveMachineToGroup(settings, machineId, group.id))
+                    }
+                    .padding(horizontal = 12.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    group.name.ifBlank { "未命名分组" },
+                    color = if (selected) SystemBlue else SecondaryText,
+                    fontSize = 12.sp,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        if (canCreateGroup) {
+            Box(
+                Modifier.height(40.dp).width(108.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(PageBackground)
+                    .border(1.dp, Separator, RoundedCornerShape(8.dp))
+                    .clickable {
+                        onSettingsChange(createMachineGroupForMachine(settings, machineId))
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.Add,
+                        contentDescription = null,
+                        tint = SystemBlue,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    Text("新建分组", color = SystemBlue, fontSize = 12.sp)
+                }
+            }
+        }
+    }
+    Spacer(Modifier.height(9.dp))
+    MachineConfigurationTextField(
+        label = "当前分组名称",
+        value = activeGroup.name,
+        maximumCharacters = MAX_MACHINE_GROUP_NAME_CHARACTERS,
+        onValueChange = {
+            onSettingsChange(renameMachineGroup(settings, activeGroup.id, it))
+        }
+    )
+    Spacer(Modifier.height(12.dp))
+    MachineConfigurationFieldLabel("本终端默认分组")
+    Spacer(Modifier.height(7.dp))
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(7.dp)
+    ) {
+        groups.forEach { group ->
+            val selected = group.id == settings.defaultMachineGroupId
+            Box(
+                Modifier.height(40.dp).widthIn(min = 92.dp, max = 180.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (selected) SoftBlue else PageBackground)
+                    .border(
+                        1.dp,
+                        if (selected) SystemBlue.copy(alpha = .34f) else Separator,
+                        RoundedCornerShape(8.dp)
+                    )
+                    .clickable(enabled = !selected) {
+                        onSettingsChange(
+                            normalizeMachineLayoutSettings(
+                                settings.copy(defaultMachineGroupId = group.id)
+                            )
+                        )
+                    }
+                    .padding(horizontal = 12.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    group.name.ifBlank { "未命名分组" },
+                    color = if (selected) SystemBlue else SecondaryText,
+                    fontSize = 12.sp,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+    Spacer(Modifier.height(7.dp))
+    Text(
+        "应用启动或 30 秒无操作后，首页会返回这个分组。",
+        color = TertiaryText,
+        fontSize = 11.sp,
+        lineHeight = 16.sp
+    )
 }
 
 @Composable
@@ -7226,13 +7444,16 @@ private fun businessDayLabel(day: DayOfWeek): String = when (day) {
 
 @Composable
 private fun AuditLogRow(entry: AuditLogEntry, categoryLabel: String) {
-    val (categoryBackground, categoryForeground) = when (entry.category) {
-        AuditLogCategory.MACHINE_A -> SoftBlue to SystemBlue
-        AuditLogCategory.MACHINE_B -> Color(0xFFEAF8EF) to Color(0xFF248A4B)
-        AuditLogCategory.MACHINE_C -> Color(0xFFFFF4E5) to Color(0xFF9A5A00)
-        AuditLogCategory.MACHINE_D -> Color(0xFFF4EEFF) to Color(0xFF7444A8)
-        AuditLogCategory.SYSTEM -> Color(0xFFEEEEF0) to SecondaryText
-        AuditLogCategory.PLAYER_PROFILE -> Color(0xFFFFEDF3) to Color(0xFFC02D62)
+    val machineOrdinal = machineIdForAuditLogCategory(entry.category)?.ordinal
+    val (categoryBackground, categoryForeground) = when {
+        machineOrdinal != null -> when (machineOrdinal % 4) {
+            0 -> SoftBlue to SystemBlue
+            1 -> Color(0xFFEAF8EF) to Color(0xFF248A4B)
+            2 -> Color(0xFFFFF4E5) to Color(0xFF9A5A00)
+            else -> Color(0xFFF4EEFF) to Color(0xFF7444A8)
+        }
+        entry.category == AuditLogCategory.SYSTEM -> Color(0xFFEEEEF0) to SecondaryText
+        else -> Color(0xFFFFEDF3) to Color(0xFFC02D62)
     }
     Row(
         Modifier.fillMaxWidth().heightIn(min = 76.dp)
@@ -7292,34 +7513,56 @@ private fun AuditLogRow(entry: AuditLogEntry, categoryLabel: String) {
     }
 }
 
+private data class AuditLogFilter(
+    val machineStableId: String? = null,
+    val category: AuditLogCategory? = null,
+    val label: String = ""
+)
+
 private fun auditLogCategoryLabel(
-    category: AuditLogCategory,
-    machineNamesByCategory: Map<AuditLogCategory, String>
-): String = when (category) {
+    entry: AuditLogEntry,
+    machinesByStableId: Map<String, MachineDisplayState>
+): String = entry.machineStableId?.let { stableId ->
+    machinesByStableId[stableId]?.name
+        ?: entry.machineName?.let { "$it（已删除）" }
+        ?: "已删除的机台"
+} ?: machineIdForAuditLogCategory(entry.category)?.let { machineId ->
+    "机台 ${machineId.name}"
+} ?: when (entry.category) {
+    AuditLogCategory.SYSTEM -> "系统"
+    AuditLogCategory.PLAYER_PROFILE -> "玩家资料"
+    else -> "机台"
+}
+
+private fun auditMachineIdentities(
+    settings: QueueRuleSettings
+): Map<AuditLogCategory, AuditMachineIdentity> = settings.configuredMachineIds.associate { machineId ->
+    auditLogCategory(machineId) to AuditMachineIdentity(
+        stableId = settings.machineStableId(machineId),
+        name = machineName(machineId, settings.machineRemark(machineId))
+    )
+}
+
+private val MACHINE_AUDIT_LOG_CATEGORIES = listOf(
     AuditLogCategory.MACHINE_A,
     AuditLogCategory.MACHINE_B,
     AuditLogCategory.MACHINE_C,
-    AuditLogCategory.MACHINE_D -> machineNamesByCategory[category]
-        ?: "机台 ${machineIdForAuditLogCategory(category)?.name.orEmpty()}"
-    AuditLogCategory.SYSTEM -> "系统"
-    AuditLogCategory.PLAYER_PROFILE -> "玩家资料"
-}
+    AuditLogCategory.MACHINE_D,
+    AuditLogCategory.MACHINE_E,
+    AuditLogCategory.MACHINE_F,
+    AuditLogCategory.MACHINE_G,
+    AuditLogCategory.MACHINE_H,
+    AuditLogCategory.MACHINE_I,
+    AuditLogCategory.MACHINE_J
+)
 
-private fun auditLogCategory(machineId: MachineId): AuditLogCategory = when (machineId) {
-    MachineId.A -> AuditLogCategory.MACHINE_A
-    MachineId.B -> AuditLogCategory.MACHINE_B
-    MachineId.C -> AuditLogCategory.MACHINE_C
-    MachineId.D -> AuditLogCategory.MACHINE_D
-}
+private fun auditLogCategory(machineId: MachineId): AuditLogCategory =
+    MACHINE_AUDIT_LOG_CATEGORIES[machineId.ordinal]
 
-private fun machineIdForAuditLogCategory(category: AuditLogCategory): MachineId? = when (category) {
-    AuditLogCategory.MACHINE_A -> MachineId.A
-    AuditLogCategory.MACHINE_B -> MachineId.B
-    AuditLogCategory.MACHINE_C -> MachineId.C
-    AuditLogCategory.MACHINE_D -> MachineId.D
-    AuditLogCategory.SYSTEM,
-    AuditLogCategory.PLAYER_PROFILE -> null
-}
+private fun machineIdForAuditLogCategory(category: AuditLogCategory): MachineId? =
+    MACHINE_AUDIT_LOG_CATEGORIES.indexOf(category)
+        .takeIf { it >= 0 }
+        ?.let(MachineId.entries::get)
 
 private fun auditLogSourceLabel(source: AuditLogSource): String = when (source) {
     AuditLogSource.ON_SITE_TERMINAL -> "现场终端"
@@ -7353,6 +7596,9 @@ private fun formatAuditLogTimestamp(timestampMillis: Long): String =
 @Composable
 private fun HomeScreen(
     machines: List<MachineDisplayState>,
+    machineGroups: List<MachineGroupConfiguration>,
+    machineGroupAssignments: Map<MachineId, String>,
+    defaultMachineGroupId: String,
     registrationOpen: Boolean,
     acceptingNewRegistrations: Boolean,
     businessHoursStatus: BusinessHoursStatus,
@@ -7387,6 +7633,23 @@ private fun HomeScreen(
     onPositionClick: (PositionSelection) -> Unit,
     onPositionReorderRequest: (MachineId, MachineQueue, Int, Int) -> Unit
 ) {
+    val activeMachineGroups = machineGroups.mapNotNull { group ->
+        val groupMachines = machines.filter { machine ->
+            machineGroupAssignments[machine.machineId] == group.id
+        }
+        group.takeIf { groupMachines.isNotEmpty() }?.let { it to groupMachines }
+    }.ifEmpty {
+        listOf(
+            MachineGroupConfiguration(DEFAULT_MACHINE_GROUP_ID, DEFAULT_MACHINE_GROUP_NAME) to
+                machines
+        )
+    }
+    val defaultGroupIndex = activeMachineGroups.indexOfFirst {
+        it.first.id == defaultMachineGroupId
+    }.takeIf { it >= 0 } ?: 0
+    val groupPagerState = rememberPagerState(initialPage = defaultGroupIndex) {
+        activeMachineGroups.size
+    }
     val isEmpty = machines.all { it.queue.registrationCount == 0 }
     val hasStoppedMachine = machines.any { !it.status.isOperational }
     val nowMillis = rememberCurrentTimeMillis()
@@ -7416,9 +7679,26 @@ private fun HomeScreen(
         }
     }
     var cloudSyncInfoVisible by remember { mutableStateOf(false) }
-    val machineLaneScrollState = rememberScrollState()
-    LaunchedEffect(queueScrollResetToken) {
-        if (machineLaneScrollState.value != 0) machineLaneScrollState.animateScrollTo(0)
+    LaunchedEffect(
+        queueScrollResetToken,
+        defaultGroupIndex,
+        activeMachineGroups.map { it.first.id }
+    ) {
+        if (groupPagerState.currentPage != defaultGroupIndex) {
+            groupPagerState.animateScrollToPage(defaultGroupIndex)
+        }
+    }
+    LaunchedEffect(
+        activeMachineGroups.map { it.first.id },
+        highlightedRegistration?.requestId
+    ) {
+        val highlightedMachineId = highlightedRegistration?.machineId ?: return@LaunchedEffect
+        val highlightedGroupIndex = activeMachineGroups.indexOfFirst { (_, groupMachines) ->
+            groupMachines.any { it.machineId == highlightedMachineId }
+        }
+        if (highlightedGroupIndex >= 0 && groupPagerState.currentPage != highlightedGroupIndex) {
+            groupPagerState.animateScrollToPage(highlightedGroupIndex)
+        }
     }
     val hasTransientSidePanelContent = completedRegistration != null ||
         homeSidePanelFeedback != null || queueUndoAction != null
@@ -7457,73 +7737,104 @@ private fun HomeScreen(
                 )
             } else {
                 Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(18.dp)) {
-                    val laneColumnModifier = Modifier.weight(1.9f).fillMaxHeight().let {
-                        if (machines.size > 2) it.verticalScroll(machineLaneScrollState) else it
-                    }
                     Column(
-                        laneColumnModifier
+                        Modifier.weight(1.9f).fillMaxHeight()
                     ) {
-                        machines.forEachIndexed { index, machine ->
-                            val machineId = machine.machineId
-                            MachineLane(
-                                machineId = machineId,
-                                remark = machine.remark,
-                                queue = machine.queue,
-                                status = machine.status,
-                                registrationOpen = registrationOpen,
-                                acceptingNewRegistrations = acceptingNewRegistrations,
-                                businessHoursClosingSoon = businessHoursStatus.closingSoon,
-                                businessHoursClosingGrace = closingGracePeriod,
-                                showCommonPlayPreview = showCommonPlayPreview &&
-                                    machine.configuration.capacity == 2,
-                                nowMillis = nowMillis,
-                                inlineReorderSession = inlineReorderSession
-                                    ?.takeIf { it.machineId == machineId },
-                                inlineReorderResetToken = inlineReorderResetToken,
-                                positionReorderResetToken = positionReorderResetToken,
-                                queueScrollResetToken = queueScrollResetToken,
-                                highlightedRegistrationKey = highlightedRegistration
-                                    ?.takeIf { it.machineId == machineId }
-                                    ?.registrationKey,
-                                onInlineReorderCancel = onInlineReorderCancel,
-                                onInlineReorderProposal = { originalQueue, proposed, movedKey ->
-                                    onInlineReorderProposal(
-                                        machineId,
-                                        originalQueue,
-                                        proposed,
-                                        movedKey
-                                    )
-                                },
-                                onFinishRequest = { onFinishRequest(machineId) },
-                                onEnterPlaying = { onEnterPlaying(machineId) },
-                                onRestore = { onRestoreMachine(machineId) },
-                                onMachineDetails = { onMachineDetails(machineId) },
-                                onJoinThisMachine = { onJoinMachine(machineId) },
-                                onRegistrationClick = { onRegistrationClick(machineId, it) },
-                                onRegistrationLongPress = {
-                                    onRegistrationLongPress(machineId, it)
-                                },
-                                onPositionClick = onPositionClick,
-                                onPositionReorderRequest = { queue, sourceIndex, destinationIndex ->
-                                    onPositionReorderRequest(
-                                        machineId,
-                                        queue,
-                                        sourceIndex,
-                                        destinationIndex
-                                    )
-                                },
-                                centerContent = machines.size == 1,
-                                modifier = if (machines.size > 2) {
-                                    Modifier.height(206.dp)
-                                } else {
-                                    Modifier.weight(1f)
+                        HorizontalPager(
+                            state = groupPagerState,
+                            key = { page -> activeMachineGroups[page].first.id },
+                            modifier = Modifier.fillMaxWidth().weight(1f),
+                            userScrollEnabled = activeMachineGroups.size > 1
+                        ) { page ->
+                            val groupMachines = activeMachineGroups[page].second
+                            val machineLaneScrollState = rememberScrollState()
+                            LaunchedEffect(queueScrollResetToken) {
+                                if (machineLaneScrollState.value != 0) {
+                                    machineLaneScrollState.animateScrollTo(0)
                                 }
-                            )
-                            if (index < machines.lastIndex) {
-                                Spacer(Modifier.height(6.dp))
-                                HorizontalDivider(color = Separator.copy(alpha = .64f))
-                                Spacer(Modifier.height(6.dp))
                             }
+                            val laneColumnModifier = Modifier.fillMaxSize().let {
+                                if (groupMachines.size > 2) {
+                                    it.verticalScroll(machineLaneScrollState)
+                                } else {
+                                    it
+                                }
+                            }
+                            Column(laneColumnModifier) {
+                                groupMachines.forEachIndexed { index, machine ->
+                                    val machineId = machine.machineId
+                                    MachineLane(
+                                        machineId = machineId,
+                                        remark = machine.remark,
+                                        queue = machine.queue,
+                                        status = machine.status,
+                                        registrationOpen = registrationOpen,
+                                        acceptingNewRegistrations = acceptingNewRegistrations,
+                                        businessHoursClosingSoon = businessHoursStatus.closingSoon,
+                                        businessHoursClosingGrace = closingGracePeriod,
+                                        showCommonPlayPreview = showCommonPlayPreview &&
+                                            machine.configuration.capacity == 2,
+                                        nowMillis = nowMillis,
+                                        inlineReorderSession = inlineReorderSession
+                                            ?.takeIf { it.machineId == machineId },
+                                        inlineReorderResetToken = inlineReorderResetToken,
+                                        positionReorderResetToken = positionReorderResetToken,
+                                        queueScrollResetToken = queueScrollResetToken,
+                                        highlightedRegistrationKey = highlightedRegistration
+                                            ?.takeIf { it.machineId == machineId }
+                                            ?.registrationKey,
+                                        onInlineReorderCancel = onInlineReorderCancel,
+                                        onInlineReorderProposal = { originalQueue, proposed, movedKey ->
+                                            onInlineReorderProposal(
+                                                machineId,
+                                                originalQueue,
+                                                proposed,
+                                                movedKey
+                                            )
+                                        },
+                                        onFinishRequest = { onFinishRequest(machineId) },
+                                        onEnterPlaying = { onEnterPlaying(machineId) },
+                                        onRestore = { onRestoreMachine(machineId) },
+                                        onMachineDetails = { onMachineDetails(machineId) },
+                                        onJoinThisMachine = { onJoinMachine(machineId) },
+                                        onRegistrationClick = {
+                                            onRegistrationClick(machineId, it)
+                                        },
+                                        onRegistrationLongPress = {
+                                            onRegistrationLongPress(machineId, it)
+                                        },
+                                        onPositionClick = onPositionClick,
+                                        onPositionReorderRequest = {
+                                                queue,
+                                                sourceIndex,
+                                                destinationIndex ->
+                                            onPositionReorderRequest(
+                                                machineId,
+                                                queue,
+                                                sourceIndex,
+                                                destinationIndex
+                                            )
+                                        },
+                                        centerContent = groupMachines.size == 1,
+                                        modifier = if (groupMachines.size > 2) {
+                                            Modifier.height(206.dp)
+                                        } else {
+                                            Modifier.weight(1f)
+                                        }
+                                    )
+                                    if (index < groupMachines.lastIndex) {
+                                        Spacer(Modifier.height(6.dp))
+                                        HorizontalDivider(color = Separator.copy(alpha = .64f))
+                                        Spacer(Modifier.height(6.dp))
+                                    }
+                                }
+                            }
+                        }
+                        if (activeMachineGroups.size > 1) {
+                            MachineGroupPageIndicator(
+                                groups = activeMachineGroups.map { it.first },
+                                currentPage = groupPagerState.currentPage
+                            )
                         }
                     }
                     HomeSidePanel(
@@ -7552,6 +7863,40 @@ private fun HomeScreen(
                 status = cloudSyncStatus,
                 onDismiss = { cloudSyncInfoVisible = false }
             )
+        }
+    }
+}
+
+@Composable
+private fun MachineGroupPageIndicator(
+    groups: List<MachineGroupConfiguration>,
+    currentPage: Int
+) {
+    val activePage = currentPage.coerceIn(0, groups.lastIndex)
+    Column(
+        Modifier.fillMaxWidth().height(34.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            groups[activePage].name,
+            color = SecondaryText,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Spacer(Modifier.height(4.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            groups.indices.forEach { index ->
+                Box(
+                    Modifier.size(if (index == activePage) 7.dp else 6.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (index == activePage) SystemBlue else Separator
+                        )
+                )
+            }
         }
     }
 }
@@ -8419,6 +8764,107 @@ internal fun machineConfigurationChangeDescriptions(
             "$prefix 计划游玩时间改为单人 ${updated.soloRoundMinutes} 分钟、" +
                 "共同游玩 ${updated.sharedRoundMinutes} 分钟"
         )
+    }
+}
+
+internal fun machineLayoutChangeDescriptions(
+    previous: QueueRuleSettings,
+    updated: QueueRuleSettings
+): List<String> {
+    val normalizedPrevious = normalizeMachineLayoutSettings(previous)
+    val normalizedUpdated = normalizeMachineLayoutSettings(updated)
+    val previousIdsByStableId = normalizedPrevious.configuredMachineIds.associateBy(
+        normalizedPrevious::machineStableId
+    )
+    val updatedIdsByStableId = normalizedUpdated.configuredMachineIds.associateBy(
+        normalizedUpdated::machineStableId
+    )
+    val removedMachineIds = normalizedPrevious.configuredMachineIds.filter { machineId ->
+        normalizedPrevious.machineStableId(machineId) !in updatedIdsByStableId
+    }
+    val addedMachineIds = normalizedUpdated.configuredMachineIds.filter { machineId ->
+        normalizedUpdated.machineStableId(machineId) !in previousIdsByStableId
+    }
+    val reindexedMachines = normalizedUpdated.configuredMachineIds.mapNotNull { updatedId ->
+        val previousId = previousIdsByStableId[normalizedUpdated.machineStableId(updatedId)]
+            ?: return@mapNotNull null
+        (previousId to updatedId).takeIf { previousId != updatedId }
+    }
+    val previousGroupsById = normalizedPrevious.configuredMachineGroups.associateBy { it.id }
+    val updatedGroupsById = normalizedUpdated.configuredMachineGroups.associateBy { it.id }
+
+    return buildList {
+        if (removedMachineIds.isNotEmpty()) {
+            add(
+                removedMachineIds.joinToString(
+                    separator = "、",
+                    prefix = "删除机台：",
+                ) { machineId ->
+                    "原机台 ${machineId.name}（${normalizedPrevious.machineRemark(machineId)}）"
+                }
+            )
+        }
+        if (addedMachineIds.isNotEmpty()) {
+            add(
+                addedMachineIds.joinToString(
+                    separator = "、",
+                    prefix = "添加机台：",
+                ) { machineId ->
+                    "机台 ${machineId.name}（${normalizedUpdated.machineRemark(machineId)}）"
+                }
+            )
+        }
+        if (reindexedMachines.isNotEmpty()) {
+            add(
+                reindexedMachines.joinToString(
+                    separator = "、",
+                    prefix = "后续机台编号已重排：",
+                ) { (previousId, updatedId) ->
+                    "原机台 ${previousId.name} 改为机台 ${updatedId.name}"
+                }
+            )
+        }
+
+        normalizedUpdated.configuredMachineIds.forEach { updatedId ->
+            val previousId = previousIdsByStableId[normalizedUpdated.machineStableId(updatedId)]
+                ?: return@forEach
+            addAll(
+                machineConfigurationChangeDescriptions(
+                    machineId = updatedId,
+                    previous = normalizedPrevious.machineConfiguration(previousId),
+                    updated = normalizedUpdated.machineConfiguration(updatedId)
+                )
+            )
+        }
+
+        normalizedUpdated.configuredMachineGroups
+            .filter { it.id !in previousGroupsById }
+            .forEach { group -> add("新增首页分组“${group.name}”") }
+        normalizedPrevious.configuredMachineGroups
+            .filter { it.id !in updatedGroupsById }
+            .forEach { group -> add("移除首页分组“${group.name}”") }
+        normalizedUpdated.configuredMachineGroups.forEach { updatedGroup ->
+            val previousGroup = previousGroupsById[updatedGroup.id] ?: return@forEach
+            if (previousGroup.name != updatedGroup.name) {
+                add("首页分组“${previousGroup.name}”改名为“${updatedGroup.name}”")
+            }
+        }
+        normalizedUpdated.configuredMachineIds.forEach { updatedId ->
+            val previousId = previousIdsByStableId[normalizedUpdated.machineStableId(updatedId)]
+                ?: return@forEach
+            val previousGroupId = normalizedPrevious.machineGroupId(previousId)
+            val updatedGroupId = normalizedUpdated.machineGroupId(updatedId)
+            if (previousGroupId != updatedGroupId) {
+                val updatedGroupName = updatedGroupsById.getValue(updatedGroupId).name
+                add("机台 ${updatedId.name} 移至首页分组“$updatedGroupName”")
+            }
+        }
+        if (normalizedPrevious.defaultMachineGroupId != normalizedUpdated.defaultMachineGroupId) {
+            val defaultGroupName = updatedGroupsById
+                .getValue(normalizedUpdated.defaultMachineGroupId)
+                .name
+            add("本终端默认分组改为“$defaultGroupName”")
+        }
     }
 }
 
@@ -14238,6 +14684,11 @@ private fun AppDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.10.0",
+            "十台机台与分组管理",
+            "机台可以添加、删除并连续配置为 A 至 J，内部稳定身份会让详情、分组和停用状态在重编号后继续跟随原机台。首页支持机台分组分页、默认分组和单机台完整布局；网站、QQ Bot、日志和云端同步同时支持十台及分组信息。添加、删除机台和修改游玩容量仍只能在关闭登记排队后进行，原有轮换、特殊状态、共同游玩预览和撤销规则不变。"
+        ),
         Triple(
             "0.9.2",
             "操作边界与提示一致性",

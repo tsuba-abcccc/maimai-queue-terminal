@@ -273,6 +273,8 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertIn("stored_at", recipient_columns)
         self.assertIn("operation_source", event_columns)
         self.assertIn("notification_categories", event_columns)
+        self.assertIn("machine_stable_id", event_columns)
+        self.assertIn("machine_name", event_columns)
         self.assertEqual("SERVER_TIMEOUT", result_source)
         self.assertEqual("ON_SITE_TERMINAL", operation_source)
         self.assertGreater(stored_at, 0)
@@ -361,11 +363,11 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertTrue(read.get_json()["terminal"]["online"])
 
-    def test_accepts_one_to_four_contiguous_machines(self):
-        for machine_count in range(1, 5):
+    def test_accepts_one_to_ten_contiguous_machines(self):
+        for machine_count in range(1, 11):
             snapshot = self.snapshot(revision=10 + machine_count)
             snapshot["schema_version"] = 5
-            machine_ids = list("ABCD")[:machine_count]
+            machine_ids = list("ABCDEFGHIJ")[:machine_count]
             snapshot["machines"] = {
                 machine_id: snapshot["machines"].get(machine_id)
                 or self.machine(name=f"测试位 · 机台 {machine_id}")
@@ -379,6 +381,53 @@ class QueueStatusApiTest(unittest.TestCase):
 
             self.assertEqual(204, publish.status_code)
             self.assertEqual(machine_ids, list(stored["machines"]))
+
+    def test_schema_v7_preserves_stable_machine_identity_and_groups(self):
+        snapshot = self.snapshot(revision=31)
+        for machine_id in "CDEFGHIJ":
+            snapshot["machines"][machine_id] = self.machine(
+                name=f"区域 {machine_id} · 机台 {machine_id}"
+            )
+        self.upgrade_snapshot_to_schema_v7(
+            snapshot,
+            group_assignments={
+                **{machine_id: "1" * 32 for machine_id in "ABCDE"},
+                **{machine_id: "2" * 32 for machine_id in "FGHIJ"},
+            },
+            groups=[
+                {"id": "1" * 32, "name": "一楼"},
+                {"id": "2" * 32, "name": "二楼"},
+            ],
+            default_group_id="2" * 32,
+        )
+
+        publish = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        stored = self.client.get("/api/queue-status").get_json()
+
+        self.assertEqual(204, publish.status_code)
+        self.assertEqual(7, stored["schema_version"])
+        self.assertEqual("2" * 32, stored["default_machine_group_id"])
+        self.assertEqual(["一楼", "二楼"], [group["name"] for group in stored["machine_groups"]])
+        self.assertEqual("2" * 32, stored["machines"]["J"]["group_id"])
+        self.assertEqual(f"{10:032x}", stored["machines"]["J"]["stable_id"])
+
+    def test_schema_v7_rejects_duplicate_identity_invalid_group_and_empty_group(self):
+        base = self.snapshot(revision=32)
+        self.upgrade_snapshot_to_schema_v7(base)
+        duplicate_identity = copy.deepcopy(base)
+        duplicate_identity["machines"]["B"]["stable_id"] = duplicate_identity["machines"]["A"]["stable_id"]
+        invalid_group = copy.deepcopy(base)
+        invalid_group["machines"]["B"]["group_id"] = "9" * 32
+        empty_group = copy.deepcopy(base)
+        empty_group["machine_groups"].append({"id": "8" * 32, "name": "空分组"})
+
+        for snapshot in (duplicate_identity, invalid_group, empty_group):
+            response = self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            )
+            self.assertEqual(400, response.status_code)
 
     def test_rejects_noncontiguous_or_unknown_machine_ids(self):
         for machine_ids in (("A", "C"), ("B",), ("A", "B", "E")):
@@ -578,6 +627,8 @@ class QueueStatusApiTest(unittest.TestCase):
             first["recent_events"][0],
         ]
         second["recent_events"][0]["operation_source"] = "QQ_BOT"
+        second["recent_events"][0]["machine_stable_id"] = "2" * 32
+        second["recent_events"][0]["machine_name"] = "二楼 · 机台 A"
 
         self.assertEqual(
             204,
@@ -594,8 +645,12 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertEqual("ABSENCE_CHANGED", first_page["logs"][0]["type"])
         self.assertEqual("QQ_BOT", first_page["logs"][0]["operation_source"])
+        self.assertEqual("2" * 32, first_page["logs"][0]["machine_stable_id"])
+        self.assertEqual("二楼 · 机台 A", first_page["logs"][0]["machine_name"])
         self.assertEqual("NO_SHOW_MOVED_TO_TAIL", second_page["logs"][0]["type"])
         self.assertEqual("ON_SITE_TERMINAL", second_page["logs"][0]["operation_source"])
+        self.assertIsNone(second_page["logs"][0]["machine_stable_id"])
+        self.assertIsNone(second_page["logs"][0]["machine_name"])
         self.assertIsNone(second_page["next_cursor"])
         self.assertTrue(first_page["capabilities"]["public_logs"])
 
@@ -626,6 +681,61 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertNotIn("13800138000", serialized)
         self.assertNotIn("12345678", serialized)
+
+    def test_system_event_rejects_machine_identity_without_machine_id(self):
+        snapshot = self.snapshot()
+        event = self.event(
+            "00000000-0000-0000-0000-000000000104",
+            "REGISTRATION_CLOSED",
+            1_000_400,
+        )
+        event["machine_id"] = None
+        event["machine_stable_id"] = "2" * 32
+        event["machine_name"] = "二楼 · 机台 A"
+        snapshot["recent_events"] = [event]
+
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("系统事件不能包含机台身份", response.get_json()["error"])
+
+    def test_republished_event_backfills_machine_identity_without_reinserting_it(self):
+        event_id = "00000000-0000-0000-0000-000000000105"
+        first = self.snapshot(revision=4)
+        first["schema_version"] = 2
+        first["recent_events"] = [
+            self.event(event_id, "REGISTRATION_UPDATED", 1_000_500)
+        ]
+        second = copy.deepcopy(first)
+        second["revision"] = 5
+        second["recent_events"][0]["machine_stable_id"] = "3" * 32
+        second["recent_events"][0]["machine_name"] = "入口侧 · 机台 A"
+
+        self.assertEqual(
+            204,
+            self.client.post("/api/queue-status", json=first, headers=self.headers).status_code,
+        )
+        self.assertEqual(
+            204,
+            self.client.post("/api/queue-status", json=second, headers=self.headers).status_code,
+        )
+        logs = self.client.get("/api/queue-logs").get_json()["logs"]
+
+        self.assertEqual(1, len(logs))
+        self.assertEqual(event_id, logs[0]["event_id"])
+        self.assertEqual("3" * 32, logs[0]["machine_stable_id"])
+        self.assertEqual("入口侧 · 机台 A", logs[0]["machine_name"])
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            event_count = connection.execute(
+                "SELECT COUNT(*) FROM queue_event WHERE event_id = ?", (event_id,)
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(1, event_count)
 
     def test_public_qq_visibility_exposes_only_the_allowed_active_contact(self):
         snapshot = self.snapshot()
@@ -662,7 +772,7 @@ class QueueStatusApiTest(unittest.TestCase):
         )
 
         self.assertEqual(204, published.status_code)
-        self.assertEqual(6, public_response.get_json()["schema_version"])
+        self.assertEqual(7, public_response.get_json()["schema_version"])
         public_registration = public_response.get_json()["machines"]["A"]["playing"][0]
         public_companion = public_response.get_json()["machines"]["A"]["playing"][1]
         self.assertEqual("12345678", public_registration["qq_number"])
@@ -1943,9 +2053,11 @@ class QueueStatusApiTest(unittest.TestCase):
 
     def test_cross_machine_event_accepts_full_capacity_and_routes_recipients(self):
         snapshot = self.remote_ready_snapshot(revision=25)
-        snapshot["machines"]["C"] = self.machine(name="前区 · 机台 C")
-        snapshot["machines"]["D"] = self.machine(name="后区 · 机台 D")
-        registration_ids = [f"{index:024x}" for index in range(1, 81)]
+        for machine_id in "CDEFGHIJ":
+            snapshot["machines"][machine_id] = self.machine(
+                name=f"区域 {machine_id} · 机台 {machine_id}"
+            )
+        registration_ids = [f"{index:024x}" for index in range(1, 201)]
         profiles = []
         contacts = []
         for index, registration_id in enumerate(registration_ids, start=1):
@@ -1977,7 +2089,7 @@ class QueueStatusApiTest(unittest.TestCase):
             {
                 "machine_id": None,
                 "title": "关闭登记排队",
-                "detail": "登记排队已关闭，并清除了所有机台的 80 份登记。",
+                "detail": "登记排队已关闭，并清除了所有机台的 200 份登记。",
                 "registration_ids": registration_ids,
             }
         )
@@ -1991,7 +2103,7 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertEqual(204, response.status_code)
         public_event = self.client.get("/api/queue-logs").get_json()["logs"][0]
-        self.assertEqual(80, len(public_event["registration_ids"]))
+        self.assertEqual(200, len(public_event["registration_ids"]))
         filtered_events = self.client.post(
             "/api/queue-bot/events",
             json={"qq": "10000001", "after": 0},
@@ -2014,7 +2126,7 @@ class QueueStatusApiTest(unittest.TestCase):
             1_000_200,
         )
         event["machine_id"] = None
-        event["registration_ids"] = [f"{index:024x}" for index in range(1, 82)]
+        event["registration_ids"] = [f"{index:024x}" for index in range(1, 202)]
         snapshot["recent_events"] = [event]
 
         response = self.client.post(
@@ -2998,6 +3110,22 @@ class QueueStatusApiTest(unittest.TestCase):
         snapshot = self.remote_ready_snapshot(revision=31)
         snapshot["machines"]["C"] = self.machine(name="靠窗 · 机台 C")
         snapshot["machines"]["D"] = self.machine(name="入口 · 机台 D")
+        first_group_id = "1" * 32
+        second_group_id = "2" * 32
+        self.upgrade_snapshot_to_schema_v7(
+            snapshot,
+            groups=[
+                {"id": first_group_id, "name": "左侧区域"},
+                {"id": second_group_id, "name": "右侧区域"},
+            ],
+            group_assignments={
+                "A": first_group_id,
+                "B": first_group_id,
+                "C": second_group_id,
+                "D": second_group_id,
+            },
+            default_group_id=second_group_id,
+        )
         self.assertEqual(
             204,
             self.client.post(
@@ -3024,6 +3152,23 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(
             list("ABCD"),
             [machine["id"] for machine in profile.get_json()["machines"]],
+        )
+        profile_payload = profile.get_json()
+        self.assertEqual(
+            [
+                {"id": first_group_id, "name": "左侧区域"},
+                {"id": second_group_id, "name": "右侧区域"},
+            ],
+            profile_payload["machine_groups"],
+        )
+        self.assertEqual(second_group_id, profile_payload["default_machine_group_id"])
+        self.assertEqual(
+            [f"{index:032x}" for index in range(1, 5)],
+            [machine["stable_id"] for machine in profile_payload["machines"]],
+        )
+        self.assertEqual(
+            [first_group_id, first_group_id, second_group_id, second_group_id],
+            [machine["group_id"] for machine in profile_payload["machines"]],
         )
         self.assertEqual(202, created.status_code)
         self.assertEqual("C", commands[0]["payload"]["machine_id"])
@@ -4437,6 +4582,25 @@ class QueueStatusApiTest(unittest.TestCase):
                 "solo_round_minutes": 12,
                 "shared_round_minutes": 15,
             }
+
+    @classmethod
+    def upgrade_snapshot_to_schema_v7(
+        cls,
+        snapshot,
+        group_assignments=None,
+        groups=None,
+        default_group_id=None,
+    ):
+        cls.upgrade_snapshot_to_schema_v6(snapshot)
+        snapshot["schema_version"] = 7
+        groups = groups or [{"id": "1" * 32, "name": "分组 1"}]
+        default_group_id = default_group_id or groups[0]["id"]
+        group_assignments = group_assignments or {}
+        snapshot["machine_groups"] = groups
+        snapshot["default_machine_group_id"] = default_group_id
+        for index, (machine_id, machine) in enumerate(snapshot["machines"].items(), start=1):
+            machine["stable_id"] = f"{index:032x}"
+            machine["group_id"] = group_assignments.get(machine_id, groups[0]["id"])
 
     def snapshot(
         self,

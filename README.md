@@ -1,11 +1,11 @@
 # maimai Q
 
-[![Version](https://img.shields.io/badge/version-0.9.2-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
+[![Version](https://img.shields.io/badge/version-0.10.0-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
 [![Android](https://img.shields.io/badge/Android-10%2B-34C759?logo=android&logoColor=white)](https://developer.android.com/about/versions/10)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-007AFF)](https://developer.android.com/compose)
 
-面向机厅现场、支持 1 至 4 台机台的电子排队终端。maimai Q 用电子队列模拟现场“挪东西排卡”的流程，在保留玩家游玩偏好和现场调整能力的同时，提供等待时间估算、本机持久化、操作日志和可选的网站同步。
+面向机厅现场、支持 1 至 10 台机台的电子排队终端。maimai Q 用电子队列模拟现场“挪东西排卡”的流程，在保留玩家游玩偏好和现场调整能力的同时，提供等待时间估算、本机持久化、操作日志和可选的网站同步。
 
 项目以 Android 横屏终端为现场最终操作端。网络不可用时，排队仍然完整运行在本机；开启同步后，网站和 QQ Bot 可以查看队列，并通过玩家资料提交线上登记。所有远程操作仍由现场终端按本地规则校验并写入。
 
@@ -16,14 +16,14 @@
 - [在线查看当前队列](https://abcccc.top/queue-status)
 - [玩家使用手册](docs/user-manual.md)
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
-- [0.1.0 至 0.9.2 更新日志](docs/update.md)
+- [0.1.0 至 0.10.0 更新日志](docs/update.md)
 - [后续版本路线](docs/roadmap.md)
 - [云端同步协议](docs/cloud-queue-sync.md)
 - [后端部署说明](cloud-server/README.md)
 
 ## 项目定位
 
-maimai Q 处理的是机厅现场排队，不是线上预约系统。它将现场连续配置的 1 至 4 台机台视为彼此独立的队列，并把每名玩家的登记、游玩偏好和现场状态组合成一轮轮可执行的等待位置。
+maimai Q 处理的是机厅现场排队，不是线上预约系统。它将现场连续配置的 1 至 10 台机台视为彼此独立的队列，并把每名玩家的登记、游玩偏好和现场状态组合成一轮轮可执行的等待位置。
 
 | 概念 | 含义 |
 | --- | --- |
@@ -39,7 +39,8 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将现�
 
 ### 排队和现场推进
 
-- 可连续配置 1 至 4 台机台，对应机台 A、B、C、D；每台机台拥有完全独立的登记顺序，并可单独设置 1 人或 2 人游玩容量。
+- 可以添加、删除最多 10 台机台，现场编号始终按 A 至 J 连续排列；每台机台拥有稳定的内部身份、完全独立的登记顺序，并可单独设置 1 人或 2 人游玩容量。
+- 可以把机台划分为多个分组并指定本终端默认分组；首页按组分页显示，单组空间不足时在组内滚动。
 - 游玩位置、等待位置、登记人数和总人数统计。
 - 容量为 2 的机台支持单人游玩、允许他人加入和与朋友固定组合；容量为 1 的机台只按单人顺序轮换。
 - 本轮结束可选择正常开始下一轮、移除本轮玩家的登记后开始下一轮，或仅结束当前轮次。
@@ -112,7 +113,7 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将现�
 - 现场终端版可以在应用设置中更换队列 API 地址和终端同步令牌，不需要为不同服务器修改源码；构建配置只作为首次安装的默认值。
 - 现场终端可单独关闭“允许线上登记”；关闭后网站和 QQ Bot 仍可查询及管理已有登记，但不能创建新的线上登记。
 - 闭店前 30 分钟，App、网站和 QQ Bot 会统一显示提醒；预计无法在闭店前轮到时，App 还会在创建登记前说明风险。闭店后，三端统一显示收尾状态。
-- 网站按现场配置提供 1 至 4 台队列、机台详情、位置详情、按机台计划时间计算的估时、公开日志、“标记为自己”和线上加入排队入口。
+- 网站按现场配置提供 1 至 10 台队列和分组切换，并显示机台详情、位置详情、按机台计划时间计算的估时、公开日志、“标记为自己”和线上加入排队入口。
 - 网站还提供终端二维码专用的移动设备登记页；短时会话限定机台和当前队列批次，过期、重复提交或队列变化都会由终端重新校验。
 - 标记后可查看自己的位置、预计时间、共同游玩对象和未到场等处理结果。
 - QQ Bot 支持加入排队，以及暂缓一次、暂时离开、切换机台、修改本次游玩偏好和退出排队；待签到登记只允许退出。
@@ -191,7 +192,7 @@ app/build/outputs/apk/local/debug/app-local-debug.apk
 .\gradlew.bat :app:packageLocalDebugApk
 ```
 
-文件会复制到 `output/apk/maimai-Q-0.9.2-local.apk`。
+文件会复制到 `output/apk/maimai-Q-0.10.0-local.apk`。
 
 macOS 或 Linux 使用：
 
@@ -266,7 +267,7 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 - 公开分发版与现场终端版应使用不同签名和不同配置。
 - 现场终端 APK 只在受控设备间传递；令牌泄漏后立即在服务端轮换。
 
-现场终端文件会复制到 `output/apk/maimai-Q-0.9.2-terminal.apk`，不得作为 GitHub 公开 Release 附件。
+现场终端文件会复制到 `output/apk/maimai-Q-0.10.0-terminal.apk`，不得作为 GitHub 公开 Release 附件。
 
 ## 部署队列 API
 

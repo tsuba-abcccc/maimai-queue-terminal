@@ -7,12 +7,12 @@
 - 服务器修改以待执行命令返回终端，经本地规则校验和落盘后才算生效。
 - 公开队列数据与私有玩家资料严格分离。
 - QQ 是玩家在 Bot 中的身份键；当前版本不再保存手机号。
-- 现场可按 A、B、C、D 的顺序连续配置 1 至 4 台机台；公开快照只包含实际配置的机台。
-- App 本地持久化格式和云端同步协议当前都使用 schema 6，但两者仍是职责不同的数据格式，不能因为版本号相同而混用请求体。
+- 现场可以添加、删除 1 至 10 台机台，展示编号始终按 A 至 J 连续排列；公开快照只包含实际配置的机台，并携带稳定机台身份与分组信息。
+- App 本地持久化格式和云端同步协议当前都使用 schema 7，但两者仍是职责不同的数据格式，不能因为版本号相同而混用请求体。
 
 ## 协议版本
 
-新版终端发布 `schema_version: 6`，服务端继续接受版本 `1` 至 `5` 的旧公开队列快照。
+新版终端发布 `schema_version: 7`，服务端继续接受版本 `1` 至 `6` 的旧公开队列快照。
 
 完整请求体限制为 `1 MiB`，单次最多包含 `500` 份玩家资料和 `200` 条公开事件。
 
@@ -21,7 +21,7 @@ Authorization: Bearer <QUEUE_SYNC_TOKEN>
 X-Device-ID: <终端 UUID>
 X-Terminal-Instance-ID: <本次进程启动生成的 UUID>
 X-Terminal-Instance-Generation: <本机单调递增的正整数>
-X-Queue-Schema-Version: 6
+X-Queue-Schema-Version: 7
 Content-Type: application/json; charset=utf-8
 ```
 
@@ -40,6 +40,12 @@ Content-Type: application/json; charset=utf-8
 - 容量为 1 的机台只能包含单人偏好登记，每个游玩位置或等待位置最多一份登记，不能包含固定组合或共同游玩预览。
 
 服务端读取 schema 1 至 5 时按容量 2、单人 12 分钟、共同游玩 15 分钟补齐旧机台配置。旧快照不会因缺少版本 6 字段而被拒绝。
+
+版本 7 增加：
+
+- 每台机台的 `stable_id`，用于在删除中间机台并重新编号后继续识别同一台物理机台。
+- 顶层 `machine_groups` 和 `default_machine_group_id`，以及每台机台的 `group_id`。每台机台必须属于一个有效分组，每个分组至少包含一台机台。
+- 机台数量上限扩展为 10，编号必须从 A 开始连续至 J；旧版本快照统一迁移到默认单分组，并按原字母补充稳定身份。
 
 `business_hours` 只包含 `enabled`、`outside`、`closing_soon`、`closing_grace`、`closes_at` 和 `registration_closes_at` 六个计算结果，不上传完整营业时间表。`closing_soon` 在营业时段进入闭店前 30 分钟后为 `true`，`closes_at` 是本次闭店时间；`closing_grace` 表示已到闭店时间但现有队列仍在收尾，`registration_closes_at` 是最迟收尾时间。
 
@@ -103,12 +109,12 @@ Content-Type: application/json; charset=utf-8
 
 `GET /api/queue-logs?queue_id=<UUID>&limit=50&before=<游标>`
 
-只返回白名单内的队列事件，不包含 QQ、性别、资料 UUID 或私有资料编辑日志。每条事件包含 `operation_source`，取值为 `ON_SITE_TERMINAL`、`QQ_BOT`、`SYSTEM_AUTOMATIC`、`MOBILE_DEVICE` 或预留的 `WEBSITE_REMOTE`。
+只返回白名单内的队列事件，不包含 QQ、性别、资料 UUID 或私有资料编辑日志。每条机台事件包含事件发生时的 `machine_id`、`machine_stable_id` 和 `machine_name`；稳定身份用于在机台重编号后继续归入同一台物理机台，已删除机台仍保留事件发生时的名称。服务端收到同一旧事件的稳定身份后只回填空字段，不改变事件游标或重新建立通知收件人。每条事件还包含 `operation_source`，取值为 `ON_SITE_TERMINAL`、`QQ_BOT`、`SYSTEM_AUTOMATIC`、`MOBILE_DEVICE` 或预留的 `WEBSITE_REMOTE`。
 
 ### 网站线上登记
 
 - `POST /api/queue-online/profile`：按 QQ 查询一份可用于线上登记的玩家资料，并返回当前可选机台和是否已有登记。
-- `POST /api/queue-online/join`：提交 `request_id`、QQ、机台编号和按需提供的本次游玩偏好。
+- `POST /api/queue-online/join`：提交 `request_id`、QQ、机台编号、查询时的队列 ID 与机台配置修订号，并按需提供本次游玩偏好。队列批次或机台配置已经变化时，服务器要求重新查询，不能把旧页面中的字母作用到重编号后的其他机台。
 - `GET /api/queue-online/commands/<command_id>`：查询终端是否已应用或拒绝该登记。
 
 这组接口不返回完整玩家资料库，也不能修改已有队列。仅在终端在线、网站同步开启、现场规则允许线上登记且登记排队开放时接受新登记。线上登记进入等待末端后带有待签到状态，并按正常登记参与公开位置和等待时间估算。30 分钟从终端实际建立登记时开始计算；到期仍未签到时终端会自动移除，如果登记更早轮到进入游玩位置，也会立即移除。服务器不独立计时或修改队列。

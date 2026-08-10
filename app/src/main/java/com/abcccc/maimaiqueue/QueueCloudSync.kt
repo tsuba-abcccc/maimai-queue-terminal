@@ -211,6 +211,10 @@ internal interface QueueStatePublisher {
 internal data class QueuePublicDisplaySettings(
     val machineRemarks: Map<MachineId, String> = DEFAULT_MACHINE_REMARKS,
     val machineConfigurations: Map<MachineId, MachineConfiguration> = emptyMap(),
+    val machineStableIds: Map<MachineId, String> = DEFAULT_MACHINE_STABLE_IDS,
+    val machineGroupAssignments: Map<MachineId, String> = DEFAULT_MACHINE_GROUP_ASSIGNMENTS,
+    val machineGroups: List<MachineGroupConfiguration> = DEFAULT_MACHINE_GROUPS,
+    val defaultMachineGroupId: String = DEFAULT_MACHINE_GROUP_ID,
     val machineConfigurationRevision: Long = 1L,
     val websiteRemoteEnabled: Boolean = true,
     val oneBotSyncEnabled: Boolean = true,
@@ -233,6 +237,20 @@ internal data class QueuePublicDisplaySettings(
         )
 
     fun machineRemark(machineId: MachineId): String = machineConfiguration(machineId).remark
+
+    fun machineStableId(machineId: MachineId): String = normalizeMachineInternalId(
+        machineStableIds[machineId],
+        defaultMachineStableId(machineId)
+    )
+
+    fun machineGroupId(machineId: MachineId): String {
+        val validGroupIds = machineGroups.mapTo(mutableSetOf()) { it.id }
+        return machineGroupAssignments[machineId]
+            ?.takeIf(validGroupIds::contains)
+            ?: defaultMachineGroupId.takeIf(validGroupIds::contains)
+            ?: machineGroups.firstOrNull()?.id
+            ?: DEFAULT_MACHINE_GROUP_ID
+    }
 }
 
 internal data class QueuePublicBusinessHours(
@@ -1358,10 +1376,32 @@ internal fun buildPublicQueueSnapshot(
             put("last_seen_at", capturedAtMillis)
         }
     )
+    val configuredMachineIds = state.configuredMachineIds
+    val usedGroupIds = configuredMachineIds.mapTo(linkedSetOf(), displaySettings::machineGroupId)
+    val configuredGroups = displaySettings.machineGroups.filter { it.id in usedGroupIds }
+        .ifEmpty { DEFAULT_MACHINE_GROUPS }
+    val configuredGroupIds = configuredGroups.mapTo(mutableSetOf()) { it.id }
+    val effectiveDefaultGroupId = displaySettings.defaultMachineGroupId
+        .takeIf(configuredGroupIds::contains)
+        ?: configuredGroups.first().id
+    put(
+        "machine_groups",
+        JSONArray().apply {
+            configuredGroups.forEach { group ->
+                put(
+                    JSONObject().apply {
+                        put("id", group.id)
+                        put("name", normalizeMachineGroupName(group.name, length()))
+                    }
+                )
+            }
+        }
+    )
+    put("default_machine_group_id", effectiveDefaultGroupId)
     put(
         "machines",
         JSONObject().apply {
-            state.configuredMachineIds.forEach { machineId ->
+            configuredMachineIds.forEach { machineId ->
                 val machine = state.machine(machineId)
                 val configuration = displaySettings.machineConfiguration(machineId)
                 put(
@@ -1379,7 +1419,10 @@ internal fun buildPublicQueueSnapshot(
                     configuration = configuration,
                     showCommonPlayPreview = displaySettings.showCommonPlayPreview,
                     capturedAtMillis = capturedAtMillis
-                )
+                ).apply {
+                    put("stable_id", displaySettings.machineStableId(machineId))
+                    put("group_id", displaySettings.machineGroupId(machineId))
+                }
                 )
             }
         }
@@ -1393,7 +1436,9 @@ internal fun buildPublicQueueSnapshot(
                 }
                 .sortedByDescending(AuditLogEntry::timestampMillis)
                 .take(MAX_PUBLIC_EVENTS_PER_SNAPSHOT)
-                .forEach { event -> put(buildPublicQueueEvent(state.queueId, event)) }
+                .forEach { event ->
+                    put(buildPublicQueueEvent(state.queueId, event, displaySettings))
+                }
         }
     )
 }
@@ -1401,8 +1446,26 @@ internal fun buildPublicQueueSnapshot(
 private fun publicMachineName(remark: String, fallback: String, machineId: String): String =
     "${normalizeMachineRemark(remark, fallback)} · 机台 $machineId"
 
-private fun buildPublicQueueEvent(queueId: String, event: AuditLogEntry): JSONObject =
-    JSONObject().apply {
+private fun buildPublicQueueEvent(
+    queueId: String,
+    event: AuditLogEntry,
+    displaySettings: QueuePublicDisplaySettings
+): JSONObject {
+    val machineId = event.category.name.removePrefix("MACHINE_")
+        .takeIf { it != event.category.name }
+    val machine = machineId?.let { value ->
+        MachineId.entries.firstOrNull { it.name == value }
+    }
+    val machineStableId = event.machineStableId
+        ?: machine?.let(displaySettings::machineStableId)
+    val machineName = event.machineName ?: machine?.let { machineIdValue ->
+        publicMachineName(
+            remark = displaySettings.machineRemark(machineIdValue),
+            fallback = DEFAULT_MACHINE_REMARKS.getValue(machineIdValue),
+            machineId = machineIdValue.name
+        )
+    }
+    return JSONObject().apply {
         put("event_id", event.id)
         put("occurred_at", event.timestampMillis)
         put("type", event.publicEventType?.name ?: PublicQueueEventType.OTHER.name)
@@ -1416,13 +1479,12 @@ private fun buildPublicQueueEvent(queueId: String, event: AuditLogEntry): JSONOb
         )
         put(
             "machine_id",
-            when (event.category) {
-                AuditLogCategory.MACHINE_A -> "A"
-                AuditLogCategory.MACHINE_B -> "B"
-                AuditLogCategory.MACHINE_C -> "C"
-                AuditLogCategory.MACHINE_D -> "D"
-                else -> JSONObject.NULL
-            }
+            machineId ?: JSONObject.NULL
+        )
+        put("machine_stable_id", machineStableId ?: JSONObject.NULL)
+        put(
+            "machine_name",
+            machineName?.takeCodePointsForSync(MAX_PUBLIC_EVENT_TITLE_LENGTH) ?: JSONObject.NULL
         )
         put("title", event.title.takeCodePointsForSync(MAX_PUBLIC_EVENT_TITLE_LENGTH))
         put("detail", event.detail.takeCodePointsForSync(MAX_PUBLIC_EVENT_DETAIL_LENGTH))
@@ -1436,6 +1498,7 @@ private fun buildPublicQueueEvent(queueId: String, event: AuditLogEntry): JSONOb
             }
         )
     }
+}
 
 private fun buildPublicMachine(
     queueId: String,
@@ -1666,10 +1729,10 @@ private class LocalTerminalIdentity(context: Context) {
     }
 }
 
-private const val PUBLIC_SCHEMA_VERSION = 6
-private const val SYNC_SCHEMA_VERSION = 6
+private const val PUBLIC_SCHEMA_VERSION = 7
+private const val SYNC_SCHEMA_VERSION = 7
 private const val MAX_PUBLIC_EVENTS_PER_SNAPSHOT = 200
-private const val MAX_PRIVATE_CONTACTS_PER_SNAPSHOT = 480
+private const val MAX_PRIVATE_CONTACTS_PER_SNAPSHOT = 600
 private const val MAX_PUBLIC_EVENT_TITLE_LENGTH = 120
 private const val MAX_PUBLIC_EVENT_DETAIL_LENGTH = 2_000
 private const val NETWORK_TIMEOUT_MILLIS = 8_000
