@@ -18,6 +18,7 @@
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
 - [0.1.0 至 0.10.0 更新日志](docs/update.md)
 - [后续版本路线](docs/roadmap.md)
+- [开发与交付记录](docs/development-log.md)
 - [云端同步协议](docs/cloud-queue-sync.md)
 - [后端部署说明](cloud-server/README.md)
 
