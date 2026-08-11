@@ -6,6 +6,28 @@ import org.junit.Test
 
 class QueueCloudCommandTest {
     @Test
+    fun mobileSessionRetriesLegacyFormatOnlyForTheOldServerFieldRejection() {
+        assertTrue(
+            shouldRetryMobileSessionWithoutStableMachineId(
+                400,
+                "移动设备登记会话参数不完整"
+            )
+        )
+        assertTrue(
+            !shouldRetryMobileSessionWithoutStableMachineId(
+                409,
+                "所选机台已经变化，请重新打开登记页面"
+            )
+        )
+        assertTrue(
+            !shouldRetryMobileSessionWithoutStableMachineId(
+                400,
+                "终端编号无效"
+            )
+        )
+    }
+
+    @Test
     fun playerProfileSyncParsesOnlyAliasesThatResolveToReturnedProfiles() {
         val canonicalId = "00000000-0000-0000-0000-000000000902"
         val validSourceId = "00000000-0000-0000-0000-000000000901"
@@ -79,6 +101,7 @@ class QueueCloudCommandTest {
                     "operation": "JOIN_QUEUE",
                     "operation_source": "WEBSITE_REMOTE",
                     "machine_id": "A",
+                    "machine_stable_id": "10000000000000000000000000000001",
                     "preference": "OPEN_TO_JOIN"
                   }
                 }
@@ -93,6 +116,7 @@ class QueueCloudCommandTest {
         assertEquals(RemoteQueueOperation.JOIN_QUEUE, join.operation)
         assertEquals(RemoteQueueOperationSource.WEBSITE_REMOTE, join.source)
         assertEquals("A", join.machineId)
+        assertEquals("10000000000000000000000000000001", join.machineStableId)
         assertEquals(PlayPreference.OPEN_TO_JOIN, join.preference)
     }
 
@@ -124,6 +148,7 @@ class QueueCloudCommandTest {
                 "payload": {
                   "queue_id": "00000000-0000-0000-0000-000000000001",
                   "machine_id": "A",
+                  "machine_stable_id": "10000000000000000000000000000001",
                   "actor_qq": "12345678",
                   "preference": "OPEN_TO_JOIN",
                   "operation_source": "MOBILE_DEVICE",
@@ -144,9 +169,37 @@ class QueueCloudCommandTest {
         val command = parsed.single() as MobileDeviceRegistrationCommand
         assertEquals("00000000-0000-0000-0000-000000000820", command.sessionId)
         assertEquals("A", command.machineId)
+        assertEquals("10000000000000000000000000000001", command.machineStableId)
         assertEquals(3L, command.expectedProfileRevision)
         assertEquals(PlayPreference.OPEN_TO_JOIN, command.preference)
         assertTrue(!command.createsProfile)
+    }
+
+    @Test
+    fun terminalCommandResponseSkipsMalformedStableMachineIdentity() {
+        val parsed = parseRemoteTerminalCommands(
+            """
+            {
+              "commands": [{
+                "command_id": "00000000-0000-0000-0000-000000000401",
+                "type": "QUEUE_OPERATION",
+                "created_at": 2000,
+                "payload": {
+                  "queue_id": "00000000-0000-0000-0000-000000000001",
+                  "profile_id": "00000000-0000-0000-0000-000000000901",
+                  "actor_qq": "12345678",
+                  "operation": "JOIN_QUEUE",
+                  "operation_source": "WEBSITE_REMOTE",
+                  "machine_id": "A",
+                  "machine_stable_id": "not-a-stable-id",
+                  "preference": "OPEN_TO_JOIN"
+                }
+              }]
+            }
+            """.trimIndent()
+        )
+
+        assertTrue(parsed.isEmpty())
     }
 
     @Test

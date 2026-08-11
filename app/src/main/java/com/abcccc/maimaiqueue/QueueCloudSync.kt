@@ -11,6 +11,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.Dispatchers
@@ -176,7 +177,8 @@ internal interface QueueCommandClient {
     suspend fun createMobileRegistrationSession(
         requestId: String,
         queueId: String,
-        machineId: String
+        machineId: String,
+        machineStableId: String
     ): MobileRegistrationSession?
     suspend fun complete(
         commandId: String,
@@ -481,37 +483,34 @@ internal class HttpQueueCommandClient(
     override suspend fun createMobileRegistrationSession(
         requestId: String,
         queueId: String,
-        machineId: String
+        machineId: String,
+        machineStableId: String
     ): MobileRegistrationSession? = withContext(Dispatchers.IO) {
         runCatching {
             val requestConfiguration = configuration
-            val body = JSONObject().apply {
-                put("request_id", requestId)
-                put("queue_id", queueId)
-                put("machine_id", machineId)
-            }.toString().toByteArray(Charsets.UTF_8)
-            val connection = openConnection(
-                terminalEndpoint(requestConfiguration, "/queue-terminal/mobile-registration-sessions"),
-                "POST",
-                requestConfiguration.token
-            ).apply {
-                doOutput = true
-                setFixedLengthStreamingMode(body.size)
-                setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            }
             try {
-                connection.outputStream.use { it.write(body) }
-                requireSuccessfulResponse(connection)
-                val response = connection.inputStream.bufferedReader(Charsets.UTF_8)
-                    .use { it.readText() }
-                val payload = JSONObject(response)
-                MobileRegistrationSession(
-                    sessionId = payload.getString("session_id"),
-                    registrationUrl = payload.getString("registration_url"),
-                    expiresAtMillis = payload.getLong("expires_at")
+                requestMobileRegistrationSession(
+                    requestConfiguration = requestConfiguration,
+                    requestId = requestId,
+                    queueId = queueId,
+                    machineId = machineId,
+                    machineStableId = machineStableId
                 )
-            } finally {
-                connection.disconnect()
+            } catch (error: QueueEndpointException) {
+                if (!shouldRetryMobileSessionWithoutStableMachineId(
+                        error.statusCode,
+                        error.serverMessage
+                    )
+                ) {
+                    throw error
+                }
+                requestMobileRegistrationSession(
+                    requestConfiguration = requestConfiguration,
+                    requestId = requestId,
+                    queueId = queueId,
+                    machineId = machineId,
+                    machineStableId = null
+                )
             }
         }.fold(
             onSuccess = { session ->
@@ -525,6 +524,44 @@ internal class HttpQueueCommandClient(
                 null
             }
         )
+    }
+
+    private fun requestMobileRegistrationSession(
+        requestConfiguration: QueueConnectionConfiguration,
+        requestId: String,
+        queueId: String,
+        machineId: String,
+        machineStableId: String?
+    ): MobileRegistrationSession {
+        val body = JSONObject().apply {
+            put("request_id", requestId)
+            put("queue_id", queueId)
+            put("machine_id", machineId)
+            if (machineStableId != null) put("machine_stable_id", machineStableId)
+        }.toString().toByteArray(Charsets.UTF_8)
+        val connection = openConnection(
+            terminalEndpoint(requestConfiguration, "/queue-terminal/mobile-registration-sessions"),
+            "POST",
+            requestConfiguration.token
+        ).apply {
+            doOutput = true
+            setFixedLengthStreamingMode(body.size)
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+        return try {
+            connection.outputStream.use { it.write(body) }
+            requireSuccessfulResponse(connection)
+            val response = connection.inputStream.bufferedReader(Charsets.UTF_8)
+                .use { it.readText() }
+            val payload = JSONObject(response)
+            MobileRegistrationSession(
+                sessionId = payload.getString("session_id"),
+                registrationUrl = payload.getString("registration_url"),
+                expiresAtMillis = payload.getLong("expires_at")
+            )
+        } finally {
+            connection.disconnect()
+        }
     }
 
     override suspend fun complete(
@@ -785,7 +822,11 @@ private fun parseQueueOperation(command: JSONObject?): RemoteQueueOperationComma
                 payload.getString("operation_source")
             ),
             machineId = payload.optionalNonBlankString("machine_id"),
+            machineStableId = payload.optionalNonBlankString("machine_stable_id"),
             targetMachineId = payload.optionalNonBlankString("target_machine_id"),
+            targetMachineStableId = payload.optionalNonBlankString(
+                "target_machine_stable_id"
+            ),
             registrationId = payload.optionalNonBlankString("registration_id"),
             preference = payload.optionalNonBlankString("preference")?.let {
                 PlayPreference.valueOf(it)
@@ -851,6 +892,7 @@ private fun parseMobileDeviceRegistration(
             sessionId = payload.optionalNonBlankString("session_id"),
             queueId = payload.getString("queue_id"),
             machineId = payload.getString("machine_id"),
+            machineStableId = payload.optionalNonBlankString("machine_stable_id"),
             actorQq = payload.getString("actor_qq"),
             preference = PlayPreference.valueOf(payload.getString("preference")),
             profileId = profileSource.getString("profile_id"),
@@ -878,6 +920,8 @@ private fun parseMobileDeviceRegistration(
             runCatching { UUID.fromString(parsed.profileId) }.isSuccess &&
             parsed.createdAtMillis > 0L &&
             parsed.machineId.matches(Regex("[A-Z][A-Z0-9_-]{0,7}")) &&
+            (parsed.machineStableId == null ||
+                parsed.machineStableId.matches(Regex("[0-9a-f]{32}"))) &&
             isValidQqNumber(parsed.actorQq) &&
             parsed.actorQq.isNotBlank() &&
             parsed.completion?.let { completion ->
@@ -916,6 +960,9 @@ private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): 
     val validMachineId = { value: String? ->
         value != null && value.matches(Regex("[A-Z][A-Z0-9_-]{0,7}"))
     }
+    val validMachineStableId = { value: String? ->
+        value == null || value.matches(Regex("[0-9a-f]{32}"))
+    }
     val validRegistrationId = command.registrationId?.matches(Regex("[0-9a-f]{24}")) == true
     val hasExpectedContext = command.expectedPosition != null
     val validExpectedContext = !hasExpectedContext || (
@@ -932,6 +979,8 @@ private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): 
         command.createdAtMillis <= 0L ||
         command.actorQq.isBlank() ||
         !isValidQqNumber(command.actorQq) ||
+        !validMachineStableId(command.machineStableId) ||
+        !validMachineStableId(command.targetMachineStableId) ||
         !validExpectedContext ||
         (command.source == RemoteQueueOperationSource.WEBSITE_REMOTE &&
             command.operation != RemoteQueueOperation.JOIN_QUEUE)
@@ -958,6 +1007,11 @@ private class QueueEndpointException(
     val serverMessage: String?
 ) : Exception("Queue endpoint returned HTTP $statusCode")
 
+internal fun shouldRetryMobileSessionWithoutStableMachineId(
+    statusCode: Int,
+    serverMessage: String?
+): Boolean = statusCode == 400 && serverMessage?.trim() == "移动设备登记会话参数不完整"
+
 private fun queuePublishFailureDetail(error: Throwable): String = when (error) {
     is QueueEndpointException -> error.serverMessage
         ?: "服务器返回 HTTP ${error.statusCode}。"
@@ -980,6 +1034,7 @@ internal class QueueCloudSyncController(
     private val onStatusChange: (QueueCloudSyncStatus) -> Unit
 ) {
     private val updates = Channel<QueuePublishPayload>(Channel.CONFLATED)
+    private val publishMutex = Mutex()
     @Volatile
     private var enabled = initiallyEnabled
     private var publishJob: Job? = null
@@ -1054,6 +1109,16 @@ internal class QueueCloudSyncController(
         updates.trySend(payload)
     }
 
+    /**
+     * Wait until a publish that was already handed to the publisher has finished.
+     * This is used before sending the final disabled snapshot so a cancelled,
+     * in-flight request cannot arrive after the disabled snapshot and re-enable
+     * remote operations on the old server.
+     */
+    suspend fun awaitIdle() {
+        publishMutex.withLock { }
+    }
+
     private fun startPublishLoop() {
         if (publishJob?.isActive == true || !enabled || !publisher.isConfigured) return
         publishJob = scope.launch { publishLoop() }
@@ -1098,12 +1163,14 @@ internal class QueueCloudSyncController(
                     }
                 }
                 try {
-                    publisher.publish(
-                        payloadToPublish.state,
-                        payloadToPublish.auditLogs,
-                        payloadToPublish.displaySettings,
-                        payloadToPublish.playerProfiles
-                    )
+                    publishMutex.withLock {
+                        publisher.publish(
+                            payloadToPublish.state,
+                            payloadToPublish.auditLogs,
+                            payloadToPublish.displaySettings,
+                            payloadToPublish.playerProfiles
+                        )
+                    }
                 } finally {
                     slowSyncIndicator.cancel()
                 }

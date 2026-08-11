@@ -42,6 +42,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -65,6 +66,7 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -150,6 +152,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -264,6 +267,12 @@ internal fun RegistrationApp() {
             )
         )
     }
+    var pendingSyncDisableSnapshot by remember(queueRuleSettingsRepository) {
+        mutableStateOf(queueRuleSettingsRepository.getPendingSyncDisableSnapshot())
+    }
+    var syncDisableFailureDetail by remember { mutableStateOf<String?>(null) }
+    var syncDisableRetryStartedAtMillis by remember { mutableStateOf<Long?>(null) }
+    var syncDisableLastErrorAtMillis by remember { mutableStateOf<Long?>(null) }
     var privateSyncFailureDetail by remember { mutableStateOf<String?>(null) }
     var privateSyncRetryStartedAtMillis by remember { mutableStateOf<Long?>(null) }
     var privateSyncLastErrorAtMillis by remember { mutableStateOf<Long?>(null) }
@@ -502,6 +511,46 @@ internal fun RegistrationApp() {
         terminalCommandReceipts = terminalCommandReceipts.values.toList()
     )
 
+    fun currentPublicDisplaySettings(
+        websiteRemoteEnabled: Boolean = queueRuleSettings.websiteSyncEnabled,
+        oneBotSyncEnabled: Boolean = queueRuleSettings.websiteSyncEnabled &&
+            queueRuleSettings.oneBotSyncEnabled
+    ): QueuePublicDisplaySettings {
+        val currentBusinessHoursStatus = evaluateBusinessHours(
+            queueRuleSettings.businessHours,
+            System.currentTimeMillis()
+        )
+        val currentClosingGracePeriod = isActiveClosingGracePeriod(
+            currentBusinessHoursStatus,
+            lastHandledClosingOccurrenceId
+        )
+        return QueuePublicDisplaySettings(
+            machineConfigurations = queueRuleSettings.machineConfigurations,
+            machineStableIds = queueRuleSettings.machineStableIds,
+            machineGroupAssignments = queueRuleSettings.machineGroupAssignments,
+            machineGroups = queueRuleSettings.machineGroups,
+            defaultMachineGroupId = queueRuleSettings.defaultMachineGroupId,
+            machineConfigurationRevision = queueRuleSettings.machineConfigurationRevision,
+            websiteRemoteEnabled = websiteRemoteEnabled,
+            oneBotSyncEnabled = oneBotSyncEnabled,
+            syncMode = queueRuleSettings.syncMode,
+            allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
+            allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
+            allowOnlineRegistration = queueRuleSettings.allowOnlineRegistration,
+            showCommonPlayPreview = queueRuleSettings.showCommonPlayPreview,
+            businessHours = QueuePublicBusinessHours(
+                enabled = currentBusinessHoursStatus.enabled,
+                outsideBusinessHours = currentBusinessHoursStatus.outsideBusinessHours,
+                closingSoon = currentBusinessHoursStatus.closingSoon,
+                closingGracePeriod = currentClosingGracePeriod,
+                closesAtMillis = currentBusinessHoursStatus.activeClosingAtMillis,
+                registrationClosesAtMillis =
+                    currentBusinessHoursStatus.registrationClosesAtMillis
+                        ?.takeIf { currentClosingGracePeriod }
+            )
+        )
+    }
+
     suspend fun persistQueueStateBeforeRemoteAcknowledgement() {
         val snapshot = currentPersistedQueueState()
         var retryDelayMillis = 250L
@@ -624,35 +673,82 @@ internal fun RegistrationApp() {
         cloudSyncController.submit(
             state = snapshot,
             auditLogs = auditLogs,
-            displaySettings = QueuePublicDisplaySettings(
-                machineConfigurations = queueRuleSettings.machineConfigurations,
-                machineStableIds = queueRuleSettings.machineStableIds,
-                machineGroupAssignments = queueRuleSettings.machineGroupAssignments,
-                machineGroups = queueRuleSettings.machineGroups,
-                defaultMachineGroupId = queueRuleSettings.defaultMachineGroupId,
-                machineConfigurationRevision =
-                    queueRuleSettings.machineConfigurationRevision,
-                websiteRemoteEnabled = queueRuleSettings.websiteSyncEnabled,
-                oneBotSyncEnabled = queueRuleSettings.websiteSyncEnabled &&
-                    queueRuleSettings.oneBotSyncEnabled,
-                syncMode = queueRuleSettings.syncMode,
-                allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
-                allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
-                allowOnlineRegistration = queueRuleSettings.allowOnlineRegistration,
-                showCommonPlayPreview = queueRuleSettings.showCommonPlayPreview,
-                businessHours = QueuePublicBusinessHours(
-                    enabled = businessHoursStatus.enabled,
-                    outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
-                    closingSoon = businessHoursStatus.closingSoon,
-                    closingGracePeriod = activeClosingGracePeriod,
-                    closesAtMillis = businessHoursStatus.activeClosingAtMillis,
-                    registrationClosesAtMillis =
-                        businessHoursStatus.registrationClosesAtMillis
-                            ?.takeIf { activeClosingGracePeriod }
-                )
-            ),
+            displaySettings = currentPublicDisplaySettings(),
             playerProfiles = playerProfiles
         )
+    }
+
+    // Turning synchronization off is itself a remote state change. Keep
+    // retrying the explicit disabled snapshot until the server confirms it,
+    // including after an app restart. This prevents a transient network
+    // failure from leaving website/Bot operations enabled on stale data.
+    LaunchedEffect(
+        pendingSyncDisableSnapshot?.endpoint,
+        pendingSyncDisableSnapshot?.token,
+        queuePersistenceReady,
+        playerProfilesLoaded,
+        pendingQueueRestore,
+        queueRuleSettings.websiteSyncEnabled
+    ) {
+        val pending = pendingSyncDisableSnapshot ?: return@LaunchedEffect
+        if (
+            queueRuleSettings.websiteSyncEnabled ||
+            !queuePersistenceReady ||
+            !playerProfilesLoaded ||
+            pendingQueueRestore != null
+        ) {
+            return@LaunchedEffect
+        }
+        val publisher = HttpQueueStatePublisher(
+            context = context,
+            endpoint = pending.endpoint,
+            token = pending.token
+        )
+        if (!publisher.isConfigured) {
+            syncDisableFailureDetail = "远端关闭状态尚未确认：服务器连接配置无效。"
+            syncDisableRetryStartedAtMillis =
+                syncDisableRetryStartedAtMillis ?: System.currentTimeMillis()
+            syncDisableLastErrorAtMillis = System.currentTimeMillis()
+            return@LaunchedEffect
+        }
+        var retryDelayMillis = 2_000L
+        while (
+            currentCoroutineContext().isActive &&
+            pendingSyncDisableSnapshot == pending &&
+            !queueRuleSettings.websiteSyncEnabled
+        ) {
+            cloudSyncController.awaitIdle()
+            val result = publisher.publish(
+                state = currentPersistedQueueState(),
+                auditLogs = auditLogs,
+                displaySettings = currentPublicDisplaySettings(
+                    websiteRemoteEnabled = false,
+                    oneBotSyncEnabled = false
+                ),
+                playerProfiles = playerProfiles
+            )
+            when (result) {
+                QueuePublishResult.Success -> {
+                    queueRuleSettingsRepository.clearPendingSyncDisableSnapshot()
+                    pendingSyncDisableSnapshot = null
+                    syncDisableFailureDetail = null
+                    syncDisableRetryStartedAtMillis = null
+                    syncDisableLastErrorAtMillis = null
+                    break
+                }
+
+                is QueuePublishResult.Failure -> {
+                    val failedAtMillis = System.currentTimeMillis()
+                    syncDisableFailureDetail =
+                        "远端关闭状态尚未确认：${result.detail}"
+                    syncDisableRetryStartedAtMillis =
+                        syncDisableRetryStartedAtMillis ?: failedAtMillis
+                    syncDisableLastErrorAtMillis = failedAtMillis
+                    delay(retryDelayMillis)
+                    retryDelayMillis = (retryDelayMillis * 2).coerceAtMost(60_000L)
+                }
+            }
+        }
     }
 
     fun queueFor(machineId: MachineId): MachineQueue =
@@ -751,6 +847,10 @@ internal fun RegistrationApp() {
             previous = previousSettings,
             updated = normalizedSettings
         )
+        val remoteCommandBoundaryChanged =
+            previousSettings.websiteSyncEnabled != normalizedSettings.websiteSyncEnabled ||
+                previousSettings.oneBotSyncEnabled != normalizedSettings.oneBotSyncEnabled ||
+                previousSettings.syncMode != normalizedSettings.syncMode
         if (riskSensitiveConfigurationChanged && registrationOpen) {
             Toast.makeText(
                 context,
@@ -763,6 +863,14 @@ internal fun RegistrationApp() {
             Toast.makeText(
                 context,
                 panguSpacing("终端正在处理远程操作，请稍后再保存机台配置。"),
+                Toast.LENGTH_LONG
+            ).show()
+            return false
+        }
+        if (remoteCommandBoundaryChanged && remoteTerminalCommandPollMutex.isLocked) {
+            Toast.makeText(
+                context,
+                panguSpacing("终端正在处理远程操作，请稍后再修改同步设置。"),
                 Toast.LENGTH_LONG
             ).show()
             return false
@@ -793,6 +901,33 @@ internal fun RegistrationApp() {
         }
         val connectionChanged = settings.queueSyncEndpoint != previousSettings.queueSyncEndpoint ||
             settings.queueSyncToken != previousSettings.queueSyncToken
+        val syncDisableRequested = previousSettings.websiteSyncEnabled &&
+            !settings.websiteSyncEnabled
+        val syncEnableRequested = !previousSettings.websiteSyncEnabled &&
+            settings.websiteSyncEnabled
+        if (syncDisableRequested) {
+            val pending = PendingSyncDisableSnapshot(
+                endpoint = previousSettings.queueSyncEndpoint,
+                token = previousSettings.queueSyncToken
+            )
+            queueRuleSettingsRepository.markPendingSyncDisableSnapshot(
+                endpoint = pending.endpoint,
+                token = pending.token
+            )
+            pendingSyncDisableSnapshot = pending
+            val pendingAtMillis = System.currentTimeMillis()
+            syncDisableFailureDetail = "正在确认远端已关闭线上操作。"
+            syncDisableRetryStartedAtMillis = pendingAtMillis
+            syncDisableLastErrorAtMillis = null
+        } else if (syncEnableRequested) {
+            // A deliberate re-enable supersedes an outstanding disable retry;
+            // the normal publish loop will advertise the enabled state again.
+            queueRuleSettingsRepository.clearPendingSyncDisableSnapshot()
+            pendingSyncDisableSnapshot = null
+            syncDisableFailureDetail = null
+            syncDisableRetryStartedAtMillis = null
+            syncDisableLastErrorAtMillis = null
+        }
         if (connectionChanged) {
             queueStatePublisher.updateConfiguration(
                 endpoint = settings.queueSyncEndpoint,
@@ -845,61 +980,6 @@ internal fun RegistrationApp() {
         queueRuleSettingsRepository.saveSettings(settings)
         if (previousSettings.websiteSyncEnabled != settings.websiteSyncEnabled) {
             cloudSyncController.setEnabled(cloudSyncAvailable && settings.websiteSyncEnabled)
-            if (
-                cloudSyncAvailable &&
-                previousSettings.websiteSyncEnabled &&
-                !settings.websiteSyncEnabled &&
-                queueStatePublisher.isConfigured
-            ) {
-                val closingStatus = evaluateBusinessHours(
-                    settings.businessHours,
-                    System.currentTimeMillis()
-                )
-                val activeClosingGrace = isActiveClosingGracePeriod(
-                    closingStatus,
-                    lastHandledClosingOccurrenceId
-                )
-                val finalSnapshot = PersistedQueueState(
-                    queueId = queueId,
-                    revision = queueRevision.incrementAndGet(),
-                    machines = machineStates.snapshot(settings.configuredMachineIds),
-                    registrationOpen = registrationOpen,
-                    nextRegistrationKey = nextKey,
-                    savedAtMillis = System.currentTimeMillis()
-                )
-                coroutineScope.launch {
-                    queueStatePublisher.publish(
-                        state = finalSnapshot,
-                        auditLogs = auditLogs,
-                        displaySettings = QueuePublicDisplaySettings(
-                            machineConfigurations = settings.machineConfigurations,
-                            machineStableIds = settings.machineStableIds,
-                            machineGroupAssignments = settings.machineGroupAssignments,
-                            machineGroups = settings.machineGroups,
-                            defaultMachineGroupId = settings.defaultMachineGroupId,
-                            machineConfigurationRevision = settings.machineConfigurationRevision,
-                            websiteRemoteEnabled = false,
-                            oneBotSyncEnabled = false,
-                            syncMode = settings.syncMode,
-                            allowDeferOneRound = settings.allowDeferOneRound,
-                            allowTemporaryLeave = settings.allowTemporaryLeave,
-                            allowOnlineRegistration = settings.allowOnlineRegistration,
-                            showCommonPlayPreview = settings.showCommonPlayPreview,
-                            businessHours = QueuePublicBusinessHours(
-                                enabled = closingStatus.enabled,
-                                outsideBusinessHours = closingStatus.outsideBusinessHours,
-                                closingSoon = closingStatus.closingSoon,
-                                closingGracePeriod = activeClosingGrace,
-                                closesAtMillis = closingStatus.activeClosingAtMillis,
-                                registrationClosesAtMillis =
-                                    closingStatus.registrationClosesAtMillis
-                                        ?.takeIf { activeClosingGrace }
-                            )
-                        ),
-                        playerProfiles = playerProfiles
-                    )
-                }
-            }
         }
         val changeDescriptions = buildList {
             if (previousSettings.allowDeferOneRound != settings.allowDeferOneRound) {
@@ -931,7 +1011,7 @@ internal fun RegistrationApp() {
                 add("同步方式：${queueSyncModeLabel(settings.syncMode)}")
             }
             if (cloudSyncAvailable && connectionChanged) {
-                add("网站连接配置已更新")
+                add("服务端连接配置已更新")
             }
             if (previousSettings.businessHours != settings.businessHours) {
                 add(
@@ -2365,7 +2445,8 @@ internal fun RegistrationApp() {
                 val session = queueCommandClient.createMobileRegistrationSession(
                     requestId = requestId,
                     queueId = requestedQueueId,
-                    machineId = machineId.name
+                    machineId = machineId.name,
+                    machineStableId = queueRuleSettings.machineStableId(machineId)
                 )
                 if (
                     queueId != requestedQueueId ||
@@ -2720,6 +2801,9 @@ internal fun RegistrationApp() {
         allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
         machineCapacities = configuredMachineIds.associate { machineId ->
             machineId.name to queueRuleSettings.machineConfiguration(machineId).capacity
+        },
+        machineStableIds = configuredMachineIds.associate { machineId ->
+            machineId.name to queueRuleSettings.machineStableId(machineId)
         },
         machineConfigurationRevision = queueRuleSettings.machineConfigurationRevision
     )
@@ -3416,8 +3500,21 @@ internal fun RegistrationApp() {
         }
     }
 
+    val publicCloudSyncStatusForDisplay = if (
+        syncDisableFailureDetail != null &&
+        cloudSyncStatus.phase == QueueCloudSyncPhase.DISABLED
+    ) {
+        cloudSyncStatus.copy(
+            phase = QueueCloudSyncPhase.WAITING_TO_RETRY,
+            retryStartedAtMillis = syncDisableRetryStartedAtMillis,
+            lastErrorAtMillis = syncDisableLastErrorAtMillis,
+            retryDetail = syncDisableFailureDetail
+        )
+    } else {
+        cloudSyncStatus
+    }
     val displayedCloudSyncStatus = combinedQueueCloudSyncStatus(
-        cloudSyncStatus,
+        publicCloudSyncStatusForDisplay,
         privateSyncFailureDetail,
         privateSyncRetryStartedAtMillis,
         privateSyncLastErrorAtMillis
@@ -6140,7 +6237,8 @@ private fun QueueRuleSettingsScreen(
     val queueSyncEndpointValid = normalizedQueueSyncEndpointDraft != null
     val queueSyncTokenValid = isValidQueueSyncToken(normalizedQueueSyncTokenDraft)
     val queueConnectionConfigured = queueSyncEndpointValid && queueSyncTokenValid
-    val queueConnectionEditable = !settings.websiteSyncEnabled
+    val queueConnectionEditable =
+        !persistedSettings.websiteSyncEnabled && !settings.websiteSyncEnabled
     val queueConnectionChanged =
         normalizedQueueSyncEndpointDraft != persistedSettings.queueSyncEndpoint ||
             normalizedQueueSyncTokenDraft != persistedSettings.queueSyncToken
@@ -6189,7 +6287,7 @@ private fun QueueRuleSettingsScreen(
             )
             Spacer(Modifier.height(20.dp))
             if (cloudSyncAvailable) {
-                MenuSectionHeader("网站连接")
+                MenuSectionHeader("服务端连接")
                 Column(
                     Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
                         .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
@@ -6205,6 +6303,11 @@ private fun QueueRuleSettingsScreen(
                         Text(
                             if (queueConnectionEditable) {
                                 "终端版可以连接自建服务器。连接设置仅保存在本机，令牌不会写入日志。"
+                            } else if (
+                                persistedSettings.websiteSyncEnabled &&
+                                !settings.websiteSyncEnabled
+                            ) {
+                                "请先保存关闭同步的设置，再重新进入本页更换服务器。"
                             } else {
                                 "如需更换服务器，请先关闭与服务端同步。"
                             },
@@ -7650,6 +7753,7 @@ private fun HomeScreen(
     val groupPagerState = rememberPagerState(initialPage = defaultGroupIndex) {
         activeMachineGroups.size
     }
+    val groupPagerScope = rememberCoroutineScope()
     val isEmpty = machines.all { it.queue.registrationCount == 0 }
     val hasStoppedMachine = machines.any { !it.status.isOperational }
     val nowMillis = rememberCurrentTimeMillis()
@@ -7831,9 +7935,19 @@ private fun HomeScreen(
                             }
                         }
                         if (activeMachineGroups.size > 1) {
-                            MachineGroupPageIndicator(
-                                groups = activeMachineGroups.map { it.first },
-                                currentPage = groupPagerState.currentPage
+                            MachineGroupPageSelector(
+                                groups = activeMachineGroups,
+                                currentPage = groupPagerState.currentPage,
+                                onPageSelected = { targetPage ->
+                                    if (
+                                        targetPage in activeMachineGroups.indices &&
+                                        targetPage != groupPagerState.currentPage
+                                    ) {
+                                        groupPagerScope.launch {
+                                            groupPagerState.animateScrollToPage(targetPage)
+                                        }
+                                    }
+                                }
                             )
                         }
                     }
@@ -7868,34 +7982,83 @@ private fun HomeScreen(
 }
 
 @Composable
-private fun MachineGroupPageIndicator(
-    groups: List<MachineGroupConfiguration>,
-    currentPage: Int
+private fun MachineGroupPageSelector(
+    groups: List<Pair<MachineGroupConfiguration, List<MachineDisplayState>>>,
+    currentPage: Int,
+    onPageSelected: (Int) -> Unit
 ) {
     val activePage = currentPage.coerceIn(0, groups.lastIndex)
-    Column(
-        Modifier.fillMaxWidth().height(34.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+    val listState = rememberLazyListState()
+    LaunchedEffect(activePage, groups.map { it.first.id }) {
+        val layoutInfo = listState.layoutInfo
+        val activeItem = layoutInfo.visibleItemsInfo.firstOrNull {
+            it.index == activePage
+        }
+        val activeItemFullyVisible = activeItem != null &&
+            activeItem.offset >= layoutInfo.viewportStartOffset &&
+            activeItem.offset + activeItem.size <= layoutInfo.viewportEndOffset
+        if (!activeItemFullyVisible) listState.animateScrollToItem(activePage)
+    }
+    BoxWithConstraints(
+        Modifier.fillMaxWidth().height(52.dp)
+            .clip(RoundedCornerShape(9.dp))
+            .background(Separator.copy(alpha = .38f))
     ) {
-        Text(
-            groups[activePage].name,
-            color = SecondaryText,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Medium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        Spacer(Modifier.height(4.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            groups.indices.forEach { index ->
-                Box(
-                    Modifier.size(if (index == activePage) 7.dp else 6.dp)
-                        .clip(CircleShape)
-                        .background(
-                            if (index == activePage) SystemBlue else Separator
-                        )
+        val itemSpacing = 3.dp
+        val horizontalPadding = 3.dp
+        val visibleItemCount = groups.size.coerceAtMost(4)
+        val itemWidth = (
+            (maxWidth - horizontalPadding * 2 - itemSpacing * (visibleItemCount - 1)) /
+                visibleItemCount
+            ).coerceAtLeast(104.dp)
+        LazyRow(
+            state = listState,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(horizontal = horizontalPadding, vertical = 2.dp),
+            horizontalArrangement = Arrangement.spacedBy(itemSpacing)
+        ) {
+            itemsIndexed(groups, key = { _, group -> group.first.id }) { index, group ->
+                val selected = index == activePage
+                val backgroundColor by animateColorAsState(
+                    if (selected) CardBackground else Color.Transparent,
+                    animationSpec = tween(durationMillis = 160),
+                    label = "machine-group-background"
                 )
+                val textColor by animateColorAsState(
+                    if (selected) PrimaryText else SecondaryText,
+                    animationSpec = tween(durationMillis = 160),
+                    label = "machine-group-text"
+                )
+                Box(
+                    Modifier.width(itemWidth).fillMaxHeight()
+                        .clip(RoundedCornerShape(7.dp))
+                        .background(backgroundColor)
+                        .selectable(
+                            selected = selected,
+                            role = Role.Tab,
+                            onClick = { onPageSelected(index) }
+                        )
+                        .padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            group.first.name,
+                            color = textColor,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            group.second.joinToString("、") { it.machineId.name },
+                            color = if (selected) SecondaryText else TertiaryText,
+                            fontSize = 9.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
             }
         }
     }
@@ -8954,6 +9117,19 @@ private fun InlineReorderContent(
         }
     }
 
+    fun cancelRegistrationDrag() {
+        val orderBeforeDrag = dragStartOrder
+        edgeScrollPerFramePx = 0f
+        draggedKey = null
+        dragStartOrder = null
+        registrationDragOffset = Offset.Zero
+        dragPointerInRoot = null
+        if (orderBeforeDrag != null && registrations != orderBeforeDrag) {
+            registrations.clear()
+            registrations.addAll(orderBeforeDrag)
+        }
+    }
+
     LaunchedEffect(initialQueue, initialRegistrationKey) {
         delay(850L)
         highlightedKey = null
@@ -9031,7 +9207,7 @@ private fun InlineReorderContent(
                     updateEdgeScroll()
                 },
                 onDragEnd = { finishRegistrationDrag(registration.key) },
-                onDragCancel = { finishRegistrationDrag(registration.key) }
+                onDragCancel = { cancelRegistrationDrag() }
             )
         }
     }
@@ -14670,7 +14846,7 @@ private fun AppDetailsDialog(
             if (cloudSyncStatus != null) {
                 "队列、玩家资料和日志始终先保存在本机。开启与服务端同步后，只有玩家选择允许公开时，当前登记的 QQ 才会显示在网页详情中；完整玩家资料、性别、默认偏好和资料内部编号仍通过私有接口保存。"
             } else {
-                "这是不连接网站的纯本地版本。队列、玩家资料和日志只保存在本机，不会上传到服务器。"
+                "这是不连接服务端的纯本地版本。队列、玩家资料和日志只保存在本机，不会上传到服务端。"
             },
             color = SecondaryText,
             fontSize = 12.sp,
@@ -15016,12 +15192,12 @@ private fun CloudSyncInfoDialog(
         HorizontalDivider(color = Separator.copy(alpha = .6f))
         CloudSyncMeaningRow(
             phase = QueueCloudSyncPhase.SYNCING,
-            description = "正在将最新队列状态上传到网站。"
+            description = "正在将最新队列状态同步到服务端。"
         )
         HorizontalDivider(color = Separator.copy(alpha = .6f))
         CloudSyncMeaningRow(
             phase = QueueCloudSyncPhase.SYNCED,
-            description = "最新队列状态已经上传到网站，网页可以显示当前内容。"
+            description = "最新队列状态已经同步到服务端，网站可以显示当前内容。"
         )
         HorizontalDivider(color = Separator.copy(alpha = .6f))
         CloudSyncMeaningRow(
@@ -15036,7 +15212,7 @@ private fun CloudSyncInfoDialog(
 
         Spacer(Modifier.height(13.dp))
         Text(
-            "公开网站会显示登记昵称、队列位置、游玩状态、时间估算，以及资料库登记的 QQ。完整玩家资料通过需要专用令牌的私有接口同步；性别、默认偏好和资料内部编号不会出现在公开队列或公开日志中。",
+            "公开网站会显示登记昵称、队列位置、游玩状态、时间估算，以及玩家允许公开的 QQ。完整玩家资料通过需要专用令牌的私有接口同步；性别、默认偏好和资料内部编号不会出现在公开队列或公开日志中。",
             color = SecondaryText,
             fontSize = 11.sp,
             lineHeight = 17.sp
@@ -15430,6 +15606,19 @@ private fun ReorderScreen(
         }
     }
 
+    fun cancelRegistrationDrag() {
+        val orderBeforeDrag = dragStartOrder
+        edgeScrollPerFramePx = 0f
+        draggedKey = null
+        dragStartOrder = null
+        registrationDragOffset = Offset.Zero
+        dragPointerInRoot = null
+        if (orderBeforeDrag != null && registrations != orderBeforeDrag) {
+            registrations.clear()
+            registrations.addAll(orderBeforeDrag)
+        }
+    }
+
     LaunchedEffect(draggedKey) {
         while (draggedKey != null) {
             val requestedScroll = edgeScrollPerFramePx
@@ -15533,7 +15722,7 @@ private fun ReorderScreen(
                             updateEdgeScroll()
                         },
                         onDragEnd = { finishRegistrationDrag(registration.key) },
-                        onDragCancel = { finishRegistrationDrag(registration.key) }
+                        onDragCancel = { cancelRegistrationDrag() }
                     )
                 }
             }

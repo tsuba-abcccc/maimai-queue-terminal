@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 
 export const name = "maimai-q";
 export const inject = { required: ["database", "http"] };
+export const BOT_VERSION = "0.3.12";
 
 interface PluginState {
   key: string;
@@ -155,6 +156,7 @@ interface BotPlayer {
   qq_number: string;
   display_id: string;
   machine_id: string;
+  machine_stable_id?: string;
   machine_name?: string;
   machine_operational?: boolean;
   machine_stop_reason?: string | null;
@@ -219,6 +221,25 @@ interface ProfilesResponse {
   profiles: PlayerProfile[];
 }
 
+type ClientVersionStatus =
+  | "LATEST"
+  | "UPDATE_AVAILABLE"
+  | "AHEAD"
+  | "UNKNOWN";
+
+interface ClientVersionComponent {
+  name: string;
+  current_version: string | null;
+  latest_version: string | null;
+  status: ClientVersionStatus;
+  updated_at: number | null;
+}
+
+export interface QueueVersionsResponse {
+  checked_at: number;
+  components: Partial<Record<"terminal" | "website" | "bot", ClientVersionComponent>>;
+}
+
 interface AffectedPlayer {
   registration_id: string;
   profile_id: string;
@@ -240,6 +261,8 @@ interface QueueEvent {
 
 interface EventsResponse {
   queue_id: string;
+  notification_scope_id?: string;
+  test_data?: boolean;
   events: QueueEvent[];
   next_cursor: number;
   latest_cursor: number;
@@ -265,6 +288,8 @@ interface QueueCommandFields {
   expected_temporary_away_skipped_turns?: number;
   expected_pending_check_in?: boolean;
   expected_machine_configuration_revision?: number;
+  expected_machine_stable_id?: string;
+  expected_target_machine_stable_id?: string;
 }
 
 interface EventCursor {
@@ -343,6 +368,7 @@ export const HELP_TEXT = [
   " - 我的排队",
   " - 查看队列",
   " - 查询人数",
+  " - 版本信息",
   " - 我的资料",
   " - 修改资料",
   " - 排队通知",
@@ -363,6 +389,7 @@ export const PROFILE_EDIT_HELP_TEXT = [
 
 export interface Config {
   apiBase: string;
+  publicQueueUrl?: string;
   botToken: string;
   oneBotSelfId?: string;
   notificationEnabled: boolean;
@@ -373,8 +400,15 @@ export interface Config {
 export const Config: Schema<Config> = Schema.object({
   apiBase: Schema.string()
     .role("link")
-    .default("https://abcccc.top")
-    .description("排队服务后端地址，不包含 /api 路径。"),
+    .required()
+    .description(
+      "排队服务后端地址，不包含 /api 路径；公开构建不会预填任何维护者服务地址。",
+    ),
+  publicQueueUrl: Schema.string()
+    .role("link")
+    .description(
+      "队列网站根地址，不包含 /queue-status 等路径；与后端分开部署时填写，留空则使用后端地址。",
+    ),
   botToken: Schema.string()
     .role("secret")
     .required()
@@ -405,6 +439,17 @@ export class QueueApi {
 
   getQueue(): Promise<QueueStatus> {
     return this.ctx.http.get(this.url("/api/queue-status"));
+  }
+
+  getVersions(): Promise<QueueVersionsResponse> {
+    return this.ctx.http.get(this.url("/api/queue-versions"));
+  }
+
+  async getWebsiteVersion(): Promise<string | undefined> {
+    const response = await this.ctx.http.get<{ version?: unknown }>(
+      this.publicUrl("/queue-client-version.json"),
+    );
+    return normalizedReportedVersion(response?.version);
   }
 
   getPlayers(qq: string): Promise<BotPlayersResponse> {
@@ -441,16 +486,36 @@ export class QueueApi {
     return response.data as RemoteCommand;
   }
 
-  async updateIdentity(botQq: string): Promise<void> {
-    const response = await this.ctx.http<{ error?: string }>(
+  async updateIdentity(botQq: string, websiteVersion?: string): Promise<void> {
+    const data: Record<string, string> = {
+      bot_qq: botQq,
+      bot_version: BOT_VERSION,
+    };
+    const normalizedWebsiteVersion = normalizedReportedVersion(websiteVersion);
+    if (normalizedWebsiteVersion) data.website_version = normalizedWebsiteVersion;
+    let response = await this.ctx.http<{ error?: string }>(
       "POST",
       this.url("/api/queue-bot/identity"),
       {
-        data: { bot_qq: botQq },
+        data,
         headers: this.privateHeaders(),
         validateStatus: () => true,
       },
     );
+    if (
+      response.status === 400 &&
+      /只包含 bot_qq|不能包含未知字段/.test(response.data?.error ?? "")
+    ) {
+      response = await this.ctx.http<{ error?: string }>(
+        "POST",
+        this.url("/api/queue-bot/identity"),
+        {
+          data: { bot_qq: botQq },
+          headers: this.privateHeaders(),
+          validateStatus: () => true,
+        },
+      );
+    }
     if (response.status >= 400) {
       throw new Error(profileUpdateErrorMessage(response.data, response.status));
     }
@@ -469,7 +534,7 @@ export class QueueApi {
     for (const [key, value] of Object.entries(fields)) {
       if (value !== undefined) data[key] = value;
     }
-    const response = await this.ctx.http<RemoteCommand | { error?: string }>(
+    let response = await this.ctx.http<RemoteCommand | { error?: string }>(
       "POST",
       this.url("/api/queue-bot/queue-commands"),
       {
@@ -478,6 +543,33 @@ export class QueueApi {
         validateStatus: () => true,
       },
     );
+    const hasNewConfirmationFields =
+      "expected_machine_stable_id" in data ||
+      "expected_target_machine_stable_id" in data ||
+      (operation !== "JOIN_QUEUE" &&
+        "expected_machine_configuration_revision" in data);
+    if (
+      hasNewConfirmationFields &&
+      response.status === 400 &&
+      "error" in response.data &&
+      response.data.error === "请求包含不支持的排队操作字段"
+    ) {
+      const legacyData = { ...data };
+      delete legacyData.expected_machine_stable_id;
+      delete legacyData.expected_target_machine_stable_id;
+      if (operation !== "JOIN_QUEUE") {
+        delete legacyData.expected_machine_configuration_revision;
+      }
+      response = await this.ctx.http<RemoteCommand | { error?: string }>(
+        "POST",
+        this.url("/api/queue-bot/queue-commands"),
+        {
+          data: legacyData,
+          headers: this.privateHeaders(),
+          validateStatus: () => true,
+        },
+      );
+    }
     if (response.status >= 400) {
       throw new Error(profileUpdateErrorMessage(response.data, response.status));
     }
@@ -513,10 +605,16 @@ export class QueueApi {
   url(path: string): string {
     return new URL(path, this.config.apiBase).toString();
   }
+
+  publicUrl(path: string): string {
+    const websiteBase = this.config.publicQueueUrl?.trim() || this.config.apiBase;
+    return new URL(path, websiteBase).toString();
+  }
 }
 
 export function apply(ctx: Context, config: Config) {
-  const configError = apiBaseValidationError(config.apiBase);
+  const configError = apiBaseValidationError(config.apiBase) ||
+    publicQueueUrlValidationError(config.publicQueueUrl);
   if (configError) throw new Error(configError);
   const logger = ctx.logger(name);
   const api = new QueueApi(ctx, config);
@@ -660,7 +758,19 @@ export function apply(ctx: Context, config: Config) {
         if (queue.onebot_sync_enabled === false) {
           throw new Error("现场终端已关闭 QQ Bot 联动。请联系现场工作人员开启后再试。");
         }
-        return formatRegistrationCount(queue, api.url("/queue-status"));
+        return formatRegistrationCount(queue, api.publicUrl("/queue-status"));
+      })
+    );
+
+  ctx.command("maimaiq.versions", "查看现场终端、网站和 QQ Bot 版本")
+    .alias("版本信息")
+    .action(() =>
+      withCommandError(async () => {
+        try {
+          return formatClientVersions(await api.getVersions());
+        } catch {
+          throw new Error("暂时无法读取版本信息，请稍后再试。");
+        }
       })
     );
 
@@ -780,7 +890,8 @@ function startBotIdentityReporting(
     if (botQq === lastReportedQq && now < nextRefreshAt) return;
     running = true;
     try {
-      await api.updateIdentity(botQq);
+      const websiteVersion = await api.getWebsiteVersion().catch(() => undefined);
+      await api.updateIdentity(botQq, websiteVersion);
       lastReportedQq = botQq;
       nextRefreshAt = now + BOT_IDENTITY_REFRESH_INTERVAL_MS;
       lastFailure = "";
@@ -999,6 +1110,9 @@ export async function joinQueueFromBot(
       expected_queue_id: queue.queue_id,
       expected_machine_configuration_revision:
         queue.machine_configuration_revision ?? 1,
+      ...(machine.stable_id
+        ? { expected_machine_stable_id: machine.stable_id }
+        : {}),
     },
   );
   if (command.status === "REJECTED") {
@@ -1230,6 +1344,9 @@ export async function transferQueueMachine(
   return formatQueueCommandResult(
     await submitCurrentRegistrationCommand(api, config, current, "TRANSFER_MACHINE", {
       target_machine_id: target.id,
+      ...(target.stable_id
+        ? { expected_target_machine_stable_id: target.stable_id }
+        : {}),
     }),
     `登记已转至${compactMachineName(target.name)} 的等待顺序末端。`,
     true,
@@ -1336,13 +1453,14 @@ async function leaveQueueFromBot(
 export function queueConfirmationContextFields(
   queueId: string,
   player: BotPlayer,
+  machineConfigurationRevision?: number,
 ): QueueCommandFields {
   const absenceStatus = player.deferred_once
     ? "DEFER_ONE_ROUND"
     : player.temporarily_away
     ? "TEMPORARILY_AWAY"
     : "NONE";
-  return {
+  const fields: QueueCommandFields = {
     expected_queue_id: queueId,
     expected_registration_id: player.registration_id,
     expected_machine_id: player.machine_id,
@@ -1354,6 +1472,16 @@ export function queueConfirmationContextFields(
     expected_pending_check_in:
       player.online_registration_pending_check_in === true,
   };
+  if (player.machine_stable_id) {
+    fields.expected_machine_stable_id = player.machine_stable_id;
+  }
+  if (
+    Number.isSafeInteger(machineConfigurationRevision) &&
+    (machineConfigurationRevision ?? 0) >= 1
+  ) {
+    fields.expected_machine_configuration_revision = machineConfigurationRevision;
+  }
+  return fields;
 }
 
 async function requireCurrentQueueRegistration(
@@ -1418,6 +1546,7 @@ async function submitCurrentRegistrationCommand(
     ...queueConfirmationContextFields(
       current.response.queue_id,
       current.player,
+      current.response.machine_configuration_revision,
     ),
   });
 }
@@ -1682,28 +1811,65 @@ export async function pollNotifications(
 ) {
   const stateKey = cursorStateKey(config);
   const saved = await readCursor(ctx, stateKey);
-  const firstPage = await api.getEvents(saved?.cursor ?? 0);
+  let firstPage = await api.getEvents(saved?.cursor ?? 0);
+  let firstScopeId = firstPage.notification_scope_id ?? firstPage.queue_id;
+  let bootstrapScope = false;
+  let bootstrapScopeId: string | null = null;
   if (!saved) {
     await ctx.database.remove("maimai_q_delivery", {
-      queueId: firstPage.queue_id,
+      queueId: firstScopeId,
     });
-    await writeCursor(ctx, stateKey, {
-      queueId: firstPage.queue_id,
+    const initialCursor = {
+      queueId: firstScopeId,
       cursor: firstPage.latest_cursor,
-    });
+    };
+    await writeCursor(ctx, stateKey, initialCursor);
+    await writeCursor(
+      ctx,
+      scopedCursorStateKey(config, firstScopeId),
+      initialCursor,
+    );
     return;
   }
-  if (saved.queueId !== firstPage.queue_id) {
-    await ctx.database.remove("maimai_q_delivery", {
-      queueId: saved.queueId,
-    });
-    await ctx.database.remove("maimai_q_delivery", {
-      queueId: firstPage.queue_id,
-    });
-    await writeCursor(ctx, stateKey, {
-      queueId: firstPage.queue_id,
-      cursor: saved.cursor,
-    });
+  if (saved.queueId !== firstScopeId) {
+    const targetScopeId = firstScopeId;
+    await writeCursor(
+      ctx,
+      scopedCursorStateKey(config, saved.queueId),
+      saved,
+    );
+    const savedForScope = await readCursor(
+      ctx,
+      scopedCursorStateKey(config, targetScopeId),
+    );
+    const hasScopedCursor = savedForScope?.queueId === targetScopeId;
+    bootstrapScope = !hasScopedCursor;
+    bootstrapScopeId = targetScopeId;
+    const resumedCursor = hasScopedCursor
+      ? savedForScope.cursor
+      : 0;
+    firstPage = await api.getEvents(resumedCursor);
+    firstScopeId = firstPage.notification_scope_id ?? firstPage.queue_id;
+    if (firstScopeId !== targetScopeId) {
+      logger.info("排队数据作用域在读取通知时再次变化，将在下一轮继续。");
+      return;
+    }
+    const activeCursor = {
+      queueId: firstScopeId,
+      cursor: resumedCursor,
+    };
+    await writeCursor(ctx, stateKey, activeCursor);
+    await writeCursor(
+      ctx,
+      scopedCursorStateKey(config, firstScopeId),
+      activeCursor,
+    );
+  } else {
+    await writeCursor(
+      ctx,
+      scopedCursorStateKey(config, firstScopeId),
+      saved,
+    );
   }
 
   let page = firstPage;
@@ -1711,15 +1877,18 @@ export async function pollNotifications(
   let selectedBot = selectOneBot(ctx, config.oneBotSelfId);
   const logState = { unavailableBotLogged: false };
   while (true) {
+    const pageScopeId = page.notification_scope_id ?? page.queue_id;
     for (const event of page.events) {
       const complete = await processNotificationEvent(
         ctx,
         api,
         logger,
-        page.queue_id,
+        pageScopeId,
         event,
         selectedBot,
         logState,
+        page.test_data === true,
+        bootstrapScope,
       );
       if (!complete) {
         cursorBlocked = true;
@@ -1728,22 +1897,54 @@ export async function pollNotifications(
       }
       if (cursorBlocked) continue;
 
-      await writeCursor(ctx, stateKey, {
-        queueId: page.queue_id,
+      const currentCursor = {
+        queueId: pageScopeId,
         cursor: event.cursor,
-      });
+      };
+      await writeCursor(ctx, stateKey, currentCursor);
+      await writeCursor(
+        ctx,
+        scopedCursorStateKey(config, pageScopeId),
+        currentCursor,
+      );
       await ctx.database.remove("maimai_q_delivery", {
-        queueId: page.queue_id,
+        queueId: pageScopeId,
         eventId: event.event_id,
         status: "DELIVERED",
       });
     }
     if (!page.has_more) break;
     const previousPageCursor = page.next_cursor;
-    page = await api.getEvents(page.next_cursor);
+    const nextPage = await api.getEvents(page.next_cursor);
+    if ((nextPage.notification_scope_id ?? nextPage.queue_id) !== pageScopeId) {
+      logger.info("排队数据作用域已经变化，将在下一轮读取新队列通知。");
+      break;
+    }
+    page = nextPage;
     if (page.next_cursor <= previousPageCursor && page.has_more) {
       logger.warn("排队通知游标没有继续向前，已暂停本轮读取。");
       break;
+    }
+  }
+  // 首次进入一个没有游标的作用域时，不把该作用域已经存在的历史事件
+  // 当成刚发生的通知。processNotificationEvent 在 bootstrap 模式下只
+  // 处理数据库中已有的 PENDING 投递，待游标定位到最新位置后恢复正常
+  // 的新事件处理。若有投递失败，则保留游标并在下一轮继续重试。
+  const finalPageScopeId = page.notification_scope_id ?? page.queue_id;
+  if (
+    bootstrapScope &&
+    !cursorBlocked &&
+    bootstrapScopeId === finalPageScopeId
+  ) {
+    const latest = page.latest_cursor;
+    if (Number.isSafeInteger(latest) && latest >= 0) {
+      const current = { queueId: finalPageScopeId, cursor: latest };
+      await writeCursor(ctx, stateKey, current);
+      await writeCursor(
+        ctx,
+        scopedCursorStateKey(config, finalPageScopeId),
+        current,
+      );
     }
   }
 }
@@ -1756,6 +1957,8 @@ async function processNotificationEvent(
   event: QueueEvent,
   bot: Bot | undefined,
   logState: { unavailableBotLogged: boolean },
+  testData = false,
+  bootstrapScope = false,
 ): Promise<boolean> {
   const currentRecipients = [
     ...new Set(
@@ -1782,6 +1985,9 @@ async function processNotificationEvent(
     queueId,
     eventId: event.event_id,
   });
+  // 作用域首次接入时只重试此前已经创建的投递，不能为历史事件新建
+  // 投递，否则切换测试/正式数据会把整段历史重新发送给玩家。
+  if (!deliveries.length && bootstrapScope) return true;
   if (!deliveries.length) {
     const recipientPreferences = await Promise.all(
       currentRecipients.map(async (qqNumber) => ({
@@ -1843,7 +2049,7 @@ async function processNotificationEvent(
       const status = formatNotificationQueueStatus(current.players);
       await bot.sendPrivateMessage(
         delivery.qqNumber,
-        formatQueueNotification(event, status),
+        formatQueueNotification(event, status, testData),
       );
       await writeNotificationDelivery(ctx, {
         ...delivery,
@@ -1952,6 +2158,10 @@ function cursorStateKey(config: Config): string {
   return `event-cursor:${new URL(config.apiBase).origin}`;
 }
 
+function scopedCursorStateKey(config: Config, scopeId: string): string {
+  return `${cursorStateKey(config)}:scope:${scopeId}`;
+}
+
 async function readCursor(
   ctx: Context,
   key: string,
@@ -1959,7 +2169,12 @@ async function readCursor(
   const rows = await ctx.database.get("maimai_q_state", { key });
   if (!rows.length) return null;
   try {
-    return JSON.parse(rows[0].value) as EventCursor;
+    const parsed = JSON.parse(rows[0].value) as Partial<EventCursor>;
+    return typeof parsed.queueId === "string" && parsed.queueId.length > 0 &&
+        typeof parsed.cursor === "number" && Number.isSafeInteger(parsed.cursor) &&
+        parsed.cursor >= 0
+      ? { queueId: parsed.queueId, cursor: parsed.cursor }
+      : null;
   } catch {
     return null;
   }
@@ -2206,9 +2421,84 @@ export function formatQueue(queue: QueueStatus): string {
   return sections.filter(Boolean).join("\n\n");
 }
 
+export function formatClientVersions(response: QueueVersionsResponse): string {
+  const definitions: ReadonlyArray<{
+    key: "terminal" | "website" | "bot";
+    fallbackName: string;
+  }> = [
+    { key: "terminal", fallbackName: "现场终端" },
+    { key: "website", fallbackName: "队列网站" },
+    { key: "bot", fallbackName: "QQ Bot" },
+  ];
+  const lines = ["版本信息"];
+  for (const { key, fallbackName } of definitions) {
+    const component = response?.components?.[key];
+    const current = normalizedReportedVersion(component?.current_version) ?? "未知";
+    const latest = normalizedReportedVersion(component?.latest_version) ?? "未知";
+    const name = typeof component?.name === "string" && component.name.trim()
+      ? component.name.trim()
+      : fallbackName;
+    lines.push(
+      "",
+      `${name}·当前 ${current}·最新 ${latest}`,
+      clientVersionStatusText(component?.status),
+      `最后上报：${clientVersionReportedAtText(component?.updated_at)}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function clientVersionReportedAtText(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return "尚未上报";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "尚未上报";
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("zh-CN", {
+      timeZone: "Asia/Shanghai",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(date).map((part) => [part.type, part.value]),
+  );
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
+}
+
+function clientVersionStatusText(status?: ClientVersionStatus): string {
+  return {
+    LATEST: "已是最新版本。",
+    UPDATE_AVAILABLE: "有新版本可用。",
+    AHEAD: "当前版本高于公开版本。",
+    UNKNOWN: "暂时无法确认版本状态。",
+  }[status ?? "UNKNOWN"] ?? "暂时无法确认版本状态。";
+}
+
+export function normalizedReportedVersion(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (
+    trimmed.length > 32 ||
+    !/^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(
+      trimmed,
+    )
+  ) return undefined;
+  const canonical = trimmed.startsWith("v") ? trimmed.slice(1) : trimmed;
+  const prerelease = canonical.split("+", 1)[0].split("-", 2)[1];
+  if (
+    prerelease?.split(".").some((identifier) =>
+      /^0[0-9]+$/.test(identifier)
+    )
+  ) return undefined;
+  return canonical;
+}
+
 export function formatRegistrationCount(
   queue: QueueStatus,
-  publicQueueUrl = "https://abcccc.top/queue-status",
+  publicQueueUrl = "队列网站",
 ): string {
   const machines = sortedMachines(queue);
   const registrationCounts = machines.map((machine) =>
@@ -2247,6 +2537,12 @@ function formatNewRegistrationEstimate(
   if (!queue.registration_open || queue.business_hours?.closing_grace) {
     return "当前不接收新登记。";
   }
+  const registrationCount = machine.playing.length +
+    machine.waiting_positions.reduce(
+      (total, position) => total + position.registrations.length,
+      0,
+    );
+  if (registrationCount >= 20) return "登记已满。";
   const estimate = machine.new_registration_estimated_wait_minutes;
   if (typeof estimate !== "number" || !Number.isFinite(estimate)) {
     return "新登记等待时间暂时无法估算。";
@@ -2688,8 +2984,11 @@ export function formatNotificationQueueStatus(players: BotPlayer[]): string {
 export function formatQueueNotification(
   event: Pick<QueueEvent, "title" | "detail">,
   status = "",
+  testData = false,
 ): string {
-  const blocks = ["【排队通知】", `${event.title}\n${event.detail}`];
+  const blocks = ["【排队通知】"];
+  if (testData) blocks.push("当前数据是测试数据。");
+  blocks.push(`${event.title}\n${event.detail}`);
   const normalizedStatus = status.trim();
   if (normalizedStatus) blocks.push(normalizedStatus);
   return compactMiddleDots(blocks.join("\n\n"));
@@ -2860,6 +3159,29 @@ export function apiBaseValidationError(value: string): string | null {
     return null;
   }
   return "apiBase 必须使用 HTTPS；只有 localhost、127.0.0.1 或 ::1 可以使用 HTTP。";
+}
+
+export function publicQueueUrlValidationError(value?: string): string | null {
+  const normalized = value?.trim();
+  if (!normalized) return null;
+  let url: URL;
+  try {
+    url = new URL(normalized);
+  } catch {
+    return "publicQueueUrl 必须是有效的队列网站地址。";
+  }
+  if (url.username || url.password) {
+    return "publicQueueUrl 不能包含用户名或密码。";
+  }
+  if (url.pathname !== "/" || url.search || url.hash) {
+    return "publicQueueUrl 应只填写网站根地址，不要包含路径、查询参数或片段。";
+  }
+  if (url.protocol === "https:") return null;
+  const localHosts = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+  if (url.protocol === "http:" && localHosts.has(url.hostname.toLowerCase())) {
+    return null;
+  }
+  return "publicQueueUrl 必须使用 HTTPS；只有 localhost、127.0.0.1 或 ::1 可以使用 HTTP。";
 }
 
 function requireSingleProfile(profiles: PlayerProfile[]): PlayerProfile {

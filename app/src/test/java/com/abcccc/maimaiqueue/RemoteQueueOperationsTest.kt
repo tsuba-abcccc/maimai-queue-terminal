@@ -71,6 +71,84 @@ class RemoteQueueOperationsTest {
     }
 
     @Test
+    fun pendingTransferCannotTargetAReassignedMachineIdentifier() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id
+        )
+        val current = state(
+            machineA = MachineQueue(waiting = listOf(player)),
+            nextKey = 3
+        ).copy(machineConfigurationRevision = 8L)
+        val commandConfirmedBeforeMachineDeletion = operationCommand(
+            RemoteQueueOperation.TRANSFER_MACHINE,
+            player,
+            targetMachineId = "B"
+        ).copy(machineConfigurationRevision = 7L)
+
+        val result = decideRemoteQueueOperation(
+            commandConfirmedBeforeMachineDeletion,
+            current
+        )
+
+        assertTrue(result is RemoteQueueOperationDecision.Reject)
+        assertEquals(
+            "机台配置已经更新，请重新查询后再操作。",
+            (result as RemoteQueueOperationDecision.Reject).detail
+        )
+        assertEquals(listOf(player.key), current.queues.getValue("A").waiting.map { it.key })
+        assertTrue(current.queues.getValue("B").allRegistrations.isEmpty())
+    }
+
+    @Test
+    fun stableMachineIdentityRejectsAReassignedSourceOrTransferTarget() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id
+        )
+        val current = state(
+            machineA = MachineQueue(waiting = listOf(player)),
+            nextKey = 3
+        ).copy(
+            machineStableIds = mapOf(
+                "A" to "20000000000000000000000000000001",
+                "B" to "20000000000000000000000000000002"
+            ),
+            machineConfigurationRevision = 8L
+        )
+        val sourceChanged = operationCommand(
+            RemoteQueueOperation.LEAVE_QUEUE,
+            player
+        ).copy(
+            machineStableId = "10000000000000000000000000000001",
+            machineConfigurationRevision = 8L
+        )
+        val targetChanged = operationCommand(
+            RemoteQueueOperation.TRANSFER_MACHINE,
+            player,
+            targetMachineId = "B"
+        ).copy(
+            machineStableId = current.machineStableIds.getValue("A"),
+            targetMachineStableId = "10000000000000000000000000000002",
+            machineConfigurationRevision = 8L
+        )
+
+        val sourceResult = decideRemoteQueueOperation(sourceChanged, current)
+        val targetResult = decideRemoteQueueOperation(targetChanged, current)
+
+        assertEquals(
+            "所选机台已经变化，请重新查询后再操作。",
+            (sourceResult as RemoteQueueOperationDecision.Reject).detail
+        )
+        assertEquals(
+            "要转入的机台已经变化，请重新查询后再操作。",
+            (targetResult as RemoteQueueOperationDecision.Reject).detail
+        )
+        assertEquals(listOf(player.key), current.queues.getValue("A").waiting.map { it.key })
+        assertTrue(current.queues.getValue("B").allRegistrations.isEmpty())
+    }
+
+    @Test
     fun onlineJoinToSinglePlayerMachineForcesSoloWithoutChangingProfileDefault() {
         val current = state().copy(
             machineCapacities = mapOf("A" to 1, "B" to 2),

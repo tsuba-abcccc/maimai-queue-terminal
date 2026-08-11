@@ -1,0 +1,17 @@
+# Put these locations in the HTTPS server block that serves public-site/dist.
+# Keep the /api/ locations from cloud-server/nginx-location.conf.example in the
+# same server block; they must be evaluated before the SPA fallback.
+root /var/www/queue-site/dist;
+
+location = /queue-status {
+    return 308 /queue-status/;
+}
+
+location / {
+    try_files $uri $uri/ /index.html;
+}
+
+location ~* \.(?:js|css|json|svg|png|webp|ico)$ {
+    add_header Cache-Control "public, max-age=300" always;
+    try_files $uri =404;
+}

@@ -196,7 +196,7 @@ test('redacts every occurrence of the current QQ from adapter errors', () => {
   assert.doesNotMatch(redacted, /12345678/)
 })
 
-test('reports the active Bot QQ to the private identity endpoint', async () => {
+test('reports the active Bot QQ and deployed client versions to the private identity endpoint', async () => {
   const requests = []
   const http = async (...args) => {
     requests.push(args)
@@ -204,7 +204,7 @@ test('reports the active Bot QQ to the private identity endpoint', async () => {
   }
   const api = new QueueApi({ http }, config())
 
-  await api.updateIdentity('123456789')
+  await api.updateIdentity('123456789', 'v0.10.1')
 
   assert.equal(requests.length, 1)
   assert.equal(requests[0][0], 'POST')
@@ -212,11 +212,53 @@ test('reports the active Bot QQ to the private identity endpoint', async () => {
     requests[0][1],
     'https://queue.example.test/api/queue-bot/identity',
   )
-  assert.deepEqual(requests[0][2].data, { bot_qq: '123456789' })
+  assert.deepEqual(requests[0][2].data, {
+    bot_qq: '123456789',
+    bot_version: '0.3.12',
+    website_version: '0.10.1',
+  })
   assert.equal(
     requests[0][2].headers.Authorization,
     'Bearer test-token',
   )
+})
+
+test('falls back to the legacy Bot identity payload on an older server', async () => {
+  const requests = []
+  const http = async (...args) => {
+    requests.push(args)
+    return requests.length === 1
+      ? { status: 400, data: { error: '请求内容必须只包含 bot_qq' } }
+      : { status: 200, data: { ok: true } }
+  }
+  const api = new QueueApi({ http }, config())
+
+  await api.updateIdentity('123456789', '0.10.1')
+
+  assert.equal(requests.length, 2)
+  assert.deepEqual(requests[0][2].data, {
+    bot_qq: '123456789',
+    bot_version: '0.3.12',
+    website_version: '0.10.1',
+  })
+  assert.deepEqual(requests[1][2].data, { bot_qq: '123456789' })
+})
+
+test('reads and validates the deployed website version manifest', async () => {
+  const ctx = {
+    http: {
+      async get(url) {
+        assert.equal(url, 'https://site.example.test/queue-client-version.json')
+        return { version: 'v0.10.1' }
+      },
+    },
+  }
+  const api = new QueueApi(ctx, {
+    ...config(),
+    publicQueueUrl: 'https://site.example.test',
+  })
+
+  assert.equal(await api.getWebsiteVersion(), '0.10.1')
 })
 
 test('submits every notification preference through player profile updates', async () => {
@@ -405,7 +447,7 @@ test('a disabled event category is skipped without sending a private message', a
   assert.equal(cursor.cursor, 1)
 })
 
-test('existing notification cursors continue through a new queue batch', async () => {
+test('a new queue scope starts at its latest cursor instead of replaying history', async () => {
   const database = new MemoryDatabase()
   await database.upsert('maimai_q_state', [{
     key: 'event-cursor:https://queue.example.test',
@@ -418,13 +460,16 @@ test('existing notification cursors continue through a new queue batch', async (
     isActive: true,
     async sendPrivateMessage(qq) { sends.push(qq) },
   }
+  const eventRequests = []
   const api = {
     async getEvents(after) {
-      assert.equal(after, 2)
+      eventRequests.push(after)
+      const events = [event(3, 'queue-reset', '11111')]
+        .filter(item => item.cursor > after)
       return {
         queue_id: 'queue-2',
-        events: [event(3, 'queue-reset', '11111')],
-        next_cursor: 3,
+        events,
+        next_cursor: events.at(-1)?.cursor ?? after,
         latest_cursor: 3,
         has_more: false,
       }
@@ -440,11 +485,209 @@ test('existing notification cursors continue through a new queue batch', async (
     logger(),
   )
 
-  assert.deepEqual(sends, ['11111'])
+  assert.deepEqual(sends, [])
+  assert.deepEqual(eventRequests, [2, 0])
   const cursor = JSON.parse(database.states.get(
     'event-cursor:https://queue.example.test',
   ).value)
   assert.deepEqual(cursor, { queueId: 'queue-2', cursor: 3 })
+})
+
+test('a new queue scope still retries an unfinished delivery without replaying other history', async () => {
+  const database = new MemoryDatabase()
+  await database.upsert('maimai_q_state', [
+    {
+      key: 'event-cursor:https://queue.example.test',
+      value: JSON.stringify({ queueId: 'queue-old', cursor: 7 }),
+    },
+    {
+      key: 'event-cursor:https://queue.example.test:scope:queue-new',
+      value: JSON.stringify({ queueId: 'queue-other', cursor: 1 }),
+    },
+  ])
+  await database.upsert('maimai_q_delivery', [{
+    queueId: 'queue-new',
+    eventId: 'pending-event',
+    qqNumber: '11111',
+    status: 'PENDING',
+    attempts: 0,
+    nextRetryAt: 0,
+    lastError: '',
+    updatedAt: 0,
+  }])
+
+  const sends = []
+  const bot = {
+    platform: 'onebot',
+    selfId: '10000',
+    isActive: true,
+    async sendPrivateMessage(qq) { sends.push(qq) },
+  }
+  const api = {
+    async getEvents(after) {
+      const events = [
+        event(1, 'old-history', '22222'),
+        event(2, 'pending-event', '11111'),
+        event(3, 'new-history', '33333'),
+      ].filter(item => item.cursor > after)
+      return {
+        queue_id: 'queue-new',
+        events,
+        next_cursor: events.at(-1)?.cursor ?? after,
+        latest_cursor: 3,
+        has_more: false,
+      }
+    },
+    async getProfiles(qq) { return profileResponse(qq) },
+    async getPlayers() { return { queue_id: 'queue-new', players: [] } },
+  }
+
+  await pollNotifications(
+    { database, bots: [bot] },
+    api,
+    config(),
+    logger(),
+  )
+
+  assert.deepEqual(sends, ['11111'])
+  assert.equal(database.deliveries.has('queue-new:pending-event:11111'), false)
+  const cursor = JSON.parse(database.states.get(
+    'event-cursor:https://queue.example.test',
+  ).value)
+  assert.deepEqual(cursor, { queueId: 'queue-new', cursor: 3 })
+})
+
+test('test notifications use an isolated scope even with the same public queue id', async () => {
+  const database = new MemoryDatabase()
+  await database.upsert('maimai_q_state', [{
+    key: 'event-cursor:https://queue.example.test',
+    value: JSON.stringify({ queueId: 'queue-1', cursor: 2 }),
+  }])
+  const messages = []
+  const bot = {
+    platform: 'onebot',
+    selfId: '10000',
+    isActive: true,
+    async sendPrivateMessage(qq, message) { messages.push({ qq, message }) },
+  }
+  const eventRequests = []
+  const api = {
+    async getEvents(after) {
+      eventRequests.push(after)
+      const events = [event(3, 'test-event-1', '11111')]
+        .filter(item => item.cursor > after)
+      return {
+        queue_id: 'queue-1',
+        notification_scope_id: 'test:terminal-2:queue-1',
+        test_data: true,
+        events,
+        next_cursor: events.at(-1)?.cursor ?? after,
+        latest_cursor: 3,
+        has_more: false,
+      }
+    },
+    async getProfiles(qq) { return profileResponse(qq) },
+    async getPlayers() { return { queue_id: 'queue-1', players: [] } },
+  }
+
+  await pollNotifications(
+    { database, bots: [bot] },
+    api,
+    config(),
+    logger(),
+  )
+
+  assert.equal(messages.length, 0)
+  assert.deepEqual(eventRequests, [2, 0])
+  const cursor = JSON.parse(database.states.get(
+    'event-cursor:https://queue.example.test',
+  ).value)
+  assert.deepEqual(cursor, {
+    queueId: 'test:terminal-2:queue-1',
+    cursor: 3,
+  })
+})
+
+test('test notification polling preserves unfinished official deliveries', async () => {
+  const database = new MemoryDatabase()
+  await database.upsert('maimai_q_state', [{
+    key: 'event-cursor:https://queue.example.test',
+    value: JSON.stringify({ queueId: 'queue-1', cursor: 0 }),
+  }])
+  let activeScope = 'official'
+  let officialDeliveryAvailable = false
+  const sends = []
+  const bot = {
+    platform: 'onebot',
+    selfId: '10000',
+    isActive: true,
+    async sendPrivateMessage(qq, message) {
+      sends.push({ qq, message })
+      if (qq === '11111' && !officialDeliveryAvailable) {
+        throw new Error('发送失败')
+      }
+    },
+  }
+  const api = {
+    async getEvents(after) {
+      const testData = activeScope === 'test'
+      const scopeId = testData ? 'test:terminal-2:queue-1' : 'queue-1'
+      const available = testData
+        ? [event(2, 'test-event-1', '22222')]
+        : [event(1, 'official-event-1', '11111')]
+      const events = available.filter(item => item.cursor > after)
+      return {
+        queue_id: 'queue-1',
+        notification_scope_id: scopeId,
+        test_data: testData,
+        events,
+        next_cursor: events.at(-1)?.cursor ?? after,
+        latest_cursor: available.at(-1).cursor,
+        has_more: false,
+      }
+    },
+    async getProfiles(qq) { return profileResponse(qq) },
+    async getPlayers() { return { queue_id: 'queue-1', players: [] } },
+  }
+  const ctx = { database, bots: [bot] }
+
+  await pollNotifications(ctx, api, config(), logger())
+  assert.equal(
+    database.deliveries.get('queue-1:official-event-1:11111').status,
+    'PENDING',
+  )
+
+  activeScope = 'test'
+  await pollNotifications(ctx, api, config(), logger())
+  assert.equal(
+    database.deliveries.get('queue-1:official-event-1:11111').status,
+    'PENDING',
+  )
+
+  const pendingOfficial = database.deliveries.get(
+    'queue-1:official-event-1:11111',
+  )
+  database.deliveries.set('queue-1:official-event-1:11111', {
+    ...pendingOfficial,
+    nextRetryAt: 0,
+  })
+  officialDeliveryAvailable = true
+  activeScope = 'official'
+  await pollNotifications(ctx, api, config(), logger())
+
+  assert.equal(
+    database.deliveries.has('queue-1:official-event-1:11111'),
+    false,
+  )
+  assert.deepEqual(sends.map(item => item.qq), ['11111', '11111'])
+  const officialCursor = JSON.parse(database.states.get(
+    'event-cursor:https://queue.example.test:scope:queue-1',
+  ).value)
+  const testCursor = JSON.parse(database.states.get(
+    'event-cursor:https://queue.example.test:scope:test:terminal-2:queue-1',
+  ).value)
+  assert.equal(officialCursor.cursor, 1)
+  assert.equal(testCursor.cursor, 2)
 })
 
 test('disabling notifications cancels an existing pending retry', async () => {

@@ -123,6 +123,11 @@ data class QueueRuleSettings(
         configuredMachineIds.filter { machineGroupId(it) == groupId }
 }
 
+data class PendingSyncDisableSnapshot(
+    val endpoint: String,
+    val token: String
+)
+
 class LocalQueueRuleSettingsRepository(
     context: Context,
     private val defaultQueueSyncEndpoint: String = "",
@@ -366,6 +371,38 @@ class LocalQueueRuleSettingsRepository(
             .apply()
     }
 
+    /**
+     * Keep this marker across process death until the server confirms that
+     * remote operations are disabled. A synchronous commit is intentional:
+     * losing the marker immediately after the user switches the setting off
+     * would leave stale remote capabilities on the server.
+     */
+    fun getPendingSyncDisableSnapshot(): PendingSyncDisableSnapshot? {
+        val endpoint = preferences.getString(KEY_PENDING_SYNC_DISABLE_ENDPOINT, null)
+            ?.trim()
+            .orEmpty()
+        val token = preferences.getString(KEY_PENDING_SYNC_DISABLE_TOKEN, null)
+            ?.trim()
+            .orEmpty()
+        return endpoint.takeIf { it.isNotEmpty() }?.let {
+            PendingSyncDisableSnapshot(endpoint = it, token = token)
+        }
+    }
+
+    fun markPendingSyncDisableSnapshot(endpoint: String, token: String) {
+        preferences.edit()
+            .putString(KEY_PENDING_SYNC_DISABLE_ENDPOINT, endpoint.trim())
+            .putString(KEY_PENDING_SYNC_DISABLE_TOKEN, token.trim())
+            .commit()
+    }
+
+    fun clearPendingSyncDisableSnapshot() {
+        preferences.edit()
+            .remove(KEY_PENDING_SYNC_DISABLE_ENDPOINT)
+            .remove(KEY_PENDING_SYNC_DISABLE_TOKEN)
+            .commit()
+    }
+
     private fun readHours(openingKey: String, closingKey: String): DailyBusinessHours =
         DailyBusinessHours(
             openingMinutes = preferences.getInt(openingKey, DEFAULT_OPENING_MINUTES),
@@ -436,6 +473,8 @@ class LocalQueueRuleSettingsRepository(
         const val KEY_DEFAULT_OPENING_MINUTES = "default_opening_minutes"
         const val KEY_DEFAULT_CLOSING_MINUTES = "default_closing_minutes"
         const val KEY_LAST_HANDLED_CLOSING_OCCURRENCE = "last_handled_closing_occurrence"
+        const val KEY_PENDING_SYNC_DISABLE_ENDPOINT = "pending_sync_disable_endpoint"
+        const val KEY_PENDING_SYNC_DISABLE_TOKEN = "pending_sync_disable_token"
     }
 }
 

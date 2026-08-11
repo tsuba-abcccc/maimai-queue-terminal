@@ -55,6 +55,32 @@ class MobileDeviceRegistrationTest {
     }
 
     @Test
+    fun reassignedMachineIdentityRejectsMobileRegistrationEvenAtTheSameRevision() {
+        val current = state().copy(
+            machineStableIds = mapOf(
+                "A" to "20000000000000000000000000000001",
+                "B" to "20000000000000000000000000000002"
+            ),
+            machineConfigurationRevision = 12L
+        )
+
+        val result = decideMobileDeviceRegistration(
+            command().copy(
+                machineStableId = "10000000000000000000000000000001",
+                machineConfigurationRevision = 12L
+            ),
+            current
+        )
+
+        assertTrue(result is MobileDeviceRegistrationDecision.Reject)
+        assertEquals(
+            "目标机台已经变化，请在终端重新打开移动设备登记。",
+            (result as MobileDeviceRegistrationDecision.Reject).detail
+        )
+        assertTrue(current.queues.values.all { it.allRegistrations.isEmpty() })
+    }
+
+    @Test
     fun singlePlayerMachineUsesSoloWithoutChangingTheProfileDefault() {
         val current = state().copy(
             machineCapacities = mapOf("A" to 1, "B" to 2),

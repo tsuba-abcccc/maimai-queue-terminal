@@ -26,13 +26,18 @@ QUEUE_COMMAND_TIMEOUT_SECONDS=600
 QUEUE_COMMAND_CLAIM_LEASE_SECONDS=15
 QUEUE_COMMAND_RETENTION_SECONDS=2592000
 QUEUE_EVENT_RECIPIENT_RETENTION_SECONDS=2592000
-QUEUE_CORS_ORIGIN=https://abcccc.top
-QUEUE_PUBLIC_SITE_URL=https://abcccc.top/queue-status
+QUEUE_CORS_ORIGIN=https://queue.example.com
+QUEUE_PUBLIC_SITE_URL=https://queue.example.com/queue-status
 QUEUE_MOBILE_SESSION_TTL_SECONDS=600
 QUEUE_MOBILE_SESSION_RETENTION_SECONDS=86400
+QUEUE_LATEST_TERMINAL_VERSION=0.10.1
+QUEUE_LATEST_WEBSITE_VERSION=0.10.1
+QUEUE_LATEST_BOT_VERSION=0.3.12
 ```
 
 `QUEUE_PROFILE_SCOPE_ID` 表示同一机厅共享的玩家资料库。主备终端使用相同值即可读取同一份云端资料；同 UUID 通过递增的资料版本合并，终端仍负责拒绝昵称、QQ 和当前队列冲突。
+
+公开/自建部署必须显式填写 `QUEUE_CORS_ORIGIN` 和 `QUEUE_PUBLIC_SITE_URL`。服务端不会再默认使用维护者的网站地址；前者用于浏览器跨域校验，后者会编码进终端生成的移动设备登记二维码。Docker Compose 会在缺少任一必需地址时拒绝启动配置。
 
 每份鉴权令牌在启用对应私有接口时都必须达到 32 个 UTF-8 字节；两份令牌都配置时不能相同。某份配置缺失或过短时，对应私有接口统一返回 `503`；两份配置相同时，终端与 Bot 私有接口都会返回 `503`。健康检查仍会响应，服务不会降级为未鉴权访问。可使用 `openssl rand -hex 32` 分别生成两份独立令牌。
 
@@ -53,6 +58,7 @@ QUEUE_MOBILE_SESSION_RETENTION_SECONDS=86400
 ```text
 GET  /api/queue-status
 GET  /api/queue-logs
+GET  /api/queue-versions
 GET  /healthz
 ```
 
@@ -71,6 +77,8 @@ GET  /api/queue-mobile/sessions/<session_token>
 POST /api/queue-mobile/sessions/<session_token>/submit
 GET  /api/queue-mobile/sessions/<session_token>/result
 ```
+
+如果未配置 `QUEUE_PUBLIC_SITE_URL`，创建移动登记会话会安全返回 `503`，不会生成指向未知站点或无效相对路径的二维码。
 
 终端接口使用 `QUEUE_SYNC_TOKEN`、稳定的 `X-Device-ID`，以及每次进程启动生成的 `X-Terminal-Instance-ID` 和单调递增的 `X-Terminal-Instance-Generation`。服务器只允许当前权威运行实例上传快照、领取命令和提交回执；旧版终端缺少实例请求头时仍按稳定设备编号兼容：
 
@@ -177,9 +185,9 @@ Windows PowerShell 激活命令为 `.venv\Scripts\Activate.ps1`。
 1. 复制 `.env.example` 为 `.env`，分别生成终端令牌与 Bot 令牌。
 2. 设置稳定的 `QUEUE_PROFILE_SCOPE_ID`。
 3. 运行 `docker compose up -d --build`。
-4. 将 `nginx-location.conf.example` 中的 location 加入 `abcccc.top` 的 HTTPS 站点。
+4. 将 `nginx-location.conf.example` 中的 location 加入自己的 HTTPS 站点。
 5. 执行 `nginx -t` 并重载 Nginx。
-6. 访问 `https://abcccc.top/queue-api-healthz` 验证服务。
+6. 访问 `https://queue.example.com/queue-api-healthz` 验证服务（将域名替换为自己的域名）。
 
 ## systemd 部署
 
@@ -245,11 +253,11 @@ sudo systemctl reload nginx
 先验证公开健康检查：
 
 ```bash
-curl -i https://abcccc.top/queue-api-healthz
+curl -i https://queue.example.com/queue-api-healthz
 curl -i -X POST -H 'Content-Type: application/json' \
-  -d '{"qq":"00000"}' https://abcccc.top/api/queue-online/profile
-curl -i https://abcccc.top/api/queue-mobile/sessions/invalid-token
-curl -i 'https://abcccc.top/api/queue-bot/events?after=0&limit=1'
+  -d '{"qq":"00000"}' https://queue.example.com/api/queue-online/profile
+curl -i https://queue.example.com/api/queue-mobile/sessions/invalid-token
+curl -i 'https://queue.example.com/api/queue-bot/events?after=0&limit=1'
 ```
 
 第一条应返回 `200`。第二条应返回后端 JSON；测试 QQ 不存在时通常为 `404 PROFILE_NOT_FOUND`，这证明网站线上登记路由已经生效。第三条应返回后端 JSON `404` 和“没有找到这次移动设备登记”，证明移动登记路由已经生效。第四条故意不带令牌，应返回 `401` 和“Bot 认证失败”，这说明 Bot 路由已经到达新版后端。其他结果的含义如下：
@@ -263,12 +271,12 @@ curl -i 'https://abcccc.top/api/queue-bot/events?after=0&limit=1'
 ```bash
 read -rsp 'QUEUE_BOT_TOKEN: ' QUEUE_BOT_TOKEN; echo
 curl -sS -H "Authorization: Bearer ${QUEUE_BOT_TOKEN}" \
-  'https://abcccc.top/api/queue-bot/events?after=0&limit=1'
+  'https://queue.example.com/api/queue-bot/events?after=0&limit=1'
 curl -sS -X POST \
   -H "Authorization: Bearer ${QUEUE_BOT_TOKEN}" \
   -H 'Content-Type: application/json' \
   -d '{"qq":"替换为已建资料的QQ号"}' \
-  'https://abcccc.top/api/queue-bot/profiles'
+  'https://queue.example.com/api/queue-bot/profiles'
 unset QUEUE_BOT_TOKEN
 ```
 

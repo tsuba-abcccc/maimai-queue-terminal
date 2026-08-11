@@ -23,6 +23,7 @@ internal data class MobileDeviceRegistrationCommand(
     val sessionId: String?,
     val queueId: String,
     val machineId: String,
+    val machineStableId: String? = null,
     val actorQq: String,
     val preference: PlayPreference,
     val profileId: String,
@@ -88,6 +89,12 @@ internal fun decideMobileDeviceRegistration(
         command.machineConfigurationRevision != state.machineConfigurationRevision
     ) {
         return reject("机台配置已经更新，请在终端重新打开移动设备登记。")
+    }
+    if (
+        command.machineStableId != null &&
+        state.machineStableIds[command.machineId] != command.machineStableId
+    ) {
+        return reject("目标机台已经变化，请在终端重新打开移动设备登记。")
     }
     if (!state.websiteRemoteEnabled) {
         return reject("与服务端同步已关闭，暂不能使用移动设备登记。")

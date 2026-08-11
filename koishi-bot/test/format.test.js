@@ -8,6 +8,7 @@ const {
   formatMachineChoice,
   formatMachineChoiceLines,
   formatMachineReplyHint,
+  formatClientVersions,
   formatRegistrationCount,
   formatOwnQueue,
   formatOwnQueueActions,
@@ -39,7 +40,7 @@ test('locks the Bot confirmation to the registration state shown before the repl
     temporarily_away: true,
     temporary_away_skipped_turns: 2,
     online_registration_pending_check_in: false,
-  })
+  }, 17)
 
   assert.deepEqual(context, {
     expected_queue_id: 'queue-1',
@@ -50,7 +51,26 @@ test('locks the Bot confirmation to the registration state shown before the repl
     expected_absence_status: 'TEMPORARILY_AWAY',
     expected_temporary_away_skipped_turns: 2,
     expected_pending_check_in: false,
+    expected_machine_configuration_revision: 17,
   })
+})
+
+test('keeps queue operations compatible when an older server omits the machine revision', () => {
+  const context = queueConfirmationContextFields('queue-1', {
+    registration_id: 'registration-1',
+    machine_id: 'A',
+    position: 'WAITING',
+    fixed_pair: false,
+    fixed_pair_id: null,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    online_registration_pending_check_in: false,
+  })
+
+  assert.equal(context.expected_machine_configuration_revision, undefined)
+  assert.equal(context.expected_queue_id, 'queue-1')
+  assert.equal(context.expected_registration_id, 'registration-1')
 })
 
 test('explains the extra on-site step for legacy online-registration profiles', () => {
@@ -68,7 +88,58 @@ test('help text uses a message-safe profile menu', () => {
   assert.match(HELP_TEXT, /排队通知/)
   assert.match(HELP_TEXT, /设置 QQ 后才能使用/)
   assert.ok(HELP_TEXT.indexOf('查询人数') > HELP_TEXT.indexOf('查看队列'))
-  assert.ok(HELP_TEXT.indexOf('查询人数') < HELP_TEXT.indexOf('我的资料'))
+  assert.ok(HELP_TEXT.indexOf('版本信息') > HELP_TEXT.indexOf('查询人数'))
+  assert.ok(HELP_TEXT.indexOf('版本信息') < HELP_TEXT.indexOf('我的资料'))
+})
+
+test('formats all client versions without exposing internal status names', () => {
+  const message = formatClientVersions({
+    checked_at: 1_000,
+    components: {
+      terminal: {
+        name: '现场终端',
+        current_version: '0.10.0',
+        latest_version: '0.10.1',
+        status: 'UPDATE_AVAILABLE',
+        updated_at: 900,
+      },
+      website: {
+        name: '队列网站',
+        current_version: 'v0.10.1',
+        latest_version: '0.10.1',
+        status: 'LATEST',
+        updated_at: 900,
+      },
+      bot: {
+        name: 'QQ Bot',
+        current_version: null,
+        latest_version: '0.3.12',
+        status: 'UNKNOWN',
+        updated_at: null,
+      },
+    },
+  })
+
+  assert.equal(
+    message,
+    [
+      '版本信息',
+      '',
+      '现场终端·当前 0.10.0·最新 0.10.1',
+      '有新版本可用。',
+      '最后上报：1970-01-01 08:00',
+      '',
+      '队列网站·当前 0.10.1·最新 0.10.1',
+      '已是最新版本。',
+      '最后上报：1970-01-01 08:00',
+      '',
+      'QQ Bot·当前 未知·最新 0.3.12',
+      '暂时无法确认版本状态。',
+      '最后上报：尚未上报',
+    ].join('\n'),
+  )
+  assert.doesNotMatch(message, /UPDATE_AVAILABLE|UNKNOWN/)
+  assert.doesNotMatch(message, / · |· /)
 })
 
 test('formats registration totals and per-machine new-registration estimates', () => {
@@ -139,6 +210,26 @@ test('does not present a live new-registration estimate when it cannot apply', (
     }),
     /机台当前停止使用/,
   )
+  assert.match(
+    formatRegistrationCount({
+      ...baseQueue,
+      machines: {
+        A: {
+          ...baseMachine,
+          playing: Array.from({ length: 2 }, (_, index) => ({
+            registration_id: `playing-${index}`,
+          })),
+          waiting_positions: [{
+            registrations: Array.from({ length: 18 }, (_, index) => ({
+              registration_id: `waiting-${index}`,
+            })),
+          }],
+          new_registration_estimated_wait_minutes: 120,
+        },
+      },
+    }),
+    /登记已满/,
+  )
 })
 
 test('does not present a wait estimate while the current QQ is temporarily away', () => {
@@ -207,6 +298,24 @@ test('describes a zero-minute personal estimate as available soon', () => {
   assert.match(text, /预计很快可以游玩/)
   assert.doesNotMatch(text, /不足 1 分钟/)
   assert.doesNotMatch(text, /约 0 分钟后/)
+})
+
+test('does not put the maintainer site into the default count message', () => {
+  const message = formatRegistrationCount({
+    registration_open: true,
+    terminal: { online: true },
+    machines: {
+      A: {
+        id: 'A',
+        name: '机台 A',
+        operational: true,
+        playing: [],
+        waiting_positions: [],
+        new_registration_estimated_wait_minutes: 0,
+      },
+    },
+  })
+  assert.doesNotMatch(message, /abcccc\.top/)
 })
 
 test('explains a missing estimate from an older personal response', () => {
@@ -1252,7 +1361,11 @@ test('explains the persistent solo preference before transferring to a single-pl
     preference: 'OPEN_TO_JOIN',
   }
   const api = {
-    getPlayers: async () => ({ queue_id: 'queue-1', players: [player] }),
+    getPlayers: async () => ({
+      queue_id: 'queue-1',
+      machine_configuration_revision: 23,
+      players: [player],
+    }),
     getQueue: async () => ({
       queue_id: 'queue-1',
       captured_at: 1,
@@ -1301,6 +1414,7 @@ test('explains the persistent solo preference before transferring to a single-pl
 
   assert.equal(submittedOperation, 'TRANSFER_MACHINE')
   assert.equal(submittedFields.target_machine_id, 'B')
+  assert.equal(submittedFields.expected_machine_configuration_revision, 23)
   assert.match(sent[0], /本次登记将使用“单人游玩”/)
   assert.match(sent[0], /默认游玩偏好不会改变/)
   assert.match(sent[0], /转回支持共同游玩的机台时，本次登记仍会保持“单人游玩”/)

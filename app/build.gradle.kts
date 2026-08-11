@@ -8,7 +8,10 @@ fun String.asBuildConfigString(): String =
 
 val queueSyncUrl = providers.gradleProperty("QUEUE_SYNC_URL")
     .orElse(providers.environmentVariable("QUEUE_SYNC_URL"))
-    .orElse("https://abcccc.top/api/queue-status")
+    // A public build must not silently point at a private/demo service.  A
+    // connected terminal can still be provisioned explicitly with
+    // -PQUEUE_SYNC_URL (or configured from the app settings).
+    .orElse("")
 val queueSyncToken = providers.gradleProperty("QUEUE_SYNC_TOKEN")
     .orElse(providers.environmentVariable("QUEUE_SYNC_TOKEN"))
     .orElse("")
@@ -16,9 +19,20 @@ val terminalBuildEnabled = providers.gradleProperty("ENABLE_TERMINAL_BUILD")
     .orElse(providers.environmentVariable("ENABLE_TERMINAL_BUILD"))
     .map { it.equals("true", ignoreCase = true) }
     .orElse(false)
-val terminalQueueSyncUrl = if (terminalBuildEnabled.get()) queueSyncUrl.get() else ""
-val terminalQueueSyncToken = if (terminalBuildEnabled.get()) queueSyncToken.get() else ""
-val appVersionName = "0.10.0"
+val embedTerminalSyncConfig = providers.gradleProperty("EMBED_TERMINAL_SYNC_CONFIG")
+    .orElse(providers.environmentVariable("EMBED_TERMINAL_SYNC_CONFIG"))
+    .map { it.equals("true", ignoreCase = true) }
+    .orElse(false)
+// Even a private Gradle user property must not accidentally put a URL or
+// token into a public APK. Embedding is an explicit opt-in for controlled
+// device builds; ordinary terminal builds are configured in the app.
+val terminalQueueSyncUrl = if (terminalBuildEnabled.get() && embedTerminalSyncConfig.get()) {
+    queueSyncUrl.get()
+} else ""
+val terminalQueueSyncToken = if (terminalBuildEnabled.get() && embedTerminalSyncConfig.get()) {
+    queueSyncToken.get()
+} else ""
+val appVersionName = "0.10.1"
 
 android {
     namespace = "com.abcccc.maimaiqueue"
@@ -32,7 +46,7 @@ android {
         applicationId = "com.abcccc.maimaiqueue"
         minSdk = 29
         targetSdk = 36
-        versionCode = 58
+        versionCode = 59
         versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

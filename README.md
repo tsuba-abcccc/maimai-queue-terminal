@@ -1,6 +1,6 @@
 # maimai Q
 
-[![Version](https://img.shields.io/badge/version-0.10.0-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
+[![Version](https://img.shields.io/badge/version-0.10.1-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
 [![Android](https://img.shields.io/badge/Android-10%2B-34C759?logo=android&logoColor=white)](https://developer.android.com/about/versions/10)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-007AFF)](https://developer.android.com/compose)
@@ -13,10 +13,11 @@
 
 ## 快速链接
 
-- [在线查看当前队列](https://abcccc.top/queue-status)
+- [公开测试版自建部署方案](docs/public-beta-deployment.md)
+- [独立公开队列页说明](public-site/README.md)
 - [玩家使用手册](docs/user-manual.md)
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
-- [0.1.0 至 0.10.0 更新日志](docs/update.md)
+- [0.1.0 至 0.10.1 更新日志](docs/update.md)
 - [后续版本路线](docs/roadmap.md)
 - [开发与交付记录](docs/development-log.md)
 - [云端同步协议](docs/cloud-queue-sync.md)
@@ -96,7 +97,7 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将现�
 - 可关闭灰色的共同游玩预览；暂缓一次和待签到登记的真实位置投影始终保留。
 - 可统一设置营业时间，也可按星期分别设置；闭店后为现有队列保留最多 20 分钟的收尾时间，开店时间不会自动开启登记。
 - 操作日志区分现场终端、QQ Bot、系统自动和预留的网站远程来源，并可按来源筛选。
-- 每台机台可配置现场备注、游戏类型、服务器、游戏版本、游玩容量，以及单人和共同游玩的计划时间；固定编号“机台 A / B / C / D”保持不变。
+- 每台机台可配置现场备注、游戏类型、服务器、游戏版本、游玩容量，以及单人和共同游玩的计划时间；现场编号始终按“机台 A”至“机台 J”连续排列。
 - 容量为 1 时，本次登记统一使用“单人游玩”，但不会修改玩家资料默认偏好；固定组合、共同游玩预览和不适用的偏好操作会同时关闭。
 - 机台数量和游玩容量只允许在关闭登记后修改。关闭登记会清空当前批次，再次开启时重新载入最新配置和机台状态，并生成新的排队批次。
 - 重要操作使用确认弹窗、状态动画和克制的操作音效。
@@ -146,7 +147,7 @@ flowchart LR
 - 本机保存优先于云端同步，服务器故障不会中断现场排队。
 - 后端再次按白名单构造公开数据，不原样保存终端传来的未知字段。
 - Bot 不能直接覆盖正式数据，只能提交由终端校验的待执行命令。
-- 仓库包含 Android 应用和队列 API；当前在线网站前端由独立站点项目托管。
+- 仓库包含 Android 应用、队列 API 和独立公开队列页；维护者个人 `site-main` 仍是独立仓库，保留自己的文章、导航和主题。
 
 ## 运行要求
 
@@ -193,7 +194,7 @@ app/build/outputs/apk/local/debug/app-local-debug.apk
 .\gradlew.bat :app:packageLocalDebugApk
 ```
 
-文件会复制到 `output/apk/maimai-Q-0.10.0-local.apk`。
+文件会复制到 `output/apk/maimai-Q-0.10.1-local.apk`。
 
 macOS 或 Linux 使用：
 
@@ -242,7 +243,7 @@ $signedApk = 'app\build\outputs\apk\local\release\app-local-release-signed.apk'
 & '<Android SDK>\build-tools\<已安装版本>\apksigner.bat' verify --verbose --print-certs $signedApk
 ```
 
-公开渠道只能上传已经验证签名的 `localRelease` APK，例如上述 `app-local-release-signed.apk`。禁止上传 `app-local-debug.apk`、`app-local-release-unsigned.apk`、旧版 `app-debug.apk`，以及任何 `app-terminal-*` 文件。
+公开渠道只能上传已经验证签名的 Release APK。`localRelease` 是完全离线版；自建服务端的测试者还需要下文所述、不含预置地址和令牌的公开 `terminalRelease`。禁止上传 Debug、未签名 APK，或任何预置了机厅私有连接信息的终端包。
 
 ### 配置与服务端同步
 
@@ -250,11 +251,12 @@ $signedApk = 'app\build\outputs\apk\local\release\app-local-release-signed.apk'
 
 ```properties
 ENABLE_TERMINAL_BUILD=true
+EMBED_TERMINAL_SYNC_CONFIG=true
 QUEUE_SYNC_URL=https://your-domain.example/api/queue-status
 QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 ```
 
-也可以使用同名环境变量。这两个构建值只作为应用首次运行时的默认连接；未预置令牌的 `terminal` 版本仍可安装，再由管理员在“更多”→“应用设置”中填写。现场终端调试包使用：
+`EMBED_TERMINAL_SYNC_CONFIG=true` 只允许受控私有构建把地址和令牌作为首次运行默认值写入 APK；公开构建即使本机存在 `QUEUE_SYNC_URL` 或 `QUEUE_SYNC_TOKEN`，也不会自动带入。也可以使用同名环境变量。未预置令牌的 `terminal` 版本仍可安装，再由管理员在“更多”→“应用设置”中填写。现场终端调试包使用：
 
 ```powershell
 .\gradlew.bat :app:packageTerminalDebugApk -PENABLE_TERMINAL_BUILD=true
@@ -262,13 +264,25 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 
 `terminal` 变体必须通过 `ENABLE_TERMINAL_BUILD=true` 显式开启，应用 ID 保持 `com.abcccc.maimaiqueue`，可覆盖安装现有现场版本。应用内修改连接前需要先关闭与服务端同步；地址必须使用 HTTPS，可以填写站点根地址或完整的 `/api/queue-status` 地址；终端同步令牌至少为 32 个 UTF-8 字节。保存有效连接后才能重新开启与服务端同步。
 
-若构建时预置了令牌，该令牌会进入 APK；应用内保存的连接只保存在终端本机。因此：
+若构建时预置了令牌，该令牌会进入 APK；应用内保存的连接只保存在终端本机。因此应把终端包明确分为两类：
 
-- GitHub 或其他公开渠道不得上传任何 `app-terminal-*`。
-- 公开分发版与现场终端版应使用不同签名和不同配置。
-- 现场终端 APK 只在受控设备间传递；令牌泄漏后立即在服务端轮换。
+- 公开联网终端版必须显式使用 `-PEMBED_TERMINAL_SYNC_CONFIG=false` 构建，不含服务器地址或令牌；安装后由机厅管理员在应用设置中填写自己的连接。
+- 预置连接的私有终端版必须使用 `-PEMBED_TERMINAL_SYNC_CONFIG=true` 单独构建，只在受控设备间传递，绝不能上传 GitHub；令牌泄漏后立即在服务端轮换。
+- 两类包可以保持相同应用 ID 和长期发布签名，便于受控终端覆盖升级；是否可以公开取决于包内是否含私有配置，而不是文件名中是否含 `terminal`。
 
-现场终端文件会复制到 `output/apk/maimai-Q-0.10.0-terminal.apk`，不得作为 GitHub 公开 Release 附件。
+公开联网终端正式版候选使用：
+
+```powershell
+.\gradlew.bat :app:assembleTerminalRelease `
+  -PENABLE_TERMINAL_BUILD=true `
+  -PEMBED_TERMINAL_SYNC_CONFIG=false `
+  -PQUEUE_SYNC_URL= `
+  -PQUEUE_SYNC_TOKEN=
+```
+
+签名后还应检查其应用 ID 为 `com.abcccc.maimaiqueue`、包含联网权限、不是 Debug 构建，并确认 APK 中没有任何实际域名或令牌。
+
+现场终端文件会复制到 `output/apk/maimai-Q-0.10.1-terminal.apk`。只有不含预置连接信息且经过正式签名和校验的构建，才可以作为 GitHub 公开 Release 附件。
 
 ## 部署队列 API
 
@@ -293,7 +307,7 @@ curl https://your-domain.example/queue-api-healthz
 {"service":"maimai-queue-status","status":"ok"}
 ```
 
-服务器还支持 systemd 部署、主终端优先和离线后的备用终端接管。完整步骤见[后端部署说明](cloud-server/README.md)。
+服务器还支持 systemd 部署、主终端优先和离线后的备用终端接管。公开测试版的完整自建步骤见[公开测试版自建部署方案](docs/public-beta-deployment.md)，API 细节见[后端部署说明](cloud-server/README.md)。
 
 ## 数据和隐私
 
@@ -360,8 +374,9 @@ maimai-queue-terminal/
 - 网站与 Koishi Bot 的线上登记仅接受已经绑定 QQ 的玩家资料；移动设备登记页可以新建资料或补全旧资料，但提交后仍需终端确认才会加入现场队列。
 - 线上登记必须在创建后的 30 分钟内到终端签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出。网站暂不提供暂缓一次、暂时离开、切换机台、修改偏好或退出排队等队列管理操作。
 - QQ Bot 只允许玩家管理与发送者 QQ 对应的本人登记，不提供远程调整其他玩家或整条队列的能力。
-- 当前公开站点的前端源码不在本仓库中。
+- `public-site/` 是公开队列页的规范前端源码；个人 `site-main` 中的队列组件由同步脚本保持一致，不会被公开站点替换。
 - 仓库没有包含可公开使用的生产同步令牌或正式签名密钥。
+- 公开测试部署不会预置维护者的服务地址；部署者必须自行配置后端、网站、Bot 和终端连接。GitHub Release 只提供经过长期 Release 证书签名并核验的 APK，工作区中的 Debug 或未签名产物不得对外分发。
 
 后续计划包括最多 10 台机台的动态增删与分组、多终端联动、轻量化游玩时间自动学习，以及完善公开安装版与现场终端版的发布流程。
 

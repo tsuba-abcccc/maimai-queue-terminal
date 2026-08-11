@@ -5,7 +5,9 @@ const {
   QueueApi,
   apiBaseValidationError,
   isOnlyBotMention,
+  normalizedReportedVersion,
   profileUpdateErrorMessage,
+  publicQueueUrlValidationError,
   requireQqSession,
   resolveProfileCommandInput,
   resolveQueueCommandInput,
@@ -171,6 +173,53 @@ test('submits queue operations with a unique request id and no undefined fields'
   assert.equal(options.headers.Authorization, 'Bearer test-token')
 })
 
+test('retries queue confirmation without new fields only when an older server rejects them', async () => {
+  const requests = []
+  const http = async (...args) => {
+    requests.push(args)
+    if (requests.length === 1) {
+      return { status: 400, data: { error: '请求包含不支持的排队操作字段' } }
+    }
+    return {
+      status: 202,
+      data: {
+        command_id: '00000000-0000-0000-0000-000000000402',
+        status: 'PENDING',
+        result_detail: null,
+      },
+    }
+  }
+  const api = new QueueApi({ http }, {
+    apiBase: 'https://queue.example.test',
+    botToken: 'test-token',
+    notificationEnabled: false,
+    notificationIntervalSeconds: 5,
+    commandWaitSeconds: 15,
+  })
+
+  await api.createQueueCommand('12345678', 'TRANSFER_MACHINE', {
+    target_machine_id: 'B',
+    expected_queue_id: '00000000-0000-0000-0000-000000000001',
+    expected_registration_id: '1'.repeat(24),
+    expected_machine_id: 'A',
+    expected_position: 'WAITING',
+    expected_fixed_pair_id: null,
+    expected_absence_status: 'NONE',
+    expected_temporary_away_skipped_turns: 0,
+    expected_pending_check_in: false,
+    expected_machine_configuration_revision: 7,
+    expected_machine_stable_id: '2'.repeat(32),
+    expected_target_machine_stable_id: '3'.repeat(32),
+  })
+
+  assert.equal(requests.length, 2)
+  assert.equal(requests[1][2].data.request_id, requests[0][2].data.request_id)
+  assert.equal('expected_machine_stable_id' in requests[1][2].data, false)
+  assert.equal('expected_target_machine_stable_id' in requests[1][2].data, false)
+  assert.equal('expected_machine_configuration_revision' in requests[1][2].data, false)
+  assert.equal(requests[1][2].data.expected_registration_id, '1'.repeat(24))
+})
+
 test('queue input uses a separate paragraph and supports cancellation', async () => {
   const sent = []
   const session = reply => ({
@@ -220,4 +269,44 @@ test('rejects ambiguous API base URLs and embedded credentials', () => {
   assert.match(apiBaseValidationError('https://user:secret@queue.example.test'), /用户名或密码/)
   assert.match(apiBaseValidationError('https://queue.example.test/api'), /只填写站点根地址/)
   assert.match(apiBaseValidationError('https://queue.example.test?token=secret'), /只填写站点根地址/)
+})
+
+test('uses the public website origin independently from the API origin', async () => {
+  const requested = []
+  const api = new QueueApi({
+    http: {
+      async get(url) {
+        requested.push(url)
+        return { version: '0.10.1' }
+      },
+    },
+  }, {
+    apiBase: 'https://api.example.test',
+    publicQueueUrl: 'https://queue.example.test',
+    botToken: 'test-token',
+    notificationEnabled: false,
+    notificationIntervalSeconds: 5,
+    commandWaitSeconds: 15,
+  })
+
+  assert.equal(api.publicUrl('/queue-status'), 'https://queue.example.test/queue-status')
+  assert.equal(await api.getWebsiteVersion(), '0.10.1')
+  assert.deepEqual(requested, ['https://queue.example.test/queue-client-version.json'])
+  assert.equal(api.url('/api/queue-status'), 'https://api.example.test/api/queue-status')
+})
+
+test('validates the optional public website root independently', () => {
+  assert.equal(publicQueueUrlValidationError(), null)
+  assert.equal(publicQueueUrlValidationError('https://queue.example.test'), null)
+  assert.equal(publicQueueUrlValidationError('http://localhost:4173'), null)
+  assert.match(publicQueueUrlValidationError('http://queue.example.test'), /必须使用 HTTPS/)
+  assert.match(publicQueueUrlValidationError('https://queue.example.test/queue-status'), /只填写网站根地址/)
+  assert.match(publicQueueUrlValidationError('https://user:secret@queue.example.test'), /用户名或密码/)
+})
+
+test('validates reported versions with the same semantic-version rules as the server', () => {
+  assert.equal(normalizedReportedVersion('v0.10.1'), '0.10.1')
+  assert.equal(normalizedReportedVersion('1.0.0-rc.1+build.2'), '1.0.0-rc.1+build.2')
+  assert.equal(normalizedReportedVersion('1.0.0-01'), undefined)
+  assert.equal(normalizedReportedVersion('1.0'), undefined)
 })

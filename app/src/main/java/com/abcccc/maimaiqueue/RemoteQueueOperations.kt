@@ -36,7 +36,9 @@ internal data class RemoteQueueOperationCommand(
     val operation: RemoteQueueOperation,
     val source: RemoteQueueOperationSource,
     val machineId: String? = null,
+    val machineStableId: String? = null,
     val targetMachineId: String? = null,
+    val targetMachineStableId: String? = null,
     val registrationId: String? = null,
     val preference: PlayPreference? = null,
     val expectedPosition: RemoteRegistrationPosition? = null,
@@ -60,6 +62,7 @@ internal data class RemoteQueueExecutionState(
     val allowDeferOneRound: Boolean,
     val allowTemporaryLeave: Boolean,
     val machineCapacities: Map<String, Int> = emptyMap(),
+    val machineStableIds: Map<String, String> = emptyMap(),
     val machineConfigurationRevision: Long = 1L
 )
 
@@ -182,6 +185,18 @@ internal fun decideRemoteQueueOperation(
         command.machineConfigurationRevision != state.machineConfigurationRevision
     ) {
         return reject("机台配置已经更新，请重新查询后再操作。")
+    }
+    if (
+        command.machineStableId != null &&
+        state.machineStableIds[command.machineId] != command.machineStableId
+    ) {
+        return reject("所选机台已经变化，请重新查询后再操作。")
+    }
+    if (
+        command.targetMachineStableId != null &&
+        state.machineStableIds[command.targetMachineId] != command.targetMachineStableId
+    ) {
+        return reject("要转入的机台已经变化，请重新查询后再操作。")
     }
     when (command.source) {
         RemoteQueueOperationSource.WEBSITE_REMOTE -> if (!state.websiteRemoteEnabled) {

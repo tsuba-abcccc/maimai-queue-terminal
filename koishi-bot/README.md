@@ -2,7 +2,7 @@
 
 该插件把 Koishi OneBot 与 maimai Q 私有 API 连接起来。QQ 号来自 OneBot 会话身份，玩家不能在命令中指定其他人的 QQ。
 
-插件采用独立版本号，当前版本为 `0.3.11`，不会跟随 Android 应用版本同步递增。
+插件采用独立版本号，当前版本为 `0.3.12`，不会跟随 Android 应用版本同步递增。
 
 ## 当前功能
 
@@ -71,10 +71,10 @@ pnpm run build
 pnpm pack
 ```
 
-`pnpm pack` 会再次构建并生成 `koishi-plugin-maimai-q-0.3.11.tgz`。将该文件放到运行 Koishi 的机器，在 Koishi 项目根目录执行：
+`pnpm pack` 会再次构建并生成 `koishi-plugin-maimai-q-0.3.12.tgz`。将该文件放到运行 Koishi 的机器，在 Koishi 项目根目录执行：
 
 ```bash
-pnpm add -w /absolute/path/to/koishi-plugin-maimai-q-0.3.11.tgz
+pnpm add -w /absolute/path/to/koishi-plugin-maimai-q-0.3.12.tgz
 ```
 
 应使用 pnpm 的本地包安装命令，不要在插件源码目录与 Koishi 项目之间直接复制 `node_modules`。
@@ -84,7 +84,8 @@ pnpm add -w /absolute/path/to/koishi-plugin-maimai-q-0.3.11.tgz
 ```yaml
 plugins:
   maimai-q:
-    apiBase: https://abcccc.top
+    apiBase: https://queue.example.com
+    publicQueueUrl: https://queue.example.com
     botToken: <与服务器 QUEUE_BOT_TOKEN 相同的令牌>
     oneBotSelfId: '<用于发送私信的机器人 QQ>'
     notificationEnabled: true
@@ -107,7 +108,9 @@ systemctl status maimai-q-koishi.service
 
 配置字段含义：
 
-- `apiBase`：例如 `https://abcccc.top`。只填写站点根地址，不要附加 `/api`、查询参数或账号密码。
+- `apiBase`：例如 `https://queue.example.com`。只填写站点根地址，不要附加 `/api`、查询参数或账号密码。
+- `apiBase` 没有维护者服务的默认值；公开或自建部署必须显式填写自己的后端地址，避免插件误连接其他机厅。
+- `publicQueueUrl`：队列网站的根地址，例如 `https://queue.example.com`。网站与 API 分开部署时必须填写；不要附加 `/queue-status` 等路径、查询参数或账号密码。留空时使用 `apiBase`。
 - `botToken`：与服务器 `QUEUE_BOT_TOKEN` 相同。
 - `oneBotSelfId`：存在多个 OneBot 实例时填写用于主动通知的机器人 QQ。留空时选择首个在线 OneBot；填写后不会自动改用其他实例。该字段不限制玩家从哪个 OneBot 会话执行命令。
 - `notificationEnabled`：是否在此 Koishi 实例运行通知轮询，默认开启。玩家资料中的个人总开关和分项设置仍由终端、Bot 与云端共同保存。
