@@ -3066,6 +3066,61 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("APPLIED", completed.get_json()["status"])
         self.assertEqual("TERMINAL", completed.get_json()["result_source"])
 
+    def test_same_terminal_restore_rejects_a_claimed_test_command(self):
+        snapshot = self.remote_ready_snapshot(revision=8)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        test_snapshot = copy.deepcopy(snapshot)
+        test_snapshot["revision"] = 9
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status",
+                json=test_snapshot,
+                headers={**self.headers, "X-Queue-Sync-Mode": "test"},
+            ).status_code,
+        )
+        command_id = "00000000-0000-0000-0000-000000000790"
+        self.assertEqual(
+            202,
+            self.client.post(
+                "/api/queue-online/join",
+                json={
+                    "request_id": command_id,
+                    "qq": "12345678",
+                    "machine_id": "A",
+                },
+            ).status_code,
+        )
+        claimed = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+        self.assertIn(command_id, {command["command_id"] for command in claimed})
+
+        restored_snapshot = copy.deepcopy(snapshot)
+        restored_snapshot["revision"] = 10
+        restored = self.client.post(
+            "/api/queue-status",
+            json=restored_snapshot,
+            headers={**self.headers, "X-Queue-Sync-Mode": "takeover"},
+        )
+        command = self.client.get(
+            f"/api/queue-online/commands/{command_id}"
+        ).get_json()
+        available = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+
+        self.assertEqual(204, restored.status_code)
+        self.assertEqual("REJECTED", command["status"])
+        self.assertEqual("SERVER_MIGRATION", command["result_source"])
+        self.assertIn("测试同步已经结束", command["result_detail"])
+        self.assertNotIn(command_id, {value["command_id"] for value in available})
+
     def test_recent_join_guard_does_not_cross_official_and_test_scopes(self):
         snapshot = self.remote_ready_snapshot(revision=10)
         self.client.post("/api/queue-status", json=snapshot, headers=self.headers)
@@ -3933,6 +3988,182 @@ class QueueStatusApiTest(unittest.TestCase):
             },
         )
         self.assertEqual(202, rejoined_after_newer_snapshot.status_code)
+
+    def test_recently_applied_website_join_blocks_mobile_registration(self):
+        snapshot = self.remote_ready_snapshot(revision=31)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        first_request_id = "00000000-0000-0000-0000-000000000434"
+        self.assertEqual(
+            202,
+            self.client.post(
+                "/api/queue-online/join",
+                json={
+                    "request_id": first_request_id,
+                    "qq": "12345678",
+                    "machine_id": "A",
+                },
+            ).status_code,
+        )
+        self.client.get("/api/queue-terminal/commands", headers=self.headers)
+        self.assertEqual(
+            "APPLIED",
+            self.client.post(
+                f"/api/queue-terminal/commands/{first_request_id}/result",
+                json={
+                    "status": "APPLIED",
+                    "detail": "线上登记已保存。",
+                    "result_registration_id": "a" * 24,
+                },
+                headers=self.headers,
+            ).get_json()["status"],
+        )
+        session = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000435",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        ).get_json()
+
+        repeated = self.client.post(
+            f"/api/queue-mobile/sessions/{session['session_token']}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000436",
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+            },
+        )
+
+        self.assertEqual(409, repeated.status_code)
+        self.assertEqual("PLAYER_OPERATION_SYNCING", repeated.get_json()["code"])
+
+    def test_recently_applied_mobile_registration_blocks_website_join(self):
+        snapshot = self.remote_ready_snapshot(revision=32)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        session = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000437",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        ).get_json()
+        command_id = "00000000-0000-0000-0000-000000000438"
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{session['session_token']}/submit",
+            json={
+                "request_id": command_id,
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+            },
+        )
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+        command = next(value for value in commands if value["command_id"] == command_id)
+        self.assertNotIn("_queue_storage_id", command["payload"])
+        self.assertEqual(
+            "APPLIED",
+            self.client.post(
+                f"/api/queue-terminal/commands/{command_id}/result",
+                json={
+                    "status": "APPLIED",
+                    "detail": "已通过移动设备加入排队。",
+                    "result_registration_id": "b" * 24,
+                },
+                headers=self.headers,
+            ).get_json()["status"],
+        )
+
+        repeated = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000439",
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+
+        self.assertEqual(202, submitted.status_code)
+        self.assertEqual(409, repeated.status_code)
+        self.assertEqual("PLAYER_OPERATION_SYNCING", repeated.get_json()["code"])
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            stored_scope = connection.execute(
+                "SELECT json_extract(payload, '$._queue_storage_id') "
+                "FROM terminal_command WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(snapshot["queue_id"], stored_scope)
+
+    def test_recent_mobile_join_guard_does_not_cross_test_scope(self):
+        snapshot = self.remote_ready_snapshot(revision=33)
+        self.client.post("/api/queue-status", json=snapshot, headers=self.headers)
+        session = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000440",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        ).get_json()
+        command_id = "00000000-0000-0000-0000-000000000441"
+        self.client.post(
+            f"/api/queue-mobile/sessions/{session['session_token']}/submit",
+            json={
+                "request_id": command_id,
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+            },
+        )
+        self.client.get("/api/queue-terminal/commands", headers=self.headers)
+        self.client.post(
+            f"/api/queue-terminal/commands/{command_id}/result",
+            json={
+                "status": "APPLIED",
+                "detail": "已通过移动设备加入排队。",
+                "result_registration_id": "c" * 24,
+            },
+            headers=self.headers,
+        )
+
+        test_snapshot = copy.deepcopy(snapshot)
+        test_snapshot["revision"] = 34
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status",
+                json=test_snapshot,
+                headers={**self.headers, "X-Queue-Sync-Mode": "test"},
+            ).status_code,
+        )
+        joined = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000442",
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+
+        self.assertEqual(202, joined.status_code, joined.get_json())
 
     def test_legacy_profile_can_join_online_before_completing_setup(self):
         snapshot = self.remote_ready_snapshot(revision=22)
@@ -5552,6 +5783,54 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual(409, rejected.status_code)
         self.assertEqual("现场规则暂不允许线上登记", rejected.get_json()["error"])
+
+    def test_mobile_registration_rechecks_online_registration_switch_before_submission(self):
+        snapshot = self.remote_ready_snapshot(revision=26)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        created = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000858",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(201, created.status_code)
+
+        disabled = copy.deepcopy(snapshot)
+        disabled["revision"] += 1
+        disabled["queue_rules"]["allow_online_registration"] = False
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=disabled, headers=self.headers
+            ).status_code,
+        )
+
+        rejected = self.client.post(
+            f"/api/queue-mobile/sessions/{created.get_json()['session_token']}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000859",
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+            },
+        )
+
+        self.assertEqual(409, rejected.status_code)
+        self.assertEqual("ONLINE_REGISTRATION_DISABLED", rejected.get_json()["code"])
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=self.headers
+        ).get_json()["commands"]
+        self.assertFalse(any(
+            command["command_id"] == "00000000-0000-0000-0000-000000000859"
+            for command in commands
+        ))
 
     def test_mobile_registration_request_id_collision_returns_conflict(self):
         snapshot = self.remote_ready_snapshot(revision=25)

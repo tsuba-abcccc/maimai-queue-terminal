@@ -25,6 +25,20 @@ class MobileDeviceRegistrationTest {
     }
 
     @Test
+    fun registrationIsRejectedWhenOnlineRegistrationIsDisabledAfterTheSessionWasOpened() {
+        val result = decideMobileDeviceRegistration(
+            command(),
+            state().copy(allowOnlineRegistration = false)
+        )
+
+        assertTrue(result is MobileDeviceRegistrationDecision.Reject)
+        assertEquals(
+            "现场规则暂不允许线上登记。",
+            (result as MobileDeviceRegistrationDecision.Reject).detail
+        )
+    }
+
+    @Test
     fun existingCompleteProfileCreatesANormalOnSiteRegistration() {
         val result = decideMobileDeviceRegistration(command(), state())
 

@@ -1056,13 +1056,15 @@ def publish_snapshot():
                     UPDATE terminal_command
                     SET status = 'REJECTED', completed_at = ?, result_detail = ?,
                         result_source = ?
-                    WHERE status = 'PENDING' AND claimed_at IS NULL AND device_id = ?
+                    WHERE status = 'PENDING' AND device_id = ?
+                      AND (claimed_at IS NULL OR ?)
                     """,
                     (
                         now,
                         TEST_SYNC_ENDED_DETAIL,
                         RESULT_SOURCE_SERVER_MIGRATION,
                         device_id,
+                        int(current_is_test and not incoming_is_test),
                     ),
                 )
         if current_instance_changed:
@@ -2516,6 +2518,64 @@ def create_bot_queue_operation_command():
     return create_queue_operation_command(source, "QQ_BOT")
 
 
+def recently_applied_join_waiting_for_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    device_id: str,
+    queue_storage_id: str,
+    actor_qq: str,
+    profile_id: str,
+    snapshot_received_at: int,
+    now: int,
+) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1 FROM terminal_command
+        WHERE status = 'APPLIED' AND device_id = ?
+          AND completed_at IS NOT NULL AND completed_at > ?
+          AND completed_at >= ?
+          AND (
+              (command_type = ? AND json_extract(payload, '$.operation') = 'JOIN_QUEUE')
+              OR command_type = ?
+          )
+          AND COALESCE(
+              json_extract(payload, '$._queue_storage_id'),
+              CASE WHEN command_type = ?
+                   THEN json_extract(payload, '$.queue_id') END
+          ) = ?
+          AND (
+              json_extract(payload, '$.actor_qq') = ?
+              OR json_extract(payload, '$.profile_id') = ?
+              OR json_extract(payload, '$.profile.profile_id') = ?
+          )
+        LIMIT 1
+        """,
+        (
+            device_id,
+            now - APPLIED_JOIN_SYNC_GUARD_SECONDS,
+            snapshot_received_at,
+            QUEUE_OPERATION_COMMAND,
+            MOBILE_REGISTRATION_COMMAND,
+            QUEUE_OPERATION_COMMAND,
+            queue_storage_id,
+            actor_qq,
+            profile_id,
+            profile_id,
+        ),
+    ).fetchone()
+    return row is not None
+
+
+def player_join_syncing_response():
+    return jsonify(
+        {
+            "ok": False,
+            "code": "PLAYER_OPERATION_SYNCING",
+            "error": "上一份登记已由终端保存，正在同步最新队列，请稍后刷新。",
+        }
+    ), 409
+
+
 def create_queue_operation_command(source: dict[str, Any], operation_source: str):
     try:
         command_id = read_uuid(source, "request_id")
@@ -2743,44 +2803,20 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
             snapshot,
             actor_qq,
         )
-        if operation == "JOIN_QUEUE" and not registration_contexts:
-            recently_applied_join = connection.execute(
-                """
-                SELECT completed_at FROM terminal_command
-                WHERE command_type = ? AND status = 'APPLIED'
-                  AND device_id = ?
-                  AND completed_at IS NOT NULL AND completed_at > ?
-                  AND COALESCE(
-                      json_extract(payload, '$._queue_storage_id'),
-                      json_extract(payload, '$.queue_id')
-                  ) = ?
-                  AND json_extract(payload, '$.operation') = 'JOIN_QUEUE'
-                  AND (
-                      json_extract(payload, '$.actor_qq') = ?
-                      OR json_extract(payload, '$.profile_id') = ?
-                  )
-                LIMIT 1
-                """,
-                (
-                    QUEUE_OPERATION_COMMAND,
-                    snapshot_row["device_id"],
-                    now - APPLIED_JOIN_SYNC_GUARD_SECONDS,
-                    queue_storage_id,
-                    actor_qq,
-                    profile["profile_id"],
-                ),
-            ).fetchone()
-            if (
-                recently_applied_join is not None
-                and snapshot_row["received_at"] <= recently_applied_join["completed_at"]
-            ):
-                return jsonify(
-                    {
-                        "ok": False,
-                        "code": "PLAYER_OPERATION_SYNCING",
-                        "error": "上一份线上登记已由终端保存，正在同步最新队列，请稍后刷新。",
-                    }
-                ), 409
+        if (
+            operation == "JOIN_QUEUE"
+            and not registration_contexts
+            and recently_applied_join_waiting_for_snapshot(
+                connection,
+                device_id=snapshot_row["device_id"],
+                queue_storage_id=queue_storage_id,
+                actor_qq=actor_qq,
+                profile_id=profile["profile_id"],
+                snapshot_received_at=snapshot_row["received_at"],
+                now=now,
+            )
+        ):
+            return player_join_syncing_response()
 
         desired, validation_error = build_queue_operation_payload(
             snapshot=snapshot,
@@ -3236,6 +3272,8 @@ def validate_open_mobile_session(
         return "与服务端同步已关闭，暂不能使用移动设备登记", 503, "WEBSITE_SYNC_DISABLED"
     if snapshot_in_closing_grace(snapshot):
         return "闭店收尾期间不再接收新的排队登记", 409, "REGISTRATION_CLOSED"
+    if not online_registration_allowed(snapshot):
+        return "现场规则暂不允许线上登记", 409, "ONLINE_REGISTRATION_DISABLED"
     if not snapshot.get("registration_open", True):
         return "现场当前没有使用登记排队", 409, "REGISTRATION_CLOSED"
     machine = snapshot.get("machines", {}).get(session["machine_id"])
@@ -3728,6 +3766,16 @@ def submit_mobile_registration_session(session_token: str):
                     "error": "这个昵称已经用于当前队列中的其他登记",
                 }
             ), 409
+        if recently_applied_join_waiting_for_snapshot(
+            connection,
+            device_id=snapshot_row["device_id"],
+            queue_storage_id=queue_storage_id,
+            actor_qq=actor_qq,
+            profile_id=profile_id,
+            snapshot_received_at=snapshot_row["received_at"],
+            now=now,
+        ):
+            return player_join_syncing_response()
         pending = connection.execute(
             """
             SELECT 1 FROM terminal_command
@@ -3749,6 +3797,7 @@ def submit_mobile_registration_session(session_token: str):
             ), 409
 
         payload = {
+            "_queue_storage_id": queue_storage_id,
             "queue_id": session["queue_id"],
             "machine_configuration_revision": snapshot.get(
                 "machine_configuration_revision", 1

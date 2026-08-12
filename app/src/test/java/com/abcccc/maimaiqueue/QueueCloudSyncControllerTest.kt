@@ -1,9 +1,13 @@
 package com.abcccc.maimaiqueue
 
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -167,9 +171,45 @@ class QueueCloudSyncControllerTest {
         controller.setEnabled(false)
     }
 
+    @Test
+    fun oneOffPublishUsesTheSameLockAsTheRegularPublishLoop() = runBlocking {
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        val publisher = RecordingPublisher(
+            beforeReturn = { state ->
+                if (state.revision == 1L) {
+                    firstStarted.complete(Unit)
+                    releaseFirst.await()
+                }
+            }
+        )
+        val controller = QueueCloudSyncController(
+            scope = this,
+            publisher = publisher,
+            onStatusChange = {}
+        )
+
+        controller.submit(state(revision = 1L))
+        firstStarted.await()
+        assertEquals(1L, publisher.publishedStates.receive().revision)
+        val oneOff = launch {
+            controller.withPublishLock {
+                publisher.publish(state(revision = 2L))
+            }
+        }
+        yield()
+        assertFalse(oneOff.isCompleted)
+
+        releaseFirst.complete(Unit)
+        withTimeout(1_000L) { oneOff.join() }
+        assertEquals(2L, publisher.publishedStates.receive().revision)
+        controller.setEnabled(false)
+    }
+
     private class RecordingPublisher(
         override val isConfigured: Boolean = true,
-        private val publishResult: QueuePublishResult = QueuePublishResult.Success
+        private val publishResult: QueuePublishResult = QueuePublishResult.Success,
+        private val beforeReturn: suspend (PersistedQueueState) -> Unit = {}
     ) : QueueStatePublisher {
         val publishedStates = Channel<PersistedQueueState>(Channel.UNLIMITED)
 
@@ -180,6 +220,7 @@ class QueueCloudSyncControllerTest {
             playerProfiles: List<PlayerProfile>
         ): QueuePublishResult {
             publishedStates.send(state)
+            beforeReturn(state)
             return publishResult
         }
     }

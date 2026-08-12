@@ -717,16 +717,17 @@ internal fun RegistrationApp() {
             pendingSyncDisableSnapshot == pending &&
             !queueRuleSettings.websiteSyncEnabled
         ) {
-            cloudSyncController.awaitIdle()
-            val result = publisher.publish(
-                state = currentPersistedQueueState(),
-                auditLogs = auditLogs,
-                displaySettings = currentPublicDisplaySettings(
-                    websiteRemoteEnabled = false,
-                    oneBotSyncEnabled = false
-                ),
-                playerProfiles = playerProfiles
-            )
+            val result = cloudSyncController.withPublishLock {
+                publisher.publish(
+                    state = currentPersistedQueueState(),
+                    auditLogs = auditLogs,
+                    displaySettings = currentPublicDisplaySettings(
+                        websiteRemoteEnabled = false,
+                        oneBotSyncEnabled = false
+                    ),
+                    playerProfiles = playerProfiles
+                )
+            }
             when (result) {
                 QueuePublishResult.Success -> {
                     queueRuleSettingsRepository.clearPendingSyncDisableSnapshot()

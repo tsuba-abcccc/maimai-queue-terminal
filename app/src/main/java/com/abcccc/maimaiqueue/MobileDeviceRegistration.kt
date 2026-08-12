@@ -99,6 +99,9 @@ internal fun decideMobileDeviceRegistration(
     if (!state.websiteRemoteEnabled) {
         return reject("与服务端同步已关闭，暂不能使用移动设备登记。")
     }
+    if (!state.allowOnlineRegistration) {
+        return reject("现场规则暂不允许线上登记。")
+    }
     if (!state.acceptingNewRegistrations) {
         return reject("现场当前没有使用登记排队。")
     }

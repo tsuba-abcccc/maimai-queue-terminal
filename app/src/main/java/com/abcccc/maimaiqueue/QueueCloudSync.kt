@@ -1119,6 +1119,14 @@ internal class QueueCloudSyncController(
         publishMutex.withLock { }
     }
 
+    /**
+     * Run a one-off publish in the same critical section as the regular
+     * publish loop. Callers use this for state transitions that must not race
+     * with a newly enabled publish loop.
+     */
+    suspend fun <T> withPublishLock(block: suspend () -> T): T =
+        publishMutex.withLock { block() }
+
     private fun startPublishLoop() {
         if (publishJob?.isActive == true || !enabled || !publisher.isConfigured) return
         publishJob = scope.launch { publishLoop() }
