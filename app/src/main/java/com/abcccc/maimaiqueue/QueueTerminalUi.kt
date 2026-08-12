@@ -15267,8 +15267,8 @@ private fun queueCloudSyncStatusLabel(status: QueueCloudSyncStatus): String = wh
         "$prefix · ${SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(it))}"
     } ?: if (status.syncMode == QueueSyncMode.TEST) "测试数据已同步" else "已同步"
     QueueCloudSyncPhase.WAITING_TO_RETRY -> status.retryDetail?.let {
-        "连接中断，等待重试：$it"
-    } ?: "连接中断，等待重试"
+        "同步失败，等待重试：$it"
+    } ?: "同步失败，等待重试"
 }
 
 private fun queueCloudSyncShortLabel(phase: QueueCloudSyncPhase): String = when (phase) {

@@ -336,6 +336,48 @@ class QueueCloudSnapshotTest {
     }
 
     @Test
+    fun systemAndPlayerProfileEventsNeverPublishDirtyMachineIdentity() {
+        val dirtyEvents = listOf(
+            AuditLogEntry(
+                id = "00000000-0000-0000-0000-000000000704",
+                timestampMillis = 2_000L,
+                category = AuditLogCategory.SYSTEM,
+                title = "关闭登记排队",
+                detail = "登记排队已关闭。",
+                queueId = queueId,
+                publicEventType = PublicQueueEventType.REGISTRATION_CLOSED,
+                machineStableId = "10000000000000000000000000000001",
+                machineName = "null"
+            ),
+            AuditLogEntry(
+                id = "00000000-0000-0000-0000-000000000705",
+                timestampMillis = 1_000L,
+                category = AuditLogCategory.PLAYER_PROFILE,
+                title = "错误公开的玩家资料事件",
+                detail = "用于验证上传前最终防护。",
+                queueId = queueId,
+                publicEventType = PublicQueueEventType.OTHER,
+                machineStableId = "10000000000000000000000000000001",
+                machineName = "入口侧 · 机台 A"
+            )
+        )
+
+        val events = buildQueueSyncSnapshot(
+            state = state(),
+            terminalId = "terminal-1",
+            capturedAtMillis = 3_000L,
+            auditLogs = dirtyEvents
+        ).getJSONArray("recent_events")
+
+        repeat(events.length()) { index ->
+            val event = events.getJSONObject(index)
+            assertTrue(event.isNull("machine_id"))
+            assertTrue(event.isNull("machine_stable_id"))
+            assertTrue(event.isNull("machine_name"))
+        }
+    }
+
+    @Test
     fun publicSnapshotExcludesPrivatePlayerProfileFields() {
         val privateProfileId = "private-profile-id-should-never-leave-device"
         val registration = Registration(

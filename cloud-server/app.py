@@ -185,7 +185,29 @@ REQUIRED_DATABASE_COLUMNS = {
 
 
 class ValidationError(ValueError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        field: str | None = None,
+        details: dict[str, Any] | None = None,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.field = field
+        self.details = details or {}
+
+
+def validation_error_payload(error: ValidationError) -> dict[str, Any]:
+    payload: dict[str, Any] = {"ok": False, "error": str(error)}
+    if error.code is not None:
+        payload["code"] = error.code
+    if error.field is not None:
+        payload["field"] = error.field
+    if error.details:
+        payload["details"] = error.details
+    return payload
 
 
 def create_app(config: dict[str, Any] | None = None) -> Flask:
@@ -859,7 +881,7 @@ def publish_snapshot():
     try:
         normalized = normalize_snapshot(payload, device_id)
     except ValidationError as error:
-        return jsonify({"ok": False, "error": str(error)}), 400
+        return jsonify(validation_error_payload(error)), 400
 
     events = normalized.pop("recent_events", [])
     private_contacts = normalized.pop("private_player_contacts", [])
@@ -5109,15 +5131,81 @@ def normalize_private_contacts(
 
 def normalize_public_events(source: Any) -> list[dict[str, Any]]:
     if not isinstance(source, list):
-        raise ValidationError("recent_events 必须是数组")
+        raise ValidationError(
+            "最近事件列表无效：recent_events 必须是数组。",
+            code="invalid_recent_events",
+            field="recent_events",
+        )
     if len(source) > MAX_EVENTS_PER_SNAPSHOT:
-        raise ValidationError("recent_events 数量超过限制")
+        raise ValidationError(
+            f"最近事件列表无效：最多只能上传 {MAX_EVENTS_PER_SNAPSHOT} 条事件。",
+            code="too_many_recent_events",
+            field="recent_events",
+        )
 
-    events = [normalize_public_event(value) for value in source]
-    event_ids = [event["event_id"] for event in events]
-    if len(event_ids) != len(set(event_ids)):
-        raise ValidationError("公开事件编号不能重复")
+    events = []
+    first_index_by_event_id: dict[str, int] = {}
+    for index, value in enumerate(source):
+        try:
+            event = normalize_public_event(value)
+            previous_index = first_index_by_event_id.get(event["event_id"])
+            if previous_index is not None:
+                raise ValidationError(
+                    f"事件编号重复：与最近事件第 {previous_index + 1} 条使用了同一编号。",
+                    code="duplicate_recent_event_id",
+                    field="event_id",
+                )
+            first_index_by_event_id[event["event_id"]] = index
+            events.append(event)
+        except ValidationError as error:
+            raise contextualize_public_event_error(error, index, value) from error
     return events
+
+
+def contextualize_public_event_error(
+    error: ValidationError,
+    index: int,
+    source: Any,
+) -> ValidationError:
+    field = f"recent_events[{index}]"
+    if error.field:
+        field = f"{field}.{error.field}"
+
+    title = None
+    event_id = None
+    if isinstance(source, dict):
+        raw_title = source.get("title")
+        if isinstance(raw_title, str):
+            normalized_title = raw_title.strip()
+            if normalized_title and normalized_title.isprintable():
+                title = normalized_title[:120]
+        raw_event_id = source.get("event_id")
+        if isinstance(raw_event_id, str):
+            normalized_event_id = raw_event_id.strip()
+            if normalized_event_id and normalized_event_id.isprintable():
+                event_id = normalized_event_id[:64]
+
+    label = f"最近事件第 {index + 1} 条"
+    if title is not None:
+        label += f"《{title}》"
+    message_lines = [f"{label}的{error}", f"字段：{field}"]
+    if event_id is not None:
+        message_lines.append(f"事件编号：{event_id}")
+
+    details: dict[str, Any] = {
+        "event_index": index,
+        "event_number": index + 1,
+    }
+    if title is not None:
+        details["event_title"] = title
+    if event_id is not None:
+        details["event_id"] = event_id
+    return ValidationError(
+        "\n".join(message_lines),
+        code=error.code or "invalid_recent_event",
+        field=field,
+        details=details,
+    )
 
 
 def normalize_public_business_hours(source: Any) -> dict[str, Any]:
@@ -5201,59 +5289,188 @@ def normalize_public_queue_rules(source: Any) -> dict[str, bool]:
 
 def normalize_public_event(source: Any) -> dict[str, Any]:
     if not isinstance(source, dict):
-        raise ValidationError("recent_events 包含无效事件")
+        raise ValidationError(
+            "内容无效：每条事件都必须是对象。",
+            code="invalid_recent_event",
+        )
     machine_id = source.get("machine_id")
     if machine_id is not None and machine_id not in MACHINE_NAMES:
-        raise ValidationError("公开事件机台编号无效")
+        raise ValidationError(
+            "机台编号无效：必须为空或使用 A 至 J 中已配置的编号。",
+            code="invalid_recent_event_machine_id",
+            field="machine_id",
+        )
     machine_stable_id = source.get("machine_stable_id")
     if machine_stable_id is not None and (
         not isinstance(machine_stable_id, str)
         or MACHINE_INTERNAL_ID_PATTERN.fullmatch(machine_stable_id) is None
     ):
-        raise ValidationError("公开事件机台稳定标识无效")
-    machine_name = read_optional_string(source, "machine_name", 120)
+        raise ValidationError(
+            "机台稳定标识无效：必须为空或使用 32 位小写十六进制标识。",
+            code="invalid_recent_event_machine_stable_id",
+            field="machine_stable_id",
+        )
+
+    raw_machine_name = source.get("machine_name")
+    if (
+        machine_id is None
+        and machine_stable_id is None
+        and raw_machine_name == "null"
+    ):
+        # Terminal 0.10.0/0.10.1 could deserialize a JSON null as the literal
+        # string "null" after a restart.  Accept only that exact historical
+        # shape; all other machine identity attached to a system event remains
+        # invalid.
+        machine_name = None
+    else:
+        try:
+            machine_name = read_optional_string(source, "machine_name", 120)
+        except ValidationError as error:
+            raise ValidationError(
+                f"机台名称无效：{error}。",
+                code="invalid_recent_event_machine_name",
+                field="machine_name",
+            ) from error
     if machine_id is None and (machine_stable_id is not None or machine_name is not None):
-        raise ValidationError("系统事件不能包含机台身份")
+        if machine_stable_id is not None:
+            identity_label = "机台稳定标识"
+            identity_field = "machine_stable_id"
+        else:
+            identity_label = "机台名称"
+            identity_field = "machine_name"
+        raise ValidationError(
+            f"{identity_label}无效：系统事件不应关联单一机台。",
+            code="system_event_has_machine_identity",
+            field=identity_field,
+        )
     registration_ids = source.get("registration_ids")
     if (
         not isinstance(registration_ids, list)
         or len(registration_ids) > MAX_EVENT_REGISTRATION_IDS
     ):
-        raise ValidationError("公开事件登记编号无效")
-    normalized_registration_ids = [
-        read_public_id({"registration_id": value}, "registration_id")
-        for value in registration_ids
-    ]
-    if len(normalized_registration_ids) != len(set(normalized_registration_ids)):
-        raise ValidationError("公开事件登记编号不能重复")
+        raise ValidationError(
+            f"登记编号列表无效：必须是数组且不能超过 {MAX_EVENT_REGISTRATION_IDS} 项。",
+            code="invalid_recent_event_registration_ids",
+            field="registration_ids",
+        )
+    normalized_registration_ids = []
+    first_registration_index_by_id: dict[str, int] = {}
+    for registration_index, value in enumerate(registration_ids):
+        try:
+            registration_id = read_public_id(
+                {"registration_id": value}, "registration_id"
+            )
+        except ValidationError as error:
+            raise ValidationError(
+                "登记编号无效：必须使用 24 位小写十六进制公开编号。",
+                code="invalid_recent_event_registration_id",
+                field=f"registration_ids[{registration_index}]",
+            ) from error
+        previous_index = first_registration_index_by_id.get(registration_id)
+        if previous_index is not None:
+            raise ValidationError(
+                f"登记编号重复：与列表第 {previous_index + 1} 项相同。",
+                code="duplicate_recent_event_registration_id",
+                field=f"registration_ids[{registration_index}]",
+            )
+        first_registration_index_by_id[registration_id] = registration_index
+        normalized_registration_ids.append(registration_id)
     operation_source = source.get("operation_source", "ON_SITE_TERMINAL")
     if not isinstance(operation_source, str) or operation_source not in OPERATION_SOURCES:
-        raise ValidationError("公开事件操作来源无效")
-    event_type = read_choice(source, "type", PUBLIC_EVENT_TYPES)
+        raise ValidationError(
+            "操作来源无效：终端上传了不支持的来源类型。",
+            code="invalid_recent_event_operation_source",
+            field="operation_source",
+        )
+    try:
+        event_type = read_choice(source, "type", PUBLIC_EVENT_TYPES)
+    except ValidationError as error:
+        raise ValidationError(
+            "事件类型无效：终端上传了不支持的事件类型。",
+            code="invalid_recent_event_type",
+            field="type",
+        ) from error
     categories_source = source.get("notification_categories")
     if categories_source is None:
         notification_categories = [notification_category_for_event_type(event_type)]
     else:
         if not isinstance(categories_source, list) or not 1 <= len(categories_source) <= 5:
-            raise ValidationError("公开事件通知类别无效")
+            raise ValidationError(
+                "通知类别无效：必须包含 1 至 5 个类别。",
+                code="invalid_recent_event_notification_categories",
+                field="notification_categories",
+            )
         if any(
             not isinstance(category, str)
             or category not in PUBLIC_NOTIFICATION_CATEGORIES
             for category in categories_source
         ):
-            raise ValidationError("公开事件通知类别无效")
+            invalid_index = next(
+                index
+                for index, category in enumerate(categories_source)
+                if not isinstance(category, str)
+                or category not in PUBLIC_NOTIFICATION_CATEGORIES
+            )
+            raise ValidationError(
+                "通知类别无效：终端上传了不支持的类别。",
+                code="invalid_recent_event_notification_category",
+                field=f"notification_categories[{invalid_index}]",
+            )
         if len(categories_source) != len(set(categories_source)):
-            raise ValidationError("公开事件通知类别不能重复")
+            seen_categories: set[str] = set()
+            duplicate_index = 0
+            for index, category in enumerate(categories_source):
+                if category in seen_categories:
+                    duplicate_index = index
+                    break
+                seen_categories.add(category)
+            raise ValidationError(
+                "通知类别重复：同一类别只能填写一次。",
+                code="duplicate_recent_event_notification_category",
+                field=f"notification_categories[{duplicate_index}]",
+            )
         notification_categories = categories_source
+    try:
+        event_id = read_uuid(source, "event_id")
+    except ValidationError as error:
+        raise ValidationError(
+            "事件编号无效：必须使用 UUID。",
+            code="invalid_recent_event_id",
+            field="event_id",
+        ) from error
+    try:
+        occurred_at = read_integer(source, "occurred_at", minimum=1)
+    except ValidationError as error:
+        raise ValidationError(
+            "发生时间无效：必须是正整数时间戳。",
+            code="invalid_recent_event_occurred_at",
+            field="occurred_at",
+        ) from error
+    try:
+        title = read_string(source, "title", maximum_length=120)
+    except ValidationError as error:
+        raise ValidationError(
+            "标题无效：必须是 1 至 120 个字符的文本。",
+            code="invalid_recent_event_title",
+            field="title",
+        ) from error
+    try:
+        detail = read_string(source, "detail", maximum_length=2_000)
+    except ValidationError as error:
+        raise ValidationError(
+            "说明无效：必须是 1 至 2000 个字符的文本。",
+            code="invalid_recent_event_detail",
+            field="detail",
+        ) from error
     return {
-        "event_id": read_uuid(source, "event_id"),
-        "occurred_at": read_integer(source, "occurred_at", minimum=1),
+        "event_id": event_id,
+        "occurred_at": occurred_at,
         "machine_id": machine_id,
         "machine_stable_id": machine_stable_id,
         "machine_name": machine_name,
         "type": event_type,
-        "title": read_string(source, "title", maximum_length=120),
-        "detail": read_string(source, "detail", maximum_length=2_000),
+        "title": title,
+        "detail": detail,
         "operation_source": operation_source,
         "notification_categories": notification_categories,
         "registration_ids": normalized_registration_ids,

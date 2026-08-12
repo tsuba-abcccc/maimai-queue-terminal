@@ -47,7 +47,12 @@ class LocalAuditLogRepository(context: Context) : AuditLogRepository {
 
     private fun loadLogs(): List<AuditLogEntry> {
         val serialized = preferences.getString(KEY_LOGS, null) ?: return emptyList()
-        return deserializeAuditLogs(serialized, MAX_LOGS)
+        val result = deserializeAuditLogsWithCanonicalSerialization(serialized, MAX_LOGS)
+            ?: return emptyList()
+        if (result.canonicalSerialization != serialized) {
+            preferences.edit().putString(KEY_LOGS, result.canonicalSerialization).commit()
+        }
+        return result.logs
     }
 
     private fun saveLogs(logs: List<AuditLogEntry>) {
@@ -61,9 +66,19 @@ class LocalAuditLogRepository(context: Context) : AuditLogRepository {
 }
 
 internal fun deserializeAuditLogs(serialized: String, maxLogs: Int = 1_000): List<AuditLogEntry> =
-    runCatching {
+    deserializeAuditLogsWithCanonicalSerialization(serialized, maxLogs)?.logs.orEmpty()
+
+private data class DeserializedAuditLogs(
+    val logs: List<AuditLogEntry>,
+    val canonicalSerialization: String
+)
+
+private fun deserializeAuditLogsWithCanonicalSerialization(
+    serialized: String,
+    maxLogs: Int
+): DeserializedAuditLogs? = runCatching {
         val array = JSONArray(serialized)
-        buildList {
+        val logs = buildList {
             repeat(array.length()) { index ->
                 val item = array.optJSONObject(index) ?: return@repeat
                 val id = item.optString("id").takeIf { it.isNotBlank() } ?: return@repeat
@@ -87,19 +102,20 @@ internal fun deserializeAuditLogs(serialized: String, maxLogs: Int = 1_000): Lis
                         ?.let(::notificationCategoryForEventType)
                         ?.let(::setOf)
                         .orEmpty()
+                val category = enumValues<AuditLogCategory>().firstOrNull {
+                    it.name == item.optString("category")
+                } ?: AuditLogCategory.SYSTEM
                 add(
                     AuditLogEntry(
                         id = id,
                         timestampMillis = timestampMillis,
-                        category = enumValues<AuditLogCategory>().firstOrNull {
-                            it.name == item.optString("category")
-                        } ?: AuditLogCategory.SYSTEM,
+                        category = category,
                         title = title,
                         detail = item.optString("detail"),
                         source = enumValues<AuditLogSource>().firstOrNull {
                             it.name == item.optString("source")
                         } ?: AuditLogSource.ON_SITE_TERMINAL,
-                        queueId = item.optString("queueId").takeIf { it.isNotBlank() },
+                        queueId = item.optionalPersistedString("queueId"),
                         publicEventType = publicEventType,
                         notificationCategories = notificationCategories,
                         affectedRegistrationKeys = item.optJSONArray("affectedRegistrationKeys")
@@ -137,35 +153,39 @@ internal fun deserializeAuditLogs(serialized: String, maxLogs: Int = 1_000): Lis
                                 }.distinctBy(AuditPlayerContact::registrationKey)
                             }
                             .orEmpty(),
-                        machineStableId = item.optString("machineStableId")
-                            .lowercase()
-                            .takeIf { MACHINE_STABLE_ID_PATTERN.matches(it) },
-                        machineName = item.optString("machineName")
-                            .takeIf { it.isNotBlank() }
-                    )
+                        machineStableId = item.optionalPersistedString("machineStableId")
+                            ?.lowercase()
+                            ?.takeIf { MACHINE_STABLE_ID_PATTERN.matches(it) },
+                        machineName = item.optionalPersistedString("machineName")
+                    ).withMachineIdentity(null)
                 )
             }
         }.sortedByDescending { it.timestampMillis }.take(maxLogs)
-    }.getOrDefault(emptyList())
+        DeserializedAuditLogs(
+            logs = logs,
+            canonicalSerialization = serializeAuditLogs(logs)
+        )
+    }.getOrNull()
 
 internal fun serializeAuditLogs(logs: List<AuditLogEntry>): String = JSONArray().apply {
     logs.forEach { entry ->
+        val normalizedEntry = entry.withMachineIdentity(null)
         put(
             JSONObject().apply {
-                put("id", entry.id)
-                put("timestampMillis", entry.timestampMillis)
-                put("category", entry.category.name)
-                put("title", entry.title)
-                put("detail", entry.detail)
-                put("source", entry.source.name)
-                put("queueId", entry.queueId ?: JSONObject.NULL)
-                put("machineStableId", entry.machineStableId ?: JSONObject.NULL)
-                put("machineName", entry.machineName ?: JSONObject.NULL)
-                put("publicEventType", entry.publicEventType?.name ?: JSONObject.NULL)
+                put("id", normalizedEntry.id)
+                put("timestampMillis", normalizedEntry.timestampMillis)
+                put("category", normalizedEntry.category.name)
+                put("title", normalizedEntry.title)
+                put("detail", normalizedEntry.detail)
+                put("source", normalizedEntry.source.name)
+                put("queueId", normalizedEntry.queueId ?: JSONObject.NULL)
+                put("machineStableId", normalizedEntry.machineStableId ?: JSONObject.NULL)
+                put("machineName", normalizedEntry.machineName ?: JSONObject.NULL)
+                put("publicEventType", normalizedEntry.publicEventType?.name ?: JSONObject.NULL)
                 put(
                     "notificationCategories",
                     JSONArray().apply {
-                        entry.notificationCategories
+                        normalizedEntry.notificationCategories
                             .sortedBy(PublicQueueNotificationCategory::name)
                             .forEach { put(it.name) }
                     }
@@ -173,13 +193,13 @@ internal fun serializeAuditLogs(logs: List<AuditLogEntry>): String = JSONArray()
                 put(
                     "affectedRegistrationKeys",
                     JSONArray().apply {
-                        entry.affectedRegistrationKeys.forEach(::put)
+                        normalizedEntry.affectedRegistrationKeys.forEach(::put)
                     }
                 )
                 put(
                     "affectedPlayerContacts",
                     JSONArray().apply {
-                        entry.affectedPlayerContacts.forEach { contact ->
+                        normalizedEntry.affectedPlayerContacts.forEach { contact ->
                             put(JSONObject().apply {
                                 put("registrationKey", contact.registrationKey)
                                 put("profileId", contact.profileId)
@@ -193,4 +213,12 @@ internal fun serializeAuditLogs(logs: List<AuditLogEntry>): String = JSONArray()
     }
 }.toString()
 
+private fun JSONObject.optionalPersistedString(key: String): String? {
+    if (!has(key) || isNull(key)) return null
+    return (opt(key) as? String)
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() && it != LEGACY_NULL_STRING }
+}
+
 private val MACHINE_STABLE_ID_PATTERN = Regex("^[0-9a-f]{32}$")
+private const val LEGACY_NULL_STRING = "null"

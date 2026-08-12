@@ -797,7 +797,7 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertNotIn("13800138000", serialized)
         self.assertNotIn("12345678", serialized)
 
-    def test_system_event_rejects_machine_identity_without_machine_id(self):
+    def test_system_event_rejects_machine_identity_with_exact_event_context(self):
         snapshot = self.snapshot()
         event = self.event(
             "00000000-0000-0000-0000-000000000104",
@@ -814,7 +814,88 @@ class QueueStatusApiTest(unittest.TestCase):
         )
 
         self.assertEqual(400, response.status_code)
-        self.assertEqual("系统事件不能包含机台身份", response.get_json()["error"])
+        body = response.get_json()
+        self.assertEqual("system_event_has_machine_identity", body["code"])
+        self.assertEqual("recent_events[0].machine_stable_id", body["field"])
+        self.assertEqual(1, body["details"]["event_number"])
+        self.assertEqual(event["event_id"], body["details"]["event_id"])
+        self.assertIn("最近事件第 1 条《机台 A · 队列已更新》", body["error"])
+        self.assertIn("系统事件不应关联单一机台", body["error"])
+        self.assertIn("字段：recent_events[0].machine_stable_id", body["error"])
+        self.assertIn(f"事件编号：{event['event_id']}", body["error"])
+
+    def test_legacy_literal_null_system_machine_name_is_repaired(self):
+        snapshot = self.snapshot()
+        event = self.event(
+            "00000000-0000-0000-0000-000000000106",
+            "REGISTRATION_CLOSED",
+            1_000_600,
+        )
+        event["machine_id"] = None
+        event["machine_stable_id"] = None
+        event["machine_name"] = "null"
+        event["title"] = "关闭登记排队"
+        snapshot["recent_events"] = [event]
+
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+
+        self.assertEqual(204, response.status_code)
+        stored_event = self.client.get("/api/queue-logs").get_json()["logs"][0]
+        self.assertIsNone(stored_event["machine_id"])
+        self.assertIsNone(stored_event["machine_stable_id"])
+        self.assertIsNone(stored_event["machine_name"])
+
+    def test_other_system_machine_names_remain_invalid_and_identify_name_field(self):
+        snapshot = self.snapshot()
+        event = self.event(
+            "00000000-0000-0000-0000-000000000107",
+            "REGISTRATION_CLOSED",
+            1_000_700,
+        )
+        event["machine_id"] = None
+        event["machine_name"] = "入口侧 · 机台 A"
+        snapshot["recent_events"] = [event]
+
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+
+        self.assertEqual(400, response.status_code)
+        body = response.get_json()
+        self.assertEqual("system_event_has_machine_identity", body["code"])
+        self.assertEqual("recent_events[0].machine_name", body["field"])
+        self.assertIn("机台名称无效", body["error"])
+
+    def test_invalid_second_event_reports_its_own_title_id_and_nested_field(self):
+        snapshot = self.snapshot()
+        first = self.event(
+            "00000000-0000-0000-0000-000000000108",
+            "REGISTRATION_UPDATED",
+            1_000_800,
+        )
+        second = self.event(
+            "00000000-0000-0000-0000-000000000109",
+            "REGISTRATION_UPDATED",
+            1_000_900,
+        )
+        second["title"] = "机台 A · 移除登记"
+        second["registration_ids"] = ["a" * 24, "invalid"]
+        snapshot["recent_events"] = [first, second]
+
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+
+        self.assertEqual(400, response.status_code)
+        body = response.get_json()
+        self.assertEqual("invalid_recent_event_registration_id", body["code"])
+        self.assertEqual("recent_events[1].registration_ids[1]", body["field"])
+        self.assertEqual(2, body["details"]["event_number"])
+        self.assertEqual(second["event_id"], body["details"]["event_id"])
+        self.assertEqual(second["title"], body["details"]["event_title"])
+        self.assertIn("最近事件第 2 条《机台 A · 移除登记》", body["error"])
 
     def test_republished_event_backfills_machine_identity_without_reinserting_it(self):
         event_id = "00000000-0000-0000-0000-000000000105"
@@ -2434,7 +2515,12 @@ class QueueStatusApiTest(unittest.TestCase):
         )
 
         self.assertEqual(400, response.status_code)
-        self.assertEqual("公开事件登记编号无效", response.get_json()["error"])
+        body = response.get_json()
+        self.assertEqual("invalid_recent_event_registration_ids", body["code"])
+        self.assertEqual("recent_events[0].registration_ids", body["field"])
+        self.assertEqual(1, body["details"]["event_number"])
+        self.assertEqual(event["event_id"], body["details"]["event_id"])
+        self.assertIn("不能超过 200 项", body["error"])
 
     def test_event_recipient_is_fixed_when_the_event_is_stored(self):
         event_id = "00000000-0000-0000-0000-000000000198"

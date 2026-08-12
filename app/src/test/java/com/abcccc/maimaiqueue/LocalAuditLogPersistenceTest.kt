@@ -3,6 +3,7 @@ package com.abcccc.maimaiqueue
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LocalAuditLogPersistenceTest {
@@ -83,6 +84,62 @@ class LocalAuditLogPersistenceTest {
             ),
             entry
         )
+    }
+
+    @Test
+    fun jsonNullMachineIdentityDoesNotBecomeLiteralNullText() {
+        val serialized = JSONArray().put(
+            validLogJson()
+                .put("category", "SYSTEM")
+                .put("machineStableId", JSONObject.NULL)
+                .put("machineName", JSONObject.NULL)
+        ).toString()
+
+        val entry = deserializeAuditLogs(serialized).single()
+
+        assertEquals(null, entry.machineStableId)
+        assertEquals(null, entry.machineName)
+    }
+
+    @Test
+    fun legacyLiteralNullAndUnexpectedSystemMachineIdentityAreMigratedAway() {
+        val serialized = JSONArray()
+            .put(
+                validLogJson()
+                    .put("id", "system-null-event")
+                    .put("category", "SYSTEM")
+                    .put("machineName", "null")
+            )
+            .put(
+                validLogJson()
+                    .put("id", "profile-dirty-event")
+                    .put("category", "PLAYER_PROFILE")
+                    .put("machineStableId", "10000000000000000000000000000001")
+                    .put("machineName", "入口侧 · 机台 A")
+            )
+            .toString()
+
+        val entries = deserializeAuditLogs(serialized)
+        val canonical = serializeAuditLogs(entries)
+
+        assertTrue(entries.all { it.machineStableId == null && it.machineName == null })
+        assertTrue(canonical.contains("\"machineName\":null"))
+        assertTrue(!canonical.contains("\"machineName\":\"null\""))
+        assertTrue(!canonical.contains("入口侧 · 机台 A"))
+    }
+
+    @Test
+    fun machineEventStillKeepsItsMachineIdentity() {
+        val serialized = JSONArray().put(
+            validLogJson()
+                .put("machineStableId", "10000000000000000000000000000001")
+                .put("machineName", "入口侧 · 机台 A")
+        ).toString()
+
+        val entry = deserializeAuditLogs(serialized).single()
+
+        assertEquals("10000000000000000000000000000001", entry.machineStableId)
+        assertEquals("入口侧 · 机台 A", entry.machineName)
     }
 
     private fun validLogJson() = JSONObject()

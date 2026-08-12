@@ -346,12 +346,7 @@ internal class HttpQueueStatePublisher(
                     if (responseCode !in 200..299) {
                         val serverMessage = connection.errorStream?.bufferedReader(Charsets.UTF_8)
                             ?.use { reader -> reader.readText().take(MAX_ERROR_BODY_LENGTH) }
-                            ?.let { responseBody ->
-                                runCatching {
-                                    JSONObject(responseBody).optString("error").trim()
-                                        .takeIf { it.isNotEmpty() }
-                                }.getOrNull()
-                            }
+                            ?.let(::queueServerErrorMessage)
                         throw QueueEndpointException(responseCode, serverMessage)
                     }
                 } finally {
@@ -368,7 +363,7 @@ internal class HttpQueueStatePublisher(
 
     private companion object {
         const val LOG_TAG = "QueueCloudSync"
-        const val MAX_ERROR_BODY_LENGTH = 512
+        const val MAX_ERROR_BODY_LENGTH = 4_096
     }
 }
 
@@ -626,12 +621,7 @@ internal class HttpQueueCommandClient(
         if (responseCode !in 200..299) {
             val serverMessage = connection.errorStream?.bufferedReader(Charsets.UTF_8)
                 ?.use { reader -> reader.readText().take(MAX_ERROR_BODY_LENGTH) }
-                ?.let { responseBody ->
-                    runCatching {
-                        JSONObject(responseBody).optString("error").trim()
-                            .takeIf { it.isNotEmpty() }
-                    }.getOrNull()
-                }
+                ?.let(::queueServerErrorMessage)
             throw QueueEndpointException(responseCode, serverMessage)
         }
     }
@@ -639,7 +629,7 @@ internal class HttpQueueCommandClient(
     private companion object {
         const val LOG_TAG = "QueueCommandSync"
         const val MAX_COMMAND_DETAIL_LENGTH = 500
-        const val MAX_ERROR_BODY_LENGTH = 512
+        const val MAX_ERROR_BODY_LENGTH = 4_096
     }
 }
 
@@ -1026,6 +1016,10 @@ private fun queuePublishFailureDetail(error: Throwable): String = when (error) {
     }
     else -> "同步请求在发送前失败。"
 }
+
+private fun queueServerErrorMessage(responseBody: String): String? = runCatching {
+    JSONObject(responseBody).optString("error").trim().takeIf(String::isNotEmpty)
+}.getOrNull()
 
 internal class QueueCloudSyncController(
     private val scope: CoroutineScope,
@@ -1531,10 +1525,11 @@ private fun buildPublicQueueEvent(
     val machine = machineId?.let { value ->
         MachineId.entries.firstOrNull { it.name == value }
     }
-    val machineStableId = event.machineStableId
-        ?: machine?.let(displaySettings::machineStableId)
-    val machineName = event.machineName ?: machine?.let { machineIdValue ->
-        publicMachineName(
+    val machineStableId = machine?.let { machineIdValue ->
+        event.machineStableId ?: displaySettings.machineStableId(machineIdValue)
+    }
+    val machineName = machine?.let { machineIdValue ->
+        event.machineName ?: publicMachineName(
             remark = displaySettings.machineRemark(machineIdValue),
             fallback = DEFAULT_MACHINE_REMARKS.getValue(machineIdValue),
             machineId = machineIdValue.name

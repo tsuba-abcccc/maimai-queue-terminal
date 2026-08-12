@@ -85,11 +85,24 @@ data class AuditLogEntry(
 )
 
 internal fun AuditLogEntry.withMachineIdentity(identity: AuditMachineIdentity?): AuditLogEntry {
+    if (!category.supportsMachineIdentity()) {
+        return if (machineStableId == null && machineName == null) {
+            this
+        } else {
+            copy(machineStableId = null, machineName = null)
+        }
+    }
     if (identity == null || (machineStableId != null && machineName != null)) return this
     return copy(
         machineStableId = machineStableId ?: identity.stableId,
         machineName = machineName ?: identity.name
     )
+}
+
+internal fun AuditLogCategory.supportsMachineIdentity(): Boolean = when (this) {
+    AuditLogCategory.SYSTEM,
+    AuditLogCategory.PLAYER_PROFILE -> false
+    else -> true
 }
 
 internal fun AuditLogEntry.withAffectedPlayerContacts(
