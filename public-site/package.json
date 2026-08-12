@@ -1,6 +1,6 @@
 {
   "name": "maimai-q-public-queue-site",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "private": true,
   "type": "module",
   "description": "maimai Q 的独立公开排队状态页与线上登记入口",

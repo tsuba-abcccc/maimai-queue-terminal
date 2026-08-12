@@ -4997,7 +4997,7 @@ class QueueStatusApiTest(unittest.TestCase):
                 json={
                     "bot_qq": "87654321",
                     "bot_version": "0.3.12",
-                    "website_version": "v0.10.1",
+                    "website_version": "v0.10.2",
                 },
                 headers=self.bot_headers,
             )
@@ -5005,7 +5005,7 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertEqual(204, published.status_code)
         self.assertEqual(200, identity.status_code)
-        self.assertEqual("0.10.1", identity.get_json()["website_version"])
+        self.assertEqual("0.10.2", identity.get_json()["website_version"])
         self.assertEqual(200, versions.status_code)
         payload = versions.get_json()
         self.assertEqual(1_234_000, payload["checked_at"])
@@ -5014,7 +5014,7 @@ class QueueStatusApiTest(unittest.TestCase):
             {
                 "name": "现场终端",
                 "current_version": "0.10.0",
-                "latest_version": "0.10.1",
+                "latest_version": "0.10.2",
                 "status": "UPDATE_AVAILABLE",
                 "updated_at": 1_234_000,
             },

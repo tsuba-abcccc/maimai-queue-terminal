@@ -253,10 +253,10 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         CORS_ORIGIN=configured_cors_origin,
         PUBLIC_SITE_URL=configured_public_site_url.rstrip("/"),
         LATEST_TERMINAL_VERSION=os.getenv(
-            "QUEUE_LATEST_TERMINAL_VERSION", "0.10.1"
+            "QUEUE_LATEST_TERMINAL_VERSION", "0.10.2"
         ),
         LATEST_WEBSITE_VERSION=os.getenv(
-            "QUEUE_LATEST_WEBSITE_VERSION", "0.10.1"
+            "QUEUE_LATEST_WEBSITE_VERSION", "0.10.2"
         ),
         LATEST_BOT_VERSION=os.getenv("QUEUE_LATEST_BOT_VERSION", "0.3.12"),
         MAX_CONTENT_LENGTH=MAX_PAYLOAD_BYTES,

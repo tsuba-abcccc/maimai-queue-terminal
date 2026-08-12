@@ -1,6 +1,6 @@
 # maimai Q 公开测试版自建部署方案
 
-本文面向不使用项目维护者服务器、希望自行部署 maimai Q 的机厅或测试者。当前方案对应 Android 终端 `0.10.1`、队列 API `0.10.1`、Koishi 插件 `0.3.12`。它是公开测试方案，不代表已经完成正式多租户和多终端联动。
+本文面向不使用项目维护者服务器、希望自行部署 maimai Q 的机厅或测试者。当前方案对应 Android 终端 `0.10.2`、队列 API `0.10.2`、Koishi 插件 `0.3.12`。它是公开测试方案，不代表已经完成正式多租户和多终端联动。
 
 ## 先确认当前边界
 
@@ -49,7 +49,7 @@ https://queue.example.com/api/queue-status
 ```bash
 git clone https://github.com/tsuba-abcccc/maimai-queue-terminal.git
 cd maimai-queue-terminal
-git checkout v0.10.1
+git checkout v0.10.2
 ```
 
 如果公开 Release 尚未发布，使用经过验收的提交哈希，并把它记录在部署记录中；不要把未提交的工作区直接复制到生产主机。
@@ -71,8 +71,8 @@ QUEUE_BOT_TOKEN=<只给 Koishi 的另一份令牌>
 QUEUE_PROFILE_SCOPE_ID=venue-demo-001
 QUEUE_CORS_ORIGIN=https://queue.example.com
 QUEUE_PUBLIC_SITE_URL=https://queue.example.com/queue-status
-QUEUE_LATEST_TERMINAL_VERSION=0.10.1
-QUEUE_LATEST_WEBSITE_VERSION=0.10.1
+QUEUE_LATEST_TERMINAL_VERSION=0.10.2
+QUEUE_LATEST_WEBSITE_VERSION=0.10.2
 QUEUE_LATEST_BOT_VERSION=0.3.12
 ```
 
@@ -126,7 +126,7 @@ export VITE_QUEUE_MOBILE_API_BASE=https://queue.example.com/api/queue-mobile/ses
 pnpm run build
 ```
 
-部署前确认 `dist/index.html`、`dist/queue-status/index.html` 和 `dist/queue-client-version.json` 存在，且 manifest 中的版本为 `0.10.1`。使用临时目录原子切换静态目录：
+部署前确认 `dist/index.html`、`dist/queue-status/index.html` 和 `dist/queue-client-version.json` 存在，且 manifest 中的版本为 `0.10.2`。使用临时目录原子切换静态目录：
 
 ```bash
 rsync -a --delete dist/ /var/www/queue-site/dist-next/
@@ -199,13 +199,13 @@ keytool -genkeypair -v -keystore maimai-q-release.jks \
 构建出的 `*-release-unsigned.apk` 需要先对齐、再签名；下面的路径以 Android SDK Build Tools 为准：
 
 ```bash
-zipalign -p -f 4 maimai-Q-0.10.1-terminal-release-unsigned.apk maimai-Q-0.10.1-terminal-aligned.apk
+zipalign -p -f 4 maimai-Q-0.10.2-terminal-release-unsigned.apk maimai-Q-0.10.2-terminal-aligned.apk
 apksigner sign --ks maimai-q-release.jks --ks-key-alias maimai-q \
-  --out maimai-Q-0.10.1-terminal.apk maimai-Q-0.10.1-terminal-aligned.apk
-apksigner verify --verbose maimai-Q-0.10.1-terminal.apk
+  --out maimai-Q-0.10.2-terminal.apk maimai-Q-0.10.2-terminal-aligned.apk
+apksigner verify --verbose maimai-Q-0.10.2-terminal.apk
 ```
 
-不要把 keystore、密码或带令牌的私有 APK 上传 GitHub。工作区中不带 `-beta` 的 `maimai-Q-0.10.1-terminal.apk` 是联调用 Debug 证书，`*-release-unsigned.apk` 是未签名候选；公开 Release 只上传已经核验长期签名的 `maimai-Q-0.10.1-local-beta.apk` 和 `maimai-Q-0.10.1-terminal-beta.apk`。
+不要把 keystore、密码或带令牌的私有 APK 上传 GitHub。工作区中不带 `-beta` 的 `maimai-Q-0.10.2-terminal.apk` 如由调试任务生成，可能使用 Debug 证书；`*-release-unsigned.apk` 是未签名候选。公开 Release 只上传已经核验长期签名的 `maimai-Q-0.10.2-local-beta.apk` 和 `maimai-Q-0.10.2-terminal-beta.apk`。
 
 ## 首次联调清单
 
@@ -276,7 +276,7 @@ API 升级完成后，管理员还必须把 `.env` 中三个 `QUEUE_LATEST_*_VER
 
 ## 维护者现有部署与公开测试包的关系
 
-- 两者使用同一套 0.10.1 队列规则和跨端协议；差异主要是签名、默认配置、网站外壳和数据实例，不是另做一套功能逻辑。
+- 两者使用同一套 0.10.2 队列规则和跨端协议；差异主要是签名、默认配置、网站外壳和数据实例，不是另做一套功能逻辑。
 - 公开 `terminal-beta.apk` 使用长期 Release 证书签名，不预置服务器地址或令牌。维护者目前现场安装的联调终端使用 Android Debug 证书，已经保存自己的服务器配置和现场数据；两个签名不同，不能直接互相覆盖安装。
 - 维护者可以继续使用现有联调终端，不会因 GitHub 公开发布而自动改变、清空或连接到其他实例。若以后迁移到公开 Release 签名，必须先导出并核对可恢复的数据与配置，再卸载 Debug 版并安装 Release 版；不要在正在排队时迁移。
 - 公开网站来自 `public-site/`；维护者自己的 `site-main` 保留个人站点外壳。两者共享队列组件，但分别构建、分别部署，公开包不会包含个人文章或导航。
