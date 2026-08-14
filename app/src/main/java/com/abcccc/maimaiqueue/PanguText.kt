@@ -110,17 +110,43 @@ internal fun Text(
 }
 
 internal fun panguSpacing(value: AnnotatedString): AnnotatedString {
-    if (value.length < 2) return value
-    val insertionOffsets = panguSpaceInsertionOffsets(value.text)
-    if (insertionOffsets.isEmpty()) return value
+    if (value.isEmpty()) return value
+    val compactedText = compactAppMiddleDotSpacing(value.text)
+    val compacted = if (compactedText == value.text) {
+        value
+    } else {
+        val compactedBuilder = AnnotatedString.Builder()
+        var sourceIndex = 0
+        while (sourceIndex < value.length) {
+            val middleDotIndex = value.text.indexOf('·', sourceIndex)
+            if (middleDotIndex < 0) {
+                compactedBuilder.append(value.subSequence(sourceIndex, value.length))
+                break
+            }
+            var left = middleDotIndex
+            while (left > sourceIndex && value.text[left - 1].isAppSpacingCharacter()) left--
+            compactedBuilder.append(value.subSequence(sourceIndex, left))
+            compactedBuilder.append(value.subSequence(middleDotIndex, middleDotIndex + 1))
+            sourceIndex = middleDotIndex + 1
+            while (sourceIndex < value.length && value.text[sourceIndex].isAppSpacingCharacter()) {
+                sourceIndex++
+            }
+        }
+        compactedBuilder.toAnnotatedString()
+    }
+    val insertionOffsets = panguSpaceInsertionOffsets(compacted.text)
+    if (insertionOffsets.isEmpty()) return compacted
 
     val builder = AnnotatedString.Builder()
     var copiedUntil = 0
     insertionOffsets.forEach { offset ->
-        builder.append(value.subSequence(copiedUntil, offset))
+        builder.append(compacted.subSequence(copiedUntil, offset))
         builder.append(' ')
         copiedUntil = offset
     }
-    builder.append(value.subSequence(copiedUntil, value.length))
+    builder.append(compacted.subSequence(copiedUntil, compacted.length))
     return builder.toAnnotatedString()
 }
+
+private fun Char.isAppSpacingCharacter(): Boolean =
+    this != '\n' && this != '\r' && (isWhitespace() || Character.isSpaceChar(this))

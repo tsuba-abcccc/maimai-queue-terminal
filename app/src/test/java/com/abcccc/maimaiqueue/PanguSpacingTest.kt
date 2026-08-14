@@ -10,11 +10,12 @@ import org.junit.Test
 
 class PanguSpacingTest {
     @Test
-    fun spacesChineseAroundLettersNumbersAndAppMiddleDot() {
+    fun spacesChineseAroundLettersAndNumbersButCompactsAppMiddleDot() {
         assertEquals(
-            "位置 A1 · 机台 A，30 分钟后可游玩。",
+            "位置 A1·机台 A，30 分钟后可游玩。",
             panguSpacing("位置A1·机台A，30分钟后可游玩。")
         )
+        assertEquals("左侧·机台 A", panguSpacing("左侧 · 机台 A"))
         assertEquals("第 2 次轮空", panguSpacing("第2次轮空"))
         assertEquals("QQ 号 123456", panguSpacing("QQ号123456"))
     }
@@ -36,9 +37,10 @@ class PanguSpacingTest {
 
     @Test
     fun keepsExistingWhitespaceAndLineBreaksStable() {
-        val formatted = "位置 A1 · 机台 A\n30 分钟后"
+        val formatted = "位置 A1·机台 A\n30 分钟后"
         assertSame(formatted, panguSpacing(formatted))
         assertEquals("中文\nA1", panguSpacing("中文\nA1"))
+        assertEquals("左侧\n·机台 A", panguSpacing("左侧\n·机台A"))
     }
 
     @Test
@@ -69,6 +71,25 @@ class PanguSpacingTest {
         assertEquals(1, formatted.spanStyles.size)
         assertEquals(3, formatted.spanStyles.single().start)
         assertEquals(5, formatted.spanStyles.single().end)
+        assertEquals(FontWeight.Bold, formatted.spanStyles.single().item.fontWeight)
+    }
+
+    @Test
+    fun annotatedTextCompactsUnicodeSpacingWithoutLosingSpans() {
+        val source = buildAnnotatedString {
+            append("左侧\u00a0")
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                append("·")
+            }
+            append("\u3000机台A")
+        }
+
+        val formatted = panguSpacing(source)
+
+        assertEquals("左侧·机台 A", formatted.text)
+        assertEquals(1, formatted.spanStyles.size)
+        assertEquals(2, formatted.spanStyles.single().start)
+        assertEquals(3, formatted.spanStyles.single().end)
         assertEquals(FontWeight.Bold, formatted.spanStyles.single().item.fontWeight)
     }
 }

@@ -1,20 +1,30 @@
 package com.abcccc.maimaiqueue
 
 internal fun panguSpacing(value: String): String {
-    if (value.length < 2) return value
-    val insertionOffsets = panguSpaceInsertionOffsets(value)
-    if (insertionOffsets.isEmpty()) return value
+    val compacted = compactAppMiddleDotSpacing(value)
+    if (compacted.length < 2) return compacted
+    val insertionOffsets = panguSpaceInsertionOffsets(compacted)
+    if (insertionOffsets.isEmpty()) return compacted
 
-    val result = StringBuilder(value.length + 8)
+    val result = StringBuilder(compacted.length + 8)
     var copiedUntil = 0
     insertionOffsets.forEach { offset ->
-        result.append(value, copiedUntil, offset)
+        result.append(compacted, copiedUntil, offset)
         result.append(' ')
         copiedUntil = offset
     }
-    result.append(value, copiedUntil, value.length)
+    result.append(compacted, copiedUntil, compacted.length)
     return result.toString()
 }
+
+internal fun compactAppMiddleDotSpacing(value: String): String =
+    value.replace(APP_MIDDLE_DOT_SPACING_REGEX, "")
+
+internal fun textBeforeAppMiddleDot(value: String): String =
+    compactAppMiddleDotSpacing(value).substringBefore('·').trimEnd()
+
+internal fun removeAppMiddleDotPrefix(value: String, prefix: String): String =
+    compactAppMiddleDotSpacing(value).removePrefix("${compactAppMiddleDotSpacing(prefix)}·")
 
 internal fun panguSpaceInsertionOffsets(value: String): List<Int> {
     if (value.length < 2) return emptyList()
@@ -73,7 +83,7 @@ private fun needsSpaceBeforeMixedOperator(
 
 internal fun needsPanguSpace(previousCodePoint: Int, currentCodePoint: Int): Boolean {
     if (isSpacingCharacter(previousCodePoint) || isSpacingCharacter(currentCodePoint)) return false
-    if (previousCodePoint == APP_MIDDLE_DOT || currentCodePoint == APP_MIDDLE_DOT) return true
+    if (previousCodePoint == APP_MIDDLE_DOT || currentCodePoint == APP_MIDDLE_DOT) return false
     return (isCjkCodePoint(previousCodePoint) && isAsciiOpeningToken(currentCodePoint)) ||
         (isAsciiClosingToken(previousCodePoint) && isCjkCodePoint(currentCodePoint))
 }
@@ -109,6 +119,8 @@ private fun isCjkCodePoint(codePoint: Int): Boolean = when (codePoint) {
 }
 
 private const val APP_MIDDLE_DOT = '·'.code
+private val APP_MIDDLE_DOT_SPACING_REGEX =
+    Regex("[\\p{Z}\\t\\u000B\\f]+(?=·)|(?<=·)[\\p{Z}\\t\\u000B\\f]+")
 private val ASCII_OPERATORS = intArrayOf(
     '+'.code, '-'.code, '*'.code, '/'.code, '='.code,
     '&'.code, '|'.code, '<'.code, '>'.code

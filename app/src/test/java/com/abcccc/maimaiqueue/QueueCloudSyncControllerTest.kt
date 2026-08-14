@@ -143,6 +143,29 @@ class QueueCloudSyncControllerTest {
     }
 
     @Test
+    fun disablingDropsThePreviousPayloadBeforeOnlineAccessIsRestored() = runBlocking {
+        val publisher = RecordingPublisher()
+        val controller = QueueCloudSyncController(
+            scope = this,
+            publisher = publisher,
+            onStatusChange = {}
+        )
+
+        controller.submit(state(revision = 7L))
+        assertEquals(7L, withTimeout(1_000L) { publisher.publishedStates.receive() }.revision)
+
+        controller.setEnabled(false)
+        controller.setEnabled(true)
+        controller.refresh()
+        yield()
+
+        assertTrue(publisher.publishedStates.tryReceive().isFailure)
+        controller.submit(state(revision = 8L))
+        assertEquals(8L, withTimeout(1_000L) { publisher.publishedStates.receive() }.revision)
+        controller.setEnabled(false)
+    }
+
+    @Test
     fun disablingSyncEndsTheCurrentRetryPeriodButKeepsTheLastErrorTime() = runBlocking {
         val statuses = Channel<QueueCloudSyncStatus>(Channel.UNLIMITED)
         val controller = QueueCloudSyncController(
@@ -217,7 +240,8 @@ class QueueCloudSyncControllerTest {
             state: PersistedQueueState,
             auditLogs: List<AuditLogEntry>,
             displaySettings: QueuePublicDisplaySettings,
-            playerProfiles: List<PlayerProfile>
+            playerProfiles: List<PlayerProfile>,
+            installationIdentity: TerminalInstallationIdentity?
         ): QueuePublishResult {
             publishedStates.send(state)
             beforeReturn(state)

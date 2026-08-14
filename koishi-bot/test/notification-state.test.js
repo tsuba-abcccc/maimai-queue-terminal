@@ -214,7 +214,7 @@ test('reports the active Bot QQ and deployed client versions to the private iden
   )
   assert.deepEqual(requests[0][2].data, {
     bot_qq: '123456789',
-    bot_version: '0.3.12',
+    bot_version: '0.3.13',
     website_version: '0.10.1',
   })
   assert.equal(
@@ -238,7 +238,7 @@ test('falls back to the legacy Bot identity payload on an older server', async (
   assert.equal(requests.length, 2)
   assert.deepEqual(requests[0][2].data, {
     bot_qq: '123456789',
-    bot_version: '0.3.12',
+    bot_version: '0.3.13',
     website_version: '0.10.1',
   })
   assert.deepEqual(requests[1][2].data, { bot_qq: '123456789' })

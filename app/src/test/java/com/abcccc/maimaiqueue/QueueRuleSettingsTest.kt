@@ -8,7 +8,43 @@ import org.junit.Test
 
 class QueueRuleSettingsTest {
     @Test
-    fun capacityAndMachineCountAreRiskSensitiveButMetadataIsNot() {
+    fun emptyUnconfiguredConnectionIsNotTreatedAsAnInvalidDraftChange() {
+        assertFalse(
+            hasQueueConnectionDraftChanged(
+                persistedEndpoint = "",
+                persistedToken = "",
+                endpointDraft = "",
+                tokenDraft = ""
+            )
+        )
+    }
+
+    @Test
+    fun unchangedLegacyInvalidConnectionDoesNotBlockUnrelatedSettings() {
+        assertFalse(
+            hasQueueConnectionDraftChanged(
+                persistedEndpoint = "legacy-server",
+                persistedToken = "short",
+                endpointDraft = " legacy-server ",
+                tokenDraft = " short "
+            )
+        )
+    }
+
+    @Test
+    fun aRealConnectionDraftChangeStillRequiresValidConnectionDetails() {
+        assertTrue(
+            hasQueueConnectionDraftChanged(
+                persistedEndpoint = "https://example.com/api/queue-status",
+                persistedToken = "a".repeat(32),
+                endpointDraft = "not-an-https-server",
+                tokenDraft = "a".repeat(32)
+            )
+        )
+    }
+
+    @Test
+    fun queueBehaviorConfigurationIsRiskSensitiveButMetadataIsNot() {
         val original = QueueRuleSettings()
 
         assertTrue(
@@ -23,6 +59,28 @@ class QueueRuleSettingsTest {
                 original.copy(
                     machineConfigurations = original.machineConfigurations +
                         (MachineId.A to original.machineConfiguration(MachineId.A).copy(capacity = 1))
+                )
+            )
+        )
+        assertTrue(
+            hasRiskSensitiveMachineConfigurationChange(
+                original,
+                original.copy(
+                    machineConfigurations = original.machineConfigurations +
+                        (MachineId.A to original.machineConfiguration(MachineId.A).copy(
+                            soloRoundMinutes = 11
+                        ))
+                )
+            )
+        )
+        assertTrue(
+            hasRiskSensitiveMachineConfigurationChange(
+                original,
+                original.copy(
+                    machineConfigurations = original.machineConfigurations +
+                        (MachineId.A to original.machineConfiguration(MachineId.A).copy(
+                            sharedRoundMinutes = 16
+                        ))
                 )
             )
         )
@@ -49,11 +107,18 @@ class QueueRuleSettingsTest {
             machineConfigurations = original.machineConfigurations +
                 (MachineId.A to original.machineConfiguration(MachineId.A).copy(capacity = 1))
         )
+        val plannedTimeChange = original.copy(
+            machineConfigurations = original.machineConfigurations +
+                (MachineId.A to original.machineConfiguration(MachineId.A).copy(
+                    soloRoundMinutes = 11
+                ))
+        )
         val machineCountChange = original.copy(configuredMachineCount = 3)
 
         assertEquals(7L, withUpdatedMachineConfigurationRevision(original, ruleOnly).machineConfigurationRevision)
         assertEquals(7L, withUpdatedMachineConfigurationRevision(original, metadataChange).machineConfigurationRevision)
         assertEquals(8L, withUpdatedMachineConfigurationRevision(original, capacityChange).machineConfigurationRevision)
+        assertEquals(8L, withUpdatedMachineConfigurationRevision(original, plannedTimeChange).machineConfigurationRevision)
         assertEquals(8L, withUpdatedMachineConfigurationRevision(original, machineCountChange).machineConfigurationRevision)
     }
 
@@ -388,6 +453,22 @@ class QueueRuleSettingsTest {
         assertNull(normalizeQueueSyncEndpoint("https://example.com/api/queue-status?debug=1"))
         assertNull(normalizeQueueSyncEndpoint("https:///api/queue-status"))
         assertNull(normalizeQueueSyncEndpoint("example.com"))
+    }
+
+    @Test
+    fun equivalentQueueSyncEndpointFormsCompareAsTheSameServer() {
+        assertTrue(
+            sameQueueSyncEndpoint(
+                "https://example.com/",
+                "https://example.com/api/queue-status"
+            )
+        )
+        assertFalse(
+            sameQueueSyncEndpoint(
+                "https://old.example.com/api/queue-status",
+                "https://new.example.com/api/queue-status"
+            )
+        )
     }
 
     @Test

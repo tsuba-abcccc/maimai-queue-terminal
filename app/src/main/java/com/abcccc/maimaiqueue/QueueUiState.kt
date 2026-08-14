@@ -20,6 +20,8 @@ import androidx.compose.ui.zIndex
 import kotlin.math.roundToInt
 
 internal enum class Screen {
+    STARTUP_CHECK,
+    ONBOARDING,
     HOME,
     AUDIT_LOG,
     SETTINGS,

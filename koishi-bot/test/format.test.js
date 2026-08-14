@@ -170,12 +170,12 @@ test('formats registration totals and per-machine new-registration estimates', (
   }
 
   assert.equal(
-    formatRegistrationCount(queue, 'https://abcccc.top/queue-status'),
+    formatRegistrationCount(queue, 'https://queue.abcccc.top'),
     [
       '当前共 10 个登记。',
       '左侧日框·机台 A 有 6 个登记，新登记估计等待 50 分钟。',
       '右侧国框·机台 B 有 4 个登记，新登记估计等待 35 分钟。',
-      '请发送「查看队列」，或者访问 https://abcccc.top/queue-status，来查看详细的排队状态。',
+      '请发送「查看队列」，或者访问 https://queue.abcccc.top，来查看详细的排队状态。',
     ].join('\n\n'),
   )
 })

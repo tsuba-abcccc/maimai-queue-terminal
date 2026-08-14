@@ -48,7 +48,7 @@ class AuditLogsTest {
             after = MachineQueue(playing = listOf(added), playingStartedAtMillis = 500L)
         )!!
 
-        assertEquals("机台 A · 新增登记", log.title)
+        assertEquals("机台 A·新增登记", log.title)
         assertTrue(log.detail.contains("新增 “小明”"))
         assertEquals(1_000L, log.timestampMillis)
     }
@@ -100,7 +100,7 @@ class AuditLogsTest {
             )
         )
 
-        assertEquals("左侧 · 机台 A · 固定组合已修改", log.title)
+        assertEquals("左侧·机台 A·固定组合已修改", log.title)
         assertTrue(log.detail.contains("“小雨”改为与朋友共同游玩"))
         assertTrue(log.detail.contains("“青空”改为与朋友共同游玩"))
         assertFalse(log.detail.contains("允许他人加入"))
@@ -115,7 +115,7 @@ class AuditLogsTest {
             after = MachineQueue(waiting = listOf(changed))
         )!!
 
-        assertEquals("机台 A · 未到场状态已更新", log.title)
+        assertEquals("机台 A·未到场状态已更新", log.title)
         assertTrue(log.detail.contains("“玩家”已记录第 1 次未到场"))
     }
 
@@ -148,9 +148,9 @@ class AuditLogsTest {
             publicEventTypeOverride = PublicQueueEventType.NO_SHOW_REMOVED
         )!!
 
-        assertEquals("机台 A · 未到场 · 已暂缓一次", deferredLog.title)
-        assertEquals("机台 A · 未到场 · 已移至队尾", movedLog.title)
-        assertEquals("机台 A · 未到场 · 已移除登记", removedLog.title)
+        assertEquals("机台 A·未到场·已暂缓一次", deferredLog.title)
+        assertEquals("机台 A·未到场·已移至队尾", movedLog.title)
+        assertEquals("机台 A·未到场·已移除登记", removedLog.title)
         assertTrue(removedLog.detail.contains("“未到场玩家”本次未到场，登记已移除"))
     }
 
@@ -248,10 +248,10 @@ class AuditLogsTest {
             )
         )
 
-        assertEquals("登记已转至右侧 · 机台 B", log.title)
+        assertEquals("登记已转至右侧·机台 B", log.title)
         assertEquals(PublicQueueEventType.REGISTRATION_UPDATED, log.publicEventType)
         assertEquals(listOf(1, 2), log.affectedRegistrationKeys)
-        assertTrue(log.detail.contains("从左侧 · 机台 A 转至右侧 · 机台 B"))
+        assertTrue(log.detail.contains("从左侧·机台 A 转至右侧·机台 B"))
         assertTrue(log.detail.contains("转入登记不再暂缓"))
         assertTrue(log.detail.contains("留在原机台的登记仍会暂缓一次"))
         assertTrue(log.detail.contains("原固定组合已解除"))
@@ -337,7 +337,7 @@ class AuditLogsTest {
         assertTrue(removedLog.detail.contains("第四次轮到"))
         assertTrue(removedLog.detail.contains("自动退出排队"))
         assertEquals(PublicQueueEventType.TEMPORARY_AWAY_EXPIRED, removedLog.publicEventType)
-        assertEquals("机台 A · 暂时离开已达轮空上限", removedLog.title)
+        assertEquals("机台 A·暂时离开已达轮空上限", removedLog.title)
     }
 
     @Test
@@ -353,7 +353,7 @@ class AuditLogsTest {
         )!!
 
         assertEquals(PublicQueueEventType.REGISTRATION_REMOVED, log.publicEventType)
-        assertEquals("机台 A · 移除登记", log.title)
+        assertEquals("机台 A·移除登记", log.title)
         assertTrue(log.detail.contains("移除 “主动退出玩家”"))
         assertFalse(log.detail.contains("第四次轮到"))
         assertFalse(log.detail.contains("自动退出"))
@@ -377,10 +377,10 @@ class AuditLogsTest {
             publicEventTypeOverride = PublicQueueEventType.ONLINE_CHECK_IN_MISSED
         )!!
 
-        assertEquals("机台 A · 线上登记签到超时", timeoutLog.title)
+        assertEquals("机台 A·线上登记签到超时", timeoutLog.title)
         assertTrue(timeoutLog.detail.contains("本次 30 分钟签到时限内完成现场签到"))
         assertFalse(timeoutLog.detail.contains("创建线上登记后"))
-        assertEquals("机台 A · 未签到登记已自动移除", missedLog.title)
+        assertEquals("机台 A·未签到登记已自动移除", missedLog.title)
         assertTrue(missedLog.detail.contains("“线上玩家”轮到进入游玩位置时"))
         assertTrue(missedLog.detail.contains("移除 “本轮玩家”"))
         assertFalse(missedLog.detail.contains("“本轮玩家”轮到进入游玩位置时"))
@@ -439,7 +439,7 @@ class AuditLogsTest {
             after = MachineQueue(waiting = listOf(claimed))
         )!!
 
-        assertEquals("机台 A · 登记已认领", log.title)
+        assertEquals("机台 A·登记已认领", log.title)
         assertTrue(log.detail.contains("“临时昵称”更名为“资料昵称”"))
         assertTrue(log.detail.contains("“资料昵称”已认领登记"))
     }
@@ -458,7 +458,7 @@ class AuditLogsTest {
             after = MachineQueue(waiting = listOf(changed))
         )!!
 
-        assertEquals("机台 A · 登记资料已更新", log.title)
+        assertEquals("机台 A·登记资料已更新", log.title)
         assertTrue(log.detail.contains("性别标识已更新"))
     }
 
@@ -631,7 +631,7 @@ class AuditLogsTest {
             semanticAction = action
         ).single { it.publicEventType == PublicQueueEventType.NO_SHOW_DEFERRED }
 
-        assertEquals("机台 A · 未到场 · 本次机会已跳过", noShowLog.title)
+        assertEquals("机台 A·未到场·本次机会已跳过", noShowLog.title)
         assertTrue(noShowLog.detail.contains("本次机会已跳过"))
         assertTrue(noShowLog.detail.contains("暂缓状态已自动解除"))
     }

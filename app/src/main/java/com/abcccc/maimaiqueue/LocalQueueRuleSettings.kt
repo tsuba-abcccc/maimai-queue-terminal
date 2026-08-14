@@ -125,7 +125,16 @@ data class QueueRuleSettings(
 
 data class PendingSyncDisableSnapshot(
     val endpoint: String,
-    val token: String
+    val token: String,
+    /**
+     * Identity captured while this endpoint was still the active connection.
+     * It must travel with the endpoint instead of being looked up from the
+     * terminal's current settings after a server switch.
+     */
+    val venueId: String? = null,
+    val terminalName: String? = null,
+    /** The protocol frozen with this delayed request; legacy snapshots have no venue ID. */
+    val schemaVersion: Int = pendingSyncDisableSchemaVersion(venueId)
 )
 
 class LocalQueueRuleSettingsRepository(
@@ -385,14 +394,45 @@ class LocalQueueRuleSettingsRepository(
             ?.trim()
             .orEmpty()
         return endpoint.takeIf { it.isNotEmpty() }?.let {
-            PendingSyncDisableSnapshot(endpoint = it, token = token)
+            val venueId = preferences.getString(KEY_PENDING_SYNC_DISABLE_VENUE_ID, null)
+                ?.trim()?.takeIf(String::isNotEmpty)
+            val fallbackSchemaVersion = pendingSyncDisableSchemaVersion(venueId)
+            PendingSyncDisableSnapshot(
+                endpoint = it,
+                token = token,
+                venueId = venueId,
+                terminalName = preferences.getString(
+                    KEY_PENDING_SYNC_DISABLE_TERMINAL_NAME,
+                    null
+                )?.trim()?.takeIf(String::isNotEmpty),
+                schemaVersion = preferences.getInt(
+                    KEY_PENDING_SYNC_DISABLE_SCHEMA_VERSION,
+                    fallbackSchemaVersion
+                ).takeIf { version ->
+                    version in LEGACY_SCHEMA_VERSION..CURRENT_SCHEMA_VERSION
+                } ?: fallbackSchemaVersion
+            )
         }
     }
 
-    fun markPendingSyncDisableSnapshot(endpoint: String, token: String) {
+    fun markPendingSyncDisableSnapshot(
+        endpoint: String,
+        token: String,
+        venueId: String? = null,
+        terminalName: String? = null,
+        schemaVersion: Int = pendingSyncDisableSchemaVersion(venueId)
+    ) {
         preferences.edit()
             .putString(KEY_PENDING_SYNC_DISABLE_ENDPOINT, endpoint.trim())
             .putString(KEY_PENDING_SYNC_DISABLE_TOKEN, token.trim())
+            .putString(KEY_PENDING_SYNC_DISABLE_VENUE_ID, venueId?.trim())
+            .putString(KEY_PENDING_SYNC_DISABLE_TERMINAL_NAME, terminalName?.trim())
+            .putInt(
+                KEY_PENDING_SYNC_DISABLE_SCHEMA_VERSION,
+                schemaVersion.takeIf {
+                    it in LEGACY_SCHEMA_VERSION..CURRENT_SCHEMA_VERSION
+                } ?: pendingSyncDisableSchemaVersion(venueId)
+            )
             .commit()
     }
 
@@ -400,6 +440,9 @@ class LocalQueueRuleSettingsRepository(
         preferences.edit()
             .remove(KEY_PENDING_SYNC_DISABLE_ENDPOINT)
             .remove(KEY_PENDING_SYNC_DISABLE_TOKEN)
+            .remove(KEY_PENDING_SYNC_DISABLE_VENUE_ID)
+            .remove(KEY_PENDING_SYNC_DISABLE_TERMINAL_NAME)
+            .remove(KEY_PENDING_SYNC_DISABLE_SCHEMA_VERSION)
             .commit()
     }
 
@@ -475,8 +518,14 @@ class LocalQueueRuleSettingsRepository(
         const val KEY_LAST_HANDLED_CLOSING_OCCURRENCE = "last_handled_closing_occurrence"
         const val KEY_PENDING_SYNC_DISABLE_ENDPOINT = "pending_sync_disable_endpoint"
         const val KEY_PENDING_SYNC_DISABLE_TOKEN = "pending_sync_disable_token"
+        const val KEY_PENDING_SYNC_DISABLE_VENUE_ID = "pending_sync_disable_venue_id"
+        const val KEY_PENDING_SYNC_DISABLE_TERMINAL_NAME = "pending_sync_disable_terminal_name"
+        const val KEY_PENDING_SYNC_DISABLE_SCHEMA_VERSION = "pending_sync_disable_schema_version"
     }
 }
+
+internal fun pendingSyncDisableSchemaVersion(venueId: String?): Int =
+    if (venueId.isNullOrBlank()) LEGACY_SCHEMA_VERSION else CURRENT_SCHEMA_VERSION
 
 internal const val DEFAULT_MACHINE_A_REMARK = "左侧"
 internal const val DEFAULT_MACHINE_B_REMARK = "右侧"
@@ -748,6 +797,26 @@ internal fun isValidQueueSyncToken(value: String): Boolean {
         normalized.toByteArray(Charsets.UTF_8).size >= MIN_QUEUE_SYNC_TOKEN_BYTES
 }
 
+internal fun hasQueueConnectionDraftChanged(
+    persistedEndpoint: String,
+    persistedToken: String,
+    endpointDraft: String,
+    tokenDraft: String
+): Boolean {
+    fun comparableEndpoint(value: String): String =
+        normalizeQueueSyncEndpoint(value) ?: value.trim()
+
+    return comparableEndpoint(endpointDraft) != comparableEndpoint(persistedEndpoint) ||
+        tokenDraft.trim() != persistedToken.trim()
+}
+
+internal fun sameQueueSyncEndpoint(first: String, second: String): Boolean {
+    fun comparable(value: String): String =
+        normalizeQueueSyncEndpoint(value) ?: value.trim()
+
+    return comparable(first) == comparable(second)
+}
+
 internal fun normalizeQueueRuleSettingsForRuntime(
     settings: QueueRuleSettings,
     cloudSyncAvailable: Boolean
@@ -792,8 +861,11 @@ internal fun hasRiskSensitiveMachineConfigurationChange(
         return true
     }
     return normalizedPrevious.configuredMachineIds.any { machineId ->
-        normalizedPrevious.machineConfiguration(machineId).capacity !=
-            normalizedUpdated.machineConfiguration(machineId).capacity
+        val previousConfiguration = normalizedPrevious.machineConfiguration(machineId)
+        val updatedConfiguration = normalizedUpdated.machineConfiguration(machineId)
+        previousConfiguration.capacity != updatedConfiguration.capacity ||
+            previousConfiguration.soloRoundMinutes != updatedConfiguration.soloRoundMinutes ||
+            previousConfiguration.sharedRoundMinutes != updatedConfiguration.sharedRoundMinutes
     }
 }
 

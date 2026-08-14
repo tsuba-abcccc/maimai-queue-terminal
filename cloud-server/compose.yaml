@@ -21,9 +21,9 @@ services:
       # Requiring it prevents a misconfigured deployment from producing an unusable
       # relative QR or silently pointing at another site's queue page.
       QUEUE_PUBLIC_SITE_URL: ${QUEUE_PUBLIC_SITE_URL:?QUEUE_PUBLIC_SITE_URL is required}
-      QUEUE_LATEST_TERMINAL_VERSION: ${QUEUE_LATEST_TERMINAL_VERSION:-0.10.2}
-      QUEUE_LATEST_WEBSITE_VERSION: ${QUEUE_LATEST_WEBSITE_VERSION:-0.10.2}
-      QUEUE_LATEST_BOT_VERSION: ${QUEUE_LATEST_BOT_VERSION:-0.3.12}
+      QUEUE_LATEST_TERMINAL_VERSION: ${QUEUE_LATEST_TERMINAL_VERSION:-0.11.0}
+      QUEUE_LATEST_WEBSITE_VERSION: ${QUEUE_LATEST_WEBSITE_VERSION:-0.11.0}
+      QUEUE_LATEST_BOT_VERSION: ${QUEUE_LATEST_BOT_VERSION:-0.3.13}
     volumes:
       - queue-status-data:/app/data
     ports:

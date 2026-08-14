@@ -2,6 +2,7 @@ package com.abcccc.maimaiqueue
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -172,15 +173,17 @@ internal interface QueueCommandClient {
     val profileSyncLastErrorAtMillis: Long?
     val commandSyncFailureDetail: String?
     val commandSyncLastErrorAtMillis: Long?
-    suspend fun fetchPlayerProfiles(): PlayerProfileSyncPayload?
-    suspend fun fetchPendingCommands(): List<RemoteTerminalCommand>?
+    suspend fun fetchPlayerProfiles(expectedVenueId: String?): PlayerProfileSyncPayload?
+    suspend fun fetchPendingCommands(expectedVenueId: String?): List<RemoteTerminalCommand>?
     suspend fun createMobileRegistrationSession(
+        expectedVenueId: String?,
         requestId: String,
         queueId: String,
         machineId: String,
         machineStableId: String
     ): MobileRegistrationSession?
     suspend fun complete(
+        expectedVenueId: String?,
         commandId: String,
         applied: Boolean,
         detail: String,
@@ -206,7 +209,8 @@ internal interface QueueStatePublisher {
         state: PersistedQueueState,
         auditLogs: List<AuditLogEntry> = emptyList(),
         displaySettings: QueuePublicDisplaySettings = QueuePublicDisplaySettings(),
-        playerProfiles: List<PlayerProfile> = emptyList()
+        playerProfiles: List<PlayerProfile> = emptyList(),
+        installationIdentity: TerminalInstallationIdentity? = null
     ): QueuePublishResult
 }
 
@@ -268,10 +272,11 @@ private data class QueuePublishPayload(
     val state: PersistedQueueState,
     val auditLogs: List<AuditLogEntry>,
     val displaySettings: QueuePublicDisplaySettings,
-    val playerProfiles: List<PlayerProfile>
+    val playerProfiles: List<PlayerProfile>,
+    val installationIdentity: TerminalInstallationIdentity?
 )
 
-private data class QueueConnectionConfiguration(
+internal data class QueueConnectionConfiguration(
     val endpoint: String,
     val token: String
 ) {
@@ -280,12 +285,66 @@ private data class QueueConnectionConfiguration(
             isValidQueueSyncToken(token)
 }
 
+/** Keeps all requests on one negotiated protocol version for this connection. */
+internal class QueueSchemaNegotiator(
+    private val initialVersion: Int = CURRENT_SCHEMA_VERSION
+) {
+    init {
+        require(initialVersion in LEGACY_SCHEMA_VERSION..CURRENT_SCHEMA_VERSION)
+    }
+
+    private var negotiationKey: String? = null
+    private var negotiatedVersion = initialVersion
+
+    @Synchronized
+    fun versionFor(
+        configuration: QueueConnectionConfiguration,
+        currentSchemaAllowed: Boolean
+    ): Int {
+        resetIfNegotiationBoundaryChanged(configuration, currentSchemaAllowed)
+        return negotiatedVersion
+    }
+
+    @Synchronized
+    fun downgrade(
+        configuration: QueueConnectionConfiguration,
+        currentSchemaAllowed: Boolean
+    ): Boolean {
+        resetIfNegotiationBoundaryChanged(configuration, currentSchemaAllowed)
+        if (negotiatedVersion <= LEGACY_SCHEMA_VERSION) return false
+        negotiatedVersion = LEGACY_SCHEMA_VERSION
+        return true
+    }
+
+    @Synchronized
+    private fun resetIfNegotiationBoundaryChanged(
+        configuration: QueueConnectionConfiguration,
+        currentSchemaAllowed: Boolean
+    ) {
+        val key = "${configuration.endpoint}\u0000${configuration.token}\u0000$currentSchemaAllowed"
+        if (negotiationKey != key) {
+            negotiationKey = key
+            negotiatedVersion = if (currentSchemaAllowed) {
+                initialVersion
+            } else {
+                LEGACY_SCHEMA_VERSION
+            }
+        }
+    }
+}
+
+internal fun isUnsupportedQueueSchemaVersion(error: Throwable): Boolean =
+    error is QueueEndpointException &&
+        error.statusCode == 400 &&
+        error.serverMessage?.trim() in UNSUPPORTED_SCHEMA_MESSAGES
+
 internal val remoteTerminalCommandPollMutex = Mutex()
 
 internal class HttpQueueStatePublisher(
     context: Context,
     endpoint: String,
-    token: String
+    token: String,
+    private val schemaNegotiator: QueueSchemaNegotiator = QueueSchemaNegotiator()
 ) : QueueStatePublisher {
     private val terminalIdentity = LocalTerminalIdentity(context).getOrCreateRuntimeIdentity()
 
@@ -309,57 +368,103 @@ internal class HttpQueueStatePublisher(
         state: PersistedQueueState,
         auditLogs: List<AuditLogEntry>,
         displaySettings: QueuePublicDisplaySettings,
-        playerProfiles: List<PlayerProfile>
-    ): QueuePublishResult =
-        withContext(Dispatchers.IO) {
+        playerProfiles: List<PlayerProfile>,
+        installationIdentity: TerminalInstallationIdentity?
+    ): QueuePublishResult {
+        // Capture the complete connection boundary before dispatching blocking
+        // I/O. If settings change while this request is running, it may finish
+        // only against the former endpoint and can never carry an old venue
+        // identity to the newly configured server.
+        val requestConfiguration = configuration
+        val currentSchemaAllowed = !installationIdentity?.venueId.isNullOrBlank()
+        return withContext(Dispatchers.IO) {
             runCatching {
-                val requestConfiguration = configuration
-                val body = buildQueueSyncSnapshot(
-                    state = state,
-                    terminalId = terminalIdentity.terminalId,
-                    capturedAtMillis = System.currentTimeMillis(),
-                    auditLogs = auditLogs,
-                    displaySettings = displaySettings,
-                    playerProfiles = playerProfiles
-                ).toString().toByteArray(Charsets.UTF_8)
-                val connection = (
-                    URL(requestConfiguration.endpoint).openConnection() as HttpURLConnection
-                    ).apply {
-                    requestMethod = "POST"
-                    connectTimeout = NETWORK_TIMEOUT_MILLIS
-                    readTimeout = NETWORK_TIMEOUT_MILLIS
-                    doOutput = true
-                    useCaches = false
-                    setFixedLengthStreamingMode(body.size)
-                    setRequestProperty("Accept", "application/json")
-                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                    setRequestProperty("Authorization", "Bearer ${requestConfiguration.token}")
-                    setTerminalIdentityHeaders(terminalIdentity)
-                    setRequestProperty("X-Queue-Schema-Version", SYNC_SCHEMA_VERSION.toString())
-                    displaySettings.syncMode.headerValue?.let { mode ->
-                        setRequestProperty("X-Queue-Sync-Mode", mode)
-                    }
-                }
                 try {
-                    connection.outputStream.use { it.write(body) }
-                    val responseCode = connection.responseCode
-                    if (responseCode !in 200..299) {
-                        val serverMessage = connection.errorStream?.bufferedReader(Charsets.UTF_8)
-                            ?.use { reader -> reader.readText().take(MAX_ERROR_BODY_LENGTH) }
-                            ?.let(::queueServerErrorMessage)
-                        throw QueueEndpointException(responseCode, serverMessage)
+                    publishOnce(
+                        configuration = requestConfiguration,
+                        schemaVersion = schemaNegotiator.versionFor(
+                            requestConfiguration,
+                            currentSchemaAllowed
+                        ),
+                        state = state,
+                        auditLogs = auditLogs,
+                        displaySettings = displaySettings,
+                        playerProfiles = playerProfiles,
+                        installationIdentity = installationIdentity
+                    )
+                } catch (error: QueueEndpointException) {
+                    if (!isUnsupportedQueueSchemaVersion(error) ||
+                        !schemaNegotiator.downgrade(
+                            requestConfiguration,
+                            currentSchemaAllowed
+                        )
+                    ) {
+                        throw error
                     }
-                } finally {
-                    connection.disconnect()
+                    publishOnce(
+                        configuration = requestConfiguration,
+                        schemaVersion = LEGACY_SCHEMA_VERSION,
+                        state = state,
+                        auditLogs = auditLogs,
+                        displaySettings = displaySettings,
+                        playerProfiles = playerProfiles,
+                        installationIdentity = installationIdentity
+                    )
                 }
             }.fold(
                 onSuccess = { QueuePublishResult.Success },
                 onFailure = { error ->
+                    if (error is CancellationException) throw error
                     Log.w(LOG_TAG, "Queue snapshot publish failed", error)
                     QueuePublishResult.Failure(queuePublishFailureDetail(error))
                 }
             )
         }
+    }
+
+    private fun publishOnce(
+        configuration: QueueConnectionConfiguration,
+        schemaVersion: Int,
+        state: PersistedQueueState,
+        auditLogs: List<AuditLogEntry>,
+        displaySettings: QueuePublicDisplaySettings,
+        playerProfiles: List<PlayerProfile>,
+        installationIdentity: TerminalInstallationIdentity?
+    ) {
+        val body = buildQueueSyncSnapshot(
+            state = state,
+            terminalId = terminalIdentity.terminalId,
+            capturedAtMillis = System.currentTimeMillis(),
+            auditLogs = auditLogs,
+            displaySettings = displaySettings,
+            playerProfiles = playerProfiles,
+            schemaVersion = schemaVersion,
+            venueId = installationIdentity?.venueId,
+            terminalName = installationIdentity?.terminalName
+        ).toString().toByteArray(Charsets.UTF_8)
+        val connection = (URL(configuration.endpoint).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = NETWORK_TIMEOUT_MILLIS
+            readTimeout = NETWORK_TIMEOUT_MILLIS
+            doOutput = true
+            useCaches = false
+            setFixedLengthStreamingMode(body.size)
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            setRequestProperty("Authorization", "Bearer ${configuration.token}")
+            setTerminalIdentityHeaders(terminalIdentity)
+            setQueueSchemaHeaders(schemaVersion, installationIdentity?.venueId)
+            displaySettings.syncMode.headerValue?.let { mode ->
+                setRequestProperty("X-Queue-Sync-Mode", mode)
+            }
+        }
+        try {
+            connection.outputStream.use { it.write(body) }
+            requireSuccessfulResponse(connection)
+        } finally {
+            connection.disconnect()
+        }
+    }
 
     private companion object {
         const val LOG_TAG = "QueueCloudSync"
@@ -370,7 +475,8 @@ internal class HttpQueueStatePublisher(
 internal class HttpQueueCommandClient(
     context: Context,
     queueStatusEndpoint: String,
-    token: String
+    token: String,
+    private val schemaNegotiator: QueueSchemaNegotiator = QueueSchemaNegotiator()
 ) : QueueCommandClient {
     private val terminalIdentity = LocalTerminalIdentity(context).getOrCreateRuntimeIdentity()
 
@@ -413,22 +519,28 @@ internal class HttpQueueCommandClient(
         commandSyncLastErrorAtMillis = null
     }
 
-    override suspend fun fetchPlayerProfiles(): PlayerProfileSyncPayload? =
+    override suspend fun fetchPlayerProfiles(
+        expectedVenueId: String?
+    ): PlayerProfileSyncPayload? =
         withContext(Dispatchers.IO) {
             runCatching {
                 val requestConfiguration = configuration
-                val connection = openConnection(
-                    terminalEndpoint(requestConfiguration, "/queue-terminal/profiles"),
-                    "GET",
-                    requestConfiguration.token
-                )
-                try {
-                    requireSuccessfulResponse(connection)
-                    val response = connection.inputStream.bufferedReader(Charsets.UTF_8)
-                        .use { it.readText() }
-                    parsePlayerProfileSyncPayload(response)
-                } finally {
-                    connection.disconnect()
+                withSchemaFallback(requestConfiguration, expectedVenueId) { schemaVersion ->
+                    val connection = openConnection(
+                        terminalEndpoint(requestConfiguration, "/queue-terminal/profiles"),
+                        "GET",
+                        requestConfiguration.token,
+                        schemaVersion,
+                        expectedVenueId
+                    )
+                    try {
+                        requireSuccessfulResponse(connection)
+                        val response = connection.inputStream.bufferedReader(Charsets.UTF_8)
+                            .use { it.readText() }
+                        parsePlayerProfileSyncPayload(response)
+                    } finally {
+                        connection.disconnect()
+                    }
                 }
             }.fold(
                 onSuccess = { profiles ->
@@ -436,6 +548,7 @@ internal class HttpQueueCommandClient(
                     profiles
                 },
                 onFailure = { error ->
+                    if (error is CancellationException) throw error
                     Log.w(LOG_TAG, "Player profile fetch failed", error)
                     profileSyncFailureDetail = queuePublishFailureDetail(error)
                     profileSyncLastErrorAtMillis = System.currentTimeMillis()
@@ -444,22 +557,28 @@ internal class HttpQueueCommandClient(
             )
         }
 
-    override suspend fun fetchPendingCommands(): List<RemoteTerminalCommand>? =
+    override suspend fun fetchPendingCommands(
+        expectedVenueId: String?
+    ): List<RemoteTerminalCommand>? =
         withContext(Dispatchers.IO) {
             runCatching {
                 val requestConfiguration = configuration
-                val connection = openConnection(
-                    terminalEndpoint(requestConfiguration, "/queue-terminal/commands"),
-                    "GET",
-                    requestConfiguration.token
-                )
-                try {
-                    requireSuccessfulResponse(connection)
-                    val response = connection.inputStream.bufferedReader(Charsets.UTF_8)
-                        .use { it.readText() }
-                    parseRemoteTerminalCommands(response)
-                } finally {
-                    connection.disconnect()
+                withSchemaFallback(requestConfiguration, expectedVenueId) { schemaVersion ->
+                    val connection = openConnection(
+                        terminalEndpoint(requestConfiguration, "/queue-terminal/commands"),
+                        "GET",
+                        requestConfiguration.token,
+                        schemaVersion,
+                        expectedVenueId
+                    )
+                    try {
+                        requireSuccessfulResponse(connection)
+                        val response = connection.inputStream.bufferedReader(Charsets.UTF_8)
+                            .use { it.readText() }
+                        parseRemoteTerminalCommands(response)
+                    } finally {
+                        connection.disconnect()
+                    }
                 }
             }.fold(
                 onSuccess = { commands ->
@@ -467,6 +586,7 @@ internal class HttpQueueCommandClient(
                     commands
                 },
                 onFailure = { error ->
+                    if (error is CancellationException) throw error
                     Log.w(LOG_TAG, "Queue command fetch failed", error)
                     commandSyncFailureDetail = queuePublishFailureDetail(error)
                     commandSyncLastErrorAtMillis = System.currentTimeMillis()
@@ -476,6 +596,7 @@ internal class HttpQueueCommandClient(
         }
 
     override suspend fun createMobileRegistrationSession(
+        expectedVenueId: String?,
         requestId: String,
         queueId: String,
         machineId: String,
@@ -483,29 +604,33 @@ internal class HttpQueueCommandClient(
     ): MobileRegistrationSession? = withContext(Dispatchers.IO) {
         runCatching {
             val requestConfiguration = configuration
-            try {
-                requestMobileRegistrationSession(
-                    requestConfiguration = requestConfiguration,
-                    requestId = requestId,
-                    queueId = queueId,
-                    machineId = machineId,
-                    machineStableId = machineStableId
-                )
-            } catch (error: QueueEndpointException) {
-                if (!shouldRetryMobileSessionWithoutStableMachineId(
-                        error.statusCode,
-                        error.serverMessage
+            withSchemaFallback(requestConfiguration, expectedVenueId) { schemaVersion ->
+                try {
+                    requestMobileRegistrationSession(
+                        requestConfiguration = requestConfiguration,
+                        schemaVersion = schemaVersion,
+                        expectedVenueId = expectedVenueId,
+                        requestId = requestId,
+                        queueId = queueId,
+                        machineId = machineId,
+                        machineStableId = machineStableId
                     )
-                ) {
-                    throw error
+                } catch (error: QueueEndpointException) {
+                    if (!shouldRetryMobileSessionWithoutStableMachineId(
+                            error.statusCode,
+                            error.serverMessage
+                        )
+                    ) throw error
+                    requestMobileRegistrationSession(
+                        requestConfiguration = requestConfiguration,
+                        schemaVersion = schemaVersion,
+                        expectedVenueId = expectedVenueId,
+                        requestId = requestId,
+                        queueId = queueId,
+                        machineId = machineId,
+                        machineStableId = null
+                    )
                 }
-                requestMobileRegistrationSession(
-                    requestConfiguration = requestConfiguration,
-                    requestId = requestId,
-                    queueId = queueId,
-                    machineId = machineId,
-                    machineStableId = null
-                )
             }
         }.fold(
             onSuccess = { session ->
@@ -513,6 +638,7 @@ internal class HttpQueueCommandClient(
                 session
             },
             onFailure = { error ->
+                if (error is CancellationException) throw error
                 Log.w(LOG_TAG, "Mobile registration session creation failed", error)
                 commandSyncFailureDetail = queuePublishFailureDetail(error)
                 commandSyncLastErrorAtMillis = System.currentTimeMillis()
@@ -523,6 +649,8 @@ internal class HttpQueueCommandClient(
 
     private fun requestMobileRegistrationSession(
         requestConfiguration: QueueConnectionConfiguration,
+        schemaVersion: Int,
+        expectedVenueId: String?,
         requestId: String,
         queueId: String,
         machineId: String,
@@ -537,7 +665,9 @@ internal class HttpQueueCommandClient(
         val connection = openConnection(
             terminalEndpoint(requestConfiguration, "/queue-terminal/mobile-registration-sessions"),
             "POST",
-            requestConfiguration.token
+            requestConfiguration.token,
+            schemaVersion,
+            expectedVenueId
         ).apply {
             doOutput = true
             setFixedLengthStreamingMode(body.size)
@@ -560,6 +690,7 @@ internal class HttpQueueCommandClient(
     }
 
     override suspend fun complete(
+        expectedVenueId: String?,
         commandId: String,
         applied: Boolean,
         detail: String,
@@ -567,24 +698,16 @@ internal class HttpQueueCommandClient(
     ): Boolean = withContext(Dispatchers.IO) {
         runCatching {
             val requestConfiguration = configuration
-            val body = JSONObject().apply {
-                put("status", if (applied) "APPLIED" else "REJECTED")
-                put("detail", detail.take(MAX_COMMAND_DETAIL_LENGTH))
-                if (applied && resultRegistrationId != null) {
-                    put("result_registration_id", resultRegistrationId)
-                }
-            }.toString().toByteArray(Charsets.UTF_8)
-            val endpoint = "${terminalEndpoint(requestConfiguration, "/queue-terminal/commands")}/$commandId/result"
-            val connection = openConnection(endpoint, "POST", requestConfiguration.token).apply {
-                doOutput = true
-                setFixedLengthStreamingMode(body.size)
-                setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            }
-            try {
-                connection.outputStream.use { it.write(body) }
-                requireSuccessfulResponse(connection)
-            } finally {
-                connection.disconnect()
+            withSchemaFallback(requestConfiguration, expectedVenueId) { schemaVersion ->
+                completeOnce(
+                    requestConfiguration = requestConfiguration,
+                    schemaVersion = schemaVersion,
+                    expectedVenueId = expectedVenueId,
+                    commandId = commandId,
+                    applied = applied,
+                    detail = detail,
+                    resultRegistrationId = resultRegistrationId
+                )
             }
         }.fold(
             onSuccess = {
@@ -592,6 +715,7 @@ internal class HttpQueueCommandClient(
                 true
             },
             onFailure = { error ->
+                if (error is CancellationException) throw error
                 Log.w(LOG_TAG, "Queue command completion failed", error)
                 commandSyncFailureDetail = queuePublishFailureDetail(error)
                 commandSyncLastErrorAtMillis = System.currentTimeMillis()
@@ -603,7 +727,9 @@ internal class HttpQueueCommandClient(
     private fun openConnection(
         endpoint: String,
         method: String,
-        requestToken: String
+        requestToken: String,
+        schemaVersion: Int,
+        expectedVenueId: String?
     ): HttpURLConnection =
         (URL(endpoint).openConnection() as HttpURLConnection).apply {
             requestMethod = method
@@ -613,8 +739,67 @@ internal class HttpQueueCommandClient(
             setRequestProperty("Accept", "application/json")
             setRequestProperty("Authorization", "Bearer $requestToken")
             setTerminalIdentityHeaders(terminalIdentity)
-            setRequestProperty("X-Queue-Schema-Version", SYNC_SCHEMA_VERSION.toString())
+            setQueueSchemaHeaders(schemaVersion, expectedVenueId)
         }
+
+    private fun <T> withSchemaFallback(
+        requestConfiguration: QueueConnectionConfiguration,
+        expectedVenueId: String?,
+        request: (schemaVersion: Int) -> T
+    ): T {
+        val currentSchemaAllowed = !expectedVenueId.isNullOrBlank()
+        val schemaVersion = schemaNegotiator.versionFor(
+            requestConfiguration,
+            currentSchemaAllowed
+        )
+        return try {
+            request(schemaVersion)
+        } catch (error: QueueEndpointException) {
+            if (!isUnsupportedQueueSchemaVersion(error) ||
+                !schemaNegotiator.downgrade(
+                    requestConfiguration,
+                    currentSchemaAllowed
+                )
+            ) throw error
+            request(LEGACY_SCHEMA_VERSION)
+        }
+    }
+
+    private fun completeOnce(
+        requestConfiguration: QueueConnectionConfiguration,
+        schemaVersion: Int,
+        expectedVenueId: String?,
+        commandId: String,
+        applied: Boolean,
+        detail: String,
+        resultRegistrationId: String?
+    ) {
+        val body = JSONObject().apply {
+            put("status", if (applied) "APPLIED" else "REJECTED")
+            put("detail", detail.take(MAX_COMMAND_DETAIL_LENGTH))
+            if (applied && resultRegistrationId != null) {
+                put("result_registration_id", resultRegistrationId)
+            }
+        }.toString().toByteArray(Charsets.UTF_8)
+        val endpoint = "${terminalEndpoint(requestConfiguration, "/queue-terminal/commands")}/$commandId/result"
+        val connection = openConnection(
+            endpoint,
+            "POST",
+            requestConfiguration.token,
+            schemaVersion,
+            expectedVenueId
+        ).apply {
+            doOutput = true
+            setFixedLengthStreamingMode(body.size)
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+        try {
+            connection.outputStream.use { it.write(body) }
+            requireSuccessfulResponse(connection)
+        } finally {
+            connection.disconnect()
+        }
+    }
 
     private fun requireSuccessfulResponse(connection: HttpURLConnection) {
         val responseCode = connection.responseCode
@@ -662,6 +847,19 @@ private fun parseSyncedPlayerProfile(source: JSONObject?): PlayerProfile? {
         }
         PlayerProfile(
             id = source.getString("profile_id"),
+            publicPlayerId = source.optionalNonBlankString("public_player_id")
+                ?.takeIf(::isValidPublicPlayerId),
+            publicPlayerIdAliases = source.optJSONArray("public_player_id_aliases")
+                ?.let { aliases ->
+                    buildSet {
+                        repeat(aliases.length()) { aliasIndex ->
+                            aliases.optString(aliasIndex)
+                                .takeIf(::isValidPublicPlayerId)
+                                ?.let(::add)
+                        }
+                    }
+                }
+                .orEmpty(),
             nickname = source.getString("nickname").trim(),
             gender = PlayerGender.valueOf(source.getString("gender")),
             defaultPreference = ProfilePlayPreference.valueOf(
@@ -992,7 +1190,7 @@ private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): 
     }
 }
 
-private class QueueEndpointException(
+internal class QueueEndpointException(
     val statusCode: Int,
     val serverMessage: String?
 ) : Exception("Queue endpoint returned HTTP $statusCode")
@@ -1002,7 +1200,7 @@ internal fun shouldRetryMobileSessionWithoutStableMachineId(
     serverMessage: String?
 ): Boolean = statusCode == 400 && serverMessage?.trim() == "移动设备登记会话参数不完整"
 
-private fun queuePublishFailureDetail(error: Throwable): String = when (error) {
+internal fun queuePublishFailureDetail(error: Throwable): String = when (error) {
     is QueueEndpointException -> error.serverMessage
         ?: "服务器返回 HTTP ${error.statusCode}。"
     is SocketTimeoutException -> "连接服务器超时。"
@@ -1017,9 +1215,22 @@ private fun queuePublishFailureDetail(error: Throwable): String = when (error) {
     else -> "同步请求在发送前失败。"
 }
 
-private fun queueServerErrorMessage(responseBody: String): String? = runCatching {
+internal fun queueServerErrorMessage(responseBody: String): String? = runCatching {
     JSONObject(responseBody).optString("error").trim().takeIf(String::isNotEmpty)
 }.getOrNull()
+
+private fun requireSuccessfulResponse(
+    connection: HttpURLConnection,
+    maximumErrorBodyLength: Int = 4_096
+) {
+    val responseCode = connection.responseCode
+    if (responseCode !in 200..299) {
+        val serverMessage = connection.errorStream?.bufferedReader(Charsets.UTF_8)
+            ?.use { reader -> reader.readText().take(maximumErrorBodyLength) }
+            ?.let(::queueServerErrorMessage)
+        throw QueueEndpointException(responseCode, serverMessage)
+    }
+}
 
 internal class QueueCloudSyncController(
     private val scope: CoroutineScope,
@@ -1048,9 +1259,12 @@ internal class QueueCloudSyncController(
         if (!enabled) {
             publishJob?.cancel()
             publishJob = null
+            latestSubmittedPayload = null
             retryStartedAtMillis = null
             while (updates.tryReceive().isSuccess) {
-                // Discard states queued before the user disabled website sync.
+                // Discard states queued before synchronization became unavailable.
+                // In particular, a payload prepared for one verified venue must
+                // never be revived by refresh() after another endpoint is selected.
             }
             onStatusChange(
                 QueueCloudSyncStatus(
@@ -1083,14 +1297,21 @@ internal class QueueCloudSyncController(
         state: PersistedQueueState,
         auditLogs: List<AuditLogEntry> = emptyList(),
         displaySettings: QueuePublicDisplaySettings = QueuePublicDisplaySettings(),
-        playerProfiles: List<PlayerProfile> = emptyList()
+        playerProfiles: List<PlayerProfile> = emptyList(),
+        installationIdentity: TerminalInstallationIdentity? = null
     ) {
         if (!enabled) return
         if (!publisher.isConfigured) {
             onStatusChange(QueueCloudSyncStatus(QueueCloudSyncPhase.NOT_CONFIGURED))
             return
         }
-        val payload = QueuePublishPayload(state, auditLogs, displaySettings, playerProfiles)
+        val payload = QueuePublishPayload(
+            state,
+            auditLogs,
+            displaySettings,
+            playerProfiles,
+            installationIdentity
+        )
         latestSubmittedPayload = payload
         startPublishLoop()
         updates.trySend(payload)
@@ -1170,7 +1391,8 @@ internal class QueueCloudSyncController(
                             payloadToPublish.state,
                             payloadToPublish.auditLogs,
                             payloadToPublish.displaySettings,
-                            payloadToPublish.playerProfiles
+                            payloadToPublish.playerProfiles,
+                            payloadToPublish.installationIdentity
                         )
                     }
                 } finally {
@@ -1231,15 +1453,21 @@ internal fun buildQueueSyncSnapshot(
     capturedAtMillis: Long,
     auditLogs: List<AuditLogEntry> = emptyList(),
     displaySettings: QueuePublicDisplaySettings = QueuePublicDisplaySettings(),
-    playerProfiles: List<PlayerProfile> = emptyList()
+    playerProfiles: List<PlayerProfile> = emptyList(),
+    schemaVersion: Int = CURRENT_SCHEMA_VERSION,
+    venueId: String? = null,
+    terminalName: String? = null
 ): JSONObject = buildPublicQueueSnapshot(
     state = state,
     terminalId = terminalId,
     capturedAtMillis = capturedAtMillis,
     auditLogs = auditLogs,
-    displaySettings = displaySettings
+    displaySettings = displaySettings,
+    schemaVersion = schemaVersion,
+    venueId = venueId,
+    terminalName = terminalName
 ).apply {
-    put("schema_version", SYNC_SCHEMA_VERSION)
+    put("schema_version", schemaVersion)
     val syncableProfiles = playerProfilesForCloudSync(playerProfiles)
     val profilesById = syncableProfiles.associateBy(PlayerProfile::id)
     put(
@@ -1249,6 +1477,9 @@ internal fun buildQueueSyncSnapshot(
                 put(
                     JSONObject().apply {
                         put("profile_id", profile.id)
+                        if (schemaVersion >= 8) {
+                            put("public_player_id", profile.publicPlayerId ?: JSONObject.NULL)
+                        }
                         put("nickname", profile.nickname)
                         put("gender", profile.gender.name)
                         put("default_preference", profile.defaultPreference.name)
@@ -1398,9 +1629,13 @@ internal fun buildPublicQueueSnapshot(
     terminalId: String,
     capturedAtMillis: Long,
     auditLogs: List<AuditLogEntry> = emptyList(),
-    displaySettings: QueuePublicDisplaySettings = QueuePublicDisplaySettings()
+    displaySettings: QueuePublicDisplaySettings = QueuePublicDisplaySettings(),
+    schemaVersion: Int = CURRENT_SCHEMA_VERSION,
+    venueId: String? = null,
+    terminalName: String? = null
 ): JSONObject = JSONObject().apply {
-    put("schema_version", PUBLIC_SCHEMA_VERSION)
+    require(schemaVersion in LEGACY_SCHEMA_VERSION..CURRENT_SCHEMA_VERSION)
+    put("schema_version", schemaVersion)
     put("queue_id", state.queueId)
     put("revision", state.revision)
     put(
@@ -1440,11 +1675,17 @@ internal fun buildPublicQueueSnapshot(
         "terminal",
         JSONObject().apply {
             put("id", terminalId)
+            if (schemaVersion >= 8 && !terminalName.isNullOrBlank()) {
+                put("name", terminalName.trim())
+            }
             put("online", true)
             put("app_version", BuildConfig.VERSION_NAME)
             put("last_seen_at", capturedAtMillis)
         }
     )
+    if (schemaVersion >= 8 && !venueId.isNullOrBlank()) {
+        put("venue", JSONObject().apply { put("id", venueId) })
+    }
     val configuredMachineIds = state.configuredMachineIds
     val usedGroupIds = configuredMachineIds.mapTo(linkedSetOf(), displaySettings::machineGroupId)
     val configuredGroups = displaySettings.machineGroups.filter { it.id in usedGroupIds }
@@ -1481,7 +1722,8 @@ internal fun buildPublicQueueSnapshot(
                     machineName = publicMachineName(
                         configuration.remark,
                         DEFAULT_MACHINE_REMARKS.getValue(machineId),
-                        machineId.name
+                        machineId.name,
+                        schemaVersion
                     ),
                     queue = machine.queue,
                     status = machine.status,
@@ -1506,19 +1748,38 @@ internal fun buildPublicQueueSnapshot(
                 .sortedByDescending(AuditLogEntry::timestampMillis)
                 .take(MAX_PUBLIC_EVENTS_PER_SNAPSHOT)
                 .forEach { event ->
-                    put(buildPublicQueueEvent(state.queueId, event, displaySettings))
+                    put(buildPublicQueueEvent(state.queueId, event, displaySettings, schemaVersion))
                 }
         }
     )
 }
 
-private fun publicMachineName(remark: String, fallback: String, machineId: String): String =
-    "${normalizeMachineRemark(remark, fallback)} · 机台 $machineId"
+private fun publicMachineName(
+    remark: String,
+    fallback: String,
+    machineId: String,
+    schemaVersion: Int
+): String {
+    val separator = if (schemaVersion >= 8) "·" else " · "
+    return "${normalizeMachineRemark(remark, fallback)}${separator}机台 $machineId"
+}
+
+private fun machineNameForSchema(value: String, machineId: String, schemaVersion: Int): String {
+    val compacted = compactAppMiddleDotSpacing(value)
+    if (schemaVersion >= 8) return compacted
+    val compactSuffix = "·机台 $machineId"
+    return if (compacted.endsWith(compactSuffix)) {
+        "${compacted.removeSuffix(compactSuffix)} · 机台 $machineId"
+    } else {
+        compacted
+    }
+}
 
 private fun buildPublicQueueEvent(
     queueId: String,
     event: AuditLogEntry,
-    displaySettings: QueuePublicDisplaySettings
+    displaySettings: QueuePublicDisplaySettings,
+    schemaVersion: Int
 ): JSONObject {
     val machineId = event.category.name.removePrefix("MACHINE_")
         .takeIf { it != event.category.name }
@@ -1532,7 +1793,8 @@ private fun buildPublicQueueEvent(
         event.machineName ?: publicMachineName(
             remark = displaySettings.machineRemark(machineIdValue),
             fallback = DEFAULT_MACHINE_REMARKS.getValue(machineIdValue),
-            machineId = machineIdValue.name
+            machineId = machineIdValue.name,
+            schemaVersion = schemaVersion
         )
     }
     return JSONObject().apply {
@@ -1554,10 +1816,21 @@ private fun buildPublicQueueEvent(
         put("machine_stable_id", machineStableId ?: JSONObject.NULL)
         put(
             "machine_name",
-            machineName?.takeCodePointsForSync(MAX_PUBLIC_EVENT_TITLE_LENGTH) ?: JSONObject.NULL
+            machineName
+                ?.let { machineNameForSchema(it, machineId.orEmpty(), schemaVersion) }
+                ?.takeCodePointsForSync(MAX_PUBLIC_EVENT_TITLE_LENGTH)
+                ?: JSONObject.NULL
         )
-        put("title", event.title.takeCodePointsForSync(MAX_PUBLIC_EVENT_TITLE_LENGTH))
-        put("detail", event.detail.takeCodePointsForSync(MAX_PUBLIC_EVENT_DETAIL_LENGTH))
+        put(
+            "title",
+            compactAppMiddleDotSpacing(event.title)
+                .takeCodePointsForSync(MAX_PUBLIC_EVENT_TITLE_LENGTH)
+        )
+        put(
+            "detail",
+            compactAppMiddleDotSpacing(event.detail)
+                .takeCodePointsForSync(MAX_PUBLIC_EVENT_DETAIL_LENGTH)
+        )
         put("operation_source", event.source.name)
         put(
             "registration_ids",
@@ -1745,13 +2018,13 @@ private fun stablePublicId(value: String): String = MessageDigest.getInstance("S
     .take(12)
     .joinToString("") { byte -> "%02x".format(byte) }
 
-private data class TerminalRuntimeIdentity(
+internal data class TerminalRuntimeIdentity(
     val terminalId: String,
     val instanceId: String,
     val instanceGeneration: Long
 )
 
-private fun HttpURLConnection.setTerminalIdentityHeaders(identity: TerminalRuntimeIdentity) {
+internal fun HttpURLConnection.setTerminalIdentityHeaders(identity: TerminalRuntimeIdentity) {
     setRequestProperty("X-Device-ID", identity.terminalId)
     setRequestProperty("X-Terminal-Instance-ID", identity.instanceId)
     setRequestProperty(
@@ -1760,7 +2033,27 @@ private fun HttpURLConnection.setTerminalIdentityHeaders(identity: TerminalRunti
     )
 }
 
-private class LocalTerminalIdentity(context: Context) {
+/**
+ * Keep the protocol boundary in one place.  Venue identity is a schema-8
+ * field; legacy requests must not send it, because old servers may reject
+ * unknown headers and must continue to receive the schema-7 shape.
+ */
+internal fun HttpURLConnection.setQueueSchemaHeaders(
+    schemaVersion: Int,
+    venueId: String?
+) {
+    setRequestProperty("X-Queue-Schema-Version", schemaVersion.toString())
+    queueVenueHeaderValue(schemaVersion, venueId)?.let { value ->
+        setRequestProperty("X-Queue-Venue-ID", value)
+    }
+}
+
+internal fun queueVenueHeaderValue(schemaVersion: Int, venueId: String?): String? =
+    venueId?.trim()?.takeIf {
+        schemaVersion >= CURRENT_SCHEMA_VERSION && it.isNotEmpty()
+    }
+
+internal class LocalTerminalIdentity(context: Context) {
     private val preferences = context.applicationContext.getSharedPreferences(
         "terminal_identity",
         Context.MODE_PRIVATE
@@ -1799,8 +2092,12 @@ private class LocalTerminalIdentity(context: Context) {
     }
 }
 
-private const val PUBLIC_SCHEMA_VERSION = 7
-private const val SYNC_SCHEMA_VERSION = 7
+internal const val CURRENT_SCHEMA_VERSION = 8
+internal const val LEGACY_SCHEMA_VERSION = 7
+private val UNSUPPORTED_SCHEMA_MESSAGES = setOf(
+    "不支持的队列数据版本",
+    "不支持的队列协议版本"
+)
 private const val MAX_PUBLIC_EVENTS_PER_SNAPSHOT = 200
 private const val MAX_PRIVATE_CONTACTS_PER_SNAPSHOT = 600
 private const val MAX_PUBLIC_EVENT_TITLE_LENGTH = 120

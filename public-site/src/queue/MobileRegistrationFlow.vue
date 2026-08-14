@@ -13,7 +13,7 @@ import {
 } from '@lucide/vue'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import MobileProfileSettings from './MobileProfileSettings.vue'
-import { normalizeMachineConfiguration } from './machineConfiguration.js'
+import { compactMiddleDots, normalizeMachineConfiguration } from './machineConfiguration.js'
 
 const props = defineProps({
   token: { type: String, required: true }
@@ -90,6 +90,10 @@ const machineConfiguration = computed(() => normalizeMachineConfiguration(
     id: session.value?.machine_id ?? session.value?.machineId,
     name: session.value?.machine_name ?? session.value?.machineName
   }
+))
+
+const sessionMachineName = computed(() => compactMiddleDots(
+  String(session.value?.machine_name ?? session.value?.machineName ?? '当前机台')
 ))
 
 const singlePlayerMachine = computed(() => machineConfiguration.value.capacity === 1)
@@ -205,6 +209,10 @@ function normalizeProfile(source) {
   if (!source?.profile_id || !source?.nickname) return null
   return {
     profileId: source.profile_id,
+    publicPlayerId: source.public_player_id || null,
+    publicPlayerIdAliases: Array.isArray(source.public_player_id_aliases)
+      ? source.public_player_id_aliases.filter((value) => /^\d{6}$/.test(value))
+      : [],
     nickname: source.nickname,
     gender: source.gender || 'UNDISCLOSED',
     defaultPreference: source.default_preference,
@@ -525,7 +533,7 @@ onBeforeUnmount(() => {
             <span aria-hidden="true"><Smartphone :size="22" /></span>
             <div>
               <h1>使用移动设备登记</h1>
-              <p v-if="session">{{ session.machine_name }}</p>
+              <p v-if="session">{{ sessionMachineName }}</p>
               <p v-else>连接现场排队终端</p>
             </div>
           </div>
@@ -559,7 +567,7 @@ onBeforeUnmount(() => {
           </section>
           <label class="mobile-search">
             <Search :size="18" aria-hidden="true" />
-            <input v-model="searchText" type="search" maxlength="32" autocomplete="off" placeholder="搜索昵称或 QQ 号" />
+            <input v-model="searchText" type="search" maxlength="32" autocomplete="off" placeholder="搜索昵称、QQ 号或玩家编号" />
             <RefreshCw v-if="searching" :size="16" class="is-spinning" aria-label="正在搜索" />
           </label>
           <p v-if="errorDetail" class="mobile-form-error" role="alert">{{ errorDetail }}</p>
@@ -569,6 +577,7 @@ onBeforeUnmount(() => {
               <span v-if="profile.profileId === rememberedProfileId" class="mobile-profile-remembered">上次使用</span>
               <strong>{{ profile.nickname }}<em :class="`is-${profile.gender.toLowerCase()}`">{{ genderSymbol(profile.gender) }}</em></strong>
               <small>{{ preferenceLabel(profile.defaultPreference) }}·{{ recentUsageText(profile) }}</small>
+              <small v-if="profile.publicPlayerId">玩家编号：{{ profile.publicPlayerId }}</small>
               <small v-if="profile.qqNumber">QQ：{{ profile.qqNumber }}</small>
               <span v-if="!profile.setupComplete" class="mobile-profile-incomplete">需要补全资料</span>
             </button>
@@ -625,7 +634,8 @@ onBeforeUnmount(() => {
           <section class="mobile-confirmation">
             <dl>
               <div><dt>玩家昵称</dt><dd>{{ confirmationProfile.nickname }} {{ genderSymbol(confirmationProfile.gender) }}</dd></div>
-              <div><dt>排队机台</dt><dd>{{ session.machine_name }}</dd></div>
+              <div v-if="confirmationProfile.publicPlayerId"><dt>玩家编号</dt><dd>{{ confirmationProfile.publicPlayerId }}</dd></div>
+              <div><dt>排队机台</dt><dd>{{ sessionMachineName }}</dd></div>
               <div><dt>默认游玩偏好</dt><dd>{{ preferenceLabel(confirmationProfile.defaultPreference) }}</dd></div>
               <div v-if="draftMode === 'NEW'"><dt>QQ</dt><dd>{{ confirmationProfile.qqNumber }}</dd></div>
             </dl>

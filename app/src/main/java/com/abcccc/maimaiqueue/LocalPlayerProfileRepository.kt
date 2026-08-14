@@ -10,8 +10,8 @@ import org.json.JSONObject
 
 interface PlayerProfileRepository {
     suspend fun getProfiles(): List<PlayerProfile>
-    suspend fun upsertProfile(profile: PlayerProfile): Boolean
-    suspend fun replaceProfiles(profiles: List<PlayerProfile>): Boolean
+    suspend fun upsertProfile(profile: PlayerProfile): PlayerProfile?
+    suspend fun replaceProfiles(profiles: List<PlayerProfile>): List<PlayerProfile>?
 }
 
 class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
@@ -23,32 +23,82 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
 
     override suspend fun getProfiles(): List<PlayerProfile> = withContext(Dispatchers.IO) {
         writeMutex.withLock {
-            clearAmbiguousQqBindings(loadProfiles()).also { profiles ->
+            clearAmbiguousQqBindings(
+                assignMissingPublicPlayerIds(loadProfiles())
+            ).also { profiles ->
                 if (profiles.isNotEmpty()) saveProfiles(profiles)
             }
         }
     }
 
-    override suspend fun upsertProfile(profile: PlayerProfile): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun upsertProfile(
+        profile: PlayerProfile
+    ): PlayerProfile? = withContext(Dispatchers.IO) {
         writeMutex.withLock {
-            val profiles = loadProfiles().toMutableList()
-            val canonicalProfile = profile.withCanonicalContact()
+            val profiles = assignMissingPublicPlayerIds(loadProfiles()).toMutableList()
+            val canonicalProfile = ensurePublicPlayerId(
+                profile.withCanonicalContact(),
+                profiles
+            )
             val existingIndex = profiles.indexOfFirst { it.id == canonicalProfile.id }
             if (existingIndex >= 0) {
                 profiles[existingIndex] = canonicalProfile
             } else {
                 profiles += canonicalProfile
             }
-            saveProfiles(profiles)
+            canonicalProfile.takeIf { saveProfiles(profiles) }
         }
     }
 
-    override suspend fun replaceProfiles(profiles: List<PlayerProfile>): Boolean =
+    override suspend fun replaceProfiles(
+        profiles: List<PlayerProfile>
+    ): List<PlayerProfile>? =
         withContext(Dispatchers.IO) {
             writeMutex.withLock {
-                saveProfiles(profiles)
+                val storedProfiles = assignMissingPublicPlayerIds(profiles)
+                storedProfiles.takeIf { saveProfiles(storedProfiles) }
             }
         }
+
+    private fun assignMissingPublicPlayerIds(profiles: List<PlayerProfile>): List<PlayerProfile> {
+        val assigned = mutableListOf<PlayerProfile>()
+        profiles.forEach { profile -> assigned += ensurePublicPlayerId(profile, assigned) }
+        return assigned
+    }
+
+    private fun ensurePublicPlayerId(
+        profile: PlayerProfile,
+        profiles: List<PlayerProfile>
+    ): PlayerProfile {
+        val occupied = profiles.asSequence()
+            .filter { it.id != profile.id }
+            .flatMap { other ->
+                listOfNotNull(other.publicPlayerId).asSequence() +
+                    other.publicPlayerIdAliases.asSequence()
+            }
+            .toHashSet()
+        val existing = profile.publicPlayerId
+            ?.takeIf(::isValidPublicPlayerId)
+            ?.takeUnless(occupied::contains)
+        if (existing != null) return profile.copy(publicPlayerId = existing)
+        val start = stablePublicPlayerIdStart(profile.id)
+        repeat(PUBLIC_PLAYER_ID_SPACE) { offset ->
+            val candidate = ((start + offset) % PUBLIC_PLAYER_ID_SPACE)
+                .toString()
+                .padStart(PUBLIC_PLAYER_ID_LENGTH, '0')
+            if (candidate !in occupied) return profile.copy(publicPlayerId = candidate)
+        }
+        return profile.copy(publicPlayerId = null)
+    }
+
+    private fun stablePublicPlayerIdStart(profileId: String): Int {
+        var hash = FNV_OFFSET_BASIS
+        profileId.toByteArray(Charsets.UTF_8).forEach { byte ->
+            hash = hash xor (byte.toLong() and 0xffL)
+            hash = (hash * FNV_PRIME) and 0xffff_ffffL
+        }
+        return (hash % PUBLIC_PLAYER_ID_SPACE).toInt()
+    }
 
     private fun loadProfiles(): List<PlayerProfile> {
         val primary = preferences.getString(KEY_PROFILES, null)?.let(::decodeProfiles)
@@ -79,6 +129,19 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                 .takeIf { it > 0L } ?: System.currentTimeMillis()
             profiles += PlayerProfile(
                 id = id,
+                publicPlayerId = item.optNullableString("publicPlayerId")
+                    ?.takeIf(::isValidPublicPlayerId),
+                publicPlayerIdAliases = item.optJSONArray("publicPlayerIdAliases")
+                    ?.let { aliases ->
+                        buildSet {
+                            repeat(aliases.length()) { aliasIndex ->
+                                aliases.optString(aliasIndex)
+                                    .takeIf(::isValidPublicPlayerId)
+                                    ?.let(::add)
+                            }
+                        }
+                    }
+                    .orEmpty(),
                 nickname = nickname,
                 gender = gender,
                 defaultPreference = preference,
@@ -115,6 +178,11 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
             array.put(
                 JSONObject().apply {
                     put("id", profile.id)
+                    put("publicPlayerId", profile.publicPlayerId ?: JSONObject.NULL)
+                    put(
+                        "publicPlayerIdAliases",
+                        JSONArray(profile.publicPlayerIdAliases.sorted())
+                    )
                     put("nickname", profile.nickname)
                     put("gender", profile.gender.name)
                     put("defaultPreference", profile.defaultPreference.name)
@@ -157,6 +225,9 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
         if (isNull(name) || !has(name)) null else optString(name).takeIf { it.isNotBlank() }
 
     private companion object {
+        const val PUBLIC_PLAYER_ID_SPACE = 1_000_000
+        const val FNV_OFFSET_BASIS = 2_166_136_261L
+        const val FNV_PRIME = 16_777_619L
         const val KEY_PROFILES = "profiles"
         const val KEY_BACKUP_PROFILES = "previous_valid_profiles"
     }

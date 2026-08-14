@@ -9,7 +9,7 @@ from threading import Barrier
 from unittest.mock import patch
 from uuid import UUID
 
-from app import create_app, initialize_database
+from app import compact_middle_dots, create_app, initialize_database
 
 
 class QueueStatusApiTest(unittest.TestCase):
@@ -41,6 +41,21 @@ class QueueStatusApiTest(unittest.TestCase):
         }
         self.bot_headers = {"Authorization": f"Bearer {self.bot_token}"}
 
+    def test_middle_dot_compaction_does_not_consume_line_breaks(self):
+        self.assertEqual("甲·乙\n丙·丁", compact_middle_dots("甲 · 乙\n丙 \u3000·\u00a0丁"))
+        self.assertEqual("甲\n·乙", compact_middle_dots("甲\n · 乙"))
+        self.assertEqual("甲·\n乙", compact_middle_dots("甲 ·\n乙"))
+
+    def schema_eight_terminal_headers(self):
+        installation = self.client.get(
+            "/api/queue-terminal/installation", headers=self.headers
+        ).get_json()
+        return {
+            **self.headers,
+            "X-Queue-Schema-Version": "8",
+            "X-Queue-Venue-ID": installation["venue"]["id"],
+        }
+
     def tearDown(self):
         self.temporary_directory.cleanup()
 
@@ -48,6 +63,291 @@ class QueueStatusApiTest(unittest.TestCase):
         response = self.client.post("/api/queue-status", json=self.snapshot())
 
         self.assertEqual(401, response.status_code)
+
+    def test_terminal_installation_registration_is_idempotent_and_rename_keeps_id(self):
+        initial = self.client.post(
+            "/api/queue-terminal/installation",
+            json={"venue_name": "初始机厅", "terminal_name": "入口终端"},
+            headers=self.headers,
+        )
+        repeated = self.client.post(
+            "/api/queue-terminal/installation",
+            json={"venue_name": "初始机厅", "terminal_name": "入口终端"},
+            headers=self.headers,
+        )
+        renamed = self.client.post(
+            "/api/queue-terminal/installation",
+            json={
+                "venue_id": initial.get_json()["venue"]["id"],
+                "venue_name": "更名后的机厅",
+                "terminal_name": "服务台终端",
+            },
+            headers=self.headers,
+        )
+
+        self.assertEqual(200, initial.status_code)
+        self.assertEqual(200, repeated.status_code)
+        self.assertEqual(200, renamed.status_code)
+        initial_payload = initial.get_json()
+        self.assertEqual(initial_payload["venue"]["id"], repeated.get_json()["venue"]["id"])
+        self.assertEqual(initial_payload["venue"]["code"], repeated.get_json()["venue"]["code"])
+        self.assertEqual(initial_payload["venue"]["id"], renamed.get_json()["venue"]["id"])
+        self.assertEqual(initial_payload["venue"]["code"], renamed.get_json()["venue"]["code"])
+        self.assertEqual("更名后的机厅", renamed.get_json()["venue"]["name"])
+        self.assertEqual("服务台终端", renamed.get_json()["terminal"]["name"])
+
+    def test_terminal_installation_rejects_a_different_expected_venue(self):
+        response = self.client.post(
+            "/api/queue-terminal/installation",
+            json={
+                "venue_id": "00000000-0000-0000-0000-000000000099",
+                "venue_name": "错误机厅",
+                "terminal_name": "现场终端",
+            },
+            headers=self.headers,
+        )
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("VENUE_MISMATCH", response.get_json()["code"])
+        fetched = self.client.get(
+            "/api/queue-terminal/installation", headers=self.headers
+        ).get_json()
+        self.assertNotEqual("错误机厅", fetched["venue"]["name"])
+
+    def test_schema_eight_private_terminal_routes_require_the_active_venue(self):
+        snapshot = self.remote_ready_snapshot(revision=4)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        missing = {**self.headers, "X-Queue-Schema-Version": "8"}
+        mismatched = {
+            **missing,
+            "X-Queue-Venue-ID": "00000000-0000-0000-0000-000000000099",
+        }
+
+        for endpoint in (
+            "/api/queue-terminal/profiles",
+            "/api/queue-terminal/commands",
+        ):
+            missing_response = self.client.get(endpoint, headers=missing)
+            mismatched_response = self.client.get(endpoint, headers=mismatched)
+            allowed_response = self.client.get(
+                endpoint, headers=self.schema_eight_terminal_headers()
+            )
+            self.assertEqual(409, missing_response.status_code)
+            self.assertEqual("VENUE_ID_REQUIRED", missing_response.get_json()["code"])
+            self.assertEqual(409, mismatched_response.status_code)
+            self.assertEqual("VENUE_MISMATCH", mismatched_response.get_json()["code"])
+            self.assertEqual(200, allowed_response.status_code)
+
+        mobile_payload = {
+            "request_id": "00000000-0000-0000-0000-000000000801",
+            "queue_id": snapshot["queue_id"],
+            "machine_id": "A",
+        }
+        self.assertEqual(
+            409,
+            self.client.post(
+                "/api/queue-terminal/mobile-registration-sessions",
+                json=mobile_payload,
+                headers=missing,
+            ).status_code,
+        )
+        self.assertEqual(
+            201,
+            self.client.post(
+                "/api/queue-terminal/mobile-registration-sessions",
+                json=mobile_payload,
+                headers=self.schema_eight_terminal_headers(),
+            ).status_code,
+        )
+
+    def test_schema_eight_snapshot_requires_a_matching_venue_object(self):
+        snapshot = self.remote_ready_snapshot(revision=3)
+        snapshot["schema_version"] = 8
+        snapshot.pop("venue", None)
+
+        missing = self.client.post(
+            "/api/queue-status",
+            json=snapshot,
+            headers=self.schema_eight_terminal_headers(),
+        )
+
+        self.assertEqual(409, missing.status_code)
+        self.assertEqual("VENUE_ID_REQUIRED", missing.get_json()["code"])
+
+        snapshot["venue"] = {
+            "id": "00000000-0000-0000-0000-000000000099",
+        }
+        mismatched = self.client.post(
+            "/api/queue-status",
+            json=snapshot,
+            headers=self.schema_eight_terminal_headers(),
+        )
+
+        self.assertEqual(409, mismatched.status_code)
+        self.assertEqual("VENUE_MISMATCH", mismatched.get_json()["code"])
+
+    def test_schema_eight_requires_matching_body_and_header_versions(self):
+        snapshot = self.remote_ready_snapshot(revision=41)
+        self.upgrade_snapshot_to_schema_v7(snapshot)
+        snapshot["schema_version"] = 8
+        snapshot["venue"] = {
+            "id": self.client.get(
+                "/api/queue-terminal/installation", headers=self.headers
+            ).get_json()["venue"]["id"]
+        }
+
+        header_without_schema = {
+            key: value
+            for key, value in self.headers.items()
+            if key != "X-Queue-Schema-Version"
+        }
+        cases = (
+            (
+                "schema 8 正文加 schema 7 请求头",
+                {**self.headers, "X-Queue-Schema-Version": "7"},
+                "SCHEMA_VERSION_MISMATCH",
+            ),
+            (
+                "schema 8 正文不带请求头",
+                header_without_schema,
+                "SCHEMA_VERSION_REQUIRED",
+            ),
+            (
+                "schema 8 正文加无效请求头",
+                {**self.headers, "X-Queue-Schema-Version": "invalid"},
+                "SCHEMA_VERSION_INVALID",
+            ),
+        )
+        for label, headers, code in cases:
+            with self.subTest(label=label):
+                response = self.client.post(
+                    "/api/queue-status", json=copy.deepcopy(snapshot), headers=headers
+                )
+                self.assertEqual(400, response.status_code)
+                self.assertEqual(code, response.get_json()["code"])
+
+        schema_seven_snapshot = copy.deepcopy(snapshot)
+        schema_seven_snapshot["schema_version"] = 7
+        schema_seven_snapshot.pop("venue", None)
+        schema_seven_headers = {**self.headers, "X-Queue-Schema-Version": "7"}
+        accepted = self.client.post(
+            "/api/queue-status",
+            json=schema_seven_snapshot,
+            headers=schema_seven_headers,
+        )
+        self.assertEqual(204, accepted.status_code)
+
+        wrong_modern_header = {**self.headers, "X-Queue-Schema-Version": "8"}
+        rejected = self.client.post(
+            "/api/queue-status",
+            json=schema_seven_snapshot,
+            headers=wrong_modern_header,
+        )
+        self.assertEqual(400, rejected.status_code)
+        self.assertEqual("SCHEMA_VERSION_MISMATCH", rejected.get_json()["code"])
+
+    def test_legacy_snapshot_is_assigned_to_the_active_venue(self):
+        published = self.client.post(
+            "/api/queue-status", json=self.snapshot(), headers=self.headers
+        )
+        installation = self.client.get(
+            "/api/queue-terminal/installation", headers=self.headers
+        ).get_json()
+        public_snapshot = self.client.get("/api/queue-status").get_json()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            stored_venue_id = connection.execute(
+                "SELECT venue_id FROM queue_snapshot WHERE id = 1"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        self.assertEqual(204, published.status_code)
+        self.assertEqual(installation["venue"]["id"], public_snapshot["venue"]["id"])
+        self.assertEqual(installation["venue"]["id"], stored_venue_id)
+
+    def test_player_public_id_collision_is_reassigned_and_synced_back(self):
+        snapshot = self.remote_ready_snapshot(revision=4)
+        self.upgrade_snapshot_to_schema_v7(snapshot)
+        snapshot["schema_version"] = 8
+        snapshot["venue"] = {
+            "id": self.client.get(
+                "/api/queue-terminal/installation", headers=self.headers
+            ).get_json()["venue"]["id"]
+        }
+        first_profile = snapshot["private_player_profiles"][0]
+        first_profile["public_player_id"] = "012345"
+        second_profile = copy.deepcopy(first_profile)
+        second_profile.update(
+            profile_id="00000000-0000-0000-0000-000000000902",
+            public_player_id="012345",
+            nickname="另一位玩家",
+            qq_number="87654321",
+        )
+        snapshot["private_player_profiles"] = [first_profile, second_profile]
+
+        published = self.client.post(
+            "/api/queue-status", json=snapshot,
+            headers=self.schema_eight_terminal_headers()
+        )
+        synced = self.client.get(
+            "/api/queue-terminal/profiles", headers=self.headers
+        ).get_json()["profiles"]
+        public_ids = {
+            profile["profile_id"]: profile["public_player_id"] for profile in synced
+        }
+
+        self.assertEqual(204, published.status_code)
+        self.assertEqual("012345", public_ids[self.profile_id])
+        self.assertRegex(
+            public_ids["00000000-0000-0000-0000-000000000902"], r"^\d{6}$"
+        )
+        self.assertNotEqual(
+            public_ids[self.profile_id],
+            public_ids["00000000-0000-0000-0000-000000000902"],
+        )
+
+    def test_historical_player_public_id_is_never_promoted_back_to_current(self):
+        snapshot = self.remote_ready_snapshot(revision=4)
+        self.upgrade_snapshot_to_schema_v7(snapshot)
+        snapshot["schema_version"] = 8
+        snapshot["venue"] = {
+            "id": self.client.get(
+                "/api/queue-terminal/installation", headers=self.headers
+            ).get_json()["venue"]["id"]
+        }
+        profile = snapshot["private_player_profiles"][0]
+        profile["public_player_id"] = "012345"
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                """
+                INSERT INTO player_public_id_alias
+                    (profile_scope_id, public_player_id, canonical_profile_id, created_at)
+                VALUES (?, '012345', ?, 1)
+                """,
+                (self.app.config["PROFILE_SCOPE_ID"], self.profile_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        published = self.client.post(
+            "/api/queue-status", json=snapshot,
+            headers=self.schema_eight_terminal_headers()
+        )
+        synced = self.client.get(
+            "/api/queue-terminal/profiles", headers=self.headers
+        ).get_json()["profiles"][0]
+
+        self.assertEqual(204, published.status_code)
+        self.assertNotEqual("012345", synced["public_player_id"])
+        self.assertEqual(["012345"], synced["public_player_id_aliases"])
 
     def test_self_hosted_defaults_do_not_point_to_maintainer_site(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -394,6 +694,79 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual(("87654321", None, None, None, None, 123), row)
 
+    def test_player_public_id_migration_is_unique_and_idempotent(self):
+        legacy_database_path = str(
+            Path(self.temporary_directory.name) / "legacy-player-public-id.db"
+        )
+        connection = sqlite3.connect(legacy_database_path)
+        try:
+            connection.execute(
+                """
+                CREATE TABLE player_profile (
+                    device_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    nickname TEXT NOT NULL,
+                    gender TEXT NOT NULL,
+                    default_preference TEXT NOT NULL,
+                    qq_number TEXT,
+                    usage_count INTEGER NOT NULL,
+                    last_used_at INTEGER,
+                    profile_revision INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL,
+                    profile_updated_at INTEGER NOT NULL,
+                    public_player_id TEXT,
+                    received_at INTEGER NOT NULL,
+                    PRIMARY KEY(device_id, profile_id)
+                )
+                """
+            )
+            connection.executemany(
+                """
+                INSERT INTO player_profile
+                    (device_id, profile_id, nickname, gender, default_preference,
+                     qq_number, usage_count, last_used_at, profile_revision,
+                     created_at, profile_updated_at, public_player_id, received_at)
+                VALUES ('default', ?, ?, 'UNDISCLOSED', 'OPEN_TO_JOIN', NULL,
+                        0, NULL, 1, 1, 1, ?, 1)
+                """,
+                [
+                    ("00000000-0000-0000-0000-000000000901", "甲", "000123"),
+                    ("00000000-0000-0000-0000-000000000902", "乙", "000123"),
+                    ("00000000-0000-0000-0000-000000000903", "丙", None),
+                ],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        initialize_database(legacy_database_path)
+        connection = sqlite3.connect(legacy_database_path)
+        try:
+            first_pass = connection.execute(
+                """
+                SELECT profile_id, public_player_id FROM player_profile
+                ORDER BY profile_id
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        initialize_database(legacy_database_path)
+        connection = sqlite3.connect(legacy_database_path)
+        try:
+            second_pass = connection.execute(
+                """
+                SELECT profile_id, public_player_id FROM player_profile
+                ORDER BY profile_id
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(first_pass, second_pass)
+        self.assertEqual("000123", first_pass[0][1])
+        self.assertEqual(3, len({row[1] for row in first_pass}))
+        self.assertTrue(all(len(row[1]) == 6 and row[1].isdigit() for row in first_pass))
+
     def test_concurrent_workers_can_migrate_the_same_legacy_database(self):
         legacy_database_path = str(
             Path(self.temporary_directory.name) / "concurrent-legacy-queue.db"
@@ -522,7 +895,7 @@ class QueueStatusApiTest(unittest.TestCase):
         stored = self.client.get("/api/queue-status").get_json()
 
         self.assertEqual(204, publish.status_code)
-        self.assertEqual(7, stored["schema_version"])
+        self.assertEqual(8, stored["schema_version"])
         self.assertEqual("2" * 32, stored["default_machine_group_id"])
         self.assertEqual(["一楼", "二楼"], [group["name"] for group in stored["machine_groups"]])
         self.assertEqual("2" * 32, stored["machines"]["J"]["group_id"])
@@ -761,7 +1134,7 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("ABSENCE_CHANGED", first_page["logs"][0]["type"])
         self.assertEqual("QQ_BOT", first_page["logs"][0]["operation_source"])
         self.assertEqual("2" * 32, first_page["logs"][0]["machine_stable_id"])
-        self.assertEqual("二楼 · 机台 A", first_page["logs"][0]["machine_name"])
+        self.assertEqual("二楼·机台 A", first_page["logs"][0]["machine_name"])
         self.assertEqual("NO_SHOW_MOVED_TO_TAIL", second_page["logs"][0]["type"])
         self.assertEqual("ON_SITE_TERMINAL", second_page["logs"][0]["operation_source"])
         self.assertIsNone(second_page["logs"][0]["machine_stable_id"])
@@ -922,7 +1295,7 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(1, len(logs))
         self.assertEqual(event_id, logs[0]["event_id"])
         self.assertEqual("3" * 32, logs[0]["machine_stable_id"])
-        self.assertEqual("入口侧 · 机台 A", logs[0]["machine_name"])
+        self.assertEqual("入口侧·机台 A", logs[0]["machine_name"])
 
         connection = sqlite3.connect(self.database_path)
         try:
@@ -968,7 +1341,7 @@ class QueueStatusApiTest(unittest.TestCase):
         )
 
         self.assertEqual(204, published.status_code)
-        self.assertEqual(7, public_response.get_json()["schema_version"])
+        self.assertEqual(8, public_response.get_json()["schema_version"])
         public_registration = public_response.get_json()["machines"]["A"]["playing"][0]
         public_companion = public_response.get_json()["machines"]["A"]["playing"][1]
         self.assertEqual("12345678", public_registration["qq_number"])
@@ -987,7 +1360,7 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("12345678", player["qq_number"])
         self.assertEqual("公开昵称", player["display_id"])
         self.assertEqual("A", player["machine_id"])
-        self.assertEqual("左侧 · 机台 A", player["machine_name"])
+        self.assertEqual("左侧·机台 A", player["machine_name"])
         self.assertTrue(player["machine_operational"])
         self.assertIsNone(player["machine_stop_reason"])
         self.assertIsNone(player["machine_stop_reason_detail"])
@@ -3417,8 +3790,8 @@ class QueueStatusApiTest(unittest.TestCase):
         current = self.client.get("/api/queue-status").get_json()
 
         self.assertEqual(204, response.status_code)
-        self.assertEqual("入口侧 · 机台 A", current["machines"]["A"]["name"])
-        self.assertEqual("墙侧 · 机台 B", current["machines"]["B"]["name"])
+        self.assertEqual("入口侧·机台 A", current["machines"]["A"]["name"])
+        self.assertEqual("墙侧·机台 B", current["machines"]["B"]["name"])
 
     def test_schema_v1_keeps_default_machine_names(self):
         snapshot = self.snapshot()
@@ -3430,7 +3803,7 @@ class QueueStatusApiTest(unittest.TestCase):
         current = self.client.get("/api/queue-status").get_json()
 
         self.assertEqual(204, response.status_code)
-        self.assertEqual("左侧 · 机台 A", current["machines"]["A"]["name"])
+        self.assertEqual("左侧·机台 A", current["machines"]["A"]["name"])
 
     def test_legacy_terminal_without_app_version_still_syncs_as_unknown(self):
         snapshot = self.snapshot(revision=5)
@@ -4996,8 +5369,8 @@ class QueueStatusApiTest(unittest.TestCase):
                 "/api/queue-bot/identity",
                 json={
                     "bot_qq": "87654321",
-                    "bot_version": "0.3.12",
-                    "website_version": "v0.10.2",
+                    "bot_version": "0.3.13",
+                    "website_version": "v0.11.0",
                 },
                 headers=self.bot_headers,
             )
@@ -5005,7 +5378,7 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertEqual(204, published.status_code)
         self.assertEqual(200, identity.status_code)
-        self.assertEqual("0.10.2", identity.get_json()["website_version"])
+        self.assertEqual("0.11.0", identity.get_json()["website_version"])
         self.assertEqual(200, versions.status_code)
         payload = versions.get_json()
         self.assertEqual(1_234_000, payload["checked_at"])
@@ -5014,7 +5387,7 @@ class QueueStatusApiTest(unittest.TestCase):
             {
                 "name": "现场终端",
                 "current_version": "0.10.0",
-                "latest_version": "0.10.2",
+                "latest_version": "0.11.0",
                 "status": "UPDATE_AVAILABLE",
                 "updated_at": 1_234_000,
             },
@@ -5198,6 +5571,42 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual(409, reused.status_code)
 
+    def test_mobile_profile_search_skips_a_legacy_profile_without_public_id(self):
+        snapshot = self.remote_ready_snapshot(revision=20)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        created = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000824",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(201, created.status_code)
+        token = created.get_json()["session_token"]
+
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE player_profile SET public_player_id = NULL WHERE profile_id = ?",
+                (self.profile_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        searched = self.client.get(
+            f"/api/queue-mobile/sessions/{token}?q=999999"
+        )
+        self.assertEqual(200, searched.status_code)
+        self.assertEqual([], searched.get_json()["profiles"])
+
     def test_mobile_registration_allows_rejoining_after_the_previous_registration_left(self):
         active_snapshot = self.remote_ready_snapshot(revision=20, with_registration=True)
         self.assertEqual(
@@ -5343,6 +5752,9 @@ class QueueStatusApiTest(unittest.TestCase):
                 "/api/queue-status", json=stale_snapshot, headers=self.headers
             ).status_code,
         )
+        original_public_player_id = self.client.get(
+            "/api/queue-terminal/profiles", headers=self.headers
+        ).get_json()["profiles"][0]["public_player_id"]
         alias_id = "00000000-0000-0000-0000-000000000902"
         connection = sqlite3.connect(self.database_path)
         try:
@@ -5460,6 +5872,37 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual("12345678", completed_profiles["profiles"][0]["qq_number"])
         self.assertEqual({}, completed_profiles["profile_aliases"])
+        self.assertEqual(
+            [original_public_player_id],
+            completed_profiles["profiles"][0]["public_player_id_aliases"],
+        )
+
+        new_session = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000836",
+                "queue_id": completed_snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        ).get_json()
+        searched_by_old_public_id = self.client.get(
+            f"/api/queue-mobile/sessions/{new_session['session_token']}"
+            f"?q={original_public_player_id}"
+        ).get_json()["profiles"]
+        terminal_profiles = self.client.get(
+            "/api/queue-terminal/profiles", headers=self.headers
+        ).get_json()["profiles"]
+
+        self.assertEqual([alias_id], [profile["profile_id"] for profile in searched_by_old_public_id])
+        self.assertEqual(
+            [original_public_player_id],
+            searched_by_old_public_id[0]["public_player_id_aliases"],
+        )
+        self.assertEqual(
+            [original_public_player_id],
+            terminal_profiles[0]["public_player_id_aliases"],
+        )
 
     def test_profile_aliases_are_resolved_before_qq_search_in_the_same_second(self):
         alias_id = "00000000-0000-0000-0000-000000000902"

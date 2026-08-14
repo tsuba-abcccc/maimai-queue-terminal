@@ -15,7 +15,7 @@ import {
 } from '@lucide/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import MobileRegistrationFlow from './MobileRegistrationFlow.vue'
-import { normalizeMachineConfiguration } from './machineConfiguration.js'
+import { compactMiddleDots, normalizeMachineConfiguration } from './machineConfiguration.js'
 
 const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL ||
   (typeof window !== 'undefined' ? `${window.location.origin}/api/queue-status` : '/api/queue-status')
@@ -39,14 +39,14 @@ const DEFAULT_MACHINE_GROUP_ID = '00000000000000000000000000000001'
 const defaultMachineDefinitions = SUPPORTED_MACHINE_IDS.map((id, index) => ({
   id,
   name: index === 0
-    ? '左侧 · 机台 A'
+    ? '左侧·机台 A'
     : index === 1
-      ? '右侧 · 机台 B'
+      ? '右侧·机台 B'
       : index === 2
-        ? '中间左侧 · 机台 C'
+        ? '中间左侧·机台 C'
         : index === 3
-           ? '中间右侧 · 机台 D'
-           : `第 ${index + 1} 台 · 机台 ${id}`
+           ? '中间右侧·机台 D'
+           : `第 ${index + 1} 台·机台 ${id}`
 }))
 const logSourceDefinitions = [
   { value: 'ALL', label: '全部来源' },
@@ -71,6 +71,7 @@ const businessHours = ref({
   registrationClosesAt: null
 })
 const terminal = ref(null)
+const venue = ref(null)
 const capabilities = ref({})
 const testData = ref(false)
 const capturedAt = ref(null)
@@ -131,6 +132,16 @@ const machineCountSummary = computed(() => (
     : `${machines.value.length} 台机台的登记顺序彼此独立`
 ))
 
+const venueHeading = computed(() => {
+  const name = typeof venue.value?.name === 'string' ? venue.value.name.trim() : ''
+  const code = typeof venue.value?.code === 'string' ? venue.value.code.trim() : ''
+  if (!name && !code) return null
+  return {
+    name: name || '当前机厅',
+    code: code || null
+  }
+})
+
 const configuredMachineGroups = computed(() => machineGroups.value.map((group) => ({
   ...group,
   machines: machines.value.filter((machine) => machine.groupId === group.id)
@@ -187,6 +198,12 @@ const snapshotStale = computed(() => (
 const terminalOnline = computed(() => (
   hasSnapshot.value && !snapshotStale.value && terminal.value?.online !== false
 ))
+
+const terminalStatusLabel = computed(() => {
+  if (!hasSnapshot.value) return '尚未接入'
+  if (snapshotStale.value) return '状态待更新'
+  return terminal.value?.online === false ? '离线' : '在线'
+})
 
 const onlineRegistrationAvailable = computed(() => (
   hasSnapshot.value &&
@@ -611,7 +628,7 @@ function normalizeMachine(definition, source) {
 
   return {
     ...definition,
-    name: source.name || definition.name,
+    name: compactMiddleDots(String(source.name || definition.name)),
     stableId: definition.stableId,
     groupId: definition.groupId,
     remark: configuration.remark,
@@ -792,6 +809,10 @@ function applyServerData(data) {
   registrationOpen.value = data?.registration_open ?? data?.registrationOpen ?? true
   businessHours.value = normalizeBusinessHours(data?.business_hours ?? data?.businessHours)
   terminal.value = data?.terminal ?? { online: true }
+  venue.value = data?.venue && typeof data.venue === 'object' ? {
+    name: String(data.venue.name || '').trim(),
+    code: String(data.venue.code || '').trim()
+  } : null
   capabilities.value = data?.capabilities || {}
   testData.value = data?.test_data === true || data?.testData === true
   queueId.value = nextQueueId
@@ -883,10 +904,12 @@ function normalizeLogEvent(source) {
     machineStableId: normalizeInternalId(
       source?.machine_stable_id ?? source?.machineStableId
     ),
-    machineName: String(source?.machine_name ?? source?.machineName ?? '').trim() || null,
+    machineName: compactMiddleDots(
+      String(source?.machine_name ?? source?.machineName ?? '').trim()
+    ) || null,
     type: String(source?.type || 'OTHER').toUpperCase(),
-    title: String(source?.title || '队列已更新'),
-    detail: String(source?.detail || ''),
+    title: compactMiddleDots(String(source?.title || '队列已更新')),
+    detail: compactMiddleDots(String(source?.detail || '')),
     operationSource: String(
       source?.operation_source ?? source?.operationSource ?? 'ON_SITE_TERMINAL'
     ).toUpperCase(),
@@ -1186,8 +1209,8 @@ function stopReasonLabel(reason, detail = null) {
 
 function machineSummary(machine) {
   if (!machine.synced) return '尚未同步现场状态'
-  const queueSummary = `${machine.waitingPositions.length} 个等待位置 · ${machine.registrationCount} 个登记`
-  if (!machine.operational) return `${queueSummary} · 已停止使用`
+  const queueSummary = `${machine.waitingPositions.length} 个等待位置·${machine.registrationCount} 个登记`
+  if (!machine.operational) return `${queueSummary}·已停止使用`
   return machine.registrationCount > 0 ? queueSummary : '当前空闲'
 }
 
@@ -1228,12 +1251,12 @@ function machineGroupName(machine) {
 function playingLabel(machine) {
   const base = `游玩位置 ${machine.id}`
   if (!machine.playing.length) return base
-  if (!terminalOnline.value) return `${base} · 状态待更新`
-  if (!machine.operational) return `${base} · 已暂停`
+  if (!terminalOnline.value) return `${base}·状态待更新`
+  if (!machine.operational) return `${base}·已暂停`
   const startedAt = parseDate(machine.playingStartedAt)
   if (!startedAt) return base
   const minutes = Math.max(0, Math.floor((currentTime.value - startedAt.getTime()) / 60000))
-  return minutes === 0 ? `${base} · 刚刚` : `${base} · 已游玩 ${minutes} 分钟`
+  return minutes === 0 ? `${base}·刚刚` : `${base}·已游玩 ${minutes} 分钟`
 }
 
 function playingOvertime(machine) {
@@ -1244,13 +1267,13 @@ function playingOvertime(machine) {
 }
 
 function positionLabel(machine, position, index) {
-  return `位置 ${machine.id}${index + 1}${position.fixedPair ? ' · 固定组合' : ''}`
+  return `位置 ${machine.id}${index + 1}${position.fixedPair ? '·固定组合' : ''}`
 }
 
 function absenceLabel(registration) {
   if (registration.temporarilyAway) {
     return registration.temporaryAwaySkippedTurns > 0
-      ? `暂时离开 · 已轮空 ${registration.temporaryAwaySkippedTurns} 次`
+      ? `暂时离开·已轮空 ${registration.temporaryAwaySkippedTurns} 次`
       : '暂时离开'
   }
   if (registration.deferredOnce) return '暂缓一次'
@@ -1258,7 +1281,7 @@ function absenceLabel(registration) {
 }
 
 function registrationLabel(registration) {
-  return (registration.onlineRegistrationPendingCheckIn ? '线上登记 · 待签到' : null) ||
+  return (registration.onlineRegistrationPendingCheckIn ? '线上登记·待签到' : null) ||
     absenceLabel(registration) ||
     (registration.noShowCount > 0 ? `未到场 ${registration.noShowCount} 次` : null) ||
     (registration.fixedPair ? '固定组合' : null) ||
@@ -1311,8 +1334,8 @@ function registrationPartnerText(detail) {
 function noShowResultLabel(registration) {
   if (!registration.noShowCount) return null
   return registration.lastNoShowActionWasDefer
-    ? `未到场 ${registration.noShowCount} 次 · 上次处理：暂缓一次`
-    : `未到场 ${registration.noShowCount} 次 · 上次处理：移至队尾`
+    ? `未到场 ${registration.noShowCount} 次·上次处理：暂缓一次`
+    : `未到场 ${registration.noShowCount} 次·上次处理：移至队尾`
 }
 
 function fullTimeText(value, fallback = '尚无记录') {
@@ -1380,7 +1403,7 @@ function openRegistrationFromPosition(registration) {
   openRegistration(
     detail.machine,
     registration,
-    detail.title.replace(' · 固定组合', ''),
+    compactMiddleDots(detail.title).replace('·固定组合', ''),
     detail.isPlaying ? null : detail.estimate,
     detail.registrations,
     detail.commonPlayPreview,
@@ -1502,9 +1525,9 @@ function eventTypeLabel(type) {
     REGISTRATION_UPDATED: '登记变动',
     QUEUE_REORDERED: '顺序调整',
     PLAYING_CHANGED: '游玩位置',
-    NO_SHOW_DEFERRED: '未到场 · 暂缓一次',
-    NO_SHOW_MOVED_TO_TAIL: '未到场 · 移至队尾',
-    NO_SHOW_REMOVED: '未到场 · 移除登记',
+     NO_SHOW_DEFERRED: '未到场·暂缓一次',
+     NO_SHOW_MOVED_TO_TAIL: '未到场·移至队尾',
+     NO_SHOW_REMOVED: '未到场·移除登记',
     TEMPORARY_AWAY_EXPIRED: '暂时离开期满退出',
     ONLINE_REGISTRATION_ADDED: '线上登记',
     ONLINE_CHECK_IN_COMPLETED: '现场签到',
@@ -1566,7 +1589,7 @@ function createRequestId() {
 
 function normalizeOnlineMachine(source) {
   const id = String(source?.id || '').toUpperCase()
-  const name = String(source?.name || `机台 ${id}`)
+  const name = compactMiddleDots(String(source?.name || `机台 ${id}`))
   const configuration = normalizeMachineConfiguration(source, { id, name })
   const registrationCount = toNonNegativeInteger(
     source?.registration_count ?? source?.registrationCount
@@ -1628,6 +1651,7 @@ function normalizeOnlineProfile(source) {
   }
   return {
     profileId: source.profile_id ?? source.profileId ?? null,
+    publicPlayerId: source.public_player_id ?? source.publicPlayerId ?? null,
     nickname,
     qqNumber,
     gender: String(source.gender || 'UNDISCLOSED').toUpperCase(),
@@ -2070,6 +2094,9 @@ onBeforeUnmount(() => {
   <main v-else class="queue-panel">
     <header class="queue-header">
       <div class="queue-heading">
+        <span v-if="venueHeading" class="queue-venue">
+          {{ venueHeading.name }}
+        </span>
         <h1>排队登记</h1>
         <p>
           <span>{{ machineCountSummary }}</span>
@@ -2105,8 +2132,8 @@ onBeforeUnmount(() => {
             <button
               class="queue-version-button"
               type="button"
-              aria-label="查看三端版本信息"
-              title="版本信息"
+              aria-label="查看机厅与系统信息"
+              title="机厅与系统"
               @click="openVersionDialog"
             >
               <Info :size="18" aria-hidden="true" />
@@ -2403,17 +2430,28 @@ onBeforeUnmount(() => {
       <Transition name="queue-dialog">
         <div v-if="versionDialogVisible" class="queue-detail-backdrop" @click.self="closeVersionDialog">
           <section class="queue-detail-dialog queue-version-dialog" role="dialog" aria-modal="true"
-            aria-label="三端版本信息">
+            aria-label="机厅与系统信息">
             <header class="queue-detail-header">
               <div>
-                <h2>版本信息</h2>
-                <p>现场终端、队列网站和 QQ Bot</p>
+                <h2>机厅与系统</h2>
+                <p>当前现场及各端运行信息</p>
               </div>
-              <button type="button" aria-label="关闭版本信息" title="关闭" @click="closeVersionDialog">
+              <button type="button" aria-label="关闭机厅与系统信息" title="关闭" @click="closeVersionDialog">
                 <X :size="20" aria-hidden="true" />
               </button>
             </header>
 
+            <section class="queue-system-details" aria-labelledby="queue-system-venue-title">
+              <h3 id="queue-system-venue-title">当前机厅</h3>
+              <dl>
+                <div><dt>机厅名称</dt><dd>{{ venueHeading?.name || '尚未提供' }}</dd></div>
+                <div><dt>机厅 ID</dt><dd>{{ venueHeading?.code || '尚未分配' }}</dd></div>
+                <div><dt>现场终端</dt><dd>{{ terminal?.name || '尚未上报' }}</dd></div>
+                <div><dt>终端状态</dt><dd>{{ terminalStatusLabel }}</dd></div>
+              </dl>
+            </section>
+
+            <h3 class="queue-version-section-title">版本信息</h3>
             <div v-if="clientVersionsLoading && !clientVersions" class="queue-version-loading" aria-live="polite">
               <RefreshCw :size="20" class="spinning" aria-hidden="true" />
               <span>正在读取版本信息</span>
@@ -2504,6 +2542,10 @@ onBeforeUnmount(() => {
                   <dt>玩家昵称</dt>
                   <dd>{{ onlineJoinProfile.nickname }}</dd>
                 </div>
+                <div v-if="onlineJoinProfile.publicPlayerId">
+                  <dt>玩家编号</dt>
+                  <dd>{{ onlineJoinProfile.publicPlayerId }}</dd>
+                </div>
                 <div>
                   <dt>性别</dt>
                   <dd class="queue-online-gender" :class="`is-${onlineJoinProfile.gender.toLowerCase()}`">
@@ -2567,7 +2609,7 @@ onBeforeUnmount(() => {
                 <TriangleAlert :size="18" aria-hidden="true" />
                 <p>
                   <strong>须在 30 分钟内完成签到</strong>
-                  <span>登记加入后会显示为“线上登记 · 待签到”。请到现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。</span>
+                  <span>登记加入后会显示为“线上登记·待签到”。请到现场终端点击自己的登记并选择“已到场”。超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。</span>
                   <span v-if="!onlineJoinProfile.setupComplete">这份玩家资料尚未补全通知偏好和 QQ 显示范围。线上登记可以先创建，但到场后须先在终端补全资料，才能签到。</span>
                 </p>
               </div>
@@ -2705,7 +2747,7 @@ onBeforeUnmount(() => {
               <div class="queue-detail-pills">
                 <span>{{ selectedDetail.registrations.length }} 个登记</span>
                 <span v-if="!selectedDetail.machine.operational">
-                  机台已停止使用 · {{ stopReasonLabel(
+                  机台已停止使用·{{ stopReasonLabel(
                     selectedDetail.machine.stopReason,
                     selectedDetail.machine.stopReasonDetail
                   ) }}
@@ -2740,7 +2782,7 @@ onBeforeUnmount(() => {
             <template v-else>
               <div class="queue-detail-pills">
                 <span v-if="selectedDetail.registration.onlineRegistrationPendingCheckIn" class="is-online">
-                  线上登记 · 待签到
+                  线上登记·待签到
                 </span>
                 <span :class="{ 'is-absence': absenceLabel(selectedDetail.registration) }">
                   {{ absenceLabel(selectedDetail.registration) || preferenceLabel(selectedDetail.registration) }}
@@ -2787,7 +2829,7 @@ onBeforeUnmount(() => {
                 </div>
                 <div v-if="!selectedDetail.machine.operational">
                   <dt>机台状态</dt>
-                  <dd>停止使用 · {{ stopReasonLabel(
+                  <dd>停止使用·{{ stopReasonLabel(
                     selectedDetail.machine.stopReason,
                     selectedDetail.machine.stopReasonDetail
                   ) }}</dd>
@@ -2889,6 +2931,14 @@ onBeforeUnmount(() => {
 .queue-panel, .queue-panel * { box-sizing: border-box; letter-spacing: 0; }
 button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transparent; }
 .queue-header { display: flex; margin: 24px 4px 20px; flex-direction: column; gap: 18px; }
+.queue-venue {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--queue-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
 .queue-heading h1 { margin: 0; border: 0; font-size: 34px; font-weight: 660; line-height: 1.15; letter-spacing: 0; }
 .queue-heading p { display: flex; margin: 7px 0 0; flex-wrap: wrap; gap: 0 6px; color: var(--queue-secondary); font-size: 13px; line-height: 1.55; }
 .queue-heading strong { color: var(--queue-text); font-weight: 560; }
@@ -3096,9 +3146,17 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-detail-privacy { max-width: 34em; margin: 8px auto 0; color: var(--queue-tertiary); font-size: 10px; line-height: 1.5; text-align: center; text-wrap: balance; }
 
 .queue-version-dialog { width: min(100%, 460px); }
-.queue-version-loading { display: flex; min-height: 220px; align-items: center; justify-content: center; flex-direction: column; gap: 10px; color: var(--queue-secondary); font-size: 11px; }
+.queue-system-details { margin-top: 17px; }
+.queue-system-details h3, .queue-version-section-title { margin: 0; border: 0; color: var(--queue-secondary); font-size: 10px; font-weight: 650; line-height: 1.4; }
+.queue-system-details dl { margin: 8px 0 0; border-top: 1px solid var(--queue-separator); }
+.queue-system-details dl > div { display: grid; min-height: 42px; padding: 8px 0; grid-template-columns: minmax(80px, auto) minmax(0, 1fr); align-items: center; gap: 16px; border-bottom: 1px solid var(--queue-separator); }
+.queue-system-details dt, .queue-system-details dd { margin: 0; font-size: 10px; line-height: 1.5; }
+.queue-system-details dt { color: var(--queue-tertiary); }
+.queue-system-details dd { overflow-wrap: anywhere; text-align: right; }
+.queue-version-section-title { margin-top: 18px; }
+.queue-version-loading { display: flex; min-height: 170px; align-items: center; justify-content: center; flex-direction: column; gap: 10px; color: var(--queue-secondary); font-size: 11px; }
 .queue-version-error { margin: 16px 0 0; padding: 10px 11px; border-left: 3px solid var(--queue-orange); color: var(--queue-secondary); background: var(--queue-soft-orange); font-size: 10px; line-height: 1.55; }
-.queue-version-list { margin-top: 14px; border-top: 1px solid var(--queue-separator); }
+.queue-version-list { margin-top: 8px; border-top: 1px solid var(--queue-separator); }
 .queue-version-list > section { padding: 13px 0; border-bottom: 1px solid var(--queue-separator); }
 .queue-version-list > section > header { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; }
 .queue-version-list > section > header strong { min-width: 0; overflow: hidden; font-size: 13px; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }

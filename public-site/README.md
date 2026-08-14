@@ -9,7 +9,7 @@ pnpm install --frozen-lockfile
 pnpm run build
 ```
 
-构建结果在 `dist/`。`dist/index.html` 与 `dist/queue-status/index.html` 都指向同一个队列应用；部署者可以将根路径或 `/queue-status` 指向它。
+构建结果在 `dist/`。根路径是独立队列页的规范地址；`/queue-status` 和 `/queue-status/` 仅作为旧链接兼容入口，建议由 Nginx 重定向到根路径。
 
 Nginx 可直接参考 [`nginx-location.conf.example`](nginx-location.conf.example)。API 反向代理仍使用主项目 `cloud-server/nginx-location.conf.example`，不要把 API 令牌写入静态站点配置。
 

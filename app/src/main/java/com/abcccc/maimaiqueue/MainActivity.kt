@@ -26,7 +26,11 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN)
+        // Compose form screens use IME insets to keep their active content and
+        // fixed action areas above the keyboard. ADJUST_RESIZE is also required
+        // for those insets to behave consistently on the Android 10 terminals
+        // still supported by the app.
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         enableEdgeToEdge()
         hideSystemBars()
         setContent {

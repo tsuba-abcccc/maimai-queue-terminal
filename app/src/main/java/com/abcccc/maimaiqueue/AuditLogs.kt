@@ -144,8 +144,8 @@ fun createAuditLogEntry(
     id = UUID.randomUUID().toString(),
     timestampMillis = timestampMillis,
     category = category,
-    title = title,
-    detail = detail,
+    title = compactAppMiddleDotSpacing(title),
+    detail = compactAppMiddleDotSpacing(detail),
     source = source,
     publicEventType = publicEventType,
     notificationCategories = notificationCategories.ifEmpty {
@@ -360,9 +360,9 @@ fun createQueueAuditLog(
         else -> PublicQueueEventType.OTHER
     }
     val generatedTitle = when (publicEventType) {
-        PublicQueueEventType.NO_SHOW_DEFERRED -> "未到场 · 已暂缓一次"
-        PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场 · 已移至队尾"
-        PublicQueueEventType.NO_SHOW_REMOVED -> "未到场 · 已移除登记"
+        PublicQueueEventType.NO_SHOW_DEFERRED -> "未到场·已暂缓一次"
+        PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场·已移至队尾"
+        PublicQueueEventType.NO_SHOW_REMOVED -> "未到场·已移除登记"
         PublicQueueEventType.TEMPORARY_AWAY_EXPIRED -> "暂时离开已达轮空上限"
         PublicQueueEventType.ONLINE_REGISTRATION_ADDED -> "线上登记已创建"
         PublicQueueEventType.ONLINE_CHECK_IN_COMPLETED -> "线上登记签到状态已更新"
@@ -415,7 +415,7 @@ fun createQueueAuditLog(
     }
     return createAuditLogEntry(
         category = category,
-        title = titleOverride ?: "$machineLabel · $generatedTitle",
+        title = titleOverride ?: "$machineLabel·$generatedTitle",
         detail = if (details.isEmpty()) {
             "队列状态发生变化。"
         } else {
@@ -555,7 +555,7 @@ fun createQueueAuditLogs(
         keys: Collection<Int>
     ): AuditLogEntry = createAuditLogEntry(
         category = category,
-        title = "$machineLabel · $title",
+        title = "$machineLabel·$title",
         detail = detail,
         source = source,
         timestampMillis = timestampMillis,
@@ -592,12 +592,12 @@ fun createQueueAuditLogs(
             type = publicEventTypeOverride ?: PublicQueueEventType.REGISTRATION_UPDATED,
             title = when (publicEventTypeOverride) {
                 PublicQueueEventType.NO_SHOW_DEFERRED -> if (stillDeferred) {
-                    "未到场 · 已暂缓一次"
+                    "未到场·已暂缓一次"
                 } else {
-                    "未到场 · 本次机会已跳过"
+                    "未到场·本次机会已跳过"
                 }
-                PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场 · 已移至队尾"
-                else -> "未到场 · 已移除登记"
+                PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场·已移至队尾"
+                else -> "未到场·已移除登记"
             },
             detail = detail,
             keys = noShowKeys
@@ -640,7 +640,7 @@ fun createQueueAuditLogs(
         .forEach { (skippedTurns, registrations) ->
             entries += event(
                 PublicQueueEventType.ABSENCE_CHANGED,
-                "暂时离开 · 已轮空 $skippedTurns 次",
+                "暂时离开·已轮空 $skippedTurns 次",
                 "${names(registrations)}本次已轮空并移至等待顺序末端，累计已轮空 $skippedTurns 次。",
                 registrations.map(Registration::key)
             )

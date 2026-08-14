@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 
 export const name = "maimai-q";
 export const inject = { required: ["database", "http"] };
-export const BOT_VERSION = "0.3.12";
+export const BOT_VERSION = "0.3.13";
 
 interface PluginState {
   key: string;
@@ -145,6 +145,11 @@ interface QueueStatus {
     registration_closes_at?: number | null;
   };
   terminal: { online: boolean };
+  venue?: {
+    id?: string;
+    code?: string;
+    name?: string | null;
+  };
   machine_groups?: MachineGroup[];
   default_machine_group_id?: string;
   machines: Record<string, QueueMachine>;
@@ -199,6 +204,7 @@ interface BotPlayersResponse {
 
 interface PlayerProfile {
   profile_id: string;
+  public_player_id?: string | null;
   nickname: string;
   gender: PlayerGender;
   default_preference: ProfilePreference;
@@ -375,6 +381,14 @@ export const HELP_TEXT = [
   "",
   "有关玩家资料的命令，需要在机厅终端创建资料并设置 QQ 后才能使用。",
 ].join("\n");
+
+/** Add the active venue only when the queue snapshot is available. */
+export function formatHelpText(
+  queue?: Pick<QueueStatus, "venue"> | null,
+): string {
+  const venueName = queueVenueName(queue);
+  return venueName ? `当前机厅：${venueName}\n\n${HELP_TEXT}` : HELP_TEXT;
+}
 
 export const PROFILE_EDIT_HELP_TEXT = [
   "可用的命令如下：",
@@ -641,10 +655,22 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.command("maimaiq", "现场排队服务")
     .alias("排队")
-    .action(() => HELP_TEXT);
+    .action(async () => {
+      try {
+        return formatHelpText(await api.getQueue());
+      } catch {
+        return HELP_TEXT;
+      }
+    });
 
-  ctx.middleware((session, next) => {
-    if (isOnlyBotMention(session)) return HELP_TEXT;
+  ctx.middleware(async (session, next) => {
+    if (isOnlyBotMention(session)) {
+      try {
+        return formatHelpText(await api.getQueue());
+      } catch {
+        return HELP_TEXT;
+      }
+    }
     return next();
   }, true);
 
@@ -758,7 +784,10 @@ export function apply(ctx: Context, config: Config) {
         if (queue.onebot_sync_enabled === false) {
           throw new Error("现场终端已关闭 QQ Bot 联动。请联系现场工作人员开启后再试。");
         }
-        return formatRegistrationCount(queue, api.publicUrl("/queue-status"));
+        return formatRegistrationCount(
+          queue,
+          config.publicQueueUrl?.trim() || config.apiBase,
+        );
       })
     );
 
@@ -1751,7 +1780,7 @@ function normalizeMachineChoice(value: string | null | undefined): string {
 }
 
 function compactMachineName(value: string): string {
-  return value.replace(/\s*·\s*/g, "·");
+  return compactMiddleDots(value);
 }
 
 export async function resolveProfileCommandInput(
@@ -2507,8 +2536,9 @@ export function formatRegistrationCount(
       0,
     )
   );
+  const venueName = queueVenueName(queue);
   const sections = [
-    `当前共 ${registrationCounts.reduce((total, count) => total + count, 0)} 个登记。`,
+    `${venueName ? `${venueName}当前` : "当前"}共 ${registrationCounts.reduce((total, count) => total + count, 0)} 个登记。`,
   ];
   if (queue.test_data) sections.push("当前数据是测试数据。");
   if (!queue.terminal.online) {
@@ -2610,7 +2640,11 @@ function formatQueueHeader(queue: QueueStatus): string {
     : queue.registration_open
     ? ""
     : "·自然排队";
-  const lines = [`当前队列·${terminalStatus}${queueMode}`];
+  const venueName = queueVenueName(queue);
+  const lines = [
+    venueName ? `${venueName}·当前队列·${terminalStatus}${queueMode}` :
+      `当前队列·${terminalStatus}${queueMode}`,
+  ];
   if (queue.test_data) {
     lines.push("", "当前数据是测试数据。");
   }
@@ -2637,6 +2671,13 @@ function formatQueueHeader(queue: QueueStatus): string {
     );
   }
   return lines.join("\n").trimEnd();
+}
+
+function queueVenueName(
+  queue?: Pick<QueueStatus, "venue"> | null,
+): string | null {
+  const name = queue?.venue?.name?.trim();
+  return name ? compactMiddleDots(name) : null;
 }
 
 function formatMachine(machine: QueueMachine, terminalOnline = true): string {
@@ -2995,12 +3036,13 @@ export function formatQueueNotification(
 }
 
 function compactMiddleDots(value: string): string {
-  return value.replace(/\s*·\s*/g, "·");
+  return value.replace(/[^\S\r\n\u2028\u2029]*·[^\S\r\n\u2028\u2029]*/g, "·");
 }
 
 function formatProfile(profile: PlayerProfile): string {
   return [
     `玩家资料：${profile.nickname}`,
+    ...(profile.public_player_id ? [`玩家编号：${profile.public_player_id}`] : []),
     `性别：${genderLabel(profile.gender)}`,
     `默认偏好：${preferenceLabel(profile.default_preference)}`,
     `使用次数：${profile.usage_count}`,
@@ -3198,9 +3240,9 @@ async function withCommandError(
   action: () => Promise<string>,
 ): Promise<string> {
   try {
-    return await action();
+    return compactMiddleDots(await action());
   } catch (error) {
-    return apiErrorMessage(error);
+    return compactMiddleDots(apiErrorMessage(error));
   }
 }
 

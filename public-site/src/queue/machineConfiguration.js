@@ -42,14 +42,20 @@ function normalizedString(value) {
   return typeof value === 'string' ? value.trim() : ''
 }
 
+const MIDDLE_DOT_SPACING_REGEX = /[^\S\r\n\u2028\u2029]*·[^\S\r\n\u2028\u2029]*/g
+
+export function compactMiddleDots(value) {
+  return typeof value === 'string' ? value.replace(MIDDLE_DOT_SPACING_REGEX, '·') : value
+}
+
 function normalizedInteger(value, fallback) {
   const number = Number(value)
   return Number.isInteger(number) && number >= 1 && number <= 120 ? number : fallback
 }
 
 function inferredRemark(name, machineId) {
-  const normalizedName = normalizedString(name)
-  const suffix = machineId ? ` · 机台 ${machineId}` : ''
+  const normalizedName = compactMiddleDots(normalizedString(name))
+  const suffix = machineId ? `·机台 ${machineId}` : ''
   if (suffix && normalizedName.endsWith(suffix)) {
     return normalizedName.slice(0, -suffix.length).trim()
   }

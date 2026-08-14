@@ -4,7 +4,11 @@
 root /var/www/queue-site/dist;
 
 location = /queue-status {
-    return 308 /queue-status/;
+    return 308 /;
+}
+
+location = /queue-status/ {
+    return 308 /;
 }
 
 location / {

@@ -216,17 +216,17 @@ class PlayerProfilePersistenceTest {
 
         override suspend fun getProfiles(): List<PlayerProfile> = emptyList()
 
-        override suspend fun upsertProfile(profile: PlayerProfile): Boolean {
+        override suspend fun upsertProfile(profile: PlayerProfile): PlayerProfile? {
             writtenIds += profile.id
             writtenProfiles += profile
             events?.add("persist:${profile.id}")
             if (profile.id in throwingIds) error("simulated write failure")
-            return profile.id !in failedIds
+            return profile.takeIf { it.id !in failedIds }
         }
 
-        override suspend fun replaceProfiles(profiles: List<PlayerProfile>): Boolean {
+        override suspend fun replaceProfiles(profiles: List<PlayerProfile>): List<PlayerProfile>? {
             replacedProfiles = profiles
-            return true
+            return profiles
         }
     }
 }

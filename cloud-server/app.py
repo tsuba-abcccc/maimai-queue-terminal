@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import json
 import os
@@ -13,8 +14,8 @@ from uuid import UUID, uuid4
 from flask import Flask, current_app, jsonify, request
 
 
-PUBLIC_SCHEMA_VERSION = 7
-SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4, 5, 6, 7}
+PUBLIC_SCHEMA_VERSION = 8
+SUPPORTED_SCHEMA_VERSIONS = {1, 2, 3, 4, 5, 6, 7, 8}
 MAX_PAYLOAD_BYTES = 1024 * 1024
 MAX_REGISTRATIONS_PER_MACHINE = 20
 MAX_MACHINE_COUNT = 10
@@ -34,6 +35,7 @@ MAX_STOP_REASON_DETAIL_CHARACTERS = 40
 PUBLIC_ID_PATTERN = re.compile(r"^[0-9a-f]{24}$")
 MACHINE_INTERNAL_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 QQ_NUMBER_PATTERN = re.compile(r"^[0-9]{5,12}$")
+PLAYER_PUBLIC_ID_PATTERN = re.compile(r"^[0-9]{6}$")
 MOBILE_SESSION_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 SEMANTIC_VERSION_PATTERN = re.compile(
     r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
@@ -85,16 +87,16 @@ TERMINAL_INSTANCE_CONFLICT_DETAIL = "另一份终端实例正在同步，请关�
 APPLIED_JOIN_SYNC_GUARD_SECONDS = 30
 SYNC_MODES = {"test", "takeover"}
 MACHINE_NAMES = {
-    "A": "左侧 · 机台 A",
-    "B": "右侧 · 机台 B",
-    "C": "中间左侧 · 机台 C",
-    "D": "中间右侧 · 机台 D",
-    "E": "第 5 台 · 机台 E",
-    "F": "第 6 台 · 机台 F",
-    "G": "第 7 台 · 机台 G",
-    "H": "第 8 台 · 机台 H",
-    "I": "第 9 台 · 机台 I",
-    "J": "第 10 台 · 机台 J",
+    "A": "左侧·机台 A",
+    "B": "右侧·机台 B",
+    "C": "中间左侧·机台 C",
+    "D": "中间右侧·机台 D",
+    "E": "第 5 台·机台 E",
+    "F": "第 6 台·机台 F",
+    "G": "第 7 台·机台 G",
+    "H": "第 8 台·机台 H",
+    "I": "第 9 台·机台 I",
+    "J": "第 10 台·机台 J",
 }
 DEFAULT_MACHINE_GROUP_ID = "00000000000000000000000000000001"
 MAX_MACHINE_GROUP_NAME_CHARACTERS = 12
@@ -102,6 +104,15 @@ MAX_MACHINE_REMARK_CHARACTERS = 8
 MAX_MACHINE_TYPE_CHARACTERS = 24
 MAX_MACHINE_SERVER_CHARACTERS = 24
 MAX_GAME_VERSION_CHARACTERS = 40
+MAX_VENUE_NAME_CHARACTERS = 40
+MAX_TERMINAL_NAME_CHARACTERS = 24
+VENUE_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+VENUE_CODE_LENGTH = 8
+# Only remove horizontal spacing around the middle dot.  A broad ``\s*``
+# would also consume a line break, joining otherwise separate log lines.
+MIDDLE_DOT_SPACING_PATTERN = re.compile(
+    r"[^\S\r\n\u2028\u2029]*·[^\S\r\n\u2028\u2029]*"
+)
 MACHINE_GAME_TYPES = {
     "MAIMAI_DX",
     "CHUNITHM",
@@ -159,7 +170,31 @@ OPERATION_SOURCES = {
 }
 
 REQUIRED_DATABASE_COLUMNS = {
-    "queue_snapshot": {"instance_id", "instance_generation"},
+    "queue_snapshot": {"instance_id", "instance_generation", "venue_id"},
+    "venue": {
+        "venue_id",
+        "venue_code",
+        "profile_scope_id",
+        "display_name",
+        "created_at",
+        "updated_at",
+    },
+    "registered_terminal": {
+        "terminal_id",
+        "venue_id",
+        "display_name",
+        "role",
+        "created_at",
+        "updated_at",
+        "last_seen_at",
+    },
+    "player_profile": {"public_player_id"},
+    "player_public_id_alias": {
+        "profile_scope_id",
+        "public_player_id",
+        "canonical_profile_id",
+        "created_at",
+    },
     "terminal_command": {
         "claimed_at",
         "claimed_terminal",
@@ -210,6 +245,168 @@ def validation_error_payload(error: ValidationError) -> dict[str, Any]:
     return payload
 
 
+def deterministic_player_public_id_start(
+    profile_scope_id: str, profile_id: str
+) -> int:
+    digest = hashlib.sha256(
+        f"{profile_scope_id}:{profile_id}".encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:8], "big") % 1_000_000
+
+
+def allocate_player_public_id(
+    connection: sqlite3.Connection,
+    *,
+    profile_scope_id: str,
+    profile_id: str,
+) -> str:
+    occupied = {
+        row[0]
+        for row in connection.execute(
+            """
+            SELECT public_player_id FROM player_profile
+            WHERE device_id = ? AND public_player_id IS NOT NULL
+            UNION
+            SELECT public_player_id FROM player_public_id_alias
+            WHERE profile_scope_id = ?
+            """,
+            (profile_scope_id, profile_scope_id),
+        ).fetchall()
+    }
+    start = deterministic_player_public_id_start(profile_scope_id, profile_id)
+    for offset in range(1_000_000):
+        candidate = f"{(start + offset) % 1_000_000:06d}"
+        if candidate not in occupied:
+            return candidate
+    raise RuntimeError("玩家编号空间已经用尽")
+
+
+def public_player_id_owner(
+    connection: sqlite3.Connection,
+    *,
+    profile_scope_id: str,
+    public_player_id: str,
+) -> str | None:
+    row = connection.execute(
+        """
+        SELECT profile_id FROM player_profile
+        WHERE device_id = ? AND public_player_id = ?
+        UNION ALL
+        SELECT canonical_profile_id FROM player_public_id_alias
+        WHERE profile_scope_id = ? AND public_player_id = ?
+        LIMIT 1
+        """,
+        (
+            profile_scope_id,
+            public_player_id,
+            profile_scope_id,
+            public_player_id,
+        ),
+    ).fetchone()
+    return row[0] if row is not None else None
+
+
+def preserve_player_public_id_alias(
+    connection: sqlite3.Connection,
+    *,
+    profile_scope_id: str,
+    public_player_id: str | None,
+    canonical_profile_id: str,
+    created_at: int,
+    previous_profile_id: str | None = None,
+) -> None:
+    if public_player_id is None:
+        return
+    owner = public_player_id_owner(
+        connection,
+        profile_scope_id=profile_scope_id,
+        public_player_id=public_player_id,
+    )
+    if owner not in (None, canonical_profile_id, previous_profile_id):
+        raise RuntimeError("玩家编号已经属于另一份玩家资料")
+    connection.execute(
+        """
+        INSERT INTO player_public_id_alias
+            (profile_scope_id, public_player_id, canonical_profile_id, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(profile_scope_id, public_player_id) DO UPDATE SET
+            canonical_profile_id = excluded.canonical_profile_id
+        """,
+        (
+            profile_scope_id,
+            public_player_id,
+            canonical_profile_id,
+            created_at,
+        ),
+    )
+
+
+def read_player_public_id_aliases(
+    connection: sqlite3.Connection,
+    *,
+    profile_scope_id: str,
+) -> dict[str, list[str]]:
+    aliases: dict[str, list[str]] = {}
+    for public_player_id, canonical_profile_id in connection.execute(
+        """
+        SELECT public_player_id, canonical_profile_id
+        FROM player_public_id_alias
+        WHERE profile_scope_id = ?
+        ORDER BY public_player_id
+        """,
+        (profile_scope_id,),
+    ).fetchall():
+        aliases.setdefault(canonical_profile_id, []).append(public_player_id)
+    return aliases
+
+
+def normalize_existing_player_public_ids(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT device_id, profile_id, public_player_id
+        FROM player_profile
+        ORDER BY device_id, profile_id
+        """
+    ).fetchall()
+    occupied_by_scope: dict[str, set[str]] = {}
+    for profile_scope_id, public_player_id in connection.execute(
+        """
+        SELECT profile_scope_id, public_player_id
+        FROM player_public_id_alias
+        WHERE public_player_id IS NOT NULL
+        """
+    ).fetchall():
+        if PLAYER_PUBLIC_ID_PATTERN.fullmatch(public_player_id or ""):
+            occupied_by_scope.setdefault(profile_scope_id, set()).add(public_player_id)
+    for profile_scope_id, profile_id, public_player_id in rows:
+        occupied = occupied_by_scope.setdefault(profile_scope_id, set())
+        normalized = (
+            public_player_id
+            if isinstance(public_player_id, str)
+            and PLAYER_PUBLIC_ID_PATTERN.fullmatch(public_player_id)
+            and public_player_id not in occupied
+            else None
+        )
+        if normalized is None:
+            start = deterministic_player_public_id_start(profile_scope_id, profile_id)
+            for offset in range(1_000_000):
+                candidate = f"{(start + offset) % 1_000_000:06d}"
+                if candidate not in occupied:
+                    normalized = candidate
+                    break
+        if normalized is None:
+            raise RuntimeError("玩家编号空间已经用尽")
+        occupied.add(normalized)
+        if normalized != public_player_id:
+            connection.execute(
+                """
+                UPDATE player_profile SET public_player_id = ?
+                WHERE device_id = ? AND profile_id = ?
+                """,
+                (normalized, profile_scope_id, profile_id),
+            )
+
+
 def create_app(config: dict[str, Any] | None = None) -> Flask:
     app = Flask(__name__)
     # A self-hosted/public build must never silently emit the maintainer's
@@ -253,19 +450,22 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         CORS_ORIGIN=configured_cors_origin,
         PUBLIC_SITE_URL=configured_public_site_url.rstrip("/"),
         LATEST_TERMINAL_VERSION=os.getenv(
-            "QUEUE_LATEST_TERMINAL_VERSION", "0.10.2"
+            "QUEUE_LATEST_TERMINAL_VERSION", "0.11.0"
         ),
         LATEST_WEBSITE_VERSION=os.getenv(
-            "QUEUE_LATEST_WEBSITE_VERSION", "0.10.2"
+            "QUEUE_LATEST_WEBSITE_VERSION", "0.11.0"
         ),
-        LATEST_BOT_VERSION=os.getenv("QUEUE_LATEST_BOT_VERSION", "0.3.12"),
+        LATEST_BOT_VERSION=os.getenv("QUEUE_LATEST_BOT_VERSION", "0.3.13"),
         MAX_CONTENT_LENGTH=MAX_PAYLOAD_BYTES,
         JSON_AS_ASCII=False,
     )
     if config:
         app.config.update(config)
 
-    initialize_database(app.config["DATABASE_PATH"])
+    initialize_database(
+        app.config["DATABASE_PATH"],
+        profile_scope_id=app.config["PROFILE_SCOPE_ID"],
+    )
     register_routes(app)
     return app
 
@@ -281,7 +481,19 @@ def open_database():
         connection.close()
 
 
-def initialize_database(database_path: str) -> None:
+def generate_venue_code(connection: sqlite3.Connection) -> str:
+    for _ in range(128):
+        candidate = "".join(
+            secrets.choice(VENUE_CODE_ALPHABET) for _ in range(VENUE_CODE_LENGTH)
+        )
+        if connection.execute(
+            "SELECT 1 FROM venue WHERE venue_code = ?", (candidate,)
+        ).fetchone() is None:
+            return candidate
+    raise RuntimeError("无法生成唯一机厅编号")
+
+
+def initialize_database(database_path: str, *, profile_scope_id: str = "default") -> None:
     path = Path(database_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=10)
@@ -293,6 +505,53 @@ def initialize_database(database_path: str) -> None:
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS venue (
+                venue_id TEXT PRIMARY KEY,
+                venue_code TEXT NOT NULL UNIQUE,
+                profile_scope_id TEXT NOT NULL UNIQUE,
+                display_name TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        active_venue = connection.execute(
+            "SELECT venue_id FROM venue WHERE profile_scope_id = ?",
+            (profile_scope_id,),
+        ).fetchone()
+        if active_venue is None:
+            now = int(time.time())
+            connection.execute(
+                """
+                INSERT INTO venue
+                    (venue_id, venue_code, profile_scope_id, display_name,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    generate_venue_code(connection),
+                    profile_scope_id,
+                    now,
+                    now,
+                ),
+            )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS registered_terminal (
+                terminal_id TEXT PRIMARY KEY,
+                venue_id TEXT NOT NULL,
+                display_name TEXT,
+                role TEXT NOT NULL DEFAULT 'AUTHORITATIVE',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_seen_at INTEGER,
+                FOREIGN KEY(venue_id) REFERENCES venue(venue_id)
+            )
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS queue_snapshot (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 queue_id TEXT NOT NULL,
@@ -301,6 +560,7 @@ def initialize_database(database_path: str) -> None:
                 device_id TEXT NOT NULL,
                 instance_id TEXT NOT NULL,
                 instance_generation INTEGER NOT NULL,
+                venue_id TEXT,
                 received_at INTEGER NOT NULL
             )
             """
@@ -311,6 +571,7 @@ def initialize_database(database_path: str) -> None:
         for column_name, declaration in (
             ("instance_id", "TEXT NOT NULL DEFAULT ''"),
             ("instance_generation", "INTEGER NOT NULL DEFAULT 0"),
+            ("venue_id", "TEXT"),
         ):
             if column_name not in queue_snapshot_columns:
                 connection.execute(
@@ -322,6 +583,16 @@ def initialize_database(database_path: str) -> None:
             SET instance_id = device_id
             WHERE instance_id = ''
             """
+        )
+        connection.execute(
+            """
+            UPDATE queue_snapshot
+            SET venue_id = (
+                SELECT venue_id FROM venue WHERE profile_scope_id = ?
+            )
+            WHERE venue_id IS NULL
+            """,
+            (profile_scope_id,),
         )
         connection.execute(
             """
@@ -441,6 +712,7 @@ def initialize_database(database_path: str) -> None:
                 profile_revision INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
                 profile_updated_at INTEGER NOT NULL,
+                public_player_id TEXT,
                 received_at INTEGER NOT NULL,
                 PRIMARY KEY(device_id, profile_id)
             )
@@ -459,6 +731,7 @@ def initialize_database(database_path: str) -> None:
             ("notify_machine_status", "INTEGER NOT NULL DEFAULT 0"),
             ("setup_version", "INTEGER NOT NULL DEFAULT 0"),
             ("profile_revision", "INTEGER NOT NULL DEFAULT 1"),
+            ("public_player_id", "TEXT"),
         ):
             if column_name not in player_profile_columns:
                 connection.execute(
@@ -468,6 +741,25 @@ def initialize_database(database_path: str) -> None:
             """
             CREATE INDEX IF NOT EXISTS player_profile_qq
             ON player_profile(device_id, qq_number)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS player_public_id_alias (
+                profile_scope_id TEXT NOT NULL,
+                public_player_id TEXT NOT NULL,
+                canonical_profile_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(profile_scope_id, public_player_id)
+            )
+            """
+        )
+        normalize_existing_player_public_ids(connection)
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS player_profile_unique_public_id
+            ON player_profile(device_id, public_player_id)
+            WHERE public_player_id IS NOT NULL
             """
         )
         connection.execute(
@@ -697,6 +989,7 @@ def register_routes(app: Flask) -> None:
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = (
             "Authorization, Content-Type, X-Device-ID, X-Queue-Schema-Version, "
+            "X-Queue-Venue-ID, "
             "X-Queue-Sync-Mode, X-Terminal-Instance-ID, "
             "X-Terminal-Instance-Generation"
         )
@@ -754,6 +1047,13 @@ def register_routes(app: Flask) -> None:
     @app.get("/api/queue-versions")
     def queue_versions():
         return read_queue_versions()
+
+    @app.route("/api/queue-terminal/installation", methods=["GET", "POST"])
+    def queue_terminal_installation():
+        authorization_error = authorize_terminal()
+        if authorization_error is not None:
+            return authorization_error
+        return read_or_update_terminal_installation()
 
     @app.route("/api/queue-bot/players", methods=["GET", "POST"])
     def queue_bot_players():
@@ -821,6 +1121,9 @@ def register_routes(app: Flask) -> None:
         authorization_error = authorize_terminal()
         if authorization_error is not None:
             return authorization_error
+        venue_error = authorize_terminal_venue()
+        if venue_error is not None:
+            return venue_error
         return read_terminal_commands()
 
     @app.get("/api/queue-terminal/profiles")
@@ -828,6 +1131,9 @@ def register_routes(app: Flask) -> None:
         authorization_error = authorize_terminal()
         if authorization_error is not None:
             return authorization_error
+        venue_error = authorize_terminal_venue()
+        if venue_error is not None:
+            return venue_error
         return read_synced_profiles(allow_qq_filter=False)
 
     @app.post("/api/queue-terminal/mobile-registration-sessions")
@@ -835,6 +1141,9 @@ def register_routes(app: Flask) -> None:
         authorization_error = authorize_terminal()
         if authorization_error is not None:
             return authorization_error
+        venue_error = authorize_terminal_venue()
+        if venue_error is not None:
+            return venue_error
         return create_mobile_registration_session()
 
     @app.get("/api/queue-mobile/sessions/<session_token>")
@@ -854,6 +1163,9 @@ def register_routes(app: Flask) -> None:
         authorization_error = authorize_terminal()
         if authorization_error is not None:
             return authorization_error
+        venue_error = authorize_terminal_venue()
+        if venue_error is not None:
+            return venue_error
         return complete_terminal_command(command_id)
 
 
@@ -862,6 +1174,34 @@ def publish_snapshot():
     if authorization_error is not None:
         return authorization_error
 
+    schema_header = request.headers.get("X-Queue-Schema-Version", "").strip()
+    invalid_schema_header = False
+    try:
+        requested_schema_version = int(schema_header) if schema_header else None
+    except ValueError:
+        # Do not silently treat a malformed declaration as a legacy client.
+        # That would let a broken/new client skip the schema-8 venue checks.
+        requested_schema_version = None
+        invalid_schema_header = bool(schema_header)
+    if invalid_schema_header:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "SCHEMA_VERSION_INVALID",
+                "error": "请求头中的队列协议版本无效。",
+            }
+        ), 400
+    if (
+        requested_schema_version is not None
+        and requested_schema_version not in SUPPORTED_SCHEMA_VERSIONS
+    ):
+        return jsonify(
+            {
+                "ok": False,
+                "code": "SCHEMA_VERSION_UNSUPPORTED",
+                "error": "请求头中的队列协议版本暂不支持。",
+            }
+        ), 400
     device_id = request.headers.get("X-Device-ID", "").strip()
     if not device_id or len(device_id) > 128:
         return jsonify({"ok": False, "error": "终端编号无效"}), 400
@@ -877,6 +1217,68 @@ def publish_snapshot():
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+
+    try:
+        payload_schema_version = read_integer(payload, "schema_version", minimum=1)
+    except ValidationError as error:
+        return jsonify(validation_error_payload(error)), 400
+    # Legacy clients did not consistently send a header while migrating
+    # between schema revisions. Keep that compatibility path intact, but do
+    # not allow either side to disguise a schema-8 request as legacy.
+    modern_schema_declared = (
+        payload_schema_version >= 8 or requested_schema_version is not None and requested_schema_version >= 8
+    )
+    if payload_schema_version >= 8 and requested_schema_version is None:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "SCHEMA_VERSION_REQUIRED",
+                "error": "新版终端同步必须明确声明队列协议版本。",
+            }
+        ), 400
+    if modern_schema_declared and requested_schema_version != payload_schema_version:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "SCHEMA_VERSION_MISMATCH",
+                "error": "请求头与请求内容中的队列协议版本不一致。",
+            }
+        ), 400
+    if payload_schema_version >= 8 and requested_schema_version >= 8:
+        # The header check above runs before parsing the body so that an
+        # unverified terminal cannot reach normalization or mutate state.
+        venue_error = authorize_terminal_venue()
+        if venue_error is not None:
+            return venue_error
+        # Check the raw venue envelope before normalizing the rest of the
+        # snapshot. A stale schema-8 client must receive the identity boundary
+        # error even when it also omitted newer fields; otherwise a generic
+        # payload error would hide the reason synchronization is paused.
+        submitted_venue = payload.get("venue")
+        submitted_venue_id = (
+            submitted_venue.get("id")
+            if isinstance(submitted_venue, dict)
+            else None
+        )
+        try:
+            submitted_venue_id = str(UUID(submitted_venue_id))
+        except (TypeError, ValueError):
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "VENUE_ID_REQUIRED",
+                    "error": "新版终端同步必须包含已核对的机厅 ID，本次同步没有执行。",
+                }
+            ), 409
+        header_venue_id = request.headers.get("X-Queue-Venue-ID", "").strip()
+        if submitted_venue_id != header_venue_id:
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "VENUE_MISMATCH",
+                    "error": "提交的机厅与当前服务端不一致，本次同步没有执行。",
+                }
+            ), 409
 
     try:
         normalized = normalize_snapshot(payload, device_id)
@@ -903,10 +1305,50 @@ def publish_snapshot():
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         cleanup_expired_event_recipients(connection, now)
+        venue = read_active_venue(connection)
+        submitted_venue = normalized.get("venue")
+        submitted_venue_id = (
+            submitted_venue.get("id")
+            if isinstance(submitted_venue, dict)
+            else None
+        )
+        if payload_schema_version >= 8 and not submitted_venue_id:
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "VENUE_ID_REQUIRED",
+                    "error": "新版终端同步必须包含已核对的机厅 ID，本次同步没有执行。",
+                }
+            ), 409
+        if submitted_venue_id is not None and submitted_venue_id != venue["venue_id"]:
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "VENUE_MISMATCH",
+                    "error": (
+                        "终端绑定的机厅与当前服务器不一致。为防止覆盖其他机厅的队列，"
+                        "本次同步没有执行，请在设置中核对服务器与机厅。"
+                    ),
+                }
+            ), 409
+        normalized["venue"] = serialize_venue(venue)
+        try:
+            upsert_registered_terminal(
+                connection,
+                terminal_id=device_id,
+                venue_id=venue["venue_id"],
+                display_name=normalized.get("terminal", {}).get("name"),
+                seen_at=now,
+            )
+        except ValidationError as error:
+            connection.rollback()
+            return jsonify(validation_error_payload(error)), 409
         current = connection.execute(
             """
             SELECT queue_id, revision, payload, device_id, instance_id,
-                   instance_generation, received_at
+                   instance_generation, venue_id, received_at
             FROM queue_snapshot WHERE id = 1
             """
         ).fetchone()
@@ -1038,9 +1480,9 @@ def publish_snapshot():
             """
             INSERT INTO queue_snapshot
                 (id, queue_id, revision, payload, device_id, instance_id,
-                 instance_generation, received_at)
+                 instance_generation, venue_id, received_at)
             VALUES
-                (1, ?, ?, ?, ?, ?, ?, ?)
+                (1, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 queue_id = excluded.queue_id,
                 revision = excluded.revision,
@@ -1048,6 +1490,7 @@ def publish_snapshot():
                 device_id = excluded.device_id,
                 instance_id = excluded.instance_id,
                 instance_generation = excluded.instance_generation,
+                venue_id = excluded.venue_id,
                 received_at = excluded.received_at
             """,
             (
@@ -1057,6 +1500,7 @@ def publish_snapshot():
                 device_id,
                 instance_id,
                 instance_generation,
+                venue["venue_id"],
                 now,
             ),
         )
@@ -1442,11 +1886,35 @@ def upsert_player_profiles(
     for profile in profiles:
         current = connection.execute(
             """
-            SELECT profile_revision, profile_updated_at FROM player_profile
+            SELECT profile_revision, profile_updated_at, public_player_id
+            FROM player_profile
             WHERE device_id = ? AND profile_id = ?
             """,
             (profile_scope_id, profile["profile_id"]),
         ).fetchone()
+        requested_public_player_id = profile.get("public_player_id")
+        current_public_player_id = (
+            current["public_player_id"] if current is not None else None
+        )
+        public_player_id = current_public_player_id
+        if public_player_id is None and requested_public_player_id is not None:
+            requested_owner = public_player_id_owner(
+                connection,
+                profile_scope_id=profile_scope_id,
+                public_player_id=requested_public_player_id,
+            )
+            # An identifier preserved in the alias table must remain historical,
+            # even when it points at this same canonical profile. Otherwise a
+            # stale terminal could silently promote an old identifier back to
+            # the profile's current public identifier.
+            if requested_owner is None:
+                public_player_id = requested_public_player_id
+        if public_player_id is None:
+            public_player_id = allocate_player_public_id(
+                connection,
+                profile_scope_id=profile_scope_id,
+                profile_id=profile["profile_id"],
+            )
         if current is not None:
             connection.execute(
                 """
@@ -1455,6 +1923,20 @@ def upsert_player_profiles(
                 """,
                 (received_at, profile_scope_id, profile["profile_id"]),
             )
+            if (
+                current_public_player_id is None
+                and public_player_id is not None
+                and not profile["legacy_revision"]
+                and profile["profile_revision"] == current["profile_revision"]
+            ):
+                connection.execute(
+                    """
+                    UPDATE player_profile
+                    SET public_player_id = ?
+                    WHERE device_id = ? AND profile_id = ?
+                    """,
+                    (public_player_id, profile_scope_id, profile["profile_id"]),
+                )
             if profile["legacy_revision"]:
                 if profile["updated_at"] <= current["profile_updated_at"]:
                     continue
@@ -1490,12 +1972,27 @@ def upsert_player_profiles(
             ):
                 continue
             if conflicting_is_historical_alias:
+                conflicting_public_id = connection.execute(
+                    """
+                    SELECT public_player_id FROM player_profile
+                    WHERE device_id = ? AND profile_id = ?
+                    """,
+                    (profile_scope_id, conflicting["profile_id"]),
+                ).fetchone()["public_player_id"]
                 connection.execute(
                     """
                     DELETE FROM player_profile
                     WHERE device_id = ? AND profile_id = ?
                     """,
                     (profile_scope_id, conflicting["profile_id"]),
+                )
+                preserve_player_public_id_alias(
+                    connection,
+                    profile_scope_id=profile_scope_id,
+                    public_player_id=conflicting_public_id,
+                    canonical_profile_id=profile["profile_id"],
+                    created_at=received_at,
+                    previous_profile_id=conflicting["profile_id"],
                 )
             else:
                 connection.execute(
@@ -1515,8 +2012,9 @@ def upsert_player_profiles(
                  notification_enabled, notify_queue_changes,
                  notify_playing_position, notify_online_check_in,
                  notify_absence, notify_machine_status, setup_version,
-                 profile_revision, created_at, profile_updated_at, received_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 profile_revision, created_at, profile_updated_at,
+                 public_player_id, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id, profile_id) DO UPDATE SET
                 nickname = excluded.nickname,
                 gender = excluded.gender,
@@ -1535,6 +2033,10 @@ def upsert_player_profiles(
                 profile_revision = excluded.profile_revision,
                 created_at = excluded.created_at,
                 profile_updated_at = excluded.profile_updated_at,
+                public_player_id = COALESCE(
+                    player_profile.public_player_id,
+                    excluded.public_player_id
+                ),
                 received_at = excluded.received_at
             """,
             (
@@ -1557,6 +2059,7 @@ def upsert_player_profiles(
                 profile["profile_revision"],
                 profile["created_at"],
                 profile["updated_at"],
+                public_player_id,
                 received_at,
             ),
         )
@@ -1594,6 +2097,162 @@ def read_current_player_profile_ids(
             (profile_scope_id,),
         ).fetchall()
     }
+
+
+def read_active_venue(connection: sqlite3.Connection) -> sqlite3.Row:
+    venue = connection.execute(
+        """
+        SELECT venue_id, venue_code, profile_scope_id, display_name,
+               created_at, updated_at
+        FROM venue WHERE profile_scope_id = ?
+        """,
+        (current_app.config["PROFILE_SCOPE_ID"],),
+    ).fetchone()
+    if venue is None:
+        raise RuntimeError("当前服务实例缺少机厅身份")
+    return venue
+
+
+def serialize_venue(venue: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": venue["venue_id"],
+        "code": venue["venue_code"],
+        "name": venue["display_name"],
+        "registered": True,
+    }
+
+
+def upsert_registered_terminal(
+    connection: sqlite3.Connection,
+    *,
+    terminal_id: str,
+    venue_id: str,
+    display_name: str | None,
+    seen_at: int,
+) -> None:
+    normalized_name = display_name.strip() if isinstance(display_name, str) else None
+    if normalized_name == "":
+        normalized_name = None
+    existing = connection.execute(
+        "SELECT venue_id FROM registered_terminal WHERE terminal_id = ?",
+        (terminal_id,),
+    ).fetchone()
+    if existing is not None and existing["venue_id"] != venue_id:
+        raise ValidationError(
+            "此终端已经绑定到另一机厅，不能自动更改归属。",
+            code="VENUE_MISMATCH",
+        )
+    connection.execute(
+        """
+        INSERT INTO registered_terminal
+            (terminal_id, venue_id, display_name, role, created_at, updated_at,
+             last_seen_at)
+        VALUES (?, ?, ?, 'AUTHORITATIVE', ?, ?, ?)
+        ON CONFLICT(terminal_id) DO UPDATE SET
+            display_name = COALESCE(excluded.display_name, registered_terminal.display_name),
+            updated_at = excluded.updated_at,
+            last_seen_at = excluded.last_seen_at
+        """,
+        (
+            terminal_id,
+            venue_id,
+            normalized_name,
+            seen_at,
+            seen_at,
+            seen_at,
+        ),
+    )
+
+
+def read_or_update_terminal_installation():
+    terminal_id = request.headers.get("X-Device-ID", "").strip()
+    if not terminal_id or len(terminal_id) > 128:
+        return jsonify({"ok": False, "error": "终端编号无效"}), 400
+    source = request.get_json(silent=True) if request.method == "POST" else None
+    if request.method == "POST":
+        if not isinstance(source, dict):
+            return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        if set(source) - {"venue_name", "terminal_name", "venue_id"}:
+            return jsonify({"ok": False, "error": "请求包含不支持的安装信息字段"}), 400
+        venue_name = source.get("venue_name")
+        terminal_name = source.get("terminal_name")
+        submitted_venue_id = source.get("venue_id")
+        if venue_name is not None and (
+            not isinstance(venue_name, str)
+            or not venue_name.strip()
+            or len(venue_name.strip()) > MAX_VENUE_NAME_CHARACTERS
+        ):
+            return jsonify({"ok": False, "error": "机厅名称必须为 1 至 40 个字符"}), 400
+        if terminal_name is not None and (
+            not isinstance(terminal_name, str)
+            or not terminal_name.strip()
+            or len(terminal_name.strip()) > MAX_TERMINAL_NAME_CHARACTERS
+        ):
+            return jsonify({"ok": False, "error": "终端名称必须为 1 至 24 个字符"}), 400
+        if submitted_venue_id is not None:
+            try:
+                submitted_venue_id = str(UUID(submitted_venue_id))
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "机厅 ID 无效"}), 400
+
+    now = int(time.time())
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        venue = read_active_venue(connection)
+        if request.method == "POST" and submitted_venue_id is not None and (
+            submitted_venue_id != venue["venue_id"]
+        ):
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "VENUE_MISMATCH",
+                    "error": "当前服务器属于另一机厅，请核对服务器地址后再继续。",
+                }
+            ), 409
+        if request.method == "POST" and venue_name is not None:
+            connection.execute(
+                "UPDATE venue SET display_name = ?, updated_at = ? WHERE venue_id = ?",
+                (venue_name.strip(), now, venue["venue_id"]),
+            )
+            venue = read_active_venue(connection)
+        try:
+            upsert_registered_terminal(
+                connection,
+                terminal_id=terminal_id,
+                venue_id=venue["venue_id"],
+                display_name=terminal_name if request.method == "POST" else None,
+                seen_at=now,
+            )
+        except ValidationError as error:
+            connection.rollback()
+            return jsonify(validation_error_payload(error)), 409
+        terminal = connection.execute(
+            """
+            SELECT terminal_id, display_name, role, created_at, updated_at,
+                   last_seen_at
+            FROM registered_terminal WHERE terminal_id = ?
+            """,
+            (terminal_id,),
+        ).fetchone()
+        connection.commit()
+    return jsonify(
+        {
+            "ok": True,
+            "venue": serialize_venue(venue),
+            "terminal": {
+                "id": terminal["terminal_id"],
+                "name": terminal["display_name"],
+                "role": terminal["role"],
+                "last_seen_at": optional_epoch_millis(terminal["last_seen_at"]),
+            },
+            "capabilities": {
+                "schema_version": PUBLIC_SCHEMA_VERSION,
+                "multiple_venues": False,
+                "multiple_terminals": False,
+            },
+        }
+    )
 
 
 def stored_profile_is_historical_alias(
@@ -1702,12 +2361,13 @@ def active_profile_scope_id(connection: sqlite3.Connection) -> str:
 def read_snapshot():
     with open_database() as connection:
         row = connection.execute(
-            "SELECT payload, device_id, received_at FROM queue_snapshot WHERE id = 1"
+            "SELECT payload, device_id, venue_id, received_at FROM queue_snapshot WHERE id = 1"
         ).fetchone()
+        venue = read_active_venue(connection)
     if row is None:
         return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
 
-    payload = json.loads(row["payload"])
+    payload = compact_public_middle_dots(json.loads(row["payload"]))
     now = int(time.time())
     last_seen_seconds = max(0, now - row["received_at"])
     payload["received_at"] = row["received_at"] * 1000
@@ -1720,6 +2380,10 @@ def read_snapshot():
         "last_seen_seconds": last_seen_seconds,
         "offline_after_seconds": current_app.config["ONLINE_TIMEOUT_SECONDS"],
     }
+    # Old schema snapshots did not carry venue information. Public readers
+    # still receive the active venue without claiming that the old terminal
+    # completed the new installation flow.
+    payload["venue"] = serialize_venue(venue)
     payload["capabilities"] = public_capabilities(payload, terminal_online)
     return jsonify(payload)
 
@@ -1930,10 +2594,10 @@ def read_queue_logs():
             "occurred_at": row["occurred_at"],
             "machine_id": row["machine_id"],
             "machine_stable_id": row["machine_stable_id"],
-            "machine_name": row["machine_name"],
+            "machine_name": compact_middle_dots(row["machine_name"]),
             "type": row["event_type"],
-            "title": row["title"],
-            "detail": row["detail"],
+            "title": compact_middle_dots(row["title"]),
+            "detail": compact_middle_dots(row["detail"]),
             "operation_source": row["operation_source"],
             "notification_categories": stored_event_notification_categories(row),
             "registration_ids": json.loads(row["registration_ids"]),
@@ -2165,10 +2829,10 @@ def read_bot_events():
                 "occurred_at": row["occurred_at"],
                 "machine_id": row["machine_id"],
                 "machine_stable_id": row["machine_stable_id"],
-                "machine_name": row["machine_name"],
+                "machine_name": compact_middle_dots(row["machine_name"]),
                 "type": row["event_type"],
-                "title": row["title"],
-                "detail": row["detail"],
+                "title": compact_middle_dots(row["title"]),
+                "detail": compact_middle_dots(row["detail"]),
                 "operation_source": row["operation_source"],
                 "notification_categories": stored_event_notification_categories(row),
                 "affected_players": affected_players,
@@ -2308,7 +2972,8 @@ def read_synced_profiles(*, allow_qq_filter: bool):
                    notification_enabled, notify_queue_changes,
                    notify_playing_position, notify_online_check_in,
                    notify_absence, notify_machine_status, setup_version,
-                   profile_revision, created_at, profile_updated_at, received_at
+                   profile_revision, created_at, profile_updated_at,
+                   public_player_id, received_at
             FROM player_profile
             WHERE device_id = ?
             ORDER BY nickname, profile_id
@@ -2320,6 +2985,9 @@ def read_synced_profiles(*, allow_qq_filter: bool):
         )
         profile_aliases = find_mobile_profile_aliases(
             rows, current_profile_ids=current_profile_ids
+        )
+        public_player_id_aliases = read_player_public_id_aliases(
+            connection, profile_scope_id=profile_scope_id
         )
         canonical_rows = [
             row for row in rows if row["profile_id"] not in profile_aliases
@@ -2351,6 +3019,10 @@ def read_synced_profiles(*, allow_qq_filter: bool):
             "profiles": [
                 {
                     "profile_id": row["profile_id"],
+                    "public_player_id": row["public_player_id"],
+                    "public_player_id_aliases": public_player_id_aliases.get(
+                        row["profile_id"], []
+                    ),
                     "nickname": row["nickname"],
                     "gender": row["gender"],
                     "default_preference": row["default_preference"],
@@ -3342,7 +4014,7 @@ def read_mobile_registration_session(session_token: str):
                    notification_enabled, notify_queue_changes,
                    notify_playing_position, notify_online_check_in,
                    notify_absence, notify_machine_status, setup_version,
-                   profile_revision, received_at
+                   profile_revision, public_player_id, received_at
             FROM player_profile
             WHERE device_id = ?
             ORDER BY usage_count DESC, COALESCE(last_used_at, 0) DESC,
@@ -3356,6 +4028,9 @@ def read_mobile_registration_session(session_token: str):
         profile_aliases = find_mobile_profile_aliases(
             profiles, current_profile_ids=current_profile_ids
         )
+        public_player_id_aliases = read_player_public_id_aliases(
+            connection, profile_scope_id=profile_scope_id
+        )
         canonical_profiles = [
             profile
             for profile in profiles
@@ -3368,6 +4043,19 @@ def read_mobile_registration_session(session_token: str):
                 for profile in profiles
                 if folded_query in profile["nickname"].casefold()
                 or (profile["qq_number"] and query in profile["qq_number"])
+                or (
+                    profile["public_player_id"]
+                    and query in profile["public_player_id"]
+                )
+                or any(
+                    query in public_player_id
+                    for public_player_id in public_player_id_aliases.get(
+                        profile_aliases.get(
+                            profile["profile_id"], profile["profile_id"]
+                        ),
+                        [],
+                    )
+                )
             }
             canonical_profiles = [
                 profile
@@ -3397,7 +4085,15 @@ def read_mobile_registration_session(session_token: str):
                 or default_machine_configuration(machine),
                 "expires_at": session["expires_at"] * 1000,
             },
-            "profiles": [serialize_mobile_profile(row) for row in profiles],
+            "profiles": [
+                serialize_mobile_profile(
+                    row,
+                    public_player_id_aliases=public_player_id_aliases.get(
+                        row["profile_id"], []
+                    ),
+                )
+                for row in profiles
+            ],
             "profile_aliases": profile_aliases,
             "bot_qq": identity["bot_qq"] if identity is not None else None,
             "capabilities": {
@@ -3410,10 +4106,16 @@ def read_mobile_registration_session(session_token: str):
     )
 
 
-def serialize_mobile_profile(profile: sqlite3.Row) -> dict[str, Any]:
+def serialize_mobile_profile(
+    profile: sqlite3.Row,
+    *,
+    public_player_id_aliases: list[str] | None = None,
+) -> dict[str, Any]:
     qq_is_public = profile["qq_visibility"] == "PUBLIC_WEBSITE"
     return {
         "profile_id": profile["profile_id"],
+        "public_player_id": profile["public_player_id"],
+        "public_player_id_aliases": public_player_id_aliases or [],
         "nickname": profile["nickname"],
         "gender": profile["gender"],
         "default_preference": profile["default_preference"],
@@ -3937,7 +4639,8 @@ def find_player_profile_by_qq(connection: sqlite3.Connection, qq_number: str):
                notification_enabled, notify_queue_changes,
                notify_playing_position, notify_online_check_in,
                notify_absence, notify_machine_status, setup_version,
-               profile_revision, created_at, profile_updated_at, received_at
+               profile_revision, created_at, profile_updated_at,
+               public_player_id, received_at
         FROM player_profile
         WHERE device_id = ?
         """,
@@ -3980,6 +4683,7 @@ def profile_qq_sync_pending_response():
 def serialize_player_profile(profile: sqlite3.Row) -> dict[str, Any]:
     return {
         "profile_id": profile["profile_id"],
+        "public_player_id": profile["public_player_id"],
         "nickname": profile["nickname"],
         "gender": profile["gender"],
         "default_preference": profile["default_preference"],
@@ -4060,7 +4764,9 @@ def serialize_remote_machine(machine_id: str, machine: dict[str, Any]) -> dict[s
 
 def default_machine_configuration(machine: dict[str, Any]) -> dict[str, Any]:
     return {
-        "remark": machine.get("remark") or machine.get("name", "").split(" · ", 1)[0],
+        "remark": machine.get("remark") or compact_middle_dots(
+            machine.get("name", "")
+        ).split("·", 1)[0],
         "game_type": "MAIMAI_DX",
         "custom_game_type": None,
         "server": "HIDDEN",
@@ -4816,6 +5522,51 @@ def authorize_terminal():
     return None
 
 
+def authorize_terminal_venue():
+    """Bind schema 8 private terminal operations to the verified venue.
+
+    Schema 1-7 clients predate venue identity and remain supported by the
+    single-venue compatibility path. A schema 8 client must provide the active
+    venue ID so replacing a service behind the same URL cannot expose another
+    venue's private profiles or commands during the next identity probe window.
+    """
+    schema_header = request.headers.get("X-Queue-Schema-Version", "").strip()
+    try:
+        schema_version = int(schema_header)
+    except ValueError:
+        return jsonify({"ok": False, "error": "队列协议版本无效"}), 400
+    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        return jsonify({"ok": False, "error": "不支持的队列协议版本"}), 400
+    if schema_version < 8:
+        return None
+
+    submitted_venue_id = request.headers.get("X-Queue-Venue-ID", "").strip()
+    try:
+        submitted_venue_id = str(UUID(submitted_venue_id))
+    except (TypeError, ValueError):
+        return jsonify(
+            {
+                "ok": False,
+                "code": "VENUE_ID_REQUIRED",
+                "error": "终端尚未提供已核对的机厅 ID，私有资料和远程操作已暂停。",
+            }
+        ), 409
+    with open_database() as connection:
+        venue = read_active_venue(connection)
+    if submitted_venue_id != venue["venue_id"]:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "VENUE_MISMATCH",
+                "error": (
+                    "终端绑定的机厅与当前服务器不一致。为防止读取或执行其他机厅的数据，"
+                    "私有资料和远程操作已暂停。"
+                ),
+            }
+        ), 409
+    return None
+
+
 def authorize_bot():
     expected_token = configured_auth_token("BOT_TOKEN", "SYNC_TOKEN")
     if expected_token is None:
@@ -4900,6 +5651,12 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
     if not isinstance(terminal, dict):
         raise ValidationError("terminal 必须是对象")
     app_version = read_optional_string(terminal, "app_version", maximum_length=32)
+    terminal_name = (
+        read_optional_string(terminal, "name", maximum_length=MAX_TERMINAL_NAME_CHARACTERS)
+        if schema_version >= 8
+        else None
+    )
+    venue = normalize_submitted_venue(payload.get("venue")) if schema_version >= 8 else None
 
     machines_source = payload.get("machines")
     if not isinstance(machines_source, dict):
@@ -4972,10 +5729,12 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
         "business_hours": business_hours,
         "terminal": {
             "id": device_id,
+            "name": terminal_name,
             "online": True,
             "app_version": app_version,
             "last_seen_at": captured_at,
         },
+        "venue": venue,
         "machine_groups": machine_groups,
         "default_machine_group_id": default_machine_group_id,
         "machines": machines,
@@ -5027,6 +5786,11 @@ def normalize_private_profiles(
             notify_machine_status = False
             setup_version = 0
             profile_revision = 1
+        public_player_id = (
+            read_optional_player_public_id(value, "public_player_id")
+            if schema_version >= 8
+            else None
+        )
         profiles.append(
             {
                 "profile_id": read_uuid(value, "profile_id"),
@@ -5051,6 +5815,7 @@ def normalize_private_profiles(
                 "notify_machine_status": notify_machine_status,
                 "setup_version": setup_version,
                 "profile_revision": profile_revision,
+                "public_player_id": public_player_id,
                 "legacy_revision": schema_version < 5,
                 "created_at": read_integer(value, "created_at", minimum=1),
                 "updated_at": read_integer(value, "updated_at", minimum=1),
@@ -5066,6 +5831,23 @@ def normalize_private_profiles(
     if len(qq_numbers) != len(set(qq_numbers)):
         raise ValidationError("玩家资料 QQ 号不能重复")
     return profiles
+
+
+def normalize_submitted_venue(source: Any) -> dict[str, Any] | None:
+    if source is None:
+        return None
+    if not isinstance(source, dict) or set(source) != {"id"}:
+        raise ValidationError("venue 必须只包含机厅 ID")
+    return {"id": read_uuid(source, "id")}
+
+
+def read_optional_player_public_id(source: dict[str, Any], key: str) -> str | None:
+    value = source.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or PLAYER_PUBLIC_ID_PATTERN.fullmatch(value) is None:
+        raise ValidationError("玩家编号必须是六位数字")
+    return value
 
 
 def normalize_private_contacts(
@@ -5331,6 +6113,7 @@ def normalize_public_event(source: Any) -> dict[str, Any]:
                 code="invalid_recent_event_machine_name",
                 field="machine_name",
             ) from error
+    machine_name = compact_middle_dots(machine_name)
     if machine_id is None and (machine_stable_id is not None or machine_name is not None):
         if machine_stable_id is not None:
             identity_label = "机台稳定标识"
@@ -5447,7 +6230,7 @@ def normalize_public_event(source: Any) -> dict[str, Any]:
             field="occurred_at",
         ) from error
     try:
-        title = read_string(source, "title", maximum_length=120)
+        title = compact_middle_dots(read_string(source, "title", maximum_length=120))
     except ValidationError as error:
         raise ValidationError(
             "标题无效：必须是 1 至 120 个字符的文本。",
@@ -5455,7 +6238,7 @@ def normalize_public_event(source: Any) -> dict[str, Any]:
             field="title",
         ) from error
     try:
-        detail = read_string(source, "detail", maximum_length=2_000)
+        detail = compact_middle_dots(read_string(source, "detail", maximum_length=2_000))
     except ValidationError as error:
         raise ValidationError(
             "说明无效：必须是 1 至 2000 个字符的文本。",
@@ -5683,7 +6466,7 @@ def normalize_machine_configuration(
     name: str,
     schema_version: int,
 ) -> dict[str, Any]:
-    suffix = f" · 机台 {machine_id}"
+    suffix = f"·机台 {machine_id}"
     remark = name[: -len(suffix)] if name.endswith(suffix) else name
     if schema_version < 6:
         return {
@@ -5786,18 +6569,34 @@ def normalize_machine_name(
     if not allow_custom_name:
         return MACHINE_NAMES[machine_id]
 
-    suffix = f" · 机台 {machine_id}"
+    suffix = f"·机台 {machine_id}"
+    legacy_suffix = f" · 机台 {machine_id}"
     name = read_string(
         source,
         "name",
-        maximum_length=MAX_MACHINE_REMARK_CHARACTERS + len(suffix),
+        maximum_length=MAX_MACHINE_REMARK_CHARACTERS + len(legacy_suffix),
     )
+    name = compact_middle_dots(name)
     if not name.endswith(suffix):
         raise ValidationError(f"机台 {machine_id} 名称必须以“{suffix.strip()}”结尾")
     remark = name[: -len(suffix)]
     if not remark or remark != remark.strip() or len(remark) > MAX_MACHINE_REMARK_CHARACTERS:
         raise ValidationError(f"机台 {machine_id} 备注必须为 1 至 8 个字符")
     return f"{remark}{suffix}"
+
+
+def compact_middle_dots(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    return MIDDLE_DOT_SPACING_PATTERN.sub("·", value)
+
+
+def compact_public_middle_dots(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: compact_public_middle_dots(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [compact_public_middle_dots(item) for item in value]
+    return compact_middle_dots(value)
 
 
 def normalize_waiting_position(machine_id: str, index: int, source: Any) -> dict[str, Any]:

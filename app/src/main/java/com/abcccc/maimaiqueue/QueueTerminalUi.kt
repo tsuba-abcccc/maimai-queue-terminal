@@ -78,6 +78,7 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -110,6 +111,7 @@ import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
@@ -228,6 +230,9 @@ internal fun RegistrationApp() {
             defaultQueueSyncToken = BuildConfig.QUEUE_SYNC_TOKEN
         )
     }
+    val terminalInstallationRepository = remember(context) {
+        LocalTerminalInstallationRepository(context)
+    }
     val initialQueueRuleSettings = remember(queueRuleSettingsRepository) {
         normalizeQueueRuleSettingsForRuntime(
             settings = queueRuleSettingsRepository.getSettings(),
@@ -237,15 +242,28 @@ internal fun RegistrationApp() {
     val initialHandledClosingOccurrenceId = remember(queueRuleSettingsRepository) {
         queueRuleSettingsRepository.getLastHandledClosingOccurrenceId()
     }
+    val initialTerminalInstallation = remember(terminalInstallationRepository) {
+        terminalInstallationRepository.getIdentity()
+    }
+    val queueSchemaNegotiator = remember { QueueSchemaNegotiator() }
     val queueStatePublisher = remember(context) {
         HttpQueueStatePublisher(
             context = context,
             endpoint = initialQueueRuleSettings.queueSyncEndpoint,
-            token = initialQueueRuleSettings.queueSyncToken
+            token = initialQueueRuleSettings.queueSyncToken,
+            schemaNegotiator = queueSchemaNegotiator
         )
     }
     val queueCommandClient = remember(context) {
         HttpQueueCommandClient(
+            context = context,
+            queueStatusEndpoint = initialQueueRuleSettings.queueSyncEndpoint,
+            token = initialQueueRuleSettings.queueSyncToken,
+            schemaNegotiator = queueSchemaNegotiator
+        )
+    }
+    val terminalInstallationClient = remember(context) {
+        HttpTerminalInstallationClient(
             context = context,
             queueStatusEndpoint = initialQueueRuleSettings.queueSyncEndpoint,
             token = initialQueueRuleSettings.queueSyncToken
@@ -280,12 +298,23 @@ internal fun RegistrationApp() {
         QueueCloudSyncController(
             scope = coroutineScope,
             publisher = queueStatePublisher,
-            initiallyEnabled = cloudSyncAvailable && initialQueueRuleSettings.websiteSyncEnabled,
+            initiallyEnabled = cloudSyncAvailable &&
+                initialQueueRuleSettings.websiteSyncEnabled &&
+                initialTerminalInstallation.allowsOnlineAccess(
+                    initialQueueRuleSettings.queueSyncEndpoint
+                ),
             onStatusChange = { cloudSyncStatus = it }
         )
     }
     val machineStates = remember { MachineRuntimeStateStore() }
-    var screen by remember { mutableStateOf(Screen.HOME) }
+    var terminalInstallation by remember { mutableStateOf(initialTerminalInstallation) }
+    var onboardingMigrationChecked by remember { mutableStateOf(false) }
+    var screen by remember {
+        mutableStateOf(
+            if (initialTerminalInstallation.onboardingCompleted) Screen.HOME
+            else Screen.STARTUP_CHECK
+        )
+    }
     var selectedMachine by remember { mutableStateOf<MachineId?>(null) }
     var isBatchFlow by remember { mutableStateOf(false) }
     var batchAmount by remember { mutableStateOf("2") }
@@ -308,6 +337,7 @@ internal fun RegistrationApp() {
     }
     var terminalCommandReceiptsLoaded by remember { mutableStateOf(false) }
     var auditLogs by remember { mutableStateOf<List<AuditLogEntry>>(emptyList()) }
+    var auditLogsLoaded by remember { mutableStateOf(false) }
     var queueRuleSettings by remember { mutableStateOf(initialQueueRuleSettings) }
     val configuredMachineIds = queueRuleSettings.configuredMachineIds
     val configuredMachineStateSnapshot = machineStates.snapshot(configuredMachineIds)
@@ -381,6 +411,7 @@ internal fun RegistrationApp() {
     var stopMachineChoiceVisible by remember { mutableStateOf(false) }
     var stopReasonTarget by remember { mutableStateOf<MachineId?>(null) }
     var machineDetailsTarget by remember { mutableStateOf<MachineId?>(null) }
+    var venueIdentityDetailsVisible by remember { mutableStateOf(false) }
     var reorderSession by remember { mutableStateOf<ReorderSession?>(null) }
     var inlineReorderProposal by remember { mutableStateOf<ReorderProposal?>(null) }
     var positionReorderProposal by remember { mutableStateOf<PositionReorderProposal?>(null) }
@@ -408,6 +439,7 @@ internal fun RegistrationApp() {
     var nextHomeSidePanelFeedbackId by remember { mutableLongStateOf(1L) }
     var pendingQueueRestore by remember { mutableStateOf<PersistedQueueState?>(null) }
     var queuePersistenceReady by remember { mutableStateOf(false) }
+    var hadStoredQueueStateAtLaunch by remember { mutableStateOf(false) }
     var inactivityWarningSeconds by remember { mutableStateOf<Int?>(null) }
     var homeQueueScrollResetToken by remember { mutableIntStateOf(0) }
     var newRegistrationHighlight by remember { mutableStateOf<NewRegistrationHighlight?>(null) }
@@ -426,6 +458,10 @@ internal fun RegistrationApp() {
     )
     val acceptingNewRegistrations = registrationOpen && !closingOccurrencePending
     val latestAcceptingNewRegistrations by rememberUpdatedState(acceptingNewRegistrations)
+    val terminalOnlineAccessAllowed = cloudSyncAvailable &&
+        queueRuleSettings.websiteSyncEnabled &&
+        terminalInstallation.allowsOnlineAccess(queueRuleSettings.queueSyncEndpoint)
+    val terminalInstallationRuntimeBoundary = terminalInstallation.runtimeEffectBoundary()
 
     fun showHomeOperationFeedback(
         title: String,
@@ -577,10 +613,12 @@ internal fun RegistrationApp() {
             entry.withMachineIdentity(machineIdentities[entry.category])
         }
         auditLogRepository.backfillMachineIdentities(machineIdentities)
+        auditLogsLoaded = true
     }
 
     LaunchedEffect(queueStateRepository, terminalCommandReceiptRepository) {
         val savedState = queueStateRepository.getState()
+        hadStoredQueueStateAtLaunch = savedState != null
         val standaloneReceipts = terminalCommandReceiptRepository.getReceipts()
         val mergedReceipts = mergeRecentCommandReceipts(
             standaloneReceipts.values,
@@ -626,6 +664,140 @@ internal fun RegistrationApp() {
         queuePersistenceReady = true
     }
 
+    // Existing installations must never be forced through a new-install
+    // wizard. Wait until the protected local stores have been read, then mark
+    // the installation as migrated without touching queue/profile/log data.
+    LaunchedEffect(
+        queuePersistenceReady,
+        playerProfilesLoaded,
+        auditLogsLoaded,
+        onboardingMigrationChecked
+    ) {
+        if (!queuePersistenceReady || !playerProfilesLoaded || !auditLogsLoaded ||
+            onboardingMigrationChecked
+        ) {
+            return@LaunchedEffect
+        }
+        val current = terminalInstallationRepository.getIdentity()
+        if (!current.onboardingCompleted) {
+            // A persisted queue snapshot exists even when it is currently empty.
+            // Treat that as an existing installation as well: an established
+            // terminal must not be sent through the first-run wizard merely
+            // because the venue ended the day with an empty, open queue.
+            val isExistingInstallation = hadStoredQueueStateAtLaunch ||
+                currentPersistedQueueState().hasMeaningfulState ||
+                playerProfiles.isNotEmpty() ||
+                auditLogs.isNotEmpty()
+            val migrated = terminalInstallationRepository.markExistingInstallationIfNeeded(
+                isExistingInstallation = isExistingInstallation,
+                cloudConfigured = cloudSyncAvailable &&
+                    queueRuleSettings.websiteSyncEnabled &&
+                    queueStatePublisher.isConfigured
+            )
+            if (migrated.onboardingCompleted) {
+                terminalInstallation = migrated
+                screen = Screen.HOME
+            } else {
+                screen = Screen.ONBOARDING
+            }
+        }
+        onboardingMigrationChecked = true
+    }
+
+    // Resolve the server identity independently from queue publishing. Ordinary
+    // network failures retry with bounded backoff and returning to the foreground
+    // starts a fresh attempt immediately. A confirmed venue mismatch is sticky
+    // and blocks all online access until settings change.
+    LaunchedEffect(
+        foregroundRefreshGeneration,
+        terminalInstallation.onboardingCompleted,
+        terminalInstallation.registrationState,
+        terminalInstallation.pendingServerNameUpdate,
+        terminalInstallation.verifiedServerEndpoint,
+        queueRuleSettings.queueSyncEndpoint,
+        queueRuleSettings.queueSyncToken,
+        queueRuleSettings.websiteSyncEnabled,
+        cloudSyncAvailable
+    ) {
+        if (!terminalInstallation.onboardingCompleted ||
+            !cloudSyncAvailable ||
+            !queueRuleSettings.websiteSyncEnabled ||
+            !terminalInstallationClient.isConfigured ||
+            terminalInstallation.registrationState ==
+                TerminalInstallationRegistrationState.VENUE_MISMATCH
+        ) return@LaunchedEffect
+
+        var identityForAttempt = terminalInstallation
+        var retryDelayMillis = INSTALLATION_PROBE_INITIAL_RETRY_MILLIS
+        while (currentCoroutineContext().isActive) {
+            val result = if (identityForAttempt.pendingServerNameUpdate) {
+                terminalInstallationClient.register(
+                    venueName = identityForAttempt.venueName,
+                    terminalName = identityForAttempt.terminalName,
+                    expectedVenueId = identityForAttempt.expectedServerVenueId
+                )
+            } else {
+                terminalInstallationClient.fetch()
+            }
+            when (result) {
+                is TerminalInstallationFetchResult.Success -> {
+                    val reconciled = reconcileTerminalInstallationIdentity(
+                        current = identityForAttempt,
+                        remote = result.identity,
+                        queueStatusEndpoint = queueRuleSettings.queueSyncEndpoint
+                    )
+                    terminalInstallationRepository.save(reconciled)
+                    terminalInstallation = reconciled
+                    identityForAttempt = reconciled
+                    delay(INSTALLATION_IDENTITY_REFRESH_INTERVAL_MILLIS)
+                }
+
+                TerminalInstallationFetchResult.UnsupportedServer -> {
+                    val compatible = markLegacyInstallationEndpointVerified(
+                        current = identityForAttempt,
+                        queueStatusEndpoint = queueRuleSettings.queueSyncEndpoint
+                    )
+                    terminalInstallationRepository.save(compatible)
+                    terminalInstallation = compatible
+                    identityForAttempt = compatible
+                    delay(LEGACY_INSTALLATION_REPROBE_INTERVAL_MILLIS)
+                }
+
+                is TerminalInstallationFetchResult.Failure -> {
+                    val failed = identityForAttempt.copy(
+                        registrationState = if (result.venueMismatch) {
+                            TerminalInstallationRegistrationState.VENUE_MISMATCH
+                        } else {
+                            identityForAttempt.registrationState
+                        },
+                        pendingServerNameUpdate = if (result.venueMismatch) {
+                            identityForAttempt.pendingServerNameUpdate
+                        } else {
+                            identityForAttempt.pendingServerNameUpdate
+                        },
+                        lastError = result.detail,
+                        lastUpdatedAtMillis = System.currentTimeMillis()
+                    )
+                    terminalInstallationRepository.save(failed)
+                    terminalInstallation = failed
+                    if (result.venueMismatch) return@LaunchedEffect
+                    identityForAttempt = failed
+                    delay(retryDelayMillis)
+                    retryDelayMillis = (retryDelayMillis * 2)
+                        .coerceAtMost(INSTALLATION_PROBE_MAX_RETRY_MILLIS)
+                }
+            }
+        }
+    }
+
+    // The controller owns retries and heartbeats, so merely suppressing new
+    // submit() calls is insufficient. Stop it whenever the installation has not
+    // verified the current endpoint, and discard every payload from the former
+    // identity boundary.
+    LaunchedEffect(terminalOnlineAccessAllowed, cloudSyncController) {
+        cloudSyncController.setEnabled(terminalOnlineAccessAllowed)
+    }
+
     LaunchedEffect(
         queuePersistenceReady,
         playerProfilesLoaded,
@@ -651,10 +823,15 @@ internal fun RegistrationApp() {
         queueRuleSettings.machineGroups,
         queueRuleSettings.defaultMachineGroupId,
         queueRuleSettings.machineConfigurationRevision,
+        terminalInstallationRuntimeBoundary,
         businessHoursStatus,
         activeClosingGracePeriod
     ) {
-        if (!queuePersistenceReady || !playerProfilesLoaded || pendingQueueRestore != null) {
+        if (!terminalInstallation.onboardingCompleted ||
+            !queuePersistenceReady ||
+            !playerProfilesLoaded ||
+            pendingQueueRestore != null
+        ) {
             return@LaunchedEffect
         }
         val snapshot = currentPersistedQueueState()
@@ -670,11 +847,16 @@ internal fun RegistrationApp() {
             }
         }
         currentCoroutineContext().ensureActive()
+        cloudSyncController.setEnabled(terminalOnlineAccessAllowed)
+        if (!terminalOnlineAccessAllowed) {
+            return@LaunchedEffect
+        }
         cloudSyncController.submit(
             state = snapshot,
             auditLogs = auditLogs,
             displaySettings = currentPublicDisplaySettings(),
-            playerProfiles = playerProfiles
+            playerProfiles = playerProfiles,
+            installationIdentity = terminalInstallation
         )
     }
 
@@ -685,24 +867,39 @@ internal fun RegistrationApp() {
     LaunchedEffect(
         pendingSyncDisableSnapshot?.endpoint,
         pendingSyncDisableSnapshot?.token,
+        pendingSyncDisableSnapshot?.venueId,
+        pendingSyncDisableSnapshot?.terminalName,
+        pendingSyncDisableSnapshot?.schemaVersion,
         queuePersistenceReady,
         playerProfilesLoaded,
         pendingQueueRestore,
-        queueRuleSettings.websiteSyncEnabled
+        queueRuleSettings.websiteSyncEnabled,
+        queueRuleSettings.queueSyncEndpoint
     ) {
         val pending = pendingSyncDisableSnapshot ?: return@LaunchedEffect
+        val pendingIsCurrentEndpoint = sameQueueSyncEndpoint(
+            pending.endpoint,
+            queueRuleSettings.queueSyncEndpoint
+        )
         if (
-            queueRuleSettings.websiteSyncEnabled ||
+            (queueRuleSettings.websiteSyncEnabled && pendingIsCurrentEndpoint) ||
             !queuePersistenceReady ||
             !playerProfilesLoaded ||
             pendingQueueRestore != null
         ) {
             return@LaunchedEffect
         }
+        val pendingIdentity = pending.venueId?.let { venueId ->
+            TerminalInstallationIdentity(
+                venueId = venueId,
+                terminalName = pending.terminalName.orEmpty()
+            )
+        }
         val publisher = HttpQueueStatePublisher(
             context = context,
             endpoint = pending.endpoint,
-            token = pending.token
+            token = pending.token,
+            schemaNegotiator = QueueSchemaNegotiator(pending.schemaVersion)
         )
         if (!publisher.isConfigured) {
             syncDisableFailureDetail = "远端关闭状态尚未确认：服务器连接配置无效。"
@@ -715,7 +912,8 @@ internal fun RegistrationApp() {
         while (
             currentCoroutineContext().isActive &&
             pendingSyncDisableSnapshot == pending &&
-            !queueRuleSettings.websiteSyncEnabled
+            (!queueRuleSettings.websiteSyncEnabled ||
+                !sameQueueSyncEndpoint(pending.endpoint, queueRuleSettings.queueSyncEndpoint))
         ) {
             val result = cloudSyncController.withPublishLock {
                 publisher.publish(
@@ -725,7 +923,11 @@ internal fun RegistrationApp() {
                         websiteRemoteEnabled = false,
                         oneBotSyncEnabled = false
                     ),
-                    playerProfiles = playerProfiles
+                    playerProfiles = playerProfiles,
+                    // The identity was captured together with this old endpoint.
+                    // Never attach the terminal's current (possibly new-server)
+                    // identity to a delayed close request.
+                    installationIdentity = pendingIdentity
                 )
             }
             when (result) {
@@ -852,10 +1054,18 @@ internal fun RegistrationApp() {
             previousSettings.websiteSyncEnabled != normalizedSettings.websiteSyncEnabled ||
                 previousSettings.oneBotSyncEnabled != normalizedSettings.oneBotSyncEnabled ||
                 previousSettings.syncMode != normalizedSettings.syncMode
+        if (requestedConnectionChanged && registrationOpen) {
+            Toast.makeText(
+                context,
+                panguSpacing("请先关闭登记排队，再更换服务器地址或终端同步令牌。"),
+                Toast.LENGTH_LONG
+            ).show()
+            return false
+        }
         if (riskSensitiveConfigurationChanged && registrationOpen) {
             Toast.makeText(
                 context,
-                panguSpacing("请先关闭登记排队，再修改机台数量或游玩容量。"),
+                panguSpacing("请先关闭登记排队，再修改机台数量、游玩容量或计划游玩时间。"),
                 Toast.LENGTH_LONG
             ).show()
             return false
@@ -907,29 +1117,45 @@ internal fun RegistrationApp() {
         val syncEnableRequested = !previousSettings.websiteSyncEnabled &&
             settings.websiteSyncEnabled
         if (syncDisableRequested) {
-            val pending = PendingSyncDisableSnapshot(
-                endpoint = previousSettings.queueSyncEndpoint,
+            val pending = pendingSyncDisableSnapshotForVerifiedEndpoint(
+                current = terminalInstallation,
+                queueStatusEndpoint = previousSettings.queueSyncEndpoint,
                 token = previousSettings.queueSyncToken
             )
-            queueRuleSettingsRepository.markPendingSyncDisableSnapshot(
-                endpoint = pending.endpoint,
-                token = pending.token
-            )
-            pendingSyncDisableSnapshot = pending
-            val pendingAtMillis = System.currentTimeMillis()
-            syncDisableFailureDetail = "正在确认远端已关闭线上操作。"
-            syncDisableRetryStartedAtMillis = pendingAtMillis
-            syncDisableLastErrorAtMillis = null
+            if (pending != null) {
+                queueRuleSettingsRepository.markPendingSyncDisableSnapshot(
+                    endpoint = pending.endpoint,
+                    token = pending.token,
+                    venueId = pending.venueId,
+                    terminalName = pending.terminalName,
+                    schemaVersion = pending.schemaVersion
+                )
+                pendingSyncDisableSnapshot = pending
+                val pendingAtMillis = System.currentTimeMillis()
+                syncDisableFailureDetail = "正在确认远端已关闭线上操作。"
+                syncDisableRetryStartedAtMillis = pendingAtMillis
+                syncDisableLastErrorAtMillis = null
+            }
         } else if (syncEnableRequested) {
-            // A deliberate re-enable supersedes an outstanding disable retry;
-            // the normal publish loop will advertise the enabled state again.
-            queueRuleSettingsRepository.clearPendingSyncDisableSnapshot()
-            pendingSyncDisableSnapshot = null
-            syncDisableFailureDetail = null
-            syncDisableRetryStartedAtMillis = null
-            syncDisableLastErrorAtMillis = null
+            // Re-enabling the same endpoint supersedes its close retry. When a
+            // different server is selected, however, the former endpoint must
+            // still receive its disabled snapshot while the new one comes online.
+            if (pendingSyncDisableSnapshot?.let {
+                    sameQueueSyncEndpoint(it.endpoint, settings.queueSyncEndpoint)
+                } != false
+            ) {
+                queueRuleSettingsRepository.clearPendingSyncDisableSnapshot()
+                pendingSyncDisableSnapshot = null
+                syncDisableFailureDetail = null
+                syncDisableRetryStartedAtMillis = null
+                syncDisableLastErrorAtMillis = null
+            }
         }
         if (connectionChanged) {
+            // Stop retries and discard the last payload before any client starts
+            // using the new endpoint. A request already in progress has captured
+            // the former connection and can only finish against that server.
+            cloudSyncController.setEnabled(false)
             queueStatePublisher.updateConfiguration(
                 endpoint = settings.queueSyncEndpoint,
                 token = settings.queueSyncToken
@@ -938,6 +1164,16 @@ internal fun RegistrationApp() {
                 queueStatusEndpoint = settings.queueSyncEndpoint,
                 token = settings.queueSyncToken
             )
+            terminalInstallationClient.updateConfiguration(
+                queueStatusEndpoint = settings.queueSyncEndpoint,
+                token = settings.queueSyncToken
+            )
+            val pendingIdentity = prepareTerminalInstallationForEndpointChange(
+                current = terminalInstallation,
+                queueStatusEndpoint = settings.queueSyncEndpoint
+            )
+            terminalInstallationRepository.save(pendingIdentity)
+            terminalInstallation = pendingIdentity
             privateSyncFailureDetail = null
             privateSyncRetryStartedAtMillis = null
             privateSyncLastErrorAtMillis = null
@@ -946,6 +1182,15 @@ internal fun RegistrationApp() {
             botQqNumber = null
             mobileRegistrationSession = null
             mobileRegistrationFailureDetail = null
+        }
+        if (syncEnableRequested && !connectionChanged) {
+            cloudSyncController.setEnabled(false)
+            val pendingIdentity = prepareTerminalInstallationForSyncEnable(
+                current = terminalInstallationRepository.getIdentity(),
+                queueStatusEndpoint = settings.queueSyncEndpoint
+            )
+            terminalInstallationRepository.save(pendingIdentity)
+            terminalInstallation = pendingIdentity
         }
         if (previousSettings.businessHours != settings.businessHours) {
             val changedScheduleStatus = evaluateBusinessHours(
@@ -980,7 +1225,11 @@ internal fun RegistrationApp() {
         queueRuleSettings = settings
         queueRuleSettingsRepository.saveSettings(settings)
         if (previousSettings.websiteSyncEnabled != settings.websiteSyncEnabled) {
-            cloudSyncController.setEnabled(cloudSyncAvailable && settings.websiteSyncEnabled)
+            cloudSyncController.setEnabled(
+                cloudSyncAvailable &&
+                    settings.websiteSyncEnabled &&
+                    terminalInstallation.allowsOnlineAccess(settings.queueSyncEndpoint)
+            )
         }
         val changeDescriptions = buildList {
             if (previousSettings.allowDeferOneRound != settings.allowDeferOneRound) {
@@ -1028,6 +1277,87 @@ internal fun RegistrationApp() {
                 detail = changeDescriptions.takeIf { it.isNotEmpty() }
                     ?.joinToString(separator = "；", postfix = "。")
                     ?: "应用设置已更新。"
+            )
+        )
+        return true
+    }
+
+    fun updateTerminalInstallationNames(venueName: String, terminalName: String): Boolean {
+        val normalizedVenueName = venueName.trim()
+        val normalizedTerminalName = terminalName.trim()
+        if (
+            normalizedVenueName.isEmpty() ||
+            normalizedTerminalName.isEmpty() ||
+            normalizedVenueName.codePointCount(0, normalizedVenueName.length) >
+                MAX_VENUE_NAME_CHARACTERS ||
+            normalizedTerminalName.codePointCount(0, normalizedTerminalName.length) >
+                MAX_TERMINAL_NAME_CHARACTERS
+        ) return false
+        // Read after the queue settings save. That save may have changed the
+        // endpoint identity boundary in the same click, and a stale Compose
+        // snapshot must not restore its former verification state.
+        val latestIdentity = terminalInstallationRepository.getIdentity()
+        if (
+            latestIdentity.venueName == normalizedVenueName &&
+            latestIdentity.terminalName == normalizedTerminalName
+        ) return true
+
+        val shouldSyncNames = cloudSyncAvailable &&
+            queueRuleSettings.websiteSyncEnabled &&
+            normalizeQueueSyncEndpoint(queueRuleSettings.queueSyncEndpoint) != null &&
+            isValidQueueSyncToken(queueRuleSettings.queueSyncToken)
+        val updated = prepareTerminalInstallationNameUpdate(
+            current = latestIdentity,
+            venueName = normalizedVenueName,
+            terminalName = normalizedTerminalName,
+            syncConfigured = shouldSyncNames
+        )
+        if (!terminalInstallationRepository.save(updated)) return false
+        terminalInstallation = updated
+        return true
+    }
+
+    fun rebindTerminalInstallationToCurrentServer(): Boolean {
+        if (registrationOpen) {
+            Toast.makeText(
+                context,
+                panguSpacing("请先关闭登记排队，再重新绑定机厅。"),
+                Toast.LENGTH_LONG
+            ).show()
+            return false
+        }
+        if (!cloudSyncAvailable ||
+            !queueRuleSettings.websiteSyncEnabled ||
+            normalizeQueueSyncEndpoint(queueRuleSettings.queueSyncEndpoint) == null ||
+            !isValidQueueSyncToken(queueRuleSettings.queueSyncToken)
+        ) {
+            Toast.makeText(
+                context,
+                panguSpacing("请先保存有效的服务器连接并开启与服务端同步。"),
+                Toast.LENGTH_LONG
+            ).show()
+            return false
+        }
+        if (remoteTerminalCommandPollMutex.isLocked) {
+            Toast.makeText(
+                context,
+                panguSpacing("终端正在处理远程操作，请稍后再重新绑定机厅。"),
+                Toast.LENGTH_LONG
+            ).show()
+            return false
+        }
+        val pending = prepareTerminalInstallationForExplicitVenueRebind(
+            current = terminalInstallationRepository.getIdentity(),
+            queueStatusEndpoint = queueRuleSettings.queueSyncEndpoint
+        )
+        if (!terminalInstallationRepository.save(pending)) return false
+        cloudSyncController.setEnabled(false)
+        terminalInstallation = pending
+        appendAuditLog(
+            createAuditLogEntry(
+                category = AuditLogCategory.SYSTEM,
+                title = "重新绑定机厅身份",
+                detail = "管理员已确认使用当前服务器重新核对机厅身份；本地队列、玩家资料和历史记录均未清除。"
             )
         )
         return true
@@ -1119,7 +1449,7 @@ internal fun RegistrationApp() {
             showHomeOperationFeedback(
                 title = homeFeedbackTitle
                     ?: if (auditEntries.size == 1) {
-                        auditEntries.single().title.removePrefix("$machineLabel · ")
+                        removeAppMiddleDotPrefix(auditEntries.single().title, machineLabel)
                     } else {
                         "队列已更新"
                     },
@@ -1532,7 +1862,7 @@ internal fun RegistrationApp() {
             title = if (registrations.size == 1) "登记已切换机台" else "多份登记已切换机台",
             detail = transferAuditLog?.detail
                 ?: "${registrations.joinToString("、") { "“${it.displayId}”" }}已转至 $destinationMachineName 的等待顺序末端。",
-            contextLabel = "$sourceMachineName · 转至 $destinationMachineName"
+            contextLabel = "$sourceMachineName·转至 $destinationMachineName"
         )
         return true
     }
@@ -2435,7 +2765,8 @@ internal fun RegistrationApp() {
             mobileRegistrationLoading ||
             !cloudSyncAvailable ||
             !queueRuleSettings.websiteSyncEnabled ||
-            !queueCommandClient.isConfigured
+            !queueCommandClient.isConfigured ||
+            !terminalInstallation.allowsOnlineAccess(queueRuleSettings.queueSyncEndpoint)
         ) return
         mobileRegistrationLoading = true
         mobileRegistrationFailureDetail = null
@@ -2444,6 +2775,7 @@ internal fun RegistrationApp() {
         coroutineScope.launch {
             try {
                 val session = queueCommandClient.createMobileRegistrationSession(
+                    expectedVenueId = terminalInstallation.expectedServerVenueId,
                     requestId = requestId,
                     queueId = requestedQueueId,
                     machineId = machineId.name,
@@ -2454,7 +2786,10 @@ internal fun RegistrationApp() {
                     selectedMachine != machineId ||
                     screen != Screen.CREATE_REGISTRATION ||
                     !queueRuleSettings.websiteSyncEnabled ||
-                    !queueCommandClient.isConfigured
+                    !queueCommandClient.isConfigured ||
+                    !terminalInstallation.allowsOnlineAccess(
+                        queueRuleSettings.queueSyncEndpoint
+                    )
                 ) return@launch
                 if (session == null) {
                     mobileRegistrationFailureDetail =
@@ -2816,7 +3151,8 @@ internal fun RegistrationApp() {
         playerProfilesLoaded,
         terminalCommandReceiptsLoaded,
         queuePersistenceReady,
-        pendingQueueRestore
+        pendingQueueRestore,
+        terminalInstallationRuntimeBoundary
     ) {
         var nextCloudProfileRefreshAtMillis = 0L
         var localWriteFailureDetail: String? = null
@@ -2841,6 +3177,18 @@ internal fun RegistrationApp() {
             }
             return persisted
         }
+        suspend fun completeRemoteCommand(
+            commandId: String,
+            applied: Boolean,
+            detail: String,
+            resultRegistrationId: String? = null
+        ): Boolean = queueCommandClient.complete(
+            expectedVenueId = terminalInstallation.expectedServerVenueId,
+            commandId = commandId,
+            applied = applied,
+            detail = detail,
+            resultRegistrationId = resultRegistrationId
+        )
         while (true) {
             if (
                 playerProfilesLoaded &&
@@ -2849,11 +3197,14 @@ internal fun RegistrationApp() {
                 pendingQueueRestore == null &&
                 cloudSyncAvailable &&
                 queueRuleSettings.websiteSyncEnabled &&
-                queueCommandClient.isConfigured
+                queueCommandClient.isConfigured &&
+                terminalInstallation.allowsOnlineAccess(queueRuleSettings.queueSyncEndpoint)
             ) {
                 val nowMillis = System.currentTimeMillis()
                 if (nowMillis >= nextCloudProfileRefreshAtMillis) {
-                    queueCommandClient.fetchPlayerProfiles()?.let { cloudPayload ->
+                    queueCommandClient.fetchPlayerProfiles(
+                        terminalInstallation.expectedServerVenueId
+                    )?.let { cloudPayload ->
                         mergeCloudPlayerProfiles(cloudPayload)
                         botQqNumber = cloudPayload.botQqNumber
                         nextCloudProfileRefreshAtMillis = nowMillis +
@@ -2861,7 +3212,9 @@ internal fun RegistrationApp() {
                     }
                 }
                 remoteTerminalCommandPollMutex.withLock {
-                    queueCommandClient.fetchPendingCommands()?.let { commands ->
+                    queueCommandClient.fetchPendingCommands(
+                        terminalInstallation.expectedServerVenueId
+                    )?.let { commands ->
                         for (command in commands) {
                         val existingReceipt = terminalCommandReceipts[command.commandId]
                         if (existingReceipt != null) {
@@ -2875,7 +3228,7 @@ internal fun RegistrationApp() {
                                 continue
                             }
                             localWriteFailureDetail = null
-                            queueCommandClient.complete(
+                            completeRemoteCommand(
                                 commandId = existingReceipt.commandId,
                                 applied = existingReceipt.applied,
                                 detail = existingReceipt.detail,
@@ -2900,7 +3253,7 @@ internal fun RegistrationApp() {
                                         localWriteFailureAtMillis = System.currentTimeMillis()
                                         continue
                                     }
-                                    queueCommandClient.complete(
+                                    completeRemoteCommand(
                                         command.commandId,
                                         applied = false,
                                         detail = detail
@@ -2935,7 +3288,7 @@ internal fun RegistrationApp() {
                                             continue
                                         }
                                         localWriteFailureDetail = null
-                                        queueCommandClient.complete(
+                                        completeRemoteCommand(
                                             command.commandId,
                                             applied = true,
                                             detail = detail
@@ -2958,7 +3311,7 @@ internal fun RegistrationApp() {
                                             continue
                                         }
                                         localWriteFailureDetail = null
-                                        queueCommandClient.complete(
+                                        completeRemoteCommand(
                                             command.commandId,
                                             applied = true,
                                             detail = detail
@@ -2980,7 +3333,7 @@ internal fun RegistrationApp() {
                                             continue
                                         }
                                         localWriteFailureDetail = null
-                                        queueCommandClient.complete(
+                                        completeRemoteCommand(
                                             command.commandId,
                                             applied = false,
                                             detail = result.detail
@@ -3136,7 +3489,7 @@ internal fun RegistrationApp() {
                                                 contextLabel = buildString {
                                                     append(remoteQueueOperationSourceLabel(command.source))
                                                     if (changedMachineLabels.isNotEmpty()) {
-                                                        append(" · ")
+                                                        append("·")
                                                         append(changedMachineLabels.joinToString("、"))
                                                     }
                                                 },
@@ -3189,7 +3542,7 @@ internal fun RegistrationApp() {
                                             continue
                                         }
                                         localWriteFailureDetail = null
-                                        queueCommandClient.complete(
+                                        completeRemoteCommand(
                                             command.commandId,
                                             applied = true,
                                             detail = result.detail,
@@ -3243,7 +3596,7 @@ internal fun RegistrationApp() {
                                             continue
                                         }
                                         localWriteFailureDetail = null
-                                        queueCommandClient.complete(
+                                        completeRemoteCommand(
                                             command.commandId,
                                             applied = true,
                                             detail = result.detail,
@@ -3266,7 +3619,7 @@ internal fun RegistrationApp() {
                                             continue
                                         }
                                         localWriteFailureDetail = null
-                                        queueCommandClient.complete(
+                                        completeRemoteCommand(
                                             command.commandId,
                                             applied = false,
                                             detail = result.detail
@@ -3362,7 +3715,7 @@ internal fun RegistrationApp() {
                                                     )
                                                 )
                                         }
-                                        queueCommandClient.complete(
+                                        completeRemoteCommand(
                                             command.commandId,
                                             applied = true,
                                             detail = result.detail
@@ -3423,7 +3776,7 @@ internal fun RegistrationApp() {
                                                     )
                                                 )
                                         }
-                                        queueCommandClient.complete(
+                                        completeRemoteCommand(
                                             command.commandId,
                                             applied = true,
                                             detail = result.detail
@@ -3449,7 +3802,7 @@ internal fun RegistrationApp() {
                                             mobileRegistrationSession = null
                                             mobileRegistrationFailureDetail = result.detail
                                         }
-                                        queueCommandClient.complete(
+                                        completeRemoteCommand(
                                             command.commandId,
                                             applied = false,
                                             detail = result.detail
@@ -3521,8 +3874,12 @@ internal fun RegistrationApp() {
         privateSyncLastErrorAtMillis
     )
 
-    LaunchedEffect(foregroundRefreshGeneration, cloudSyncController) {
-        cloudSyncController.refresh()
+    LaunchedEffect(
+        foregroundRefreshGeneration,
+        cloudSyncController,
+        terminalOnlineAccessAllowed
+    ) {
+        if (terminalOnlineAccessAllowed) cloudSyncController.refresh()
     }
 
     fun returnHomeAndClearTransientState(resetQueueScroll: Boolean) {
@@ -3551,6 +3908,7 @@ internal fun RegistrationApp() {
         enterPlayingConfirmation = null
         moreMenuVisible = false
         appDetailsVisible = false
+        venueIdentityDetailsVisible = false
         versionHistoryVisible = false
         editMachineChoiceVisible = false
         stopMachineChoiceVisible = false
@@ -3603,6 +3961,7 @@ internal fun RegistrationApp() {
         enterPlayingConfirmation != null ||
         moreMenuVisible ||
         appDetailsVisible ||
+        venueIdentityDetailsVisible ||
         versionHistoryVisible ||
         editMachineChoiceVisible ||
         stopMachineChoiceVisible ||
@@ -3656,6 +4015,7 @@ internal fun RegistrationApp() {
     }
 
     val inactivityNeedsFormWarning = when (screen) {
+        Screen.ONBOARDING,
         Screen.SETTINGS,
         Screen.CREATE_REGISTRATION,
         Screen.PREFERENCE,
@@ -3705,6 +4065,11 @@ internal fun RegistrationApp() {
     ) {
         while (true) {
             delay(250L)
+            if (screen == Screen.ONBOARDING) {
+                inactivityWarningSeconds = null
+                hostActivity?.recordUserInteraction()
+                continue
+            }
             if (playerProfileWriteInProgress) {
                 inactivityWarningSeconds = null
                 hostActivity?.recordUserInteraction()
@@ -3784,6 +4149,53 @@ internal fun RegistrationApp() {
                     label = "navigation"
                 ) { target ->
                     when (target) {
+                        Screen.STARTUP_CHECK -> TerminalStartupCheckScreen()
+
+                        Screen.ONBOARDING -> TerminalOnboardingScreen(
+                            initialIdentity = terminalInstallation,
+                            cloudSyncAvailable = cloudSyncAvailable,
+                            initialSettings = queueRuleSettings,
+                            installationClient = terminalInstallationClient,
+                            onSaveConnection = { endpoint, token, syncEnabled ->
+                                val updated = queueRuleSettings.copy(
+                                    queueSyncEndpoint = endpoint,
+                                    queueSyncToken = token,
+                                    websiteSyncEnabled = syncEnabled,
+                                    oneBotSyncEnabled = syncEnabled &&
+                                        queueRuleSettings.oneBotSyncEnabled
+                                )
+                                queueRuleSettings = normalizeQueueRuleSettingsForRuntime(
+                                    updated,
+                                    cloudSyncAvailable
+                                )
+                                queueRuleSettingsRepository.saveSettings(queueRuleSettings)
+                                queueStatePublisher.updateConfiguration(endpoint, token)
+                                queueCommandClient.updateConfiguration(endpoint, token)
+                                terminalInstallationClient.updateConfiguration(endpoint, token)
+                                cloudSyncController.setEnabled(false)
+                            },
+                            onProgress = { step, venueName, terminalName ->
+                                terminalInstallation = terminalInstallationRepository
+                                    .saveOnboardingProgress(step, venueName, terminalName)
+                            },
+                            onPreparedIdentity = { identity ->
+                                terminalInstallationRepository.save(identity)
+                                terminalInstallation = identity
+                            },
+                            onComplete = {
+                                terminalInstallation = terminalInstallationRepository
+                                    .completePreparedOnboarding()
+                                cloudSyncController.setEnabled(
+                                    cloudSyncAvailable &&
+                                        queueRuleSettings.websiteSyncEnabled &&
+                                        terminalInstallation.allowsOnlineAccess(
+                                            queueRuleSettings.queueSyncEndpoint
+                                        )
+                                )
+                                screen = Screen.HOME
+                            }
+                        )
+
                         Screen.HOME -> HomeScreen(
                             machines = configuredMachines,
                             machineGroups = queueRuleSettings.configuredMachineGroups,
@@ -3795,6 +4207,7 @@ internal fun RegistrationApp() {
                             businessHoursStatus = businessHoursStatus,
                             closingGracePeriod = activeClosingGracePeriod,
                             showCommonPlayPreview = queueRuleSettings.showCommonPlayPreview,
+                            venueName = terminalInstallation.venueName,
                             cloudSyncStatus = displayedCloudSyncStatus.takeIf { cloudSyncAvailable },
                             queueUndoAction = queueUndoAction,
                             onUndoQueueAction = ::undoLatestQueueAction,
@@ -3868,6 +4281,7 @@ internal fun RegistrationApp() {
                                 if (reorderSession == null) restoreMachine(it)
                             },
                             onMachineDetails = { machineDetailsTarget = it },
+                            onVenueDetails = { venueIdentityDetailsVisible = true },
                             onRegistrationClick = ::openRegistration,
                             onRegistrationLongPress = { machineId, registrationKey ->
                                 beginReorder(machineId, false, registrationKey)
@@ -3895,9 +4309,12 @@ internal fun RegistrationApp() {
 
                         Screen.SETTINGS -> QueueRuleSettingsScreen(
                             persistedSettings = queueRuleSettings,
+                            terminalInstallation = terminalInstallation,
                             cloudSyncAvailable = cloudSyncAvailable,
                             registrationOpen = registrationOpen,
                             onSettingsChange = ::updateQueueRuleSettings,
+                            onInstallationNamesChange = ::updateTerminalInstallationNames,
+                            onRebindInstallation = ::rebindTerminalInstallationToCurrentServer,
                             onBack = { screen = Screen.HOME }
                         )
 
@@ -3926,7 +4343,20 @@ internal fun RegistrationApp() {
                             },
                             mobileRegistrationEnabled = cloudSyncAvailable &&
                                 queueRuleSettings.websiteSyncEnabled &&
-                                queueCommandClient.isConfigured,
+                                queueCommandClient.isConfigured &&
+                                terminalInstallation.allowsOnlineAccess(
+                                    queueRuleSettings.queueSyncEndpoint
+                                ),
+                            mobileRegistrationDisabledReason = when {
+                                !cloudSyncAvailable ||
+                                    !queueRuleSettings.websiteSyncEnabled ||
+                                    !queueCommandClient.isConfigured ->
+                                    "请先在应用设置中配置并开启与服务端同步。"
+                                terminalInstallation.registrationState ==
+                                    TerminalInstallationRegistrationState.VENUE_MISMATCH ->
+                                    "当前服务器属于另一机厅。请先在应用设置中修正连接。"
+                                else -> "正在核对服务器所属机厅，完成后才能使用移动设备登记。"
+                            },
                             mobileRegistrationLoading = mobileRegistrationLoading,
                             machineLabel = selectedMachine?.let(::configuredMachineName)
                                 ?: "所选机台",
@@ -4473,7 +4903,7 @@ internal fun RegistrationApp() {
                                             label = if (wasPlaying) {
                                                 playingPositionName(selection.machineId)
                                             } else {
-                                                "位置 ${selection.machineId.name}${waitingIndex + 1} · 固定组合"
+                                                "位置 ${selection.machineId.name}${waitingIndex + 1}·固定组合"
                                             },
                                             registrationKeys = groupKeys.toList(),
                                             isPlayingPosition = wasPlaying,
@@ -5105,11 +5535,20 @@ internal fun RegistrationApp() {
                 if (appDetailsVisible) {
                     AppDetailsDialog(
                         cloudSyncStatus = displayedCloudSyncStatus.takeIf { cloudSyncAvailable },
+                        terminalInstallation = terminalInstallation,
                         onOpenVersionHistory = {
                             appDetailsVisible = false
                             versionHistoryVisible = true
                         },
                         onDismiss = { appDetailsVisible = false }
+                    )
+                }
+
+                if (venueIdentityDetailsVisible) {
+                    TerminalInstallationDetailsDialog(
+                        identity = terminalInstallation,
+                        queueStatusEndpoint = queueRuleSettings.queueSyncEndpoint,
+                        onDismiss = { venueIdentityDetailsVisible = false }
                     )
                 }
 
@@ -5449,7 +5888,7 @@ internal fun RegistrationApp() {
                                 "按照正常轮换推进时，所选登记会先与其他登记重新组合，不能直接校正为当前所选位置。请按现场实际情况逐轮结束。"
                         }
                         AdvanceToPlayingConfirmation(
-                            selectionLabel = selection.label.substringBefore(" · "),
+                            selectionLabel = textBeforeAppMiddleDot(selection.label),
                             playingPositionLabel = playingPositionName(selection.machineId),
                             registrations = positions.getOrNull(targetIndex).orEmpty(),
                             completedWaitingPositionCount = targetIndex.coerceAtLeast(0),
@@ -5466,7 +5905,7 @@ internal fun RegistrationApp() {
                                         ),
                                         message = "${playingPositionName(selection.machineId)} 已校正",
                                         feedbackTitle = "游玩位置已校正",
-                                        feedbackDetail = "已将${selection.label.substringBefore(" · ")}及其之前的队列位置按实际进度完成处理。"
+                                        feedbackDetail = "已将${textBeforeAppMiddleDot(selection.label)}及其之前的队列位置按实际进度完成处理。"
                                     )
                                 } else {
                                     showStalePositionActionNotApplied(selection.machineId)
@@ -5961,6 +6400,9 @@ internal fun RegistrationApp() {
                             cloudSyncAvailable &&
                             queueRuleSettings.websiteSyncEnabled &&
                             queueCommandClient.isConfigured &&
+                            terminalInstallation.allowsOnlineAccess(
+                                queueRuleSettings.queueSyncEndpoint
+                            ) &&
                             !mobileRegistrationLoading,
                         onDismiss = { mobileRegistrationFailureDetail = null },
                         onRetry = {
@@ -6188,12 +6630,84 @@ private fun AuditLogScreen(
     }
 }
 
+private enum class QueueSettingsSection(
+    val title: String,
+    val summary: String
+) {
+    VENUE_AND_TERMINAL("机厅与终端", "机厅名称、终端名称与安装身份"),
+    SERVER_AND_LINKS("服务端与联动", "服务器连接、同步、线上登记与 QQ Bot"),
+    BUSINESS_HOURS("营业时间", "开闭店时间与每周安排"),
+    QUEUE_RULES("排队规则", "暂缓一次、暂时离开与共同游玩预览"),
+    MACHINES_AND_GROUPS("机台与分组", "机台管理、分组与详细配置")
+}
+
+@Composable
+private fun QueueSettingsNavigation(
+    sections: List<QueueSettingsSection>,
+    selected: QueueSettingsSection,
+    onSelect: (QueueSettingsSection) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier.clip(RoundedCornerShape(14.dp)).background(CardBackground)
+            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(14.dp))
+            .verticalScroll(rememberScrollState())
+            .padding(7.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp)
+    ) {
+        sections.forEach { section ->
+            val isSelected = section == selected
+            val backgroundColor by animateColorAsState(
+                if (isSelected) SoftBlue.copy(alpha = .72f) else Color.Transparent,
+                tween(160),
+                label = "设置导航背景"
+            )
+            Row(
+                Modifier.fillMaxWidth().heightIn(min = 62.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(backgroundColor)
+                    .clickable(enabled = !isSelected) { onSelect(section) }
+                    .padding(horizontal = 13.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    Modifier.width(3.dp).height(34.dp).clip(CircleShape)
+                        .background(if (isSelected) SystemBlue else Color.Transparent)
+                )
+                Spacer(Modifier.width(11.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        section.title,
+                        color = if (isSelected) SystemBlue else PrimaryText,
+                        fontSize = 13.sp,
+                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        section.summary,
+                        color = SecondaryText,
+                        fontSize = 9.sp,
+                        lineHeight = 13.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Spacer(Modifier.width(5.dp))
+                Text("›", color = if (isSelected) SystemBlue else TertiaryText, fontSize = 18.sp)
+            }
+        }
+    }
+}
+
 @Composable
 private fun QueueRuleSettingsScreen(
     persistedSettings: QueueRuleSettings,
+    terminalInstallation: TerminalInstallationIdentity,
     cloudSyncAvailable: Boolean,
     registrationOpen: Boolean,
     onSettingsChange: (QueueRuleSettings) -> Boolean,
+    onInstallationNamesChange: (venueName: String, terminalName: String) -> Boolean,
+    onRebindInstallation: () -> Boolean,
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
@@ -6207,8 +6721,28 @@ private fun QueueRuleSettingsScreen(
     var queueSyncTokenDraft by remember(persistedSettings.queueSyncToken) {
         mutableStateOf(persistedSettings.queueSyncToken)
     }
+    // Keep the administrator's draft stable while the background installation
+    // probe refreshes server identity details. The settings screen is disposed
+    // when it is left, so a fresh visit still starts from the latest identity.
+    var venueNameDraft by remember {
+        mutableStateOf(terminalInstallation.venueName)
+    }
+    var terminalNameDraft by remember {
+        mutableStateOf(terminalInstallation.terminalName)
+    }
+    var venueNameEdited by remember { mutableStateOf(false) }
+    var terminalNameEdited by remember { mutableStateOf(false) }
     var showTakeoverConfirmation by remember { mutableStateOf(false) }
     var showDiscardConfirmation by remember { mutableStateOf(false) }
+    var showVenueRebindConfirmation by remember { mutableStateOf(false) }
+    var selectedSection by remember { mutableStateOf(QueueSettingsSection.VENUE_AND_TERMINAL) }
+    LaunchedEffect(terminalInstallation.venueName, terminalInstallation.terminalName) {
+        // A background installation probe may finish while this screen is
+        // open. Adopt refreshed names only for fields the administrator has
+        // not touched; an active draft must never be overwritten.
+        if (!venueNameEdited) venueNameDraft = terminalInstallation.venueName
+        if (!terminalNameEdited) terminalNameDraft = terminalInstallation.terminalName
+    }
     fun updateDraft(updatedSettings: QueueRuleSettings) {
         settings = updatedSettings
         hostActivity?.recordUserInteraction()
@@ -6238,11 +6772,14 @@ private fun QueueRuleSettingsScreen(
     val queueSyncEndpointValid = normalizedQueueSyncEndpointDraft != null
     val queueSyncTokenValid = isValidQueueSyncToken(normalizedQueueSyncTokenDraft)
     val queueConnectionConfigured = queueSyncEndpointValid && queueSyncTokenValid
-    val queueConnectionEditable =
+    val queueConnectionEditable = !registrationOpen &&
         !persistedSettings.websiteSyncEnabled && !settings.websiteSyncEnabled
-    val queueConnectionChanged =
-        normalizedQueueSyncEndpointDraft != persistedSettings.queueSyncEndpoint ||
-            normalizedQueueSyncTokenDraft != persistedSettings.queueSyncToken
+    val queueConnectionChanged = hasQueueConnectionDraftChanged(
+        persistedEndpoint = persistedSettings.queueSyncEndpoint,
+        persistedToken = persistedSettings.queueSyncToken,
+        endpointDraft = queueSyncEndpointDraft,
+        tokenDraft = queueSyncTokenDraft
+    )
     val settingsToSave = normalizeMachineLayoutSettings(
         settings.copy(
             machineConfigurations = normalizedMachineConfigurations,
@@ -6250,10 +6787,22 @@ private fun QueueRuleSettingsScreen(
             queueSyncToken = normalizedQueueSyncTokenDraft
         )
     )
-    val settingsChanged = settingsToSave != persistedSettings
+    val normalizedVenueNameDraft = venueNameDraft.trim()
+    val normalizedTerminalNameDraft = terminalNameDraft.trim()
+    val installationNamesValid = normalizedVenueNameDraft.isNotEmpty() &&
+        normalizedTerminalNameDraft.isNotEmpty() &&
+        normalizedVenueNameDraft.codePointCount(0, normalizedVenueNameDraft.length) <=
+            MAX_VENUE_NAME_CHARACTERS &&
+        normalizedTerminalNameDraft.codePointCount(0, normalizedTerminalNameDraft.length) <=
+            MAX_TERMINAL_NAME_CHARACTERS
+    val installationNamesChanged = normalizedVenueNameDraft != terminalInstallation.venueName ||
+        normalizedTerminalNameDraft != terminalInstallation.terminalName
+    val queueSettingsChanged = settingsToSave != persistedSettings
+    val settingsChanged = queueSettingsChanged || installationNamesChanged
     val connectionChangeValid = !queueConnectionChanged ||
         (queueSyncEndpointValid && queueSyncTokenValid)
-    val settingsValid = remarksValid && machineDetailsValid && machineGroupsValid &&
+    val settingsValid = installationNamesValid && remarksValid &&
+        machineDetailsValid && machineGroupsValid &&
         connectionChangeValid &&
         (!settings.websiteSyncEnabled || queueConnectionConfigured)
     val requestBack = {
@@ -6261,34 +6810,207 @@ private fun QueueRuleSettingsScreen(
     }
     BackHandler(onBack = requestBack)
 
-    Column(Modifier.fillMaxSize().padding(horizontal = 36.dp, vertical = 24.dp)) {
+    val availableSections = if (cloudSyncAvailable) {
+        QueueSettingsSection.entries
+    } else {
+        QueueSettingsSection.entries.filterNot {
+            it == QueueSettingsSection.SERVER_AND_LINKS
+        }
+    }
+
+    Column(
+        Modifier.fillMaxSize().imePadding().padding(horizontal = 32.dp, vertical = 22.dp)
+    ) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             AppBackButton(requestBack)
+            Spacer(Modifier.width(14.dp))
+            Column {
+                Text(
+                    "应用设置",
+                    color = PrimaryText,
+                    fontSize = 25.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "修改内容会在点击“保存设置”后统一生效。",
+                    color = SecondaryText,
+                    fontSize = 11.sp
+                )
+            }
             Spacer(Modifier.weight(1f))
-            Text("应用设置", color = TertiaryText, fontSize = 12.sp)
+            if (settingsChanged) {
+                Text(
+                    "有未保存的修改",
+                    color = Color(0xFF9A5B00),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            } else {
+                Text("所有设置均已保存", color = TertiaryText, fontSize = 11.sp)
+            }
         }
-        Spacer(Modifier.height(14.dp))
-        Column(
-            Modifier.fillMaxWidth().weight(1f).widthIn(max = 760.dp)
-                .align(Alignment.CenterHorizontally)
-                .verticalScroll(rememberScrollState())
-                .padding(bottom = 20.dp)
+        Spacer(Modifier.height(16.dp))
+        Row(
+            Modifier.fillMaxWidth().weight(1f).widthIn(max = 1160.dp)
+                .align(Alignment.CenterHorizontally),
+            horizontalArrangement = Arrangement.spacedBy(18.dp)
         ) {
-            Text("应用设置", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(6.dp))
-            Text(
-                if (cloudSyncAvailable) {
-                    "调整与服务端同步、排队规则和机台配置。机台编号按 A 至 J 连续排列，删除中间机台后会自动重排。"
-                } else {
-                    "调整排队规则和机台配置。机台编号按 A 至 J 连续排列，删除中间机台后会自动重排。"
+            QueueSettingsNavigation(
+                sections = availableSections,
+                selected = selectedSection,
+                onSelect = {
+                    selectedSection = it
+                    hostActivity?.recordUserInteraction()
                 },
-                color = SecondaryText,
-                fontSize = 12.sp,
-                lineHeight = 18.sp
+                modifier = Modifier.width(224.dp).fillMaxHeight()
             )
-            Spacer(Modifier.height(20.dp))
-            if (cloudSyncAvailable) {
-                MenuSectionHeader("服务端连接")
+            AnimatedContent(
+                targetState = selectedSection,
+                transitionSpec = {
+                    val forward = targetState.ordinal >= initialState.ordinal
+                    val enterOffset: (Int) -> Int = { width ->
+                        if (forward) width / 14 else -width / 14
+                    }
+                    val exitOffset: (Int) -> Int = { width ->
+                        if (forward) -width / 18 else width / 18
+                    }
+                    (fadeIn(tween(180)) + slideInHorizontally(tween(220), enterOffset)) togetherWith
+                        (fadeOut(tween(130)) + slideOutHorizontally(tween(180), exitOffset))
+                },
+                label = "设置分类切换",
+                modifier = Modifier.weight(1f).fillMaxHeight()
+            ) { visibleSection ->
+                Column(
+                    Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                        .padding(end = 8.dp, bottom = 18.dp)
+                ) {
+                    Text(
+                        visibleSection.title,
+                        color = PrimaryText,
+                        fontSize = 28.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        visibleSection.summary,
+                        color = SecondaryText,
+                        fontSize = 12.sp
+                    )
+                    Spacer(Modifier.height(18.dp))
+            if (visibleSection == QueueSettingsSection.VENUE_AND_TERMINAL) {
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
+                    .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 16.dp, vertical = 14.dp)
+            ) {
+                Text(
+                    "当前排队数据所属的现场",
+                    color = PrimaryText,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "名称会显示在现场终端、网站和 QQ Bot。修改名称不会改变机厅 ID、队列、玩家资料或历史记录，也不要求关闭登记排队。",
+                    color = SecondaryText,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp
+                )
+                terminalInstallation.venueCode?.let { code ->
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "机厅 ID：$code",
+                        color = TertiaryText,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = venueNameDraft,
+                    onValueChange = {
+                        venueNameEdited = true
+                        venueNameDraft = limitCodePointLength(
+                            it.filterNot(Char::isISOControl),
+                            MAX_VENUE_NAME_CHARACTERS
+                        )
+                        hostActivity?.recordUserInteraction()
+                    },
+                    label = { Text("机厅名称") },
+                    placeholder = { Text("例如：星海游戏厅") },
+                    singleLine = true,
+                    isError = normalizedVenueNameDraft.isEmpty(),
+                    supportingText = {
+                        Text("用于玩家识别现场，不作为数据主键。")
+                    },
+                    shape = RoundedCornerShape(ControlRadius),
+                    colors = playerProfileTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(4.dp))
+                OutlinedTextField(
+                    value = terminalNameDraft,
+                    onValueChange = {
+                        terminalNameEdited = true
+                        terminalNameDraft = limitCodePointLength(
+                            it.filterNot(Char::isISOControl),
+                            MAX_TERMINAL_NAME_CHARACTERS
+                        )
+                        hostActivity?.recordUserInteraction()
+                    },
+                    label = { Text("终端名称") },
+                    placeholder = { Text(DEFAULT_TERMINAL_NAME) },
+                    singleLine = true,
+                    isError = normalizedTerminalNameDraft.isEmpty(),
+                    supportingText = {
+                        Text("用于以后区分同一机厅内的现场终端。")
+                    },
+                    shape = RoundedCornerShape(ControlRadius),
+                    colors = playerProfileTextFieldColors(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (terminalInstallation.pendingServerNameUpdate) {
+                    Spacer(Modifier.height(7.dp))
+                    Text(
+                        "名称已保存在本机，正在等待同步到服务端；现场排队不受影响。",
+                        color = Color(0xFF9A5B00),
+                        fontSize = 11.sp,
+                        lineHeight = 16.sp
+                    )
+                }
+                terminalInstallation.lastError?.let { detail ->
+                    Spacer(Modifier.height(7.dp))
+                    Text(
+                        detail,
+                        color = if (
+                            terminalInstallation.registrationState ==
+                                TerminalInstallationRegistrationState.VENUE_MISMATCH
+                        ) Destructive else SecondaryText,
+                        fontSize = 11.sp,
+                        lineHeight = 16.sp
+                    )
+                }
+                if (
+                    terminalInstallation.registrationState ==
+                    TerminalInstallationRegistrationState.VENUE_MISMATCH
+                ) {
+                    Spacer(Modifier.height(12.dp))
+                    SecondaryButton(
+                        text = "重新绑定当前服务器",
+                        onClick = { showVenueRebindConfirmation = true },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !registrationOpen && !settingsChanged &&
+                            persistedSettings.websiteSyncEnabled && queueConnectionConfigured,
+                        disabledReason = when {
+                            registrationOpen -> "请先关闭登记排队，再重新绑定机厅。"
+                            settingsChanged -> "请先保存或放弃当前页面中的其他修改。"
+                            else -> "请先保存有效的服务器连接并开启与服务端同步。"
+                        }
+                    )
+                }
+            }
+            }
+            if (visibleSection == QueueSettingsSection.SERVER_AND_LINKS && cloudSyncAvailable) {
                 Column(
                     Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
                         .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
@@ -6304,6 +7026,11 @@ private fun QueueRuleSettingsScreen(
                         Text(
                             if (queueConnectionEditable) {
                                 "终端版可以连接自建服务器。连接设置仅保存在本机，令牌不会写入日志。"
+                            } else if (registrationOpen &&
+                                !persistedSettings.websiteSyncEnabled &&
+                                !settings.websiteSyncEnabled
+                            ) {
+                                "请先关闭登记排队，再更换服务器地址或终端同步令牌。"
                             } else if (
                                 persistedSettings.websiteSyncEnabled &&
                                 !settings.websiteSyncEnabled
@@ -6326,7 +7053,7 @@ private fun QueueRuleSettingsScreen(
                             },
                             modifier = Modifier.fillMaxWidth(),
                             enabled = queueConnectionEditable,
-                            label = { Text("队列 API 地址") },
+                            label = { Text("服务器地址") },
                             placeholder = { Text("https://example.com") },
                             singleLine = true,
                             isError = queueConnectionEditable && queueSyncEndpointDraft.isNotBlank() &&
@@ -6454,9 +7181,8 @@ private fun QueueRuleSettingsScreen(
                         }
                     )
                 }
-                Spacer(Modifier.height(20.dp))
             }
-            MenuSectionHeader("营业时间")
+            if (visibleSection == QueueSettingsSection.BUSINESS_HOURS) {
             Column(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
                     .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
@@ -6588,8 +7314,8 @@ private fun QueueRuleSettingsScreen(
                     }
                 }
             }
-            Spacer(Modifier.height(20.dp))
-            MenuSectionHeader("排队规则")
+            }
+            if (visibleSection == QueueSettingsSection.QUEUE_RULES) {
             Column(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
                     .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
@@ -6611,13 +7337,7 @@ private fun QueueRuleSettingsScreen(
                         updateDraft(settings.copy(allowTemporaryLeave = it))
                     }
                 )
-            }
-            Spacer(Modifier.height(20.dp))
-            MenuSectionHeader("机台配置")
-            Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius)).background(CardBackground)
-                    .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(CardRadius))
-            ) {
+                HorizontalDivider(color = Separator.copy(alpha = .72f))
                 QueueRuleSettingRow(
                     title = "显示共同游玩预览",
                     description = "在开放单人位置中显示按当前轮换规则预计的共同游玩玩家。预览不会改变真实队列。",
@@ -6626,7 +7346,13 @@ private fun QueueRuleSettingsScreen(
                         updateDraft(settings.copy(showCommonPlayPreview = it))
                     }
                 )
-                HorizontalDivider(color = Separator.copy(alpha = .72f))
+            }
+            }
+            if (visibleSection == QueueSettingsSection.MACHINES_AND_GROUPS) {
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius)).background(CardBackground)
+                    .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(CardRadius))
+            ) {
                 Column(Modifier.fillMaxWidth().padding(16.dp)) {
                 Text(
                     "按现场实际情况添加或删除机台。机台编号始终从 A 开始连续排列，最多支持到 J；分组只改变首页显示，不改变各机台的独立队列。",
@@ -6637,7 +7363,7 @@ private fun QueueRuleSettingsScreen(
                 if (registrationOpen) {
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "关闭登记排队后才能添加、删除机台或修改游玩容量。分组、备注与机台详情仍可直接更新。",
+                        "关闭登记排队后才能添加、删除机台、修改游玩容量或计划游玩时间。分组、备注与机台详情仍可直接更新。",
                         color = Color(0xFF9A5B00),
                         fontSize = 11.sp,
                         lineHeight = 16.sp
@@ -6680,7 +7406,7 @@ private fun QueueRuleSettingsScreen(
                 MachineConfigurationEditor(
                     machineId = activeMachineId,
                     configuration = settings.machineConfiguration(activeMachineId),
-                    capacityEditable = !registrationOpen,
+                    behaviorEditable = !registrationOpen,
                     onConfigurationChange = { updated ->
                         updateDraft(
                             settings.copy(
@@ -6692,46 +7418,77 @@ private fun QueueRuleSettingsScreen(
                 )
                 }
             }
-            Spacer(Modifier.height(22.dp))
+            }
+                }
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        Row(
+            Modifier.fillMaxWidth().widthIn(max = 1160.dp).align(Alignment.CenterHorizontally),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            val validationMessage = when {
+                !installationNamesValid -> "请填写有效的机厅名称和终端名称。"
+                !remarksValid -> "请填写所有已启用机台的备注。"
+                !machineDetailsValid -> "请填写选择为“其他”的机台类型或服务器名称。"
+                !machineGroupsValid -> "请填写所有机台分组的名称。"
+                !connectionChangeValid -> "请填写有效的服务器地址和终端同步令牌。"
+                !settings.websiteSyncEnabled || queueConnectionConfigured -> null
+                else -> "开启与服务端同步前，请先填写有效的服务器连接。"
+            }
+            if (validationMessage != null && settingsChanged) {
+                Text(
+                    validationMessage,
+                    color = Destructive,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp,
+                    modifier = Modifier.weight(1f).padding(end = 16.dp)
+                )
+            } else {
+                Text(
+                    if (settingsChanged) "切换分类不会丢失本次修改。" else "切换分类不会立即修改运行中的设置。",
+                    color = TertiaryText,
+                    fontSize = 11.sp,
+                    modifier = Modifier.weight(1f).padding(end = 16.dp)
+                )
+            }
             PrimaryButton(
                 text = "保存设置",
                 onClick = {
-                    if (onSettingsChange(settingsToSave)) {
+                    val queueSettingsSaved = !queueSettingsChanged ||
+                        onSettingsChange(settingsToSave)
+                    val installationNamesSaved = queueSettingsSaved &&
+                        (!installationNamesChanged || onInstallationNamesChange(
+                            normalizedVenueNameDraft,
+                            normalizedTerminalNameDraft
+                        ))
+                    if (queueSettingsSaved && installationNamesSaved) {
                         Toast.makeText(
                             context,
                             panguSpacing("应用设置已保存。"),
                             Toast.LENGTH_SHORT
                         ).show()
                         onBack()
+                    } else if (queueSettingsSaved) {
+                        Toast.makeText(
+                            context,
+                            panguSpacing("排队设置已保存，但机厅与终端名称未能写入本机，请重试。"),
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
                 },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.width(220.dp),
                 enabled = settingsChanged && settingsValid,
                 disabledReason = when {
                     !settingsChanged -> "当前没有未保存的设置。"
+                    !installationNamesValid -> "请填写有效的机厅名称和终端名称。"
                     !remarksValid -> "请填写所有已启用机台的备注。"
                     !machineDetailsValid -> "请填写选择为“其他”的机台类型或服务器名称。"
                     !machineGroupsValid -> "请填写所有机台分组的名称。"
-                    !connectionChangeValid -> "请填写有效的队列 API 地址和终端同步令牌。"
+                    !connectionChangeValid -> "请填写有效的服务器地址和终端同步令牌。"
                     else -> "开启与服务端同步前，请先填写有效的服务器连接。"
                 }
             )
-            if (settingsChanged && !settingsValid) {
-                Spacer(Modifier.height(7.dp))
-                Text(
-                    when {
-                        !remarksValid -> "请填写所有已启用机台的备注。"
-                        !machineDetailsValid -> "请填写选择为“其他”的机台类型或服务器名称。"
-                        !machineGroupsValid -> "请填写所有机台分组的名称。"
-                        !connectionChangeValid -> "请填写有效的队列 API 地址和终端同步令牌。"
-                        else -> "开启与服务端同步前，请先填写有效的服务器连接。"
-                    },
-                    color = Destructive,
-                    fontSize = 11.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
         }
     }
     if (showTakeoverConfirmation) {
@@ -6781,7 +7538,7 @@ private fun QueueRuleSettingsScreen(
     if (showDiscardConfirmation) {
         RemoveRegistrationConfirmation(
             title = "放弃未保存的设置？",
-            message = "返回后，这次对营业时间、同步设置、排队规则和机台配置所做的修改不会生效。",
+            message = "返回后，这次对机厅与终端名称、营业时间、同步设置、排队规则和机台配置所做的修改不会生效。",
             confirmText = "放弃修改",
             onDismiss = { showDiscardConfirmation = false },
             onConfirm = {
@@ -6789,6 +7546,380 @@ private fun QueueRuleSettingsScreen(
                 onBack()
             }
         )
+    }
+    if (showVenueRebindConfirmation) {
+        RemoveRegistrationConfirmation(
+            title = "重新绑定当前服务器？",
+            message = "确认后，终端会放弃原服务端机厅 ID，并将当前服务器登记为本终端所属机厅。核对成功后，本机现有队列和玩家资料会同步到当前服务器；本地队列、玩家资料和历史记录不会被清除。请仅在已经核对服务器地址与现场归属后继续。",
+            confirmText = "确认重新绑定",
+            onDismiss = { showVenueRebindConfirmation = false },
+            onConfirm = {
+                if (onRebindInstallation()) showVenueRebindConfirmation = false
+            }
+        )
+    }
+}
+
+@Composable
+private fun TerminalStartupCheckScreen() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(32.dp),
+                color = SystemBlue,
+                strokeWidth = 3.dp
+            )
+            Spacer(Modifier.height(14.dp))
+            Text(
+                "正在核对本机数据",
+                color = PrimaryText,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(5.dp))
+            Text(
+                "队列、玩家资料和设置核对完成后即可继续。",
+                color = SecondaryText,
+                fontSize = 12.sp
+            )
+        }
+    }
+}
+
+@Composable
+private fun TerminalOnboardingScreen(
+    initialIdentity: TerminalInstallationIdentity,
+    cloudSyncAvailable: Boolean,
+    initialSettings: QueueRuleSettings,
+    installationClient: HttpTerminalInstallationClient,
+    onSaveConnection: (endpoint: String, token: String, syncEnabled: Boolean) -> Unit,
+    onProgress: (step: Int, venueName: String?, terminalName: String?) -> Unit,
+    onPreparedIdentity: (TerminalInstallationIdentity) -> Unit,
+    onComplete: () -> Unit
+) {
+    val coroutineScope = rememberCoroutineScope()
+    var step by remember(initialIdentity.onboardingStep) {
+        mutableIntStateOf(initialIdentity.onboardingStep.coerceIn(0, LAST_ONBOARDING_STEP))
+    }
+    var endpointDraft by remember(initialSettings.queueSyncEndpoint) {
+        mutableStateOf(initialSettings.queueSyncEndpoint)
+    }
+    var tokenDraft by remember(initialSettings.queueSyncToken) {
+        mutableStateOf(initialSettings.queueSyncToken)
+    }
+    var useServer by remember {
+        mutableStateOf(
+            cloudSyncAvailable &&
+                initialSettings.websiteSyncEnabled &&
+                normalizeQueueSyncEndpoint(initialSettings.queueSyncEndpoint) != null &&
+                isValidQueueSyncToken(initialSettings.queueSyncToken)
+        )
+    }
+    var venueNameDraft by remember(initialIdentity.venueName) {
+        mutableStateOf(initialIdentity.venueName)
+    }
+    var terminalNameDraft by remember(initialIdentity.terminalName) {
+        mutableStateOf(initialIdentity.terminalName.ifBlank { DEFAULT_TERMINAL_NAME })
+    }
+    var preparedIdentity by remember(initialIdentity) { mutableStateOf(initialIdentity) }
+    var submitting by remember { mutableStateOf(false) }
+    var connectionFailure by remember { mutableStateOf<String?>(null) }
+
+    val normalizedEndpoint = normalizeQueueSyncEndpoint(endpointDraft)
+    val normalizedToken = tokenDraft.trim()
+    val connectionValid = normalizedEndpoint != null && isValidQueueSyncToken(normalizedToken)
+    val venueName = venueNameDraft.trim()
+    val terminalName = terminalNameDraft.trim()
+    val identityValid = venueName.isNotEmpty() && terminalName.isNotEmpty() &&
+        venueName.codePointCount(0, venueName.length) <= MAX_VENUE_NAME_CHARACTERS &&
+        terminalName.codePointCount(0, terminalName.length) <= MAX_TERMINAL_NAME_CHARACTERS
+
+    fun goTo(target: Int) {
+        step = target.coerceIn(0, LAST_ONBOARDING_STEP)
+        onProgress(step, venueNameDraft, terminalNameDraft)
+    }
+
+    BackHandler(enabled = step > 0 && !submitting) {
+        goTo(previousOnboardingStep(step, cloudSyncAvailable))
+    }
+    Column(Modifier.fillMaxSize().imePadding().padding(horizontal = 36.dp, vertical = 24.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("maimai Q", color = PrimaryText, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.weight(1f))
+            Text(
+                "首次设置·${step + 1}/${LAST_ONBOARDING_STEP + 1}",
+                color = TertiaryText,
+                fontSize = 12.sp
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            repeat(LAST_ONBOARDING_STEP + 1) { index ->
+                Box(
+                    Modifier.weight(1f).height(4.dp).clip(CircleShape)
+                        .background(if (index <= step) SystemBlue else Separator)
+                )
+            }
+        }
+        Box(Modifier.fillMaxSize().widthIn(max = 820.dp).align(Alignment.CenterHorizontally)) {
+            Column(
+                Modifier.fillMaxWidth().align(Alignment.Center)
+                    .verticalScroll(rememberScrollState()).padding(vertical = 24.dp)
+            ) {
+                when (step) {
+                    0 -> {
+                        Text("开始设置现场终端", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            if (cloudSyncAvailable) {
+                                "接下来会确认是否连接服务端、填写机厅与终端名称，并核对开始使用前的关键设置。排队数据始终先保存在本机。"
+                            } else {
+                                "这是纯本地版本。接下来填写机厅与终端名称，并核对开始使用前的关键设置；所有排队数据只保存在本机。"
+                            },
+                            color = SecondaryText,
+                            fontSize = 14.sp,
+                            lineHeight = 21.sp
+                        )
+                        Spacer(Modifier.height(22.dp))
+                        Column(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+                                .background(CardBackground)
+                                .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(14.dp))
+                                .padding(17.dp)
+                        ) {
+                            Text("不会改变既有排队规则", color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                            Spacer(Modifier.height(5.dp))
+                            Text(
+                                "此流程只建立安装身份和必要配置，不会修改轮换、闭店收尾、暂缓一次、暂时离开、签到或共同游玩规则。",
+                                color = SecondaryText,
+                                fontSize = 12.sp,
+                                lineHeight = 18.sp
+                            )
+                        }
+                        Spacer(Modifier.height(22.dp))
+                        PrimaryButton("开始设置", { goTo(if (cloudSyncAvailable) 1 else 2) }, Modifier.fillMaxWidth())
+                    }
+
+                    1 -> {
+                        Text("连接服务端", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(7.dp))
+                        Text(
+                            "联网后，网站和 QQ Bot 可以读取队列，并按照终端规则提交线上操作。也可以暂时跳过，之后在应用设置中连接。",
+                            color = SecondaryText,
+                            fontSize = 14.sp,
+                            lineHeight = 21.sp
+                        )
+                        Spacer(Modifier.height(20.dp))
+                        FriendConsentConfirmation(
+                            checked = useServer,
+                            text = "现在连接服务端",
+                            onToggle = {
+                                useServer = !useServer
+                                connectionFailure = null
+                            }
+                        )
+                        if (useServer) {
+                            Spacer(Modifier.height(14.dp))
+                            OutlinedTextField(
+                                value = endpointDraft,
+                                onValueChange = {
+                                    endpointDraft = it.filterNot(Char::isISOControl)
+                                    connectionFailure = null
+                                },
+                                label = { Text("服务器地址") },
+                                placeholder = { Text("https://example.com/api/queue-status") },
+                                singleLine = true,
+                                isError = endpointDraft.isNotBlank() && normalizedEndpoint == null,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(Modifier.height(10.dp))
+                            OutlinedTextField(
+                                value = tokenDraft,
+                                onValueChange = {
+                                    tokenDraft = it.filterNot(Char::isISOControl)
+                                    connectionFailure = null
+                                },
+                                label = { Text("终端同步令牌") },
+                                singleLine = true,
+                                visualTransformation = PasswordVisualTransformation(),
+                                isError = tokenDraft.isNotBlank() && !isValidQueueSyncToken(normalizedToken),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            connectionFailure?.let { detail ->
+                                Spacer(Modifier.height(10.dp))
+                                Text(detail, color = Destructive, fontSize = 12.sp, lineHeight = 18.sp)
+                            }
+                        }
+                        Spacer(Modifier.height(20.dp))
+                        PrimaryButton(
+                            text = if (useServer) "保存连接并继续" else "暂时跳过并继续",
+                            onClick = {
+                                onSaveConnection(
+                                    normalizedEndpoint.orEmpty(),
+                                    normalizedToken,
+                                    useServer
+                                )
+                                preparedIdentity = prepareOnboardingIdentityForConnectionChoice(
+                                    current = preparedIdentity,
+                                    useServer = useServer,
+                                    queueStatusEndpoint = normalizedEndpoint
+                                )
+                                onPreparedIdentity(preparedIdentity)
+                                goTo(2)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !useServer || connectionValid,
+                            disabledReason = "请填写有效的 HTTPS 服务器地址和终端同步令牌。"
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        SecondaryButton("返回", { goTo(0) }, Modifier.fillMaxWidth())
+                    }
+
+                    2 -> {
+                        Text("设置机厅身份", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(7.dp))
+                        Text(
+                            "机厅名称会显示在终端、网站和 QQ Bot 的合适位置；终端名称用于以后区分同一机厅内的设备。两者都可以在设置中修改。",
+                            color = SecondaryText,
+                            fontSize = 14.sp,
+                            lineHeight = 21.sp
+                        )
+                        Spacer(Modifier.height(18.dp))
+                        OutlinedTextField(
+                            value = venueNameDraft,
+                            onValueChange = {
+                                venueNameDraft = limitCodePointLength(it.filterNot(Char::isISOControl), MAX_VENUE_NAME_CHARACTERS)
+                                connectionFailure = null
+                            },
+                            label = { Text("机厅名称") },
+                            placeholder = { Text("例如：星海游戏厅") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedTextField(
+                            value = terminalNameDraft,
+                            onValueChange = {
+                                terminalNameDraft = limitCodePointLength(it.filterNot(Char::isISOControl), MAX_TERMINAL_NAME_CHARACTERS)
+                                connectionFailure = null
+                            },
+                            label = { Text("终端名称") },
+                            placeholder = { Text(DEFAULT_TERMINAL_NAME) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        connectionFailure?.let { detail ->
+                            Spacer(Modifier.height(10.dp))
+                            Text(detail, color = Destructive, fontSize = 12.sp, lineHeight = 18.sp)
+                        }
+                        Spacer(Modifier.height(20.dp))
+                        PrimaryButton(
+                            text = if (useServer) "注册机厅并继续" else "保存本地身份并继续",
+                            onClick = {
+                                if (submitting) return@PrimaryButton
+                                submitting = true
+                                connectionFailure = null
+                                coroutineScope.launch {
+                                    val base = preparedIdentity.copy(
+                                        venueName = venueName,
+                                        terminalName = terminalName,
+                                        onboardingStep = 3,
+                                        onboardingCompleted = false,
+                                        lastUpdatedAtMillis = System.currentTimeMillis()
+                                    )
+                                    val result = if (useServer) {
+                                        installationClient.register(
+                                            venueName = venueName,
+                                            terminalName = terminalName,
+                                            expectedVenueId = base.expectedServerVenueId
+                                        )
+                                    } else {
+                                        null
+                                    }
+                                    val ready = when (result) {
+                                        is TerminalInstallationFetchResult.Success ->
+                                            result.identity.copy(
+                                                onboardingCompleted = false,
+                                                onboardingStep = 3,
+                                                venueBindingServerEndpoint = normalizedEndpoint,
+                                                verifiedServerEndpoint = normalizedEndpoint,
+                                                venueName = venueName,
+                                                terminalName = terminalName
+                                            )
+                                        TerminalInstallationFetchResult.UnsupportedServer ->
+                                            markLegacyInstallationEndpointVerified(base, normalizedEndpoint.orEmpty())
+                                                .copy(onboardingStep = 3)
+                                        is TerminalInstallationFetchResult.Failure -> {
+                                            connectionFailure = result.detail
+                                            null
+                                        }
+                                        null -> base.copy(
+                                            venueId = base.venueId ?: java.util.UUID.randomUUID().toString(),
+                                            registrationState = TerminalInstallationRegistrationState.LOCAL_ONLY,
+                                            verifiedServerEndpoint = null
+                                        )
+                                    }
+                                    if (ready != null) {
+                                        preparedIdentity = ready
+                                        onPreparedIdentity(ready)
+                                        goTo(3)
+                                    }
+                                    submitting = false
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = identityValid && !submitting,
+                            disabledReason = if (submitting) "正在保存机厅身份。" else
+                                "请填写机厅名称和终端名称。"
+                        )
+                        if (step > 0) {
+                            Spacer(Modifier.height(8.dp))
+                            SecondaryButton("返回", { goTo(if (cloudSyncAvailable) 1 else 0) }, Modifier.fillMaxWidth(), enabled = !submitting)
+                        }
+                    }
+
+                    else -> {
+                        Text("可以开始使用", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(7.dp))
+                        Text(
+                            "请核对以下信息。进入首页后，可以从“更多 → 应用设置”继续调整机台配置、营业时间和线上登记。",
+                            color = SecondaryText,
+                            fontSize = 14.sp,
+                            lineHeight = 21.sp
+                        )
+                        Spacer(Modifier.height(18.dp))
+                        Column(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+                                .background(CardBackground)
+                                .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(14.dp))
+                                .padding(horizontal = 17.dp)
+                        ) {
+                            AppDetailRow("机厅", preparedIdentity.venueName.ifBlank { "尚未填写" })
+                            HorizontalDivider(color = Separator.copy(alpha = .72f))
+                            AppDetailRow("终端", preparedIdentity.terminalName)
+                            HorizontalDivider(color = Separator.copy(alpha = .72f))
+                            AppDetailRow(
+                                "连接状态",
+                                when (preparedIdentity.registrationState) {
+                                    TerminalInstallationRegistrationState.REGISTERED -> "已在服务端注册"
+                                    TerminalInstallationRegistrationState.WAITING_FOR_SERVER -> "兼容服务端连接"
+                                    TerminalInstallationRegistrationState.LOCAL_ONLY -> "仅在本机使用"
+                                    TerminalInstallationRegistrationState.VENUE_MISMATCH -> "机厅身份不一致"
+                                }
+                            )
+                            preparedIdentity.venueCode?.let { code ->
+                                HorizontalDivider(color = Separator.copy(alpha = .72f))
+                                AppDetailRow("机厅 ID", code)
+                            }
+                        }
+                        Spacer(Modifier.height(20.dp))
+                        PrimaryButton("进入排队首页", onComplete, Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(8.dp))
+                        SecondaryButton("返回修改", { goTo(2) }, Modifier.fillMaxWidth())
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -7097,7 +8228,7 @@ private fun MachineGroupingEditor(
 private fun MachineConfigurationEditor(
     machineId: MachineId,
     configuration: MachineConfiguration,
-    capacityEditable: Boolean,
+    behaviorEditable: Boolean,
     onConfigurationChange: (MachineConfiguration) -> Unit
 ) {
     MachineRemarkField(
@@ -7211,7 +8342,7 @@ private fun MachineConfigurationEditor(
         options = listOf(1 to "1 人", 2 to "2 人"),
         selected = configuration.capacity,
         columns = 2,
-        enabled = capacityEditable,
+        enabled = behaviorEditable,
         disabledReason = "请先关闭登记排队，再修改游玩容量。",
         onSelect = { capacity ->
             onConfigurationChange(configuration.copy(capacity = capacity))
@@ -7234,6 +8365,8 @@ private fun MachineConfigurationEditor(
     PlannedRoundMinutesStepper(
         label = "单人游玩",
         minutes = configuration.soloRoundMinutes,
+        enabled = behaviorEditable,
+        disabledReason = "请先关闭登记排队，再修改计划游玩时间。",
         onMinutesChange = {
             onConfigurationChange(configuration.copy(soloRoundMinutes = it))
         }
@@ -7242,6 +8375,8 @@ private fun MachineConfigurationEditor(
     PlannedRoundMinutesStepper(
         label = "两人共同游玩",
         minutes = configuration.sharedRoundMinutes,
+        enabled = behaviorEditable,
+        disabledReason = "请先关闭登记排队，再修改计划游玩时间。",
         onMinutesChange = {
             onConfigurationChange(configuration.copy(sharedRoundMinutes = it))
         }
@@ -7336,12 +8471,15 @@ private fun MachineConfigurationTextField(
 private fun PlannedRoundMinutesStepper(
     label: String,
     minutes: Int,
+    enabled: Boolean = true,
+    disabledReason: String = "当前不能修改这项设置。",
     onMinutesChange: (Int) -> Unit
 ) {
+    val context = LocalContext.current
     Row(
         Modifier.fillMaxWidth().height(48.dp)
             .clip(RoundedCornerShape(8.dp))
-            .background(PageBackground)
+            .background(if (enabled) PageBackground else PageBackground.copy(alpha = 0.58f))
             .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(8.dp)),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -7353,13 +8491,21 @@ private fun PlannedRoundMinutesStepper(
         )
         Spacer(Modifier.weight(1f))
         IconButton(
-            onClick = { onMinutesChange((minutes - 1).coerceAtLeast(MIN_PLANNED_ROUND_MINUTES)) },
-            enabled = minutes > MIN_PLANNED_ROUND_MINUTES,
-            modifier = Modifier.size(48.dp)
+            onClick = {
+                if (enabled) {
+                    if (minutes > MIN_PLANNED_ROUND_MINUTES) {
+                        onMinutesChange(minutes - 1)
+                    }
+                } else {
+                    showDisabledActionReason(context, "计划游玩时间", disabledReason)
+                }
+            },
+            enabled = true,
+            modifier = Modifier.size(48.dp).alpha(if (enabled) 1f else 0.55f)
         ) {
             Text(
                 "−",
-                color = if (minutes > MIN_PLANNED_ROUND_MINUTES) PrimaryText else TertiaryText,
+                color = if (enabled && minutes > MIN_PLANNED_ROUND_MINUTES) PrimaryText else TertiaryText,
                 fontSize = 20.sp,
                 textAlign = TextAlign.Center
             )
@@ -7373,11 +8519,28 @@ private fun PlannedRoundMinutesStepper(
             modifier = Modifier.width(68.dp)
         )
         IconButton(
-            onClick = { onMinutesChange((minutes + 1).coerceAtMost(MAX_PLANNED_ROUND_MINUTES)) },
-            enabled = minutes < MAX_PLANNED_ROUND_MINUTES,
-            modifier = Modifier.size(48.dp)
+            onClick = {
+                if (enabled) {
+                    if (minutes < MAX_PLANNED_ROUND_MINUTES) {
+                        onMinutesChange(minutes + 1)
+                    }
+                } else {
+                    showDisabledActionReason(context, "计划游玩时间", disabledReason)
+                }
+            },
+            enabled = true,
+            modifier = Modifier.size(48.dp).alpha(if (enabled) 1f else 0.55f)
         ) {
-            Icon(Icons.Default.Add, "增加${label}计划时间", Modifier.size(18.dp))
+            Icon(
+                Icons.Default.Add,
+                "增加${label}计划时间",
+                Modifier.size(18.dp),
+                tint = if (enabled && minutes < MAX_PLANNED_ROUND_MINUTES) {
+                    PrimaryText
+                } else {
+                    TertiaryText
+                }
+            )
         }
     }
 }
@@ -7708,6 +8871,7 @@ private fun HomeScreen(
     businessHoursStatus: BusinessHoursStatus,
     closingGracePeriod: Boolean,
     showCommonPlayPreview: Boolean,
+    venueName: String,
     cloudSyncStatus: QueueCloudSyncStatus?,
     queueUndoAction: QueueUndoAction?,
     onUndoQueueAction: () -> Unit,
@@ -7732,6 +8896,7 @@ private fun HomeScreen(
     onEnterPlaying: (MachineId) -> Unit,
     onRestoreMachine: (MachineId) -> Unit,
     onMachineDetails: (MachineId) -> Unit,
+    onVenueDetails: () -> Unit,
     onRegistrationClick: (MachineId, Int) -> Unit,
     onRegistrationLongPress: (MachineId, Int) -> Unit,
     onPositionClick: (PositionSelection) -> Unit,
@@ -7815,9 +8980,11 @@ private fun HomeScreen(
                 outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
                 machineCount = machines.size,
                 totalRegistrationCount = machines.sumOf { it.queue.registrationCount },
+                venueName = venueName,
                 cloudSyncStatus = cloudSyncStatus,
                 onCloudSyncClick = { cloudSyncInfoVisible = true },
-                onMore = onMore
+                onMore = onMore,
+                onVenueDetails = onVenueDetails
             )
             Spacer(Modifier.height(11.dp))
             HorizontalDivider(color = Separator.copy(alpha = .72f))
@@ -8072,9 +9239,11 @@ private fun AppHeader(
     outsideBusinessHours: Boolean,
     machineCount: Int,
     totalRegistrationCount: Int,
+    venueName: String,
     cloudSyncStatus: QueueCloudSyncStatus?,
     onCloudSyncClick: () -> Unit,
-    onMore: () -> Unit
+    onMore: () -> Unit,
+    onVenueDetails: () -> Unit
 ) {
     val context = LocalContext.current
     val batteryManager = remember(context) { context.getSystemService(BatteryManager::class.java) }
@@ -8084,6 +9253,18 @@ private fun AppHeader(
     }
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Column {
+            if (venueName.isNotBlank()) {
+                Text(
+                    venueName,
+                    color = SecondaryText,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.clip(RoundedCornerShape(6.dp))
+                        .clickable(onClick = onVenueDetails)
+                        .padding(horizontal = 2.dp, vertical = 2.dp)
+                )
+                Spacer(Modifier.height(1.dp))
+            }
             Text("排队登记", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
@@ -8091,7 +9272,7 @@ private fun AppHeader(
                     color = SecondaryText,
                     fontSize = 13.sp
                 )
-                Text(" · ", color = TertiaryText, fontSize = 13.sp)
+                Text("·", color = TertiaryText, fontSize = 13.sp)
                 Text(
                     "当前共 $totalRegistrationCount 个登记",
                     color = PrimaryText,
@@ -8343,7 +9524,7 @@ private fun MachineLane(
         includeCommonPlayPreview = false
     ).positions.size
     val queueCountSummary =
-        "$displayedWaitingPositionCount 个等待位置 · ${queue.registrationCount} 个登记"
+        "$displayedWaitingPositionCount 个等待位置·${queue.registrationCount} 个登记"
     Column(
         modifier.padding(horizontal = 2.dp, vertical = 3.dp),
         verticalArrangement = if (centerContent) Arrangement.Center else Arrangement.Top
@@ -8363,7 +9544,7 @@ private fun MachineLane(
                         buildAnnotatedString {
                             withStyle(SpanStyle(color = SecondaryText, fontWeight = FontWeight.Medium)) {
                                 append(remark)
-                                append(" · ")
+                                append("·")
                             }
                             withStyle(SpanStyle(color = PrimaryText, fontWeight = FontWeight.SemiBold)) {
                                 append("机台 $letter")
@@ -8378,12 +9559,12 @@ private fun MachineLane(
                 Text(
                     when {
                         queue.registrationCount > 0 && inlineReorderSession != null ->
-                            "$queueCountSummary · 正在调整"
+                            "$queueCountSummary·正在调整"
                         queue.registrationCount > 0 && !status.isOperational ->
-                            "$queueCountSummary · 已停止使用"
+                            "$queueCountSummary·已停止使用"
                         queue.registrationCount > 0 -> queueCountSummary
                         !status.isOperational ->
-                            "已停止使用 · ${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}"
+                            "已停止使用·${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}"
                         else -> "当前空闲"
                     },
                     color = SecondaryText,
@@ -8659,8 +9840,8 @@ private fun MachineLane(
                             label = when {
                                 displayedQueue.playing.isEmpty() -> playingPositionName(machineId)
                                 playingMinutes == null || playingMinutes == 0L ->
-                                    "${playingPositionName(machineId)} · 刚刚"
-                                else -> "${playingPositionName(machineId)} · 已游玩 $playingMinutes 分钟"
+                                    "${playingPositionName(machineId)}·刚刚"
+                                else -> "${playingPositionName(machineId)}·已游玩 $playingMinutes 分钟"
                             },
                             registrations = displayedQueue.playing,
                             isPlaying = true,
@@ -8704,7 +9885,7 @@ private fun MachineLane(
                                 registrations[0].fixedPartnerKey == registrations[1].key &&
                                 registrations[1].fixedPartnerKey == registrations[0].key
                             val positionLabel = "位置 $letter${index + 1}" +
-                                if (fixedPair) " · 固定组合" else ""
+                                if (fixedPair) "·固定组合" else ""
                             val positionKey = waitingPositionKey(registrations)
                             val actualPositionIndex = actualWaitingPositions.indexOfFirst { actual ->
                                 actual.map { it.key }.toSet() == registrations.map { it.key }.toSet()
@@ -9610,7 +10791,7 @@ private fun RegistrationTile(
     val pendingCheckIn = registration.requiresOnSiteCheckIn
     val visibleStatus = when {
         commonPlayPreview -> "共同游玩预览"
-        pendingCheckIn -> "线上登记 · 待签到"
+        pendingCheckIn -> "线上登记·待签到"
         absenceStatus != null -> absenceStatus
         else -> noShowStatus
     }
@@ -9888,7 +11069,7 @@ private fun RegistrationCompletedPanel(
 ) {
     val visibleDisplayId = queueDisplayId(completion.displayId)
     val statusText = when {
-        completion.requiresOnSiteCheckIn -> "线上登记 · 等待现场签到"
+        completion.requiresOnSiteCheckIn -> "线上登记·等待现场签到"
         completion.isPlaying -> "已经进入游玩位置"
         else -> "登记已加入等待顺序"
     }
@@ -10307,6 +11488,7 @@ private fun CreateRegistrationScreen(
     onGenerateId: () -> Unit,
     onPlayerLibrary: () -> Unit,
     mobileRegistrationEnabled: Boolean,
+    mobileRegistrationDisabledReason: String,
     mobileRegistrationLoading: Boolean,
     machineLabel: String,
     singlePlayerMachine: Boolean,
@@ -10355,7 +11537,7 @@ private fun CreateRegistrationScreen(
                 disabledReason = if (mobileRegistrationLoading) {
                     "登记二维码正在创建，请稍候。"
                 } else {
-                    "请先在应用设置中配置并开启与服务端同步。"
+                    mobileRegistrationDisabledReason
                 },
                 onClick = onMobileRegistration,
                 modifier = Modifier.weight(1f)
@@ -10478,7 +11660,7 @@ private fun PlayerLibraryScreen(
                     value = searchQuery,
                     onValueChange = onSearchQueryChange,
                     label = { Text("搜索玩家") },
-                    placeholder = { Text("输入昵称或 QQ 号") },
+                    placeholder = { Text("输入昵称、QQ 号或玩家编号") },
                     singleLine = true,
                     shape = RoundedCornerShape(ControlRadius),
                     colors = playerProfileTextFieldColors(),
@@ -10503,7 +11685,11 @@ private fun PlayerLibraryScreen(
                         )
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            if (profiles.isEmpty()) "新建后，之后可以更快地加入排队。" else "请尝试其他昵称或 QQ 号。",
+                            if (profiles.isEmpty()) {
+                                "新建后，之后可以更快地加入排队。"
+                            } else {
+                                "请尝试其他昵称、QQ 号或玩家编号。"
+                            },
                             color = SecondaryText,
                             fontSize = 12.sp
                         )
@@ -10612,6 +11798,15 @@ private fun PlayerProfileCard(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
+            profile.publicPlayerId?.let { publicPlayerId ->
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "玩家编号 $publicPlayerId",
+                    color = TertiaryText,
+                    fontSize = 9.sp,
+                    maxLines = 1
+                )
+            }
         }
         IconButton(onClick = onEdit, modifier = Modifier.size(48.dp)) {
             Icon(
@@ -11184,6 +12379,10 @@ private fun PlayerProfileDetailScreen(
                 )
                 Spacer(Modifier.height(3.dp))
                 Text(profileContactSummary(profile), color = SecondaryText, fontSize = 11.sp)
+                profile.publicPlayerId?.let { publicPlayerId ->
+                    Spacer(Modifier.height(3.dp))
+                    Text("玩家编号：$publicPlayerId", color = TertiaryText, fontSize = 11.sp)
+                }
             }
         }
         Spacer(Modifier.height(14.dp))
@@ -11311,6 +12510,10 @@ private fun FriendPairPlayerProfileDetailScreen(
                 )
                 Spacer(Modifier.height(3.dp))
                 Text(profileContactSummary(profile), color = SecondaryText, fontSize = 11.sp)
+                profile.publicPlayerId?.let { publicPlayerId ->
+                    Spacer(Modifier.height(3.dp))
+                    Text("玩家编号：$publicPlayerId", color = TertiaryText, fontSize = 11.sp)
+                }
             }
         }
         Spacer(Modifier.height(13.dp))
@@ -11444,6 +12647,10 @@ private fun ClaimPlayerProfileDetailScreen(
                 )
                 Spacer(Modifier.height(3.dp))
                 Text(profileContactSummary(profile), color = SecondaryText, fontSize = 11.sp)
+                profile.publicPlayerId?.let { publicPlayerId ->
+                    Spacer(Modifier.height(3.dp))
+                    Text("玩家编号：$publicPlayerId", color = TertiaryText, fontSize = 11.sp)
+                }
             }
         }
         Spacer(Modifier.height(13.dp))
@@ -11516,6 +12723,10 @@ private fun IncompletePlayerProfileScreen(
             Column(Modifier.weight(1f)) {
                 Text(profile.nickname, color = PrimaryText, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(4.dp))
+                profile.publicPlayerId?.let { publicPlayerId ->
+                    Text("玩家编号：$publicPlayerId", color = TertiaryText, fontSize = 11.sp)
+                    Spacer(Modifier.height(3.dp))
+                }
                 Text(
                     if (!profile.hasValidContact) {
                         "需要填写有效的 QQ 号并确认通知设置。"
@@ -12047,7 +13258,7 @@ private fun FriendPairFlowDialog(
                             MenuAction(
                                 candidate.displayId,
                                 if (machineOperational) {
-                                    "${positionLabels[candidate.key] ?: "等待顺序"} · ${playPreferenceLabel(candidate)}。"
+                                    "${positionLabels[candidate.key] ?: "等待顺序"}·${playPreferenceLabel(candidate)}。"
                                 } else {
                                     "当前机台已停止使用，恢复正常使用后才能组成固定组合。"
                                 },
@@ -12504,7 +13715,7 @@ private fun RegistrationActions(
                 ) {
                     if (registration.requiresOnSiteCheckIn) {
                         DetailPill(
-                            text = "线上登记 · 待签到",
+                            text = "线上登记·待签到",
                             color = OnlineRegistrationStatusColor,
                             backgroundColor = OnlineRegistrationStatusBackground
                         )
@@ -13499,7 +14710,7 @@ private fun PositionActions(
                         ?.let { "未到场 $it 次" }
                     val pendingCheckIn = registration.requiresOnSiteCheckIn
                     val visibleStatus = when {
-                        pendingCheckIn -> "线上登记 · 待签到"
+                        pendingCheckIn -> "线上登记·待签到"
                         absenceStatus != null -> absenceStatus
                         noShowStatus != null -> noShowStatus
                         else -> playPreferenceLabel(registration)
@@ -14697,9 +15908,9 @@ private fun QueueRestoreMachineRow(
                 if (queue.registrationCount == 0) {
                     append("没有登记")
                 } else {
-                    append("${queue.waitingProjection(includeCommonPlayPreview = false).positions.size} 个等待位置 · ${queue.registrationCount} 个登记")
+                    append("${queue.waitingProjection(includeCommonPlayPreview = false).positions.size} 个等待位置·${queue.registrationCount} 个登记")
                 }
-                if (!status.isOperational) append(" · 已停止使用")
+                if (!status.isOperational) append("·已停止使用")
             },
             color = if (status.isOperational) SecondaryText else Color(0xFF9A5B00),
             fontSize = 11.sp,
@@ -14812,6 +16023,7 @@ private fun MoreMenu(
 @Composable
 private fun AppDetailsDialog(
     cloudSyncStatus: QueueCloudSyncStatus?,
+    terminalInstallation: TerminalInstallationIdentity,
     onOpenVersionHistory: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -14824,6 +16036,15 @@ private fun AppDetailsDialog(
         AppDetailLinkRow("版本", BuildConfig.VERSION_NAME, "查看更新记录", onOpenVersionHistory)
         HorizontalDivider(color = Separator.copy(alpha = .72f))
         AppDetailRow("构建编号", BuildConfig.VERSION_CODE.toString())
+        Spacer(Modifier.height(15.dp))
+        AppDetailSectionTitle("机厅与终端")
+        AppDetailRow("机厅", terminalInstallation.venueName.ifBlank { "尚未填写" })
+        terminalInstallation.venueCode?.let { code ->
+            HorizontalDivider(color = Separator.copy(alpha = .72f))
+            AppDetailRow("机厅 ID", code)
+        }
+        HorizontalDivider(color = Separator.copy(alpha = .72f))
+        AppDetailRow("终端", terminalInstallation.terminalName)
         Spacer(Modifier.height(15.dp))
         AppDetailSectionTitle("运行规格")
         AppDetailRow("排队方式", "各机台分别独立排序")
@@ -14859,8 +16080,60 @@ private fun AppDetailsDialog(
 }
 
 @Composable
+private fun TerminalInstallationDetailsDialog(
+    identity: TerminalInstallationIdentity,
+    queueStatusEndpoint: String,
+    onDismiss: () -> Unit
+) {
+    val status = when (identity.registrationState) {
+        TerminalInstallationRegistrationState.REGISTERED -> "已在服务端注册"
+        TerminalInstallationRegistrationState.WAITING_FOR_SERVER ->
+            if (identity.allowsOnlineAccess(queueStatusEndpoint)) "兼容服务端连接" else "等待核对服务端"
+        TerminalInstallationRegistrationState.LOCAL_ONLY -> "仅在本机使用"
+        TerminalInstallationRegistrationState.VENUE_MISMATCH -> "机厅身份不一致"
+    }
+    ModalSurface(onDismiss, width = 500.dp) {
+        Text("机厅与终端", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(5.dp))
+        Text(
+            "用于核对当前排队数据所属的现场。",
+            color = SecondaryText,
+            fontSize = 12.sp
+        )
+        Spacer(Modifier.height(16.dp))
+        AppDetailRow("机厅", identity.venueName.ifBlank { "尚未填写" })
+        identity.venueCode?.let { code ->
+            HorizontalDivider(color = Separator.copy(alpha = .72f))
+            AppDetailRow("机厅 ID", code)
+        }
+        HorizontalDivider(color = Separator.copy(alpha = .72f))
+        AppDetailRow("终端", identity.terminalName)
+        HorizontalDivider(color = Separator.copy(alpha = .72f))
+        AppDetailRow("状态", status)
+        identity.lastError?.let { detail ->
+            Spacer(Modifier.height(12.dp))
+            Text(
+                detail,
+                color = if (
+                    identity.registrationState == TerminalInstallationRegistrationState.VENUE_MISMATCH
+                ) Destructive else SecondaryText,
+                fontSize = 12.sp,
+                lineHeight = 18.sp
+            )
+        }
+        Spacer(Modifier.height(18.dp))
+        SecondaryButton("关闭", onDismiss, Modifier.fillMaxWidth())
+    }
+}
+
+@Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.11.0",
+            "机厅身份与跨端资料基础",
+            "建立机厅与终端身份、schema 8 协议和旧终端兼容边界；新增六位玩家编号、玩家编号别名、首次启动引导和机厅名称展示。统一 App、网站、服务端与 QQ Bot 的中点文案、线上登记状态和机厅信息；身份核对完成前暂停私有资料与远程操作，避免更换服务端或跨机厅时误读、误写数据。"
+        ),
         Triple(
             "0.10.2",
             "公开测试与同步故障修复",
@@ -15269,7 +16542,7 @@ private fun queueCloudSyncStatusLabel(status: QueueCloudSyncStatus): String = wh
     }
     QueueCloudSyncPhase.SYNCED -> status.lastSuccessfulAtMillis?.let {
         val prefix = if (status.syncMode == QueueSyncMode.TEST) "测试数据已同步" else "已同步"
-        "$prefix · ${SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(it))}"
+        "$prefix·${SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(it))}"
     } ?: if (status.syncMode == QueueSyncMode.TEST) "测试数据已同步" else "已同步"
     QueueCloudSyncPhase.WAITING_TO_RETRY -> status.retryDetail?.let {
         "同步失败，等待重试：$it"
@@ -15381,7 +16654,7 @@ private fun MachineStopChoice(machineName: String, status: MachineStatus, onClic
         description = if (status.isOperational) {
             "选择后继续说明停止使用的原因。"
         } else {
-            "已停止使用 · ${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}"
+            "已停止使用·${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}"
         },
         destructive = status.isOperational,
         enabled = status.isOperational,
@@ -17080,7 +18353,7 @@ private fun positionRelationshipDescriptions(
 }
 
 internal fun machineName(machineId: MachineId, remark: String): String =
-    "$remark · 机台 ${machineId.name}"
+    "$remark·机台 ${machineId.name}"
 
 private fun MachineQueue.registrationPositionName(
     machineId: MachineId,
@@ -17142,7 +18415,7 @@ private fun registrationAbsenceStatusLabel(
     QueueAbsenceStatus.TEMPORARILY_AWAY -> buildString {
         append("暂时离开")
         if (includeSkippedTurns && registration.temporaryAwaySkippedTurns > 0) {
-            append(" · 已轮空 ${registration.temporaryAwaySkippedTurns} 次")
+            append("·已轮空 ${registration.temporaryAwaySkippedTurns} 次")
         }
     }
 }

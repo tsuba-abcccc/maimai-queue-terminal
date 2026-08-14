@@ -10,6 +10,55 @@ class QueueCloudSnapshotTest {
     private val queueId = "00000000-0000-0000-0000-000000000099"
 
     @Test
+    fun schemaSevenFallbackOmitsSchemaEightIdentityFields() {
+        val profile = PlayerProfile(
+            id = "00000000-0000-0000-0000-000000000111",
+            publicPlayerId = "001234",
+            nickname = "测试玩家",
+            gender = PlayerGender.UNDISCLOSED,
+            defaultPreference = ProfilePlayPreference.SOLO,
+            createdAtMillis = 100L,
+            updatedAtMillis = 100L
+        )
+
+        val snapshot = buildQueueSyncSnapshot(
+            state = state(),
+            terminalId = "terminal-1",
+            capturedAtMillis = 1_000L,
+            playerProfiles = listOf(profile),
+            schemaVersion = 7,
+            venueId = "00000000-0000-0000-0000-000000000222",
+            terminalName = "入口终端"
+        )
+        val terminal = snapshot.getJSONObject("terminal")
+        val serializedProfile = snapshot.getJSONArray("private_player_profiles")
+            .getJSONObject(0)
+
+        assertEquals(7, snapshot.getInt("schema_version"))
+        assertEquals("左侧 · 机台 A", snapshot.getJSONObject("machines")
+            .getJSONObject("A").getString("name"))
+        assertFalse(snapshot.has("venue"))
+        assertFalse(terminal.has("name"))
+        assertFalse(serializedProfile.has("public_player_id"))
+    }
+
+    @Test
+    fun schemaEightSnapshotIncludesInstallationIdentity() {
+        val venueId = "00000000-0000-0000-0000-000000000222"
+        val snapshot = buildQueueSyncSnapshot(
+            state = state(),
+            terminalId = "terminal-1",
+            capturedAtMillis = 1_000L,
+            schemaVersion = 8,
+            venueId = venueId,
+            terminalName = "入口终端"
+        )
+
+        assertEquals(venueId, snapshot.getJSONObject("venue").getString("id"))
+        assertEquals("入口终端", snapshot.getJSONObject("terminal").getString("name"))
+    }
+
+    @Test
     fun publicSnapshotContainsQueueLayoutAndWaitEstimate() {
         val nowMillis = 1_000_000L
         val playing = Registration(
@@ -69,8 +118,8 @@ class QueueCloudSnapshotTest {
         val machines = snapshot.getJSONObject("machines")
         val businessHours = snapshot.getJSONObject("business_hours")
 
-        assertEquals("入口侧 · 机台 A", machines.getJSONObject("A").getString("name"))
-        assertEquals("墙侧 · 机台 B", machines.getJSONObject("B").getString("name"))
+        assertEquals("入口侧·机台 A", machines.getJSONObject("A").getString("name"))
+        assertEquals("墙侧·机台 B", machines.getJSONObject("B").getString("name"))
         assertFalse(snapshot.getBoolean("onebot_sync_enabled"))
         assertFalse(snapshot.getBoolean("registration_open"))
         assertFalse(
@@ -116,7 +165,7 @@ class QueueCloudSnapshotTest {
         val machine = snapshot.getJSONObject("machines").getJSONObject("A")
         val configuration = machine.getJSONObject("configuration")
 
-        assertEquals(7, snapshot.getInt("schema_version"))
+        assertEquals(8, snapshot.getInt("schema_version"))
         assertEquals(7L, snapshot.getLong("machine_configuration_revision"))
         assertEquals("入口侧", machine.getString("remark"))
         assertEquals("OTHER", configuration.getString("game_type"))
@@ -155,7 +204,7 @@ class QueueCloudSnapshotTest {
         val published = snapshot.getJSONObject("machines").getJSONObject("A")
             .getJSONObject("configuration")
 
-        assertEquals(7, snapshot.getInt("schema_version"))
+        assertEquals(8, snapshot.getInt("schema_version"))
         assertEquals(9L, snapshot.getLong("machine_configuration_revision"))
         assertEquals(1, published.getInt("capacity"))
         assertEquals(18, published.getInt("solo_round_minutes"))
@@ -199,7 +248,7 @@ class QueueCloudSnapshotTest {
             assertEquals("machine count $machineCount", machineIds.map(MachineId::name).toSet(), publishedIds)
             machineIds.forEach { machineId ->
                 val machine = machines.getJSONObject(machineId.name)
-                assertEquals("区域${machineId.name} · 机台 ${machineId.name}", machine.getString("name"))
+                assertEquals("区域${machineId.name}·机台 ${machineId.name}", machine.getString("name"))
                 assertEquals(1, machine.getInt("registration_count"))
             }
         }
@@ -296,7 +345,7 @@ class QueueCloudSnapshotTest {
             "20000000000000000000000000000005",
             published.getJSONObject(1).getString("machine_stable_id")
         )
-        assertEquals("二楼 · 机台 E", published.getJSONObject(1).getString("machine_name"))
+        assertEquals("二楼·机台 E", published.getJSONObject(1).getString("machine_name"))
     }
 
     @Test
@@ -691,7 +740,7 @@ class QueueCloudSnapshotTest {
         )
         val events = snapshot.getJSONArray("recent_events")
 
-        assertEquals(7, snapshot.getInt("schema_version"))
+        assertEquals(8, snapshot.getInt("schema_version"))
         assertEquals(1, events.length())
         assertEquals("NO_SHOW_MOVED_TO_TAIL", events.getJSONObject(0).getString("type"))
         assertEquals(
@@ -761,9 +810,10 @@ class QueueCloudSnapshotTest {
         val profiles = snapshot.getJSONArray("private_player_profiles")
         val contact = contacts.getJSONObject(0)
 
-        assertEquals(7, snapshot.getInt("schema_version"))
+        assertEquals(8, snapshot.getInt("schema_version"))
         assertEquals(1, contacts.length())
         assertEquals(3, profiles.length())
+        assertTrue(profiles.getJSONObject(0).has("public_player_id"))
         assertEquals(publicRegistrationId(queueId, 10), contact.getString("registration_id"))
         assertEquals(qqProfileId, contact.getString("profile_id"))
         assertEquals("12345678", contact.getString("qq_number"))

@@ -37,6 +37,8 @@ const val CURRENT_PLAYER_PROFILE_SETUP_VERSION = 1
 
 data class PlayerProfile(
     val id: String,
+    val publicPlayerId: String? = null,
+    val publicPlayerIdAliases: Set<String> = emptySet(),
     val nickname: String,
     val gender: PlayerGender,
     val defaultPreference: ProfilePlayPreference,
@@ -62,10 +64,21 @@ data class PlayerProfile(
 
     fun withCanonicalContact(): PlayerProfile {
         val normalizedQqNumber = normalizedQqNumber()
-        return if (qqNumber == normalizedQqNumber) {
+        val normalizedPublicPlayerIdAliases = publicPlayerIdAliases
+            .asSequence()
+            .filter(::isValidPublicPlayerId)
+            .filterNot { it == publicPlayerId }
+            .toSet()
+        return if (
+            qqNumber == normalizedQqNumber &&
+            publicPlayerIdAliases == normalizedPublicPlayerIdAliases
+        ) {
             this
         } else {
-            copy(qqNumber = normalizedQqNumber)
+            copy(
+                qqNumber = normalizedQqNumber,
+                publicPlayerIdAliases = normalizedPublicPlayerIdAliases
+            )
         }
     }
 
@@ -110,6 +123,9 @@ fun isValidQqNumber(value: String?): Boolean {
         (normalized.length in QQ_NUMBER_LENGTH_RANGE && normalized.all { it in '0'..'9' })
 }
 
+fun isValidPublicPlayerId(value: String?): Boolean =
+    value != null && value.length == PUBLIC_PLAYER_ID_LENGTH && value.all { it in '0'..'9' }
+
 fun normalizeOptionalContact(value: String?): String? = value?.trim()?.takeIf { it.isNotEmpty() }
 
 internal fun clearAmbiguousQqBindings(
@@ -142,7 +158,18 @@ internal fun shouldApplyCloudPlayerProfile(
     nicknameConflictsWithQueue: (nickname: String, profileId: String) -> Boolean
 ): Boolean {
     val localSameId = localProfiles.firstOrNull { it.id == cloudProfile.id }
-    if (localSameId != null && cloudProfile.revision <= localSameId.revision) return false
+    if (localSameId != null && cloudProfile.revision <= localSameId.revision) {
+        return cloudProfile.revision == localSameId.revision &&
+            cloudProfile.publicPlayerId != null &&
+            (
+                cloudProfile.publicPlayerId != localSameId.publicPlayerId ||
+                    cloudProfile.publicPlayerIdAliases != localSameId.publicPlayerIdAliases
+                ) &&
+            localSameId.copy(
+                publicPlayerId = cloudProfile.publicPlayerId,
+                publicPlayerIdAliases = cloudProfile.publicPlayerIdAliases
+            ) == cloudProfile
+    }
     val cloudQq = cloudProfile.normalizedQqNumber()
     if (localProfiles.any { local ->
             local.id != cloudProfile.id && (
@@ -164,6 +191,7 @@ internal fun PlayerProfile.isContactlessLegacyAliasOf(canonical: PlayerProfile):
         defaultPreference == canonical.defaultPreference
 
 const val MAX_QQ_NUMBER_LENGTH = 12
+const val PUBLIC_PLAYER_ID_LENGTH = 6
 private val QQ_NUMBER_LENGTH_RANGE = 5..MAX_QQ_NUMBER_LENGTH
 
 fun filterAndSortPlayerProfiles(
@@ -177,7 +205,9 @@ fun filterAndSortPlayerProfiles(
     } else {
         profiles.filter { profile ->
             profile.nickname.contains(normalizedQuery, ignoreCase = true) ||
-                profile.normalizedQqNumber()?.contains(normalizedQuery) == true
+                profile.normalizedQqNumber()?.contains(normalizedQuery) == true ||
+                profile.publicPlayerId?.contains(normalizedQuery) == true ||
+                profile.publicPlayerIdAliases.any { it.contains(normalizedQuery) }
         }
     }
     val nicknameComparator = Comparator<PlayerProfile> { first, second ->

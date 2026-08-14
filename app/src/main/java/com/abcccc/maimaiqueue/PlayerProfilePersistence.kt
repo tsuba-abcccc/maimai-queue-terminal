@@ -37,9 +37,9 @@ internal class PlayerProfilePersistenceCoordinator(
         profile: PlayerProfile,
         onPersisted: (PlayerProfile) -> Unit = {}
     ): Boolean = writeMutex.withLock {
-        val persisted = persist(profile)
-        if (persisted) onPersisted(profile)
-        persisted
+        val persistedProfile = persist(profile) ?: return@withLock false
+        onPersisted(persistedProfile)
+        true
     }
 
     suspend fun mutateAndApply(
@@ -51,9 +51,9 @@ internal class PlayerProfilePersistenceCoordinator(
         val currentProfile = currentProfiles().firstOrNull { it.id == profileId }
             ?: return@withLock false
         val updatedProfile = mutation(currentProfile)
-        val persisted = persist(updatedProfile)
-        if (persisted) onPersisted(updatedProfile)
-        persisted
+        val persistedProfile = persist(updatedProfile) ?: return@withLock false
+        onPersisted(persistedProfile)
+        true
     }
 
     suspend fun persistIndividually(
@@ -67,11 +67,14 @@ internal class PlayerProfilePersistenceCoordinator(
         profiles.forEach { profile ->
             if (!shouldPersist(profile)) {
                 skippedProfiles += profile
-            } else if (persist(profile)) {
-                onPersisted(profile)
-                persistedProfiles += profile
             } else {
-                failedProfiles += profile
+                val persistedProfile = persist(profile)
+                if (persistedProfile != null) {
+                    onPersisted(persistedProfile)
+                    persistedProfiles += persistedProfile
+                } else {
+                    failedProfiles += profile
+                }
             }
         }
         PlayerProfilePersistenceResult(
@@ -140,14 +143,18 @@ internal class PlayerProfilePersistenceCoordinator(
             }
         }
         val profilesChanged = orderedProfiles != localProfiles
-        if (profilesChanged && !replaceAll(orderedProfiles)) {
-            return@withLock CloudPlayerProfilePersistenceResult.PersistenceFailed
+        val persistedProfiles = if (profilesChanged) {
+            replaceAll(orderedProfiles)
+                ?: return@withLock CloudPlayerProfilePersistenceResult.PersistenceFailed
+        } else {
+            orderedProfiles
         }
+        val persistedById = persistedProfiles.associateBy(PlayerProfile::id)
         CloudPlayerProfilePersistenceResult.Success(
-            profiles = orderedProfiles,
-            appliedProfiles = appliedProfiles,
+            profiles = persistedProfiles,
+            appliedProfiles = appliedProfiles.mapNotNull { persistedById[it.id] },
             appliedAliases = appliedAliases,
-            profilesChanged = profilesChanged
+            profilesChanged = persistedProfiles != localProfiles
         )
     }
 
@@ -163,9 +170,10 @@ internal class PlayerProfilePersistenceCoordinator(
             nicknameConflictsWithQueue = nicknameConflictsWithQueue
         )) {
             is PlayerProfileCommandDecision.Apply -> {
-                if (persist(decision.profile)) {
-                    onPersisted(decision.profile)
-                    PlayerProfileCommandPersistenceResult.Applied(decision.profile)
+                val persistedProfile = persist(decision.profile)
+                if (persistedProfile != null) {
+                    onPersisted(persistedProfile)
+                    PlayerProfileCommandPersistenceResult.Applied(persistedProfile)
                 } else {
                     PlayerProfileCommandPersistenceResult.PersistenceFailed
                 }
@@ -173,7 +181,9 @@ internal class PlayerProfilePersistenceCoordinator(
 
             PlayerProfileCommandDecision.AlreadyApplied -> {
                 val currentProfile = currentProfiles().firstOrNull { it.id == command.profileId }
-                if (currentProfile != null && persist(currentProfile)) {
+                val persistedProfile = currentProfile?.let { persist(it) }
+                if (persistedProfile != null) {
+                    if (persistedProfile != currentProfile) onPersisted(persistedProfile)
                     PlayerProfileCommandPersistenceResult.AlreadyApplied
                 } else {
                     PlayerProfileCommandPersistenceResult.PersistenceFailed
@@ -185,19 +195,19 @@ internal class PlayerProfilePersistenceCoordinator(
         }
     }
 
-    private suspend fun persist(profile: PlayerProfile): Boolean = try {
+    private suspend fun persist(profile: PlayerProfile): PlayerProfile? = try {
         repository.upsertProfile(profile)
     } catch (error: CancellationException) {
         throw error
     } catch (_: Exception) {
-        false
+        null
     }
 
-    private suspend fun replaceAll(profiles: List<PlayerProfile>): Boolean = try {
+    private suspend fun replaceAll(profiles: List<PlayerProfile>): List<PlayerProfile>? = try {
         repository.replaceProfiles(profiles)
     } catch (error: CancellationException) {
         throw error
     } catch (_: Exception) {
-        false
+        null
     }
 }
