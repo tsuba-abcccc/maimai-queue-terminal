@@ -266,7 +266,7 @@ Koishi 在连接 OneBot 后上报实际登录 QQ，并定期刷新。终端拉�
 
 ```properties
 ENABLE_TERMINAL_BUILD=true
-QUEUE_SYNC_URL=https://queue.example.com/api/queue-status
+QUEUE_SYNC_URL=https://example.com/api/queue-status
 QUEUE_SYNC_TOKEN=<终端令牌>
 ```
 

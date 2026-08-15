@@ -7,7 +7,7 @@
 - 最稳定的部署形态是“一台服务端实例 + 一个现场终端 + 一个 Bot 实例”。终端本机始终是队列事实来源，服务端故障时现场排队仍可继续。
 - 当前服务端数据库的公开快照是一份队列实例。要同时运行多个机厅，测试阶段应为每个机厅创建独立的 API 实例、SQLite 数据目录、令牌和站点地址；不要让多个机厅共用同一个数据库卷。
 - 当前支持备用终端接管，但不支持多台终端同时写入同一队列。另一份终端正在同步时，服务器会拒绝第二份实例，显示“另一份终端实例正在同步”。正式的多终端联动仍属于后续版本。
-- 公开测试网站是 `public-site/` 下的独立 Vue/Vite 静态页；不需要在生产环境长期运行 Node.js。API 和 Bot 才是常驻服务。它只包含排队状态、公开日志、版本信息和线上登记，不带维护者个人网站的文章、导航或重定向。个人 `site-main` 仍可独立部署，继续保留原有完整内容。
+- 公开测试网站是 `public-site/` 下的独立 Vue/Vite 静态页；不需要在生产环境长期运行 Node.js。API 和 Bot 才是常驻服务。它只包含排队状态、公开日志、版本信息和线上登记，不带其他站点的文章、导航或重定向逻辑。其他站点可以独立部署，保留各自内容。
 - SQLite 适合公开测试和小规模机厅。大规模、多机厅和高并发使用前，应等待多租户方案或自行评估 PostgreSQL 迁移。
 
 ## 推荐拓扑
@@ -23,8 +23,8 @@ Koishi + OneBot ──────┘
 推荐让网站和 API 使用同一个 HTTPS 域名，例如：
 
 ```text
-https://queue.example.com
-https://queue.example.com/api/queue-status
+https://example.com
+https://example.com/api/queue-status
 ```
 
 这样不需要额外配置跨域。网站与 API 分域也可以，但必须把 `QUEUE_CORS_ORIGIN` 和网站构建时的 `VITE_QUEUE_*` 地址同时配置正确。
@@ -69,8 +69,8 @@ openssl rand -hex 32   # 再生成一份，写入 QUEUE_BOT_TOKEN
 QUEUE_SYNC_TOKEN=<只给现场终端的令牌>
 QUEUE_BOT_TOKEN=<只给 Koishi 的另一份令牌>
 QUEUE_PROFILE_SCOPE_ID=venue-demo-001
-QUEUE_CORS_ORIGIN=https://queue.example.com
-QUEUE_PUBLIC_SITE_URL=https://queue.example.com
+QUEUE_CORS_ORIGIN=https://example.com
+QUEUE_PUBLIC_SITE_URL=https://example.com
 QUEUE_LATEST_TERMINAL_VERSION=0.11.0
 QUEUE_LATEST_WEBSITE_VERSION=0.11.0
 QUEUE_LATEST_BOT_VERSION=0.3.13
@@ -96,8 +96,8 @@ Compose 将 SQLite 保存在名为 `queue-status-data` 的持久卷中，API 只
 ```bash
 sudo nginx -t
 sudo systemctl reload nginx
-curl -fsS https://queue.example.com/queue-api-healthz
-curl -fsS https://queue.example.com/api/queue-versions
+curl -fsS https://example.com/queue-api-healthz
+curl -fsS https://example.com/api/queue-versions
 ```
 
 健康检查应返回 `status: ok`。`/api/queue-versions` 可以在还没有终端上传时显示“未知”，这不代表服务故障。
@@ -106,7 +106,7 @@ curl -fsS https://queue.example.com/api/queue-versions
 
 ### 4. 构建并部署网站
 
-公开测试网站直接使用主项目固定版本中的 `public-site/`，不需要克隆或运行个人 `site-main`：
+公开测试网站直接使用主项目固定版本中的 `public-site/`，不需要克隆或运行其他站点：
 
 ```bash
 cd public-site
@@ -116,13 +116,13 @@ pnpm install --frozen-lockfile
 同域名部署时，建议显式设置所有 API 地址，避免构建机上的示例域名被带入产物：
 
 ```bash
-export VITE_QUEUE_STATUS_API_URL=https://queue.example.com/api/queue-status
-export VITE_QUEUE_LOG_API_URL=https://queue.example.com/api/queue-logs
-export VITE_QUEUE_VERSIONS_API_URL=https://queue.example.com/api/queue-versions
-export VITE_QUEUE_ONLINE_PROFILE_API_URL=https://queue.example.com/api/queue-online/profile
-export VITE_QUEUE_ONLINE_JOIN_API_URL=https://queue.example.com/api/queue-online/join
-export VITE_QUEUE_ONLINE_COMMAND_API_BASE=https://queue.example.com/api/queue-online/commands
-export VITE_QUEUE_MOBILE_API_BASE=https://queue.example.com/api/queue-mobile/sessions
+export VITE_QUEUE_STATUS_API_URL=https://example.com/api/queue-status
+export VITE_QUEUE_LOG_API_URL=https://example.com/api/queue-logs
+export VITE_QUEUE_VERSIONS_API_URL=https://example.com/api/queue-versions
+export VITE_QUEUE_ONLINE_PROFILE_API_URL=https://example.com/api/queue-online/profile
+export VITE_QUEUE_ONLINE_JOIN_API_URL=https://example.com/api/queue-online/join
+export VITE_QUEUE_ONLINE_COMMAND_API_BASE=https://example.com/api/queue-online/commands
+export VITE_QUEUE_MOBILE_API_BASE=https://example.com/api/queue-mobile/sessions
 pnpm run build
 ```
 
@@ -137,7 +137,7 @@ mv /var/www/queue-site/dist-next /var/www/queue-site/dist
 
 根路径是独立队列页的规范入口；`/queue-status` 和 `/queue-status/` 仅作为旧链接兼容入口，建议在反向代理中重定向到根路径。二维码应使用 `QUEUE_PUBLIC_SITE_URL` 配置的根地址。
 
-个人站点需要单独部署时，在主项目 `public-site/` 中先运行 `pnpm run sync:site-main -- --site-main <个人 site-main 路径>`，再按个人站点自己的 VitePress 流程构建。同步脚本只更新四个队列共享组件；发布前必须运行 `pnpm run check:site-main -- --site-main <个人 site-main 路径>`，确保两个站点的队列逻辑一致。
+其他站点需要复用队列组件时，可将 `public-site/src/queue/` 按自身构建流程同步到对应前端，并在发布前运行项目提供的一致性检查，确保各站点的队列逻辑一致。
 
 若站点和 API 分域，仍需设置 API 的 `QUEUE_CORS_ORIGIN` 为精确的网站 origin（不要写路径、不要使用 `*`），并让网站构建变量指向 API 域名。
 
@@ -163,8 +163,8 @@ pnpm add -w /absolute/path/to/koishi-plugin-maimai-q-0.3.13.tgz
 ```yaml
 plugins:
   maimai-q:
-    apiBase: https://queue.example.com
-    publicQueueUrl: https://queue.example.com
+    apiBase: https://example.com
+    publicQueueUrl: https://example.com
     botToken: <QUEUE_BOT_TOKEN>
     oneBotSelfId: '<Bot QQ>'
     notificationEnabled: true
@@ -233,7 +233,7 @@ apksigner verify --verbose maimai-Q-0.11.0-terminal.apk
 - 主仓库 Git tag（例如 `v0.11.0`）和 GitHub Release；
 - API 源码或 Docker 构建上下文、数据库迁移说明；
 - Android APK（公开本地版、必要时另附受控终端版）；
-- `public-site` 对应源码、静态站点压缩包和 `queue-client-version.json`；个人 `site-main` 如同步发布，再另外保留其对应提交或 tag；
+- `public-site` 对应源码、静态站点压缩包和 `queue-client-version.json`；其他独立站点如同步发布，再另外保留其对应提交或 tag；
 - Koishi 插件 tarball、版本号和 lockfile；
 - 面向玩家的更新日志、管理员更新说明和每个文件的 SHA-256；
 - 兼容性说明：支持的队列 schema、最低 Android 版本、是否需要迁移。
@@ -279,9 +279,9 @@ API 升级完成后，管理员还必须把 `.env` 中三个 `QUEUE_LATEST_*_VER
 - 两者使用同一套 0.11.0 队列规则和跨端协议；差异主要是签名、默认配置、网站外壳和数据实例，不是另做一套功能逻辑。
 - 公开 `terminal-beta.apk` 使用长期 Release 证书签名，不预置服务器地址或令牌。维护者目前现场安装的联调终端使用 Android Debug 证书，已经保存自己的服务器配置和现场数据；两个签名不同，不能直接互相覆盖安装。
 - 维护者可以继续使用现有联调终端，不会因 GitHub 公开发布而自动改变、清空或连接到其他实例。若以后迁移到公开 Release 签名，必须先导出并核对可恢复的数据与配置，再卸载 Debug 版并安装 Release 版；不要在正在排队时迁移。
-- 公开网站来自 `public-site/`；维护者自己的 `site-main` 保留个人站点外壳。两者共享队列组件，但分别构建、分别部署，公开包不会包含个人文章或导航。
+- 公开网站来自 `public-site/`；其他站点可以保留自己的站点外壳。两者共享队列组件，但分别构建、分别部署，公开包不会包含其他站点的文章或导航。
 - 每个公开部署者使用自己的 API、SQLite 数据卷、域名和令牌。GitHub 发布不会开放维护者数据库，也不会让其他部署实例自动连接维护者服务。
 
 ## 当前测试版的发布判断
 
-本版本的后端、Bot、Android 和独立公开网站门槛测试已通过，APK 已用长期发布证书签名并附带校验清单，公开测试 Release 使用 `public-site/`，个人 `site-main` 不会被替换或并入公开站点。当前不提供预构建 Docker 镜像；本机未运行 Docker daemon，因此部署者仍需在自己的主机上执行一次 `docker compose build`，并在真实域名环境完成联调、备份和恢复演练。创建 Release 后，部署者必须把服务端三个 `QUEUE_LATEST_*_VERSION` 设置为实际配套版本，并在发布记录中注明公开站点提交。
+本版本的后端、Bot、Android 和独立公开网站门槛测试已通过，APK 已用长期发布证书签名并附带校验清单，公开测试 Release 使用 `public-site/`，不会替换或并入其他站点。当前不提供预构建 Docker 镜像；本机未运行 Docker daemon，因此部署者仍需在自己的主机上执行一次 `docker compose build`，并在真实域名环境完成联调、备份和恢复演练。创建 Release 后，部署者必须把服务端三个 `QUEUE_LATEST_*_VERSION` 设置为实际配套版本，并在发布记录中注明公开站点提交。

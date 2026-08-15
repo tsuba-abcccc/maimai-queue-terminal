@@ -601,7 +601,7 @@ QQ 是玩家资料的必要信息，也是后续 QQ Bot 识别玩家和发送排
 
 已配置与服务端同步的机厅可以通过以下页面查看公开队列：
 
-[打开 maimai Q 在线队列](https://queue.example.com/queue-status)
+[打开 maimai Q 在线队列](https://example.com/queue-status)
 
 ### 网站可以查看什么
 
