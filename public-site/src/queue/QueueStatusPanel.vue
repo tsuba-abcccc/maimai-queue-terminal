@@ -3082,8 +3082,9 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-logs-header h2 { margin: 0; border: 0; font-size: 20px; font-weight: 630; letter-spacing: 0; }
 .queue-logs-header p { margin: 4px 0 0; color: var(--queue-secondary); font-size: 11px; line-height: 1.5; }
 .queue-log-filter-groups { display: flex; min-width: 0; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
-.queue-log-filters { display: flex; padding: 3px; flex: 0 1 auto; flex-wrap: wrap; border-radius: 9px; background: var(--queue-position); }
-.queue-log-filters button { min-height: 30px; padding: 0 9px; border: 0; border-radius: 7px; color: var(--queue-secondary); background: transparent; cursor: pointer; font-size: 10px; transition: color .16s ease, background .16s ease, box-shadow .16s ease; }
+.queue-log-filters { display: flex; min-width: 0; max-width: 100%; padding: 3px; flex: 0 1 auto; flex-wrap: nowrap; overflow-x: auto; border-radius: 9px; background: var(--queue-position); scrollbar-width: none; }
+.queue-log-filters::-webkit-scrollbar { display: none; }
+.queue-log-filters button { min-height: 30px; padding: 0 9px; flex: 0 0 auto; border: 0; border-radius: 7px; color: var(--queue-secondary); background: transparent; cursor: pointer; font-size: 10px; white-space: nowrap; transition: color .16s ease, background .16s ease, box-shadow .16s ease; }
 .queue-log-filters button.active { color: var(--queue-text); background: var(--queue-card); box-shadow: 0 1px 3px rgba(0, 0, 0, .08); }
 .queue-log-list { margin: 17px 0 0; padding: 0; list-style: none; border-top: 1px solid var(--queue-separator); }
 .queue-log-list li { display: grid; padding: 14px 2px; grid-template-columns: 112px minmax(0, 1fr); gap: 18px; border-bottom: 1px solid var(--queue-separator); }
@@ -3287,8 +3288,8 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
   .queue-self-clear { grid-column: 2; justify-self: start; padding: 4px 0; }
   .queue-logs { padding: 15px; }
   .queue-logs-header { align-items: stretch; flex-direction: column; }
-  .queue-log-filter-groups { align-items: stretch; flex-direction: column; }
-  .queue-log-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(64px, 1fr)); }
+  .queue-log-filter-groups { width: 100%; align-items: stretch; flex-direction: column; gap: 6px; }
+  .queue-log-filters { width: 100%; flex: 0 1 auto; }
   .queue-log-filters button { padding: 0 5px; }
   .queue-log-list li { grid-template-columns: 1fr; gap: 7px; }
   .queue-log-time { display: flex; align-items: center; gap: 7px; }

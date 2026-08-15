@@ -23,6 +23,17 @@
 - [云端同步协议](docs/cloud-queue-sync.md)
 - [后端部署说明](cloud-server/README.md)
 
+## 不自行构建的公开测试部署
+
+如果只想使用已经验收的公开测试包，不需要构建 Android 应用、网站前端或 QQ Bot。请从[GitHub Releases](https://github.com/tsuba-abcccc/maimai-queue-terminal/releases)下载同一 Release 中的配套附件，并按[公开测试版自建部署方案](docs/public-beta-deployment.md)配置自己的服务端和 Bot：
+
+1. 终端直接安装 `maimai-Q-<版本>-terminal-beta.apk`；不需要运行 Gradle。完全离线使用时安装 `local-beta.apk`，它不会连接服务器。
+2. 服务端使用 Release 对应的源码或 Docker 构建上下文启动 API。当前公开 Release 尚未提供预构建 Docker 镜像，因此服务端仍需在自己的主机执行一次 `docker compose up -d --build`；这不会涉及 Android 或网站前端构建。
+3. Bot 直接安装 Release 中配套版本的 `koishi-plugin-maimai-q-<Bot版本>.tgz`，不需要从源码打包。只使用 Bot 时可以不部署网站；需要公开队列或线上登记时，再直接解压同一 Release 的 `public-site-<终端版本>-beta.tar.gz`，由 Nginx/Caddy 提供静态文件，不需要运行 Vite 构建。
+4. 使用 Release 附带的 `SHA256SUMS` 校验所有下载文件，服务端地址、令牌、域名和数据库只填写自己的配置，不要复制示例中的实际值。
+
+这条路径适合公开测试和小规模单机厅部署；不要求维护源码，也不会自动连接项目维护者的服务器。
+
 ## 项目定位
 
 maimai Q 处理的是机厅现场排队，不是线上预约系统。它将现场连续配置的 1 至 10 台机台视为彼此独立的队列，并把每名玩家的登记、游玩偏好和现场状态组合成一轮轮可执行的等待位置。
