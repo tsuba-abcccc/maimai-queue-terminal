@@ -26,8 +26,8 @@ QUEUE_COMMAND_TIMEOUT_SECONDS=600
 QUEUE_COMMAND_CLAIM_LEASE_SECONDS=15
 QUEUE_COMMAND_RETENTION_SECONDS=2592000
 QUEUE_EVENT_RECIPIENT_RETENTION_SECONDS=2592000
-QUEUE_CORS_ORIGIN=https://queue.example.com
-QUEUE_PUBLIC_SITE_URL=https://queue.example.com
+QUEUE_CORS_ORIGIN=https://example.com
+QUEUE_PUBLIC_SITE_URL=https://example.com
 QUEUE_MOBILE_SESSION_TTL_SECONDS=600
 QUEUE_MOBILE_SESSION_RETENTION_SECONDS=86400
 QUEUE_LATEST_TERMINAL_VERSION=0.11.0
@@ -187,7 +187,7 @@ Windows PowerShell 激活命令为 `.venv\Scripts\Activate.ps1`。
 3. 运行 `docker compose up -d --build`。
 4. 将 `nginx-location.conf.example` 中的 location 加入自己的 HTTPS 站点。
 5. 执行 `nginx -t` 并重载 Nginx。
-6. 访问 `https://queue.example.com/queue-api-healthz` 验证服务（将域名替换为自己的域名）。
+6. 访问 `https://example.com/queue-api-healthz` 验证服务（将域名替换为自己的域名）。
 
 ## systemd 部署
 
@@ -253,11 +253,11 @@ sudo systemctl reload nginx
 先验证公开健康检查：
 
 ```bash
-curl -i https://queue.example.com/queue-api-healthz
+curl -i https://example.com/queue-api-healthz
 curl -i -X POST -H 'Content-Type: application/json' \
-  -d '{"qq":"00000"}' https://queue.example.com/api/queue-online/profile
-curl -i https://queue.example.com/api/queue-mobile/sessions/invalid-token
-curl -i 'https://queue.example.com/api/queue-bot/events?after=0&limit=1'
+  -d '{"qq":"00000"}' https://example.com/api/queue-online/profile
+curl -i https://example.com/api/queue-mobile/sessions/invalid-token
+curl -i 'https://example.com/api/queue-bot/events?after=0&limit=1'
 ```
 
 第一条应返回 `200`。第二条应返回后端 JSON；测试 QQ 不存在时通常为 `404 PROFILE_NOT_FOUND`，这证明网站线上登记路由已经生效。第三条应返回后端 JSON `404` 和“没有找到这次移动设备登记”，证明移动登记路由已经生效。第四条故意不带令牌，应返回 `401` 和“Bot 认证失败”，这说明 Bot 路由已经到达新版后端。其他结果的含义如下：
@@ -271,12 +271,12 @@ curl -i 'https://queue.example.com/api/queue-bot/events?after=0&limit=1'
 ```bash
 read -rsp 'QUEUE_BOT_TOKEN: ' QUEUE_BOT_TOKEN; echo
 curl -sS -H "Authorization: Bearer ${QUEUE_BOT_TOKEN}" \
-  'https://queue.example.com/api/queue-bot/events?after=0&limit=1'
+  'https://example.com/api/queue-bot/events?after=0&limit=1'
 curl -sS -X POST \
   -H "Authorization: Bearer ${QUEUE_BOT_TOKEN}" \
   -H 'Content-Type: application/json' \
   -d '{"qq":"替换为已建资料的QQ号"}' \
-  'https://queue.example.com/api/queue-bot/profiles'
+  'https://example.com/api/queue-bot/profiles'
 unset QUEUE_BOT_TOKEN
 ```
 

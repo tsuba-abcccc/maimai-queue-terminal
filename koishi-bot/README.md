@@ -84,8 +84,8 @@ pnpm add -w /absolute/path/to/koishi-plugin-maimai-q-0.3.13.tgz
 ```yaml
 plugins:
   maimai-q:
-    apiBase: https://queue.example.com
-    publicQueueUrl: https://queue.example.com
+    apiBase: https://example.com
+    publicQueueUrl: https://example.com
     botToken: <与服务器 QUEUE_BOT_TOKEN 相同的令牌>
     oneBotSelfId: '<用于发送私信的机器人 QQ>'
     notificationEnabled: true
@@ -108,9 +108,9 @@ systemctl status maimai-q-koishi.service
 
 配置字段含义：
 
-- `apiBase`：例如 `https://queue.example.com`。只填写站点根地址，不要附加 `/api`、查询参数或账号密码。
+- `apiBase`：例如 `https://example.com`。只填写站点根地址，不要附加 `/api`、查询参数或账号密码。
 - `apiBase` 没有维护者服务的默认值；公开或自建部署必须显式填写自己的后端地址，避免插件误连接其他机厅。
-- `publicQueueUrl`：队列网站的根地址，例如 `https://queue.example.com`。网站与 API 分开部署时必须填写；不要附加 `/queue-status` 等路径、查询参数或账号密码。留空时使用 `apiBase`。
+- `publicQueueUrl`：队列网站的根地址，例如 `https://example.com`。网站与 API 分开部署时必须填写；不要附加 `/queue-status` 等路径、查询参数或账号密码。留空时使用 `apiBase`。
 - `botToken`：与服务器 `QUEUE_BOT_TOKEN` 相同。
 - `oneBotSelfId`：存在多个 OneBot 实例时填写用于主动通知的机器人 QQ。留空时选择首个在线 OneBot；填写后不会自动改用其他实例。该字段不限制玩家从哪个 OneBot 会话执行命令。
 - `notificationEnabled`：是否在此 Koishi 实例运行通知轮询，默认开启。玩家资料中的个人总开关和分项设置仍由终端、Bot 与云端共同保存。
