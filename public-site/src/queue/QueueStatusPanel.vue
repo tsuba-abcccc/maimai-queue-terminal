@@ -2322,6 +2322,54 @@ function markOnlinePlayerAsSelf(registration = null, allowReplacementPrompt = tr
   return true
 }
 
+function openExistingOnlineRegistration(registration = null) {
+  const registrationId = registration?.registration_id ?? registration?.registrationId ?? ''
+  const location = registrationId
+    ? registrationLocations.value.find(({ registration: candidate }) => (
+      candidate.registrationId === registrationId
+    ))
+    : null
+
+  // Anonymous self lookups retain the existing local marker behavior. A lookup
+  // made for someone else must never turn that person's registration into ours.
+  if (onlineJoinAudience.value === 'SELF' && !playerAccount.value &&
+    !markOnlinePlayerAsSelf(registration)) {
+    closeOnlineJoin()
+    return
+  }
+
+  closeOnlineJoin()
+  if (!location) {
+    loadQueue(true)
+    return
+  }
+  showMachineGroup(location.machine)
+  openRegistration(
+    location.machine,
+    location.registration,
+    location.label,
+    location.kind === 'PLAYING' ? null : location.estimate,
+    location.registrations,
+    location.commonPlayPreview,
+    location.kind === 'PLAYING'
+  )
+}
+
+function openActiveSelfDetail() {
+  const location = markedSelfLocation.value
+  if (!location) return
+  showMachineGroup(location.machine)
+  openRegistration(
+    location.machine,
+    location.registration,
+    location.label,
+    location.kind === 'PLAYING' ? null : location.estimate,
+    location.registrations,
+    location.commonPlayPreview,
+    location.kind === 'PLAYING'
+  )
+}
+
 function scheduleOnlineCommandPoll() {
   if (!onlineJoinCommandId.value) return
   if (onlineCommandTimer) window.clearTimeout(onlineCommandTimer)
@@ -2608,7 +2656,10 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <section v-if="activeSelfIdentity" class="queue-self" :class="`is-${markedSelfTone()}`" aria-live="polite">
+    <section v-if="activeSelfIdentity" class="queue-self" :class="[`is-${markedSelfTone()}`, { 'is-clickable': markedSelfLocation }]"
+      :role="markedSelfLocation ? 'button' : undefined" :tabindex="markedSelfLocation ? 0 : undefined"
+      aria-live="polite" @click="openActiveSelfDetail"
+      @keydown.enter.self.prevent="openActiveSelfDetail" @keydown.space.self.prevent="openActiveSelfDetail">
       <div class="queue-self-icon" aria-hidden="true">
         <UserRoundCheck :size="22" />
       </div>
@@ -2631,7 +2682,7 @@ onBeforeUnmount(() => {
           </span>
         </div>
       </div>
-      <button v-if="!accountSessionActive" class="queue-self-clear" type="button" @click="clearMarkedSelf">取消标记</button>
+      <button v-if="!accountSessionActive" class="queue-self-clear" type="button" @click.stop="clearMarkedSelf">取消标记</button>
       <span v-else class="queue-self-account-badge">已登录</span>
     </section>
 
@@ -3129,8 +3180,8 @@ onBeforeUnmount(() => {
                 : '不能重复加入排队。' }}</p>
               <p v-if="onlineJoinExistingRegistration.online_registration_pending_check_in && !onlineJoinProfile.setupComplete">这份玩家资料尚未补全。到场后须先在终端补全资料，才能签到。</p>
               <button class="queue-online-primary" type="button"
-                @click="markOnlinePlayerAsSelf(onlineJoinExistingRegistration); closeOnlineJoin()">
-                查看我的排队
+                @click="openExistingOnlineRegistration(onlineJoinExistingRegistration)">
+                {{ onlineJoinAudience === 'OTHER' ? '查看该登记' : '查看我的排队' }}
               </button>
             </div>
 
@@ -3562,6 +3613,8 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-stale-notice span { margin-top: 2px; color: var(--queue-secondary); font-size: 11px; line-height: 1.55; }
 
 .queue-self { display: grid; margin: 0 0 18px; padding: 17px 18px; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: start; gap: 13px; border: 1px solid color-mix(in srgb, var(--queue-blue) 28%, var(--queue-separator)); border-radius: 14px; background: color-mix(in srgb, var(--queue-soft-blue) 72%, var(--queue-card)); }
+.queue-self.is-clickable { cursor: pointer; }
+.queue-self.is-clickable:focus-visible { outline: 2px solid var(--queue-blue); outline-offset: 2px; }
 .queue-self.is-warning { border-color: color-mix(in srgb, #ff9500 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-orange) 74%, var(--queue-card)); }
 .queue-self.is-danger { border-color: color-mix(in srgb, var(--queue-red) 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-red) 76%, var(--queue-card)); }
 .queue-self.is-online { border-color: color-mix(in srgb, var(--queue-online) 36%, var(--queue-separator)); background: color-mix(in srgb, var(--queue-soft-online) 78%, var(--queue-card)); }

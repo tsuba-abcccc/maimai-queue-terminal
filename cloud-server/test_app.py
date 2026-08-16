@@ -284,6 +284,16 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertTrue(command.get_json()["payload"]["profile_identity_verified"])
         self.assertEqual(400, forged.status_code)
 
+        command_status = fresh_client.get(
+            f"/api/queue-online/commands/{command_payload['request_id']}"
+        )
+        anonymous_status = self.app.test_client().get(
+            f"/api/queue-online/commands/{command_payload['request_id']}"
+        )
+        self.assertEqual(200, command_status.status_code)
+        self.assertEqual("PENDING", command_status.get_json()["status"])
+        self.assertEqual(404, anonymous_status.status_code)
+
     def test_player_account_rebinding_preserves_settings_and_validation_uses_http_errors(self):
         snapshot = self.remote_ready_snapshot()
         self.assertEqual(

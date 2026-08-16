@@ -238,11 +238,13 @@ function registrationAbsenceStatus(registration) {
 
 function accountQueuePositionText(registration) {
   return registration.position === 'PLAYING'
-    ? `${registration.machine_id} 机台游玩位置`
-    : `队列位置 ${registration.machine_id}${registration.position_index}`
+    ? `游玩位置 ${registration.machine_id}`
+    : `位置 ${registration.machine_id}${registration.position_index || ''}`
 }
 
 function accountQueueEstimateText(registration) {
+  if (!queueState.value?.queue?.terminal_online) return '状态待更新，暂时无法确认当前安排'
+  if (registration.machine_operational === false) return '机台停止使用，恢复后重新确认'
   if (registration.position === 'PLAYING') return '现在可以游玩'
   if (registration.online_registration_pending_check_in) return '完成现场签到后才是有效登记'
   if (registration.temporarily_away) return '暂时离开，无法估算'
@@ -253,7 +255,10 @@ function accountQueueEstimateText(registration) {
 
 function accountQueueStateText(registration) {
   if (registration.online_registration_pending_check_in) return '线上登记 · 待签到'
-  if (registration.temporarily_away) return `暂时离开 · 已轮空 ${registration.temporary_away_skipped_turns || 0} 次`
+  if (registration.temporarily_away) {
+    const skippedTurns = registration.temporary_away_skipped_turns || 0
+    return skippedTurns > 0 ? `暂时离开 · 已轮空 ${skippedTurns} 次` : '暂时离开'
+  }
   if (registration.deferred_once) return '暂缓一次'
   return registration.preference === 'SOLO' ? '单人游玩' : '允许他人加入'
 }

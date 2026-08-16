@@ -5553,6 +5553,19 @@ def read_website_command(command_id: str):
     payload = json.loads(row["payload"])
     if payload.get("operation_source") != "WEBSITE_REMOTE":
         return jsonify({"ok": False, "error": "没有找到这条命令"}), 404
+    request_identity = payload.get("_request")
+    account_profile_id = (
+        request_identity.get("actor_profile_id")
+        if isinstance(request_identity, dict)
+        else None
+    )
+    if account_profile_id:
+        # Account queue actions are private. Public online-join commands do
+        # not carry actor_profile_id and remain readable without a login.
+        with open_database() as connection:
+            current = current_player_account_session(connection)
+        if current is None or current[1]["profile_id"] != account_profile_id:
+            return jsonify({"ok": False, "error": "没有找到这条命令"}), 404
     command = serialize_command(row)
     command.pop("payload", None)
     return jsonify(command)
