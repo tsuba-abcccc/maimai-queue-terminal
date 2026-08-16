@@ -104,13 +104,28 @@ class QueueCloudCommandTest {
                     "machine_stable_id": "10000000000000000000000000000001",
                     "preference": "OPEN_TO_JOIN"
                   }
+                },
+                {
+                  "command_id": "00000000-0000-0000-0000-000000000402",
+                  "type": "QUEUE_OPERATION",
+                  "created_at": 2001,
+                  "payload": {
+                    "queue_id": "00000000-0000-0000-0000-000000000001",
+                    "profile_id": "00000000-0000-0000-0000-000000000901",
+                    "actor_qq": "87654321",
+                    "profile_identity_verified": true,
+                    "operation": "LEAVE_QUEUE",
+                    "operation_source": "WEBSITE_REMOTE",
+                    "machine_id": "A",
+                    "registration_id": "000000000000000000000001"
+                  }
                 }
               ]
             }
             """.trimIndent()
         )
 
-        assertEquals(2, parsed.size)
+        assertEquals(3, parsed.size)
         assertTrue(parsed[0] is PlayerProfileUpdateCommand)
         val join = parsed[1] as RemoteQueueOperationCommand
         assertEquals(RemoteQueueOperation.JOIN_QUEUE, join.operation)
@@ -118,6 +133,10 @@ class QueueCloudCommandTest {
         assertEquals("A", join.machineId)
         assertEquals("10000000000000000000000000000001", join.machineStableId)
         assertEquals(PlayPreference.OPEN_TO_JOIN, join.preference)
+        val accountOperation = parsed[2] as RemoteQueueOperationCommand
+        assertEquals(RemoteQueueOperation.LEAVE_QUEUE, accountOperation.operation)
+        assertEquals(RemoteQueueOperationSource.WEBSITE_REMOTE, accountOperation.source)
+        assertTrue(accountOperation.profileIdentityVerified)
     }
 
     @Test
@@ -128,6 +147,64 @@ class QueueCloudCommandTest {
               "commands": [
                 {"command_id": "not-a-uuid", "type": "QUEUE_OPERATION", "payload": {}},
                 {"command_id": "00000000-0000-0000-0000-000000000402", "type": "UNKNOWN", "payload": {}}
+              ]
+            }
+            """.trimIndent()
+        )
+
+        assertTrue(parsed.isEmpty())
+    }
+
+    @Test
+    fun terminalCommandResponseRejectsUnverifiedOrMislabelledWebsiteIdentity() {
+        val parsed = parseRemoteTerminalCommands(
+            """
+            {
+              "commands": [
+                {
+                  "command_id": "00000000-0000-0000-0000-000000000410",
+                  "type": "QUEUE_OPERATION",
+                  "created_at": 2000,
+                  "payload": {
+                    "queue_id": "00000000-0000-0000-0000-000000000001",
+                    "profile_id": "00000000-0000-0000-0000-000000000901",
+                    "actor_qq": "12345678",
+                    "operation": "LEAVE_QUEUE",
+                    "operation_source": "WEBSITE_REMOTE",
+                    "machine_id": "A",
+                    "registration_id": "000000000000000000000001"
+                  }
+                },
+                {
+                  "command_id": "00000000-0000-0000-0000-000000000411",
+                  "type": "QUEUE_OPERATION",
+                  "created_at": 2000,
+                  "payload": {
+                    "queue_id": "00000000-0000-0000-0000-000000000001",
+                    "profile_id": "00000000-0000-0000-0000-000000000901",
+                    "actor_qq": "12345678",
+                    "profile_identity_verified": true,
+                    "operation": "LEAVE_QUEUE",
+                    "operation_source": "QQ_BOT",
+                    "machine_id": "A",
+                    "registration_id": "000000000000000000000001"
+                  }
+                },
+                {
+                  "command_id": "00000000-0000-0000-0000-000000000412",
+                  "type": "QUEUE_OPERATION",
+                  "created_at": 2000,
+                  "payload": {
+                    "queue_id": "00000000-0000-0000-0000-000000000001",
+                    "profile_id": "00000000-0000-0000-0000-000000000901",
+                    "actor_qq": "12345678",
+                    "profile_identity_verified": true,
+                    "operation": "JOIN_QUEUE",
+                    "operation_source": "WEBSITE_REMOTE",
+                    "machine_id": "A",
+                    "preference": "OPEN_TO_JOIN"
+                  }
+                }
               ]
             }
             """.trimIndent()

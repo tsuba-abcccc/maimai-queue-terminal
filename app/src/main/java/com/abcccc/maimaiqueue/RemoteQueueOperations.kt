@@ -33,6 +33,7 @@ internal data class RemoteQueueOperationCommand(
     val queueId: String,
     val profileId: String,
     val actorQq: String,
+    val profileIdentityVerified: Boolean = false,
     val operation: RemoteQueueOperation,
     val source: RemoteQueueOperationSource,
     val machineId: String? = null,
@@ -209,7 +210,14 @@ internal fun decideRemoteQueueOperation(
 
     val profile = state.playerProfiles.firstOrNull { it.id == command.profileId }
         ?: return reject("玩家资料已不存在。")
-    if (profile.normalizedQqNumber() != command.actorQq) {
+    val websiteAccountIdentityVerified =
+        command.source == RemoteQueueOperationSource.WEBSITE_REMOTE &&
+            command.operation != RemoteQueueOperation.JOIN_QUEUE &&
+            command.profileIdentityVerified
+    if (
+        profile.normalizedQqNumber() != command.actorQq &&
+        !websiteAccountIdentityVerified
+    ) {
         return reject("玩家资料绑定的 QQ 已发生变化，请重新查询后再操作。")
     }
 

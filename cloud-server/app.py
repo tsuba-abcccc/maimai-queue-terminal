@@ -9,9 +9,10 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
-from flask import Flask, current_app, jsonify, request
+from flask import Flask, current_app, jsonify, make_response, request
 
 
 PUBLIC_SCHEMA_VERSION = 8
@@ -37,6 +38,14 @@ MACHINE_INTERNAL_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 QQ_NUMBER_PATTERN = re.compile(r"^[0-9]{5,12}$")
 PLAYER_PUBLIC_ID_PATTERN = re.compile(r"^[0-9]{6}$")
 MOBILE_SESSION_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+PLAYER_ACCOUNT_SESSION_COOKIE = "maimai_q_session"
+PLAYER_ACCOUNT_PASSWORD_MIN_LENGTH = 8
+PLAYER_ACCOUNT_PASSWORD_MAX_LENGTH = 128
+PLAYER_ACCOUNT_SESSION_TOKEN_BYTES = 32
+PLAYER_ACCOUNT_BINDING_TOKEN_BYTES = 32
+PLAYER_ACCOUNT_SCRYPT_N = 2**14
+PLAYER_ACCOUNT_SCRYPT_R = 8
+PLAYER_ACCOUNT_SCRYPT_P = 1
 SEMANTIC_VERSION_PATTERN = re.compile(
     r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -55,6 +64,14 @@ NOTIFICATION_FIELDS = (
     "notify_online_check_in",
     "notify_absence",
     "notify_machine_status",
+)
+BOT_PROFILE_UPDATE_FIELDS = (
+    "nickname",
+    "gender",
+    "default_preference",
+    "qq_visibility",
+    *NOTIFICATION_FIELDS,
+    "setup_version",
 )
 PROFILE_UPDATE_COMMAND = "UPDATE_PLAYER_PROFILE"
 QUEUE_OPERATION_COMMAND = "QUEUE_OPERATION"
@@ -188,7 +205,51 @@ REQUIRED_DATABASE_COLUMNS = {
         "updated_at",
         "last_seen_at",
     },
-    "player_profile": {"public_player_id"},
+    "player_profile": {
+        "public_player_id",
+        "web_account_bound",
+        "terminal_editing_allowed",
+        "visited_venues_public",
+        "web_profile_revision",
+    },
+    "player_account": {
+        "account_id",
+        "profile_scope_id",
+        "profile_id",
+        "password_salt",
+        "password_hash",
+        "created_at",
+        "updated_at",
+        "password_changed_at",
+    },
+    "player_web_session": {
+        "session_id",
+        "account_id",
+        "token_hash",
+        "csrf_hash",
+        "created_at",
+        "last_seen_at",
+        "expires_at",
+        "revoked_at",
+    },
+    "player_binding_session": {
+        "binding_id",
+        "profile_scope_id",
+        "profile_id",
+        "token_hash",
+        "created_by_terminal",
+        "created_at",
+        "expires_at",
+        "consumed_at",
+        "invalidated_at",
+    },
+    "player_auth_limit": {
+        "action",
+        "subject_hash",
+        "window_started_at",
+        "failure_count",
+        "blocked_until",
+    },
     "player_public_id_alias": {
         "profile_scope_id",
         "public_player_id",
@@ -447,13 +508,34 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         MOBILE_SESSION_RETENTION_SECONDS=int(
             os.getenv("QUEUE_MOBILE_SESSION_RETENTION_SECONDS", "86400")
         ),
+        PLAYER_ACCOUNT_SESSION_TTL_SECONDS=int(
+            os.getenv("QUEUE_PLAYER_SESSION_TTL_SECONDS", "2592000")
+        ),
+        PLAYER_BINDING_SESSION_TTL_SECONDS=int(
+            os.getenv("QUEUE_PLAYER_BINDING_TTL_SECONDS", "600")
+        ),
+        PLAYER_AUTH_LIMIT_WINDOW_SECONDS=int(
+            os.getenv("QUEUE_PLAYER_AUTH_LIMIT_WINDOW_SECONDS", "900")
+        ),
+        PLAYER_AUTH_LIMIT_BLOCK_SECONDS=int(
+            os.getenv("QUEUE_PLAYER_AUTH_LIMIT_BLOCK_SECONDS", "900")
+        ),
+        PLAYER_AUTH_LIMIT_FAILURES=int(
+            os.getenv("QUEUE_PLAYER_AUTH_LIMIT_FAILURES", "5")
+        ),
+        PLAYER_ACCOUNT_COOKIE_SECURE=os.getenv(
+            "QUEUE_PLAYER_COOKIE_SECURE", "true"
+        ).strip().lower() not in {"0", "false", "no"},
+        PLAYER_ACCOUNT_SITE_URL=os.getenv(
+            "QUEUE_PLAYER_ACCOUNT_SITE_URL", ""
+        ).strip().rstrip("/"),
         CORS_ORIGIN=configured_cors_origin,
         PUBLIC_SITE_URL=configured_public_site_url.rstrip("/"),
         LATEST_TERMINAL_VERSION=os.getenv(
-            "QUEUE_LATEST_TERMINAL_VERSION", "0.11.0"
+            "QUEUE_LATEST_TERMINAL_VERSION", "0.12.0"
         ),
         LATEST_WEBSITE_VERSION=os.getenv(
-            "QUEUE_LATEST_WEBSITE_VERSION", "0.11.0"
+            "QUEUE_LATEST_WEBSITE_VERSION", "0.12.0"
         ),
         LATEST_BOT_VERSION=os.getenv("QUEUE_LATEST_BOT_VERSION", "0.3.13"),
         MAX_CONTENT_LENGTH=MAX_PAYLOAD_BYTES,
@@ -713,6 +795,10 @@ def initialize_database(database_path: str, *, profile_scope_id: str = "default"
                 created_at INTEGER NOT NULL,
                 profile_updated_at INTEGER NOT NULL,
                 public_player_id TEXT,
+                web_account_bound INTEGER NOT NULL DEFAULT 0,
+                terminal_editing_allowed INTEGER NOT NULL DEFAULT 1,
+                visited_venues_public INTEGER NOT NULL DEFAULT 1,
+                web_profile_revision INTEGER NOT NULL DEFAULT 0,
                 received_at INTEGER NOT NULL,
                 PRIMARY KEY(device_id, profile_id)
             )
@@ -732,6 +818,10 @@ def initialize_database(database_path: str, *, profile_scope_id: str = "default"
             ("setup_version", "INTEGER NOT NULL DEFAULT 0"),
             ("profile_revision", "INTEGER NOT NULL DEFAULT 1"),
             ("public_player_id", "TEXT"),
+            ("web_account_bound", "INTEGER NOT NULL DEFAULT 0"),
+            ("terminal_editing_allowed", "INTEGER NOT NULL DEFAULT 1"),
+            ("visited_venues_public", "INTEGER NOT NULL DEFAULT 1"),
+            ("web_profile_revision", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column_name not in player_profile_columns:
                 connection.execute(
@@ -768,6 +858,75 @@ def initialize_database(database_path: str, *, profile_scope_id: str = "default"
                 profile_scope_id TEXT NOT NULL,
                 profile_id TEXT NOT NULL,
                 PRIMARY KEY(profile_scope_id, profile_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS player_account (
+                account_id TEXT PRIMARY KEY,
+                profile_scope_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                password_salt BLOB NOT NULL,
+                password_hash BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                password_changed_at INTEGER NOT NULL,
+                UNIQUE(profile_scope_id, profile_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS player_web_session (
+                session_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                csrf_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                revoked_at INTEGER,
+                FOREIGN KEY(account_id) REFERENCES player_account(account_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS player_web_session_account
+            ON player_web_session(account_id, expires_at)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS player_binding_session (
+                binding_id TEXT PRIMARY KEY,
+                profile_scope_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_by_terminal TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                consumed_at INTEGER,
+                invalidated_at INTEGER
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS player_binding_session_profile
+            ON player_binding_session(profile_scope_id, profile_id, expires_at)
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS player_auth_limit (
+                action TEXT NOT NULL,
+                subject_hash TEXT NOT NULL,
+                window_started_at INTEGER NOT NULL,
+                failure_count INTEGER NOT NULL,
+                blocked_until INTEGER,
+                PRIMARY KEY(action, subject_hash)
             )
             """
         )
@@ -989,10 +1148,12 @@ def register_routes(app: Flask) -> None:
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = (
             "Authorization, Content-Type, X-Device-ID, X-Queue-Schema-Version, "
-            "X-Queue-Venue-ID, "
+            "X-Queue-Venue-ID, X-CSRF-Token, "
             "X-Queue-Sync-Mode, X-Terminal-Instance-ID, "
             "X-Terminal-Instance-Generation"
         )
+        if origin:
+            response.headers["Access-Control-Allow-Credentials"] = "true"
         response.headers["Cache-Control"] = "no-store, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["Vary"] = "Origin"
@@ -1054,6 +1215,52 @@ def register_routes(app: Flask) -> None:
         if authorization_error is not None:
             return authorization_error
         return read_or_update_terminal_installation()
+
+    @app.post("/api/queue-terminal/player-bindings")
+    def queue_terminal_create_player_binding():
+        authorization_error = authorize_terminal()
+        if authorization_error is not None:
+            return authorization_error
+        venue_error = authorize_terminal_venue()
+        if venue_error is not None:
+            return venue_error
+        return create_player_binding_session()
+
+    @app.get("/api/player-account/bindings/<binding_token>")
+    def player_account_binding(binding_token: str):
+        return read_player_binding_session(binding_token)
+
+    @app.post("/api/player-account/bindings/<binding_token>/complete")
+    def player_account_complete_binding(binding_token: str):
+        return complete_player_binding_session(binding_token)
+
+    @app.post("/api/player-account/login")
+    def player_account_login():
+        return login_player_account()
+
+    @app.get("/api/player-account")
+    def player_account_current():
+        return read_current_player_account()
+
+    @app.patch("/api/player-account/profile")
+    def player_account_update_profile():
+        return update_current_player_account_profile()
+
+    @app.post("/api/player-account/password")
+    def player_account_update_password():
+        return update_current_player_account_password()
+
+    @app.get("/api/player-account/queue")
+    def player_account_queue():
+        return read_current_player_account_queue()
+
+    @app.post("/api/player-account/queue-commands")
+    def player_account_queue_command():
+        return create_player_account_queue_operation_command()
+
+    @app.post("/api/player-account/logout")
+    def player_account_logout():
+        return logout_player_account()
 
     @app.route("/api/queue-bot/players", methods=["GET", "POST"])
     def queue_bot_players():
@@ -1167,6 +1374,1325 @@ def register_routes(app: Flask) -> None:
         if venue_error is not None:
             return venue_error
         return complete_terminal_command(command_id)
+
+
+def player_account_token_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def validate_player_account_password(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValidationError("请输入账户密码。", code="PASSWORD_REQUIRED", field="password")
+    if len(value) < PLAYER_ACCOUNT_PASSWORD_MIN_LENGTH:
+        raise ValidationError(
+            f"密码至少需要 {PLAYER_ACCOUNT_PASSWORD_MIN_LENGTH} 个字符。",
+            code="PASSWORD_TOO_SHORT",
+            field="password",
+        )
+    if len(value) > PLAYER_ACCOUNT_PASSWORD_MAX_LENGTH or len(value.encode("utf-8")) > 512:
+        raise ValidationError(
+            f"密码不能超过 {PLAYER_ACCOUNT_PASSWORD_MAX_LENGTH} 个字符。",
+            code="PASSWORD_TOO_LONG",
+            field="password",
+        )
+    if value.isspace():
+        raise ValidationError("密码不能只包含空格。", code="PASSWORD_INVALID", field="password")
+    return value
+
+
+def hash_player_account_password(password: str, salt: bytes) -> bytes:
+    return hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=PLAYER_ACCOUNT_SCRYPT_N,
+        r=PLAYER_ACCOUNT_SCRYPT_R,
+        p=PLAYER_ACCOUNT_SCRYPT_P,
+        dklen=32,
+    )
+
+
+def player_auth_subject(action: str, value: str) -> str:
+    return hashlib.sha256(f"{action}\0{value}".encode("utf-8")).hexdigest()
+
+
+def player_auth_limit_error(
+    connection: sqlite3.Connection,
+    *,
+    action: str,
+    subject_hash: str,
+    now: int,
+):
+    row = connection.execute(
+        """
+        SELECT blocked_until FROM player_auth_limit
+        WHERE action = ? AND subject_hash = ?
+        """,
+        (action, subject_hash),
+    ).fetchone()
+    if row is None or row["blocked_until"] is None or row["blocked_until"] <= now:
+        return None
+    return jsonify(
+        {
+            "ok": False,
+            "code": "AUTH_RATE_LIMITED",
+            "error": "尝试次数过多，请稍后再试。",
+            "retry_after": row["blocked_until"] - now,
+        }
+    ), 429
+
+
+def record_player_auth_failure(
+    connection: sqlite3.Connection,
+    *,
+    action: str,
+    subject_hash: str,
+    now: int,
+) -> None:
+    window_seconds = max(60, current_app.config["PLAYER_AUTH_LIMIT_WINDOW_SECONDS"])
+    block_seconds = max(60, current_app.config["PLAYER_AUTH_LIMIT_BLOCK_SECONDS"])
+    failure_limit = max(2, current_app.config["PLAYER_AUTH_LIMIT_FAILURES"])
+    row = connection.execute(
+        """
+        SELECT window_started_at, failure_count, blocked_until
+        FROM player_auth_limit WHERE action = ? AND subject_hash = ?
+        """,
+        (action, subject_hash),
+    ).fetchone()
+    if row is None or row["window_started_at"] <= now - window_seconds:
+        window_started_at = now
+        failure_count = 1
+    else:
+        window_started_at = row["window_started_at"]
+        failure_count = row["failure_count"] + 1
+    blocked_until = now + block_seconds if failure_count >= failure_limit else None
+    connection.execute(
+        """
+        INSERT INTO player_auth_limit
+            (action, subject_hash, window_started_at, failure_count, blocked_until)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(action, subject_hash) DO UPDATE SET
+            window_started_at = excluded.window_started_at,
+            failure_count = excluded.failure_count,
+            blocked_until = excluded.blocked_until
+        """,
+        (action, subject_hash, window_started_at, failure_count, blocked_until),
+    )
+
+
+def clear_player_auth_failures(
+    connection: sqlite3.Connection, *, action: str, subject_hash: str
+) -> None:
+    connection.execute(
+        "DELETE FROM player_auth_limit WHERE action = ? AND subject_hash = ?",
+        (action, subject_hash),
+    )
+
+
+def player_account_cookie_options() -> dict[str, Any]:
+    return {
+        "secure": bool(current_app.config["PLAYER_ACCOUNT_COOKIE_SECURE"]),
+        "samesite": "Lax",
+        "path": "/",
+    }
+
+
+def set_player_account_cookies(
+    response,
+    *,
+    session_token: str,
+    csrf_token: str,
+    max_age: int,
+) -> None:
+    options = player_account_cookie_options()
+    response.set_cookie(
+        PLAYER_ACCOUNT_SESSION_COOKIE,
+        session_token,
+        max_age=max_age,
+        httponly=True,
+        **options,
+    )
+    response.set_cookie(
+        f"{PLAYER_ACCOUNT_SESSION_COOKIE}_csrf",
+        csrf_token,
+        max_age=max_age,
+        httponly=False,
+        **options,
+    )
+
+
+def clear_player_account_cookies(response) -> None:
+    options = player_account_cookie_options()
+    response.delete_cookie(
+        PLAYER_ACCOUNT_SESSION_COOKIE,
+        httponly=True,
+        **options,
+    )
+    response.delete_cookie(
+        f"{PLAYER_ACCOUNT_SESSION_COOKIE}_csrf",
+        httponly=False,
+        **options,
+    )
+
+
+def create_player_web_session(
+    connection: sqlite3.Connection,
+    *,
+    account_id: str,
+    now: int,
+) -> tuple[str, str, int]:
+    session_token = secrets.token_urlsafe(PLAYER_ACCOUNT_SESSION_TOKEN_BYTES)
+    csrf_token = secrets.token_urlsafe(PLAYER_ACCOUNT_SESSION_TOKEN_BYTES)
+    ttl_seconds = max(300, current_app.config["PLAYER_ACCOUNT_SESSION_TTL_SECONDS"])
+    expires_at = now + ttl_seconds
+    connection.execute(
+        """
+        INSERT INTO player_web_session
+            (session_id, account_id, token_hash, csrf_hash, created_at,
+             last_seen_at, expires_at, revoked_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+        """,
+        (
+            str(uuid4()),
+            account_id,
+            player_account_token_hash(session_token),
+            player_account_token_hash(csrf_token),
+            now,
+            now,
+            expires_at,
+        ),
+    )
+    return session_token, csrf_token, ttl_seconds
+
+
+def current_player_account_session(
+    connection: sqlite3.Connection,
+) -> tuple[sqlite3.Row, sqlite3.Row] | None:
+    session_token = request.cookies.get(PLAYER_ACCOUNT_SESSION_COOKIE, "")
+    if not session_token or len(session_token) > 256:
+        return None
+    now = int(time.time())
+    session = connection.execute(
+        """
+        SELECT * FROM player_web_session
+        WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?
+        """,
+        (player_account_token_hash(session_token), now),
+    ).fetchone()
+    if session is None:
+        return None
+    account = connection.execute(
+        """
+        SELECT account.*, profile.nickname, profile.qq_number,
+               profile.public_player_id, profile.gender,
+               profile.default_preference, profile.qq_visibility,
+               profile.notification_enabled, profile.notify_queue_changes,
+               profile.notify_playing_position, profile.notify_online_check_in,
+               profile.notify_absence, profile.notify_machine_status,
+               profile.setup_version, profile.profile_revision,
+               profile.web_account_bound, profile.terminal_editing_allowed,
+               profile.visited_venues_public, profile.web_profile_revision,
+               profile.profile_updated_at, venue.venue_id, venue.venue_code,
+               venue.display_name AS venue_name
+        FROM player_account AS account
+        JOIN player_profile AS profile
+          ON profile.device_id = account.profile_scope_id
+         AND profile.profile_id = account.profile_id
+        JOIN venue ON venue.profile_scope_id = account.profile_scope_id
+        WHERE account.account_id = ?
+        """,
+        (session["account_id"],),
+    ).fetchone()
+    if account is None:
+        return None
+    if session["last_seen_at"] <= now - 300:
+        connection.execute(
+            "UPDATE player_web_session SET last_seen_at = ? WHERE session_id = ?",
+            (now, session["session_id"]),
+        )
+    return session, account
+
+
+def require_player_account_csrf(session: sqlite3.Row):
+    header_token = request.headers.get("X-CSRF-Token", "")
+    cookie_token = request.cookies.get(f"{PLAYER_ACCOUNT_SESSION_COOKIE}_csrf", "")
+    if (
+        not header_token
+        or not cookie_token
+        or not hmac.compare_digest(header_token, cookie_token)
+        or not hmac.compare_digest(
+            player_account_token_hash(header_token), session["csrf_hash"]
+        )
+    ):
+        return jsonify(
+            {
+                "ok": False,
+                "code": "CSRF_TOKEN_INVALID",
+                "error": "页面验证信息已经失效，请刷新页面后重试。",
+            }
+        ), 403
+    return None
+
+
+def serialize_player_account(account: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "account_id": account["account_id"],
+        "profile": {
+            "profile_id": account["profile_id"],
+            "public_player_id": account["public_player_id"],
+            "nickname": account["nickname"],
+            "qq_number": account["qq_number"],
+            "gender": account["gender"],
+            "default_preference": account["default_preference"],
+            "qq_visibility": account["qq_visibility"],
+            "notification_enabled": bool(account["notification_enabled"]),
+            "notify_queue_changes": bool(account["notify_queue_changes"]),
+            "notify_playing_position": bool(account["notify_playing_position"]),
+            "notify_online_check_in": bool(account["notify_online_check_in"]),
+            "notify_absence": bool(account["notify_absence"]),
+            "notify_machine_status": bool(account["notify_machine_status"]),
+            "setup_complete": account["setup_version"] > 0,
+            "profile_revision": account["profile_revision"],
+            "web_account_bound": bool(account["web_account_bound"]),
+            "terminal_editing_allowed": bool(account["terminal_editing_allowed"]),
+            "visited_venues_public": bool(account["visited_venues_public"]),
+            "web_profile_revision": account["web_profile_revision"],
+            "updated_at": account["profile_updated_at"],
+        },
+        "venue": {
+            "id": account["venue_id"],
+            "code": account["venue_code"],
+            "name": account["venue_name"],
+        },
+    }
+
+
+def create_player_binding_session():
+    source = request.get_json(silent=True)
+    if not isinstance(source, dict):
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+    try:
+        profile_id = str(UUID(source.get("profile_id", "")))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "玩家资料编号无效"}), 400
+    site_url = current_app.config["PLAYER_ACCOUNT_SITE_URL"] or current_app.config[
+        "PUBLIC_SITE_URL"
+    ]
+    if not site_url:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "PLAYER_ACCOUNT_SITE_NOT_CONFIGURED",
+                "error": "服务端尚未配置玩家账户页面，请联系管理员。",
+            }
+        ), 503
+    device_id = request.headers.get("X-Device-ID", "").strip()
+    try:
+        instance_id, instance_generation = read_terminal_instance_identity(device_id)
+    except ValidationError as error:
+        return jsonify(validation_error_payload(error)), 400
+    now = int(time.time())
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        venue = read_active_venue(connection)
+        snapshot = connection.execute(
+            """
+            SELECT device_id, instance_id, instance_generation, payload
+            FROM queue_snapshot WHERE id = 1
+            """
+        ).fetchone()
+        if not terminal_instance_matches(
+            snapshot, device_id, instance_id, instance_generation
+        ):
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "STALE_TERMINAL_INSTANCE",
+                    "error": TERMINAL_INSTANCE_CONFLICT_DETAIL,
+                }
+            ), 409
+        snapshot_payload = json.loads(snapshot["payload"])
+        if snapshot_payload.get("test_data", False):
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "TEST_DATA_ACCOUNT_BINDING_UNAVAILABLE",
+                    "error": "当前数据是测试数据，不能绑定长期网页账户。",
+                }
+            ), 409
+        profile = connection.execute(
+            """
+            SELECT profile_id, public_player_id, nickname, qq_number, setup_version
+            FROM player_profile
+            WHERE device_id = ? AND profile_id = ?
+              AND profile_id IN (
+                  SELECT profile_id FROM current_player_profile
+                  WHERE profile_scope_id = ?
+              )
+            """,
+            (venue["profile_scope_id"], profile_id, venue["profile_scope_id"]),
+        ).fetchone()
+        if profile is None:
+            connection.rollback()
+            return jsonify({"ok": False, "error": "没有找到当前玩家资料"}), 404
+        if profile["setup_version"] <= 0 or profile["qq_number"] is None:
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "PLAYER_PROFILE_INCOMPLETE",
+                    "error": "请先在现场终端补全玩家资料，再绑定网页账户。",
+                }
+            ), 409
+        binding_token = secrets.token_urlsafe(PLAYER_ACCOUNT_BINDING_TOKEN_BYTES)
+        binding_id = str(uuid4())
+        expires_at = now + max(
+            60, current_app.config["PLAYER_BINDING_SESSION_TTL_SECONDS"]
+        )
+        connection.execute(
+            """
+            UPDATE player_binding_session SET invalidated_at = ?
+            WHERE profile_scope_id = ? AND profile_id = ?
+              AND consumed_at IS NULL AND invalidated_at IS NULL AND expires_at > ?
+            """,
+            (now, venue["profile_scope_id"], profile_id, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO player_binding_session
+                (binding_id, profile_scope_id, profile_id, token_hash,
+                 created_by_terminal, created_at, expires_at, consumed_at,
+                 invalidated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+            """,
+            (
+                binding_id,
+                venue["profile_scope_id"],
+                profile_id,
+                player_account_token_hash(binding_token),
+                device_id,
+                now,
+                expires_at,
+            ),
+        )
+        connection.commit()
+    separator = "&" if "?" in site_url else "?"
+    binding_url = (
+        f"{site_url}{separator}{urlencode({'account_binding': binding_token})}"
+        if site_url
+        else None
+    )
+    return jsonify(
+        {
+            "binding_id": binding_id,
+            "binding_token": binding_token,
+            "binding_url": binding_url,
+            "expires_at": expires_at * 1000,
+            "profile": {
+                "profile_id": profile["profile_id"],
+                "public_player_id": profile["public_player_id"],
+                "nickname": profile["nickname"],
+                "qq_number": profile["qq_number"],
+            },
+        }
+    ), 201
+
+
+def read_player_binding_row(
+    connection: sqlite3.Connection, binding_token: str
+) -> sqlite3.Row | None:
+    if not MOBILE_SESSION_TOKEN_PATTERN.fullmatch(binding_token):
+        return None
+    return connection.execute(
+        """
+        SELECT binding.*, profile.public_player_id, profile.nickname,
+               profile.qq_number, profile.setup_version, venue.venue_id,
+               venue.venue_code, venue.display_name AS venue_name,
+               account.account_id
+        FROM player_binding_session AS binding
+        JOIN player_profile AS profile
+          ON profile.device_id = binding.profile_scope_id
+         AND profile.profile_id = binding.profile_id
+        JOIN venue ON venue.profile_scope_id = binding.profile_scope_id
+        LEFT JOIN player_account AS account
+          ON account.profile_scope_id = binding.profile_scope_id
+         AND account.profile_id = binding.profile_id
+        WHERE binding.token_hash = ?
+        """,
+        (player_account_token_hash(binding_token),),
+    ).fetchone()
+
+
+def player_binding_state_error(binding: sqlite3.Row | None, now: int):
+    if binding is None:
+        return jsonify({"ok": False, "error": "绑定页面无效，请在终端重新打开。"}), 404
+    if binding["consumed_at"] is not None:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "PLAYER_BINDING_USED",
+                "error": "这次绑定已经完成，请直接登录。",
+            }
+        ), 409
+    if binding["invalidated_at"] is not None or binding["expires_at"] <= now:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "PLAYER_BINDING_EXPIRED",
+                "error": "绑定页面已经失效，请在现场终端重新生成。",
+            }
+        ), 410
+    if binding["setup_version"] <= 0 or binding["qq_number"] is None:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "PLAYER_PROFILE_INCOMPLETE",
+                "error": "玩家资料尚未补全，请先回到现场终端完成资料设置。",
+            }
+        ), 409
+    return None
+
+
+def read_player_binding_session(binding_token: str):
+    now = int(time.time())
+    with open_database() as connection:
+        binding = read_player_binding_row(connection, binding_token)
+    state_error = player_binding_state_error(binding, now)
+    if state_error is not None:
+        return state_error
+    return jsonify(
+        {
+            "binding_id": binding["binding_id"],
+            "expires_at": binding["expires_at"] * 1000,
+            "rebind": binding["account_id"] is not None,
+            "profile": {
+                "profile_id": binding["profile_id"],
+                "public_player_id": binding["public_player_id"],
+                "nickname": binding["nickname"],
+                "qq_number": binding["qq_number"],
+            },
+            "venue": {
+                "id": binding["venue_id"],
+                "code": binding["venue_code"],
+                "name": binding["venue_name"],
+            },
+        }
+    )
+
+
+def complete_player_binding_session(binding_token: str):
+    source = request.get_json(silent=True)
+    if not isinstance(source, dict):
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+    try:
+        password = validate_player_account_password(source.get("password"))
+    except ValidationError as error:
+        return jsonify(validation_error_payload(error)), 400
+    now = int(time.time())
+    subject_hash = player_auth_subject("binding", binding_token)
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        limit_error = player_auth_limit_error(
+            connection,
+            action="binding",
+            subject_hash=subject_hash,
+            now=now,
+        )
+        if limit_error is not None:
+            connection.commit()
+            return limit_error
+        binding = read_player_binding_row(connection, binding_token)
+        state_error = player_binding_state_error(binding, now)
+        if state_error is not None:
+            record_player_auth_failure(
+                connection,
+                action="binding",
+                subject_hash=subject_hash,
+                now=now,
+            )
+            connection.commit()
+            return state_error
+        salt = secrets.token_bytes(16)
+        password_hash = hash_player_account_password(password, salt)
+        account_id = binding["account_id"] or str(uuid4())
+        connection.execute(
+            """
+            INSERT INTO player_account
+                (account_id, profile_scope_id, profile_id, password_salt,
+                 password_hash, created_at, updated_at, password_changed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(profile_scope_id, profile_id) DO UPDATE SET
+                password_salt = excluded.password_salt,
+                password_hash = excluded.password_hash,
+                updated_at = excluded.updated_at,
+                password_changed_at = excluded.password_changed_at
+            """,
+            (
+                account_id,
+                binding["profile_scope_id"],
+                binding["profile_id"],
+                salt,
+                password_hash,
+                now,
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            "UPDATE player_web_session SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL",
+            (now, account_id),
+        )
+        if binding["account_id"] is None:
+            connection.execute(
+                """
+                UPDATE player_profile
+                SET web_account_bound = 1,
+                    terminal_editing_allowed = 0,
+                    visited_venues_public = 1,
+                    qq_visibility = 'PUBLIC_WEBSITE',
+                    web_profile_revision = web_profile_revision + 1,
+                    profile_revision = profile_revision + 1,
+                    profile_updated_at = ?
+                WHERE device_id = ? AND profile_id = ?
+                """,
+                (
+                    now * 1000,
+                    binding["profile_scope_id"],
+                    binding["profile_id"],
+                ),
+            )
+        connection.execute(
+            "UPDATE player_binding_session SET consumed_at = ? WHERE binding_id = ?",
+            (now, binding["binding_id"]),
+        )
+        session_token, csrf_token, ttl_seconds = create_player_web_session(
+            connection, account_id=account_id, now=now
+        )
+        clear_player_auth_failures(
+            connection, action="binding", subject_hash=subject_hash
+        )
+        connection.commit()
+        session_account = current_player_account_session_for_id(connection, account_id)
+    response = make_response(
+        jsonify(
+            {
+                "ok": True,
+                "account": serialize_player_account(session_account),
+                "csrf_token": csrf_token,
+            }
+        )
+    )
+    set_player_account_cookies(
+        response,
+        session_token=session_token,
+        csrf_token=csrf_token,
+        max_age=ttl_seconds,
+    )
+    return response, 201
+
+
+def current_player_account_session_for_id(
+    connection: sqlite3.Connection, account_id: str
+) -> sqlite3.Row:
+    return connection.execute(
+        """
+        SELECT account.*, profile.nickname, profile.qq_number,
+               profile.public_player_id, profile.gender,
+               profile.default_preference, profile.qq_visibility,
+               profile.notification_enabled, profile.notify_queue_changes,
+               profile.notify_playing_position, profile.notify_online_check_in,
+               profile.notify_absence, profile.notify_machine_status,
+               profile.setup_version, profile.profile_revision,
+               profile.web_account_bound, profile.terminal_editing_allowed,
+               profile.visited_venues_public, profile.web_profile_revision,
+               profile.profile_updated_at, venue.venue_id, venue.venue_code,
+               venue.display_name AS venue_name
+        FROM player_account AS account
+        JOIN player_profile AS profile
+          ON profile.device_id = account.profile_scope_id
+         AND profile.profile_id = account.profile_id
+        JOIN venue ON venue.profile_scope_id = account.profile_scope_id
+        WHERE account.account_id = ?
+        """,
+        (account_id,),
+    ).fetchone()
+
+
+def login_player_account():
+    source = request.get_json(silent=True)
+    if not isinstance(source, dict):
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+    qq_number = str(source.get("qq", "")).strip()
+    password = source.get("password")
+    if QQ_NUMBER_PATTERN.fullmatch(qq_number) is None or not isinstance(password, str):
+        return jsonify(
+            {
+                "ok": False,
+                "code": "ACCOUNT_LOGIN_FAILED",
+                "error": "QQ 或密码不正确。",
+            }
+        ), 401
+    now = int(time.time())
+    subject_hash = player_auth_subject("login", qq_number)
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        limit_error = player_auth_limit_error(
+            connection, action="login", subject_hash=subject_hash, now=now
+        )
+        if limit_error is not None:
+            connection.commit()
+            return limit_error
+        account = connection.execute(
+            """
+            SELECT account.* FROM player_account AS account
+            JOIN player_profile AS profile
+              ON profile.device_id = account.profile_scope_id
+             AND profile.profile_id = account.profile_id
+            JOIN current_player_profile AS current_profile
+              ON current_profile.profile_scope_id = account.profile_scope_id
+             AND current_profile.profile_id = account.profile_id
+            JOIN venue ON venue.profile_scope_id = account.profile_scope_id
+            WHERE profile.qq_number = ?
+            """,
+            (qq_number,),
+        ).fetchone()
+        supplied_hash = (
+            hash_player_account_password(password, bytes(account["password_salt"]))
+            if account is not None
+            else hash_player_account_password(password, b"\0" * 16)
+        )
+        if account is None or not hmac.compare_digest(
+            supplied_hash, bytes(account["password_hash"])
+        ):
+            record_player_auth_failure(
+                connection,
+                action="login",
+                subject_hash=subject_hash,
+                now=now,
+            )
+            connection.commit()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "ACCOUNT_LOGIN_FAILED",
+                    "error": "QQ 或密码不正确。",
+                }
+            ), 401
+        clear_player_auth_failures(
+            connection, action="login", subject_hash=subject_hash
+        )
+        session_token, csrf_token, ttl_seconds = create_player_web_session(
+            connection, account_id=account["account_id"], now=now
+        )
+        full_account = current_player_account_session_for_id(
+            connection, account["account_id"]
+        )
+        connection.commit()
+    response = make_response(
+        jsonify(
+            {
+                "ok": True,
+                "account": serialize_player_account(full_account),
+                "csrf_token": csrf_token,
+            }
+        )
+    )
+    set_player_account_cookies(
+        response,
+        session_token=session_token,
+        csrf_token=csrf_token,
+        max_age=ttl_seconds,
+    )
+    return response
+
+
+def read_current_player_account():
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = current_player_account_session(connection)
+        if current is None:
+            connection.commit()
+            response = make_response(
+                jsonify(
+                    {
+                        "ok": False,
+                        "code": "ACCOUNT_LOGIN_REQUIRED",
+                        "error": "请先登录玩家账户。",
+                    }
+                ),
+                401,
+            )
+            clear_player_account_cookies(response)
+            return response
+        _, account = current
+        csrf_token = request.cookies.get(f"{PLAYER_ACCOUNT_SESSION_COOKIE}_csrf", "")
+        connection.commit()
+    return jsonify(
+        {
+            "ok": True,
+            "account": serialize_player_account(account),
+            "csrf_token": csrf_token,
+        }
+    )
+
+
+def update_current_player_account_profile():
+    source = request.get_json(silent=True)
+    if not isinstance(source, dict):
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+    allowed_fields = {
+        "expected_profile_revision",
+        "nickname",
+        "gender",
+        "default_preference",
+        "qq_number",
+        "qq_visibility",
+        *NOTIFICATION_FIELDS,
+        "terminal_editing_allowed",
+        "visited_venues_public",
+        "current_password",
+    }
+    if not set(source) <= allowed_fields:
+        return jsonify({"ok": False, "error": "请求包含不支持的玩家资料字段"}), 400
+    editable_fields = set(source) - {"expected_profile_revision", "current_password"}
+    if not editable_fields:
+        return jsonify({"ok": False, "error": "没有需要保存的玩家资料字段"}), 400
+    try:
+        expected_revision = read_integer(
+            source, "expected_profile_revision", minimum=1, maximum=2**63 - 1
+        )
+        requested: dict[str, Any] = {}
+        if "nickname" in source:
+            requested["nickname"] = read_string(source, "nickname", maximum_length=18)
+        if "gender" in source:
+            requested["gender"] = read_choice(source, "gender", PLAYER_GENDERS)
+        if "default_preference" in source:
+            requested["default_preference"] = read_choice(
+                source, "default_preference", PROFILE_PREFERENCES
+            )
+        if "qq_number" in source:
+            requested["qq_number"] = read_qq_number(source, "qq_number")
+        if "qq_visibility" in source:
+            requested["qq_visibility"] = read_choice(
+                source, "qq_visibility", QQ_VISIBILITIES
+            )
+        for field in NOTIFICATION_FIELDS:
+            if field in source:
+                requested[field] = read_boolean(source, field)
+        for field in ("terminal_editing_allowed", "visited_venues_public"):
+            if field in source:
+                requested[field] = read_boolean(source, field)
+    except ValidationError as error:
+        return jsonify(validation_error_payload(error)), 400
+
+    now = int(time.time())
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = current_player_account_session(connection)
+        if current is None:
+            connection.commit()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "ACCOUNT_LOGIN_REQUIRED",
+                    "error": "请先登录玩家账户。",
+                }
+            ), 401
+        session, account = current
+        csrf_error = require_player_account_csrf(session)
+        if csrf_error is not None:
+            connection.rollback()
+            return csrf_error
+        if account["profile_revision"] != expected_revision:
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "PLAYER_PROFILE_CHANGED",
+                    "error": "玩家资料已经在其他端更新，请刷新后重试。",
+                }
+            ), 409
+
+        qq_changed = (
+            "qq_number" in requested
+            and requested["qq_number"] != account["qq_number"]
+        )
+        if qq_changed:
+            subject_hash = player_auth_subject("qq-change", account["account_id"])
+            limit_error = player_auth_limit_error(
+                connection,
+                action="qq-change",
+                subject_hash=subject_hash,
+                now=now,
+            )
+            if limit_error is not None:
+                connection.commit()
+                return limit_error
+            current_password = source.get("current_password")
+            if not isinstance(current_password, str) or not hmac.compare_digest(
+                hash_player_account_password(
+                    current_password, bytes(account["password_salt"])
+                ),
+                bytes(account["password_hash"]),
+            ):
+                record_player_auth_failure(
+                    connection,
+                    action="qq-change",
+                    subject_hash=subject_hash,
+                    now=now,
+                )
+                connection.commit()
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "CURRENT_PASSWORD_INVALID",
+                        "field": "current_password",
+                        "error": "当前密码不正确，QQ 没有修改。",
+                    }
+                ), 403
+            clear_player_auth_failures(
+                connection,
+                action="qq-change",
+                subject_hash=subject_hash,
+            )
+            conflict = connection.execute(
+                """
+                SELECT 1 FROM player_profile
+                WHERE device_id = ? AND profile_id != ? AND qq_number = ?
+                """,
+                (
+                    account["profile_scope_id"],
+                    account["profile_id"],
+                    requested["qq_number"],
+                ),
+            ).fetchone()
+            if conflict is not None:
+                connection.commit()
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "QQ_ALREADY_USED",
+                        "field": "qq_number",
+                        "error": "这个 QQ 已经关联其他玩家资料。",
+                    }
+                ), 409
+
+        nickname = requested.get("nickname")
+        if nickname is not None and nickname.casefold() != account["nickname"].casefold():
+            profile_conflict = connection.execute(
+                """
+                SELECT 1 FROM player_profile
+                WHERE device_id = ? AND profile_id != ? AND lower(nickname) = lower(?)
+                """,
+                (account["profile_scope_id"], account["profile_id"], nickname),
+            ).fetchone()
+            queue_conflict = False
+            snapshot_row = connection.execute(
+                "SELECT device_id, queue_id, payload FROM queue_snapshot WHERE id = 1"
+            ).fetchone()
+            if snapshot_row is not None:
+                snapshot_payload = json.loads(snapshot_row["payload"])
+                queue_storage_id = queue_storage_id_for_snapshot(
+                    snapshot_row["queue_id"], snapshot_payload, snapshot_row["device_id"]
+                )
+                for machine in snapshot_payload.get("machines", {}).values():
+                    for registration in all_machine_registrations(machine):
+                        if str(registration.get("display_id", "")).casefold() != nickname.casefold():
+                            continue
+                        contact = connection.execute(
+                            """
+                            SELECT player_id FROM queue_private_contact
+                            WHERE queue_id = ? AND registration_id = ?
+                            """,
+                            (queue_storage_id, registration.get("registration_id")),
+                        ).fetchone()
+                        if contact is None or contact["player_id"] != account["profile_id"]:
+                            queue_conflict = True
+                            break
+                    if queue_conflict:
+                        break
+            if profile_conflict is not None or queue_conflict:
+                connection.rollback()
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "NICKNAME_ALREADY_USED",
+                        "field": "nickname",
+                        "error": "这个昵称已经用于其他玩家资料或当前登记。",
+                    }
+                ), 409
+
+        update_values = {
+            "nickname": account["nickname"],
+            "gender": account["gender"],
+            "default_preference": account["default_preference"],
+            "qq_number": account["qq_number"],
+            "qq_visibility": account["qq_visibility"],
+            "notification_enabled": bool(account["notification_enabled"]),
+            "notify_queue_changes": bool(account["notify_queue_changes"]),
+            "notify_playing_position": bool(account["notify_playing_position"]),
+            "notify_online_check_in": bool(account["notify_online_check_in"]),
+            "notify_absence": bool(account["notify_absence"]),
+            "notify_machine_status": bool(account["notify_machine_status"]),
+            "terminal_editing_allowed": bool(account["terminal_editing_allowed"]),
+            "visited_venues_public": bool(account["visited_venues_public"]),
+            **requested,
+        }
+        changed = any(update_values[field] != account[field] for field in update_values)
+        if changed:
+            updated_at = max(now * 1000, account["profile_updated_at"] + 1)
+            connection.execute(
+                """
+                UPDATE player_profile SET
+                    nickname = ?, gender = ?, default_preference = ?,
+                    qq_number = ?, qq_visibility = ?,
+                    notification_enabled = ?, notify_queue_changes = ?,
+                    notify_playing_position = ?, notify_online_check_in = ?,
+                    notify_absence = ?, notify_machine_status = ?,
+                    terminal_editing_allowed = ?, visited_venues_public = ?,
+                    web_profile_revision = web_profile_revision + 1,
+                    profile_revision = profile_revision + 1,
+                    profile_updated_at = ?
+                WHERE device_id = ? AND profile_id = ?
+                """,
+                (
+                    update_values["nickname"],
+                    update_values["gender"],
+                    update_values["default_preference"],
+                    update_values["qq_number"],
+                    update_values["qq_visibility"],
+                    int(update_values["notification_enabled"]),
+                    int(update_values["notify_queue_changes"]),
+                    int(update_values["notify_playing_position"]),
+                    int(update_values["notify_online_check_in"]),
+                    int(update_values["notify_absence"]),
+                    int(update_values["notify_machine_status"]),
+                    int(update_values["terminal_editing_allowed"]),
+                    int(update_values["visited_venues_public"]),
+                    updated_at,
+                    account["profile_scope_id"],
+                    account["profile_id"],
+                ),
+            )
+        updated_account = current_player_account_session_for_id(
+            connection, account["account_id"]
+        )
+        connection.commit()
+    return jsonify(
+        {
+            "ok": True,
+            "changed": changed,
+            "account": serialize_player_account(updated_account),
+            "sync_status": "WAITING_FOR_TERMINAL" if changed else "CURRENT",
+        }
+    )
+
+
+def update_current_player_account_password():
+    source = request.get_json(silent=True)
+    if not isinstance(source, dict):
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+    current_password = source.get("current_password")
+    try:
+        new_password = validate_player_account_password(source.get("new_password"))
+        confirmation = validate_player_account_password(
+            source.get("new_password_confirmation")
+        )
+    except ValidationError as error:
+        return jsonify(validation_error_payload(error)), 400
+    if new_password != confirmation:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "PASSWORD_CONFIRMATION_MISMATCH",
+                "field": "new_password_confirmation",
+                "error": "两次输入的新密码不一致。",
+            }
+        ), 400
+    if not isinstance(current_password, str):
+        return jsonify(
+            {
+                "ok": False,
+                "code": "CURRENT_PASSWORD_REQUIRED",
+                "field": "current_password",
+                "error": "请输入当前账户密码。",
+            }
+        ), 400
+    now = int(time.time())
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = current_player_account_session(connection)
+        if current is None:
+            connection.commit()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "ACCOUNT_LOGIN_REQUIRED",
+                    "error": "请先登录玩家账户。",
+                }
+            ), 401
+        session, account = current
+        csrf_error = require_player_account_csrf(session)
+        if csrf_error is not None:
+            connection.rollback()
+            return csrf_error
+        subject_hash = player_auth_subject("password-change", account["account_id"])
+        limit_error = player_auth_limit_error(
+            connection,
+            action="password-change",
+            subject_hash=subject_hash,
+            now=now,
+        )
+        if limit_error is not None:
+            connection.commit()
+            return limit_error
+        supplied_hash = hash_player_account_password(
+            current_password, bytes(account["password_salt"])
+        )
+        if not hmac.compare_digest(supplied_hash, bytes(account["password_hash"])):
+            record_player_auth_failure(
+                connection,
+                action="password-change",
+                subject_hash=subject_hash,
+                now=now,
+            )
+            connection.commit()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "CURRENT_PASSWORD_INVALID",
+                    "field": "current_password",
+                    "error": "当前密码不正确，密码没有修改。",
+                }
+            ), 403
+        clear_player_auth_failures(
+            connection,
+            action="password-change",
+            subject_hash=subject_hash,
+        )
+        if hmac.compare_digest(
+            hash_player_account_password(
+                new_password, bytes(account["password_salt"])
+            ),
+            bytes(account["password_hash"]),
+        ):
+            connection.commit()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "PASSWORD_UNCHANGED",
+                    "error": "新密码不能与当前密码相同。",
+                }
+            ), 400
+        salt = secrets.token_bytes(16)
+        password_hash = hash_player_account_password(new_password, salt)
+        connection.execute(
+            """
+            UPDATE player_account
+            SET password_salt = ?, password_hash = ?,
+                password_changed_at = ?, updated_at = ?
+            WHERE account_id = ?
+            """,
+            (salt, password_hash, now, now, account["account_id"]),
+        )
+        connection.execute(
+            """
+            UPDATE player_web_session
+            SET revoked_at = ?
+            WHERE account_id = ? AND session_id != ? AND revoked_at IS NULL
+            """,
+            (now, account["account_id"], session["session_id"]),
+        )
+        updated_account = current_player_account_session_for_id(
+            connection, account["account_id"]
+        )
+        connection.commit()
+    return jsonify(
+        {
+            "ok": True,
+            "account": serialize_player_account(updated_account),
+            "message": "密码已修改，其他设备上的网页登录已退出。",
+        }
+    )
+
+
+def read_current_player_account_queue():
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = current_player_account_session(connection)
+        if current is None:
+            connection.commit()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "ACCOUNT_LOGIN_REQUIRED",
+                    "error": "请先登录玩家账户。",
+                }
+            ), 401
+        _, account = current
+        snapshot_row = connection.execute(
+            """
+            SELECT queue_id, revision, payload, device_id, received_at
+            FROM queue_snapshot WHERE id = 1
+            """
+        ).fetchone()
+        if snapshot_row is None:
+            connection.commit()
+            return jsonify(
+                {
+                    "ok": True,
+                    "queue": None,
+                    "registrations": [],
+                    "error": "现场终端尚未同步排队状态。",
+                }
+            )
+        snapshot = json.loads(snapshot_row["payload"])
+        queue_storage_id, _ = snapshot_storage_context(snapshot_row, snapshot)
+        contexts = find_profile_registration_contexts(
+            connection,
+            queue_storage_id,
+            snapshot,
+            account["profile_id"],
+        )
+        connection.commit()
+
+    now = int(time.time())
+    terminal_online = (
+        max(0, now - snapshot_row["received_at"])
+        <= current_app.config["ONLINE_TIMEOUT_SECONDS"]
+    )
+    remote_actions = bool(
+        terminal_online and snapshot.get("website_remote_enabled", False)
+    )
+    machines = {
+        machine_id: serialize_remote_machine(machine_id, machine)
+        for machine_id, machine in snapshot.get("machines", {}).items()
+    }
+    registrations = []
+    for context in contexts:
+        registration = context["registration"]
+        machine = snapshot.get("machines", {}).get(context["machine_id"], {})
+        registrations.append(
+            {
+                "registration_id": registration["registration_id"],
+                "display_id": registration["display_id"],
+                "machine_id": context["machine_id"],
+                "machine_stable_id": context["machine_stable_id"],
+                "machine_name": context["machine_name"],
+                "machine_operational": context["machine_operational"],
+                "position": context["position"],
+                "position_index": context["position_index"],
+                "estimated_wait_minutes": context["estimated_wait_minutes"],
+                "preference": registration["preference"],
+                "fixed_pair": registration["fixed_pair"],
+                "fixed_pair_id": registration["fixed_pair_id"],
+                "deferred_once": registration["deferred_once"],
+                "temporarily_away": registration["temporarily_away"],
+                "temporary_away_skipped_turns": registration[
+                    "temporary_away_skipped_turns"
+                ],
+                "online_registration_pending_check_in": registration.get(
+                    "online_registration_pending_check_in", False
+                ),
+                "machine_capacity": machine_capacity(machine),
+            }
+        )
+    return jsonify(
+        {
+            "ok": True,
+            "queue": {
+                "queue_id": snapshot_row["queue_id"],
+                "revision": snapshot_row["revision"],
+                "machine_configuration_revision": snapshot.get(
+                    "machine_configuration_revision", 1
+                ),
+                "received_at": snapshot_row["received_at"] * 1000,
+                "terminal_online": terminal_online,
+                "remote_actions": remote_actions,
+                "queue_rules": snapshot.get("queue_rules")
+                or normalize_public_queue_rules(None),
+                "machines": list(machines.values()),
+            },
+            "registrations": registrations,
+        }
+    )
+
+
+def create_player_account_queue_operation_command():
+    source = request.get_json(silent=True)
+    if not isinstance(source, dict):
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+    allowed_fields = {
+        "request_id",
+        "operation",
+        "target_machine_id",
+        "preference",
+        "expected_queue_id",
+        "expected_registration_id",
+        "expected_machine_id",
+        "expected_position",
+        "expected_fixed_pair_id",
+        "expected_absence_status",
+        "expected_temporary_away_skipped_turns",
+        "expected_pending_check_in",
+        "expected_machine_configuration_revision",
+        "expected_machine_stable_id",
+        "expected_target_machine_stable_id",
+    }
+    if set(source) - allowed_fields:
+        return jsonify(
+            {"ok": False, "error": "请求包含不支持的个人排队操作字段"}
+        ), 400
+    if source.get("operation") == "JOIN_QUEUE":
+        return jsonify(
+            {"ok": False, "error": "加入排队请使用网站上的“加入排队”入口。"}
+        ), 400
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = current_player_account_session(connection)
+        if current is None:
+            connection.commit()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "ACCOUNT_LOGIN_REQUIRED",
+                    "error": "请先登录玩家账户。",
+                }
+            ), 401
+        session, account = current
+        csrf_error = require_player_account_csrf(session)
+        if csrf_error is not None:
+            connection.rollback()
+            return csrf_error
+        actor_qq = account["qq_number"]
+        actor_profile_id = account["profile_id"]
+        connection.commit()
+    return create_queue_operation_command(
+        {**source, "actor_qq": actor_qq},
+        "WEBSITE_REMOTE",
+        actor_profile_id=actor_profile_id,
+    )
+
+
+def logout_player_account():
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        current = current_player_account_session(connection)
+        if current is not None:
+            session, _ = current
+            csrf_error = require_player_account_csrf(session)
+            if csrf_error is not None:
+                connection.rollback()
+                return csrf_error
+            connection.execute(
+                "UPDATE player_web_session SET revoked_at = ? WHERE session_id = ?",
+                (int(time.time()), session["session_id"]),
+            )
+        connection.commit()
+    response = make_response(jsonify({"ok": True}))
+    clear_player_account_cookies(response)
+    return response
 
 
 def publish_snapshot():
@@ -1653,6 +3179,7 @@ def publish_snapshot():
             upsert_player_profiles(
                 connection,
                 profile_scope_id=profile_scope_id,
+                terminal_device_id=device_id,
                 profiles=private_profiles,
                 received_at=now,
             )
@@ -1876,17 +3403,57 @@ def publish_snapshot():
     return "", 204
 
 
+def applied_bot_profile_update_matches(
+    connection: sqlite3.Connection,
+    *,
+    terminal_device_id: str,
+    current: sqlite3.Row,
+    incoming: dict[str, Any],
+) -> bool:
+    if incoming["profile_revision"] != current["profile_revision"] + 1:
+        return False
+    rows = connection.execute(
+        """
+        SELECT payload FROM terminal_command
+        WHERE device_id = ? AND command_type = ? AND status = 'APPLIED'
+          AND json_extract(payload, '$.profile_id') = ?
+          AND json_extract(payload, '$.expected_profile_revision') = ?
+        ORDER BY completed_at DESC
+        LIMIT 5
+        """,
+        (
+            terminal_device_id,
+            PROFILE_UPDATE_COMMAND,
+            incoming["profile_id"],
+            current["profile_revision"],
+        ),
+    ).fetchall()
+    for row in rows:
+        payload = json.loads(row["payload"])
+        if all(incoming.get(field) == payload.get(field) for field in BOT_PROFILE_UPDATE_FIELDS):
+            return True
+    return False
+
+
 def upsert_player_profiles(
     connection: sqlite3.Connection,
     *,
     profile_scope_id: str,
+    terminal_device_id: str,
     profiles: list[dict[str, Any]],
     received_at: int,
 ) -> None:
     for profile in profiles:
         current = connection.execute(
             """
-            SELECT profile_revision, profile_updated_at, public_player_id
+            SELECT profile_revision, profile_updated_at, public_player_id,
+                   nickname, gender, default_preference, qq_number,
+                   usage_count, last_used_at, qq_visibility,
+                   notification_enabled, notify_queue_changes,
+                   notify_playing_position, notify_online_check_in,
+                   notify_absence, notify_machine_status, setup_version,
+                   web_account_bound, terminal_editing_allowed,
+                   visited_venues_public, web_profile_revision
             FROM player_profile
             WHERE device_id = ? AND profile_id = ?
             """,
@@ -1916,6 +3483,79 @@ def upsert_player_profiles(
                 profile_id=profile["profile_id"],
             )
         if current is not None:
+            protected_values_changed = False
+            if current["web_account_bound"]:
+                incoming_web_revision = profile.get("web_profile_revision", 0)
+                authorized_bot_update = applied_bot_profile_update_matches(
+                    connection,
+                    terminal_device_id=terminal_device_id,
+                    current=current,
+                    incoming=profile,
+                )
+                protect_profile_fields = (
+                    incoming_web_revision < current["web_profile_revision"]
+                    or (
+                        not bool(current["terminal_editing_allowed"])
+                        and not authorized_bot_update
+                    )
+                )
+                protected_values_changed = any(
+                    profile.get(field) != current[field]
+                    for field in (
+                        "qq_number",
+                        "terminal_editing_allowed",
+                        "visited_venues_public",
+                        "web_profile_revision",
+                    )
+                )
+                profile = {
+                    **profile,
+                    "qq_number": current["qq_number"],
+                    "web_account_bound": True,
+                    "terminal_editing_allowed": bool(
+                        current["terminal_editing_allowed"]
+                    ),
+                    "visited_venues_public": bool(current["visited_venues_public"]),
+                    "web_profile_revision": current["web_profile_revision"],
+                    "usage_count": max(profile["usage_count"], current["usage_count"]),
+                    "last_used_at": max(
+                        filter(
+                            lambda value: value is not None,
+                            (profile["last_used_at"], current["last_used_at"]),
+                        ),
+                        default=None,
+                    ),
+                }
+                if protect_profile_fields:
+                    protected_fields = (
+                        "nickname",
+                        "gender",
+                        "default_preference",
+                        "qq_visibility",
+                        "notification_enabled",
+                        "notify_queue_changes",
+                        "notify_playing_position",
+                        "notify_online_check_in",
+                        "notify_absence",
+                        "notify_machine_status",
+                        "setup_version",
+                    )
+                    protected_values_changed = protected_values_changed or any(
+                        profile.get(field) != current[field]
+                        for field in protected_fields
+                    )
+                    profile = {
+                        **profile,
+                        **{field: current[field] for field in protected_fields},
+                    }
+            else:
+                profile = {
+                    **profile,
+                    "web_account_bound": False,
+                    "terminal_editing_allowed": True,
+                    "visited_venues_public": True,
+                    "web_profile_revision": 0,
+                }
             connection.execute(
                 """
                 UPDATE player_profile SET received_at = ?
@@ -1945,7 +3585,37 @@ def upsert_player_profiles(
                     "profile_revision": current["profile_revision"] + 1,
                 }
             elif profile["profile_revision"] <= current["profile_revision"]:
-                continue
+                operational_values_changed = (
+                    profile["usage_count"] > current["usage_count"]
+                    or (
+                        profile["last_used_at"] is not None
+                        and (
+                            current["last_used_at"] is None
+                            or profile["last_used_at"] > current["last_used_at"]
+                        )
+                    )
+                )
+                if not operational_values_changed:
+                    continue
+                profile = {
+                    **profile,
+                    "profile_revision": current["profile_revision"] + 1,
+                }
+            elif protected_values_changed:
+                profile = {
+                    **profile,
+                    "profile_revision": max(
+                        profile["profile_revision"], current["profile_revision"]
+                    ) + 1,
+                }
+        else:
+            profile = {
+                **profile,
+                "web_account_bound": False,
+                "terminal_editing_allowed": True,
+                "visited_venues_public": True,
+                "web_profile_revision": 0,
+            }
 
         qq_number = profile["qq_number"]
         if qq_number is not None:
@@ -2013,8 +3683,9 @@ def upsert_player_profiles(
                  notify_playing_position, notify_online_check_in,
                  notify_absence, notify_machine_status, setup_version,
                  profile_revision, created_at, profile_updated_at,
-                 public_player_id, received_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 public_player_id, web_account_bound, terminal_editing_allowed,
+                 visited_venues_public, web_profile_revision, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id, profile_id) DO UPDATE SET
                 nickname = excluded.nickname,
                 gender = excluded.gender,
@@ -2037,6 +3708,10 @@ def upsert_player_profiles(
                     player_profile.public_player_id,
                     excluded.public_player_id
                 ),
+                web_account_bound = excluded.web_account_bound,
+                terminal_editing_allowed = excluded.terminal_editing_allowed,
+                visited_venues_public = excluded.visited_venues_public,
+                web_profile_revision = excluded.web_profile_revision,
                 received_at = excluded.received_at
             """,
             (
@@ -2060,6 +3735,10 @@ def upsert_player_profiles(
                 profile["created_at"],
                 profile["updated_at"],
                 public_player_id,
+                int(profile["web_account_bound"]),
+                int(profile["terminal_editing_allowed"]),
+                int(profile["visited_venues_public"]),
+                profile["web_profile_revision"],
                 received_at,
             ),
         )
@@ -2973,7 +4652,9 @@ def read_synced_profiles(*, allow_qq_filter: bool):
                    notify_playing_position, notify_online_check_in,
                    notify_absence, notify_machine_status, setup_version,
                    profile_revision, created_at, profile_updated_at,
-                   public_player_id, received_at
+                   public_player_id, web_account_bound,
+                   terminal_editing_allowed, visited_venues_public,
+                   web_profile_revision, received_at
             FROM player_profile
             WHERE device_id = ?
             ORDER BY nickname, profile_id
@@ -3036,6 +4717,10 @@ def read_synced_profiles(*, allow_qq_filter: bool):
                     "notify_online_check_in": bool(row["notify_online_check_in"]),
                     "notify_absence": bool(row["notify_absence"]),
                     "notify_machine_status": bool(row["notify_machine_status"]),
+                    "web_account_bound": bool(row["web_account_bound"]),
+                    "terminal_editing_allowed": bool(row["terminal_editing_allowed"]),
+                    "visited_venues_public": bool(row["visited_venues_public"]),
+                    "web_profile_revision": row["web_profile_revision"],
                     "setup_version": row["setup_version"],
                     "profile_revision": row["profile_revision"],
                     "created_at": row["created_at"],
@@ -3270,7 +4955,12 @@ def player_join_syncing_response():
     ), 409
 
 
-def create_queue_operation_command(source: dict[str, Any], operation_source: str):
+def create_queue_operation_command(
+    source: dict[str, Any],
+    operation_source: str,
+    *,
+    actor_profile_id: str | None = None,
+):
     try:
         command_id = read_uuid(source, "request_id")
         actor_qq = read_qq_number(source, "actor_qq")
@@ -3400,6 +5090,8 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
         "expected_context": expected_context,
         "expected_join_context": expected_join_context,
     }
+    if actor_profile_id is not None:
+        request_identity["actor_profile_id"] = actor_profile_id
 
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -3477,7 +5169,11 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
             detail, status_code = availability_error
             return jsonify({"ok": False, "error": detail}), status_code
 
-        profile = find_player_profile_by_qq(connection, actor_qq)
+        profile = (
+            find_player_profile_by_id(connection, actor_profile_id)
+            if actor_profile_id is not None
+            else find_player_profile_by_qq(connection, actor_qq)
+        )
         if profile is None:
             return jsonify(
                 {
@@ -3491,11 +5187,20 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
             ), 404
         if profile["qq_number"] != actor_qq:
             return profile_qq_sync_pending_response()
-        registration_contexts = find_qq_registration_contexts(
-            connection,
-            queue_storage_id,
-            snapshot,
-            actor_qq,
+        registration_contexts = (
+            find_profile_registration_contexts(
+                connection,
+                queue_storage_id,
+                snapshot,
+                actor_profile_id,
+            )
+            if actor_profile_id is not None
+            else find_qq_registration_contexts(
+                connection,
+                queue_storage_id,
+                snapshot,
+                actor_qq,
+            )
         )
         if (
             operation == "JOIN_QUEUE"
@@ -3533,6 +5238,8 @@ def create_queue_operation_command(source: dict[str, Any], operation_source: str
         # snapshot. Keep server-side duplicate guards scoped to the actual data
         # set without exposing this internal identifier to clients.
         desired["_queue_storage_id"] = queue_storage_id
+        if actor_profile_id is not None:
+            desired["profile_identity_verified"] = True
 
         pending = connection.execute(
             """
@@ -4630,6 +6337,26 @@ def read_mobile_registration_result(session_token: str):
     return jsonify(serialize_mobile_command_result(command, session))
 
 
+def find_player_profile_by_id(
+    connection: sqlite3.Connection, profile_id: str
+):
+    profile_scope_id = active_profile_scope_id(connection)
+    return connection.execute(
+        """
+        SELECT profile_id, nickname, gender, default_preference, qq_number,
+               usage_count, last_used_at, qq_visibility,
+               notification_enabled, notify_queue_changes,
+               notify_playing_position, notify_online_check_in,
+               notify_absence, notify_machine_status, setup_version,
+               profile_revision, created_at, profile_updated_at,
+               public_player_id, received_at
+        FROM player_profile
+        WHERE device_id = ? AND profile_id = ?
+        """,
+        (profile_scope_id, profile_id),
+    ).fetchone()
+
+
 def find_player_profile_by_qq(connection: sqlite3.Connection, qq_number: str):
     profile_scope_id = active_profile_scope_id(connection)
     profiles = connection.execute(
@@ -4718,6 +6445,26 @@ def find_qq_registration_contexts(
             WHERE queue_id = ? AND qq_number = ?
             """,
             (queue_id, qq_number),
+        ).fetchall()
+    }
+    indexed = index_snapshot_registrations(snapshot)
+    return [indexed[value] for value in registration_ids if value in indexed]
+
+
+def find_profile_registration_contexts(
+    connection: sqlite3.Connection,
+    queue_id: str,
+    snapshot: dict[str, Any],
+    profile_id: str,
+) -> list[dict[str, Any]]:
+    registration_ids = {
+        row["registration_id"]
+        for row in connection.execute(
+            """
+            SELECT registration_id FROM queue_private_contact
+            WHERE queue_id = ? AND player_id = ?
+            """,
+            (queue_id, profile_id),
         ).fetchall()
     }
     indexed = index_snapshot_registrations(snapshot)
@@ -5791,6 +7538,30 @@ def normalize_private_profiles(
             if schema_version >= 8
             else None
         )
+        if schema_version >= 8:
+            web_account_bound = (
+                read_boolean(value, "web_account_bound")
+                if "web_account_bound" in value else False
+            )
+            terminal_editing_allowed = (
+                read_boolean(value, "terminal_editing_allowed")
+                if "terminal_editing_allowed" in value else True
+            )
+            visited_venues_public = (
+                read_boolean(value, "visited_venues_public")
+                if "visited_venues_public" in value else True
+            )
+            web_profile_revision = (
+                read_integer(
+                    value, "web_profile_revision", minimum=0, maximum=2**63 - 1
+                )
+                if "web_profile_revision" in value else 0
+            )
+        else:
+            web_account_bound = False
+            terminal_editing_allowed = True
+            visited_venues_public = True
+            web_profile_revision = 0
         profiles.append(
             {
                 "profile_id": read_uuid(value, "profile_id"),
@@ -5816,6 +7587,10 @@ def normalize_private_profiles(
                 "setup_version": setup_version,
                 "profile_revision": profile_revision,
                 "public_player_id": public_player_id,
+                "web_account_bound": web_account_bound,
+                "terminal_editing_allowed": terminal_editing_allowed,
+                "visited_venues_public": visited_venues_public,
+                "web_profile_revision": web_profile_revision,
                 "legacy_revision": schema_version < 5,
                 "created_at": read_integer(value, "created_at", minimum=1),
                 "updated_at": read_integer(value, "updated_at", minimum=1),

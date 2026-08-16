@@ -161,6 +161,11 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                     absence = item.optBoolean("notifyAbsence", true),
                     machineStatus = item.optBoolean("notifyMachineStatus", false)
                 ),
+                webAccountBound = item.optBoolean("webAccountBound", false),
+                terminalEditingAllowed = item.optBoolean("terminalEditingAllowed", true),
+                visitedVenuesPublic = item.optBoolean("visitedVenuesPublic", true),
+                webProfileRevision = item.optLong("webProfileRevision", 0L)
+                    .coerceAtLeast(0L),
                 setupVersion = item.optInt("setupVersion", 0).coerceAtLeast(0),
                 revision = item.optLong("revision", 1L).coerceAtLeast(1L),
                 createdAtMillis = createdAtMillis,
@@ -197,6 +202,10 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                     put("notifyOnlineCheckIn", profile.notificationPreferences.onlineCheckIn)
                     put("notifyAbsence", profile.notificationPreferences.absence)
                     put("notifyMachineStatus", profile.notificationPreferences.machineStatus)
+                    put("webAccountBound", profile.webAccountBound)
+                    put("terminalEditingAllowed", profile.terminalEditingAllowed)
+                    put("visitedVenuesPublic", profile.visitedVenuesPublic)
+                    put("webProfileRevision", profile.webProfileRevision)
                     put("setupVersion", profile.setupVersion)
                     put("revision", profile.revision)
                     put("createdAtMillis", profile.createdAtMillis)

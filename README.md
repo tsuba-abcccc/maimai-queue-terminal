@@ -1,6 +1,6 @@
 # maimai Q
 
-[![Version](https://img.shields.io/badge/version-0.11.0-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
+[![Version](https://img.shields.io/badge/version-0.12.0-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
 [![Android](https://img.shields.io/badge/Android-10%2B-34C759?logo=android&logoColor=white)](https://developer.android.com/about/versions/10)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-007AFF)](https://developer.android.com/compose)
@@ -17,7 +17,7 @@
 - [独立公开队列页说明](public-site/README.md)
 - [玩家使用手册](docs/user-manual.md)
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
-- [0.1.0 至 0.11.0 更新日志](docs/update.md)
+- [0.1.0 至 0.12.0 更新日志](docs/update.md)
 - [后续版本路线](docs/roadmap.md)
 - [开发与交付记录](docs/development-log.md)
 - [云端同步协议](docs/cloud-queue-sync.md)
@@ -205,7 +205,7 @@ app/build/outputs/apk/local/debug/app-local-debug.apk
 .\gradlew.bat :app:packageLocalDebugApk
 ```
 
-文件会复制到 `output/apk/maimai-Q-0.11.0-local.apk`。
+文件会复制到 `output/apk/maimai-Q-0.12.0-local.apk`。
 
 macOS 或 Linux 使用：
 
@@ -293,7 +293,7 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 
 签名后还应检查其应用 ID 为 `com.abcccc.maimaiqueue`、包含联网权限、不是 Debug 构建，并确认 APK 中没有任何实际域名或令牌。
 
-现场终端文件会复制到 `output/apk/maimai-Q-0.11.0-terminal.apk`。只有不含预置连接信息且经过正式签名和校验的构建，才可以作为 GitHub 公开 Release 附件。
+现场终端文件会复制到 `output/apk/maimai-Q-0.12.0-terminal.apk`。只有不含预置连接信息且经过正式签名和校验的构建，才可以作为 GitHub 公开 Release 附件。
 
 ## 部署队列 API
 
@@ -383,7 +383,7 @@ maimai-queue-terminal/
 - “使用移动设备登记”依赖现场终端生成的短时二维码，不能脱离现场或作为远程预约入口使用。
 - 玩家资料仍由终端执行最终冲突校验；云端较新版本可以回流本机，同版本或旧版本不会覆盖本机资料。
 - 网站与 Koishi Bot 的线上登记仅接受已经绑定 QQ 的玩家资料；移动设备登记页可以新建资料或补全旧资料，但提交后仍需终端确认才会加入现场队列。
-- 线上登记必须在创建后的 30 分钟内到终端签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出。网站暂不提供暂缓一次、暂时离开、切换机台、修改偏好或退出排队等队列管理操作。
+- 线上登记必须在创建后的 30 分钟内到终端签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出。登录网页个人账户后，可以管理本人的正常登记；暂缓一次、暂时离开、切换机台、修改本次偏好和退出排队仍由现场终端按最新状态确认。待签到登记在网页只能退出排队，签到必须在现场终端完成。
 - QQ Bot 只允许玩家管理与发送者 QQ 对应的本人登记，不提供远程调整其他玩家或整条队列的能力。
 - `public-site/` 是公开队列页的规范前端源码；其他站点可以按自身构建流程复用队列组件，公开站点与其他站点分别构建、互不覆盖。
 - 仓库没有包含可公开使用的生产同步令牌或正式签名密钥。

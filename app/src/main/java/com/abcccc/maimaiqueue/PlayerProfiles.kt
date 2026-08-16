@@ -49,6 +49,10 @@ data class PlayerProfile(
     val qqVisibility: QqVisibility = QqVisibility.TERMINAL_ONLY,
     val notificationPreferences: QueueNotificationPreferences =
         QueueNotificationPreferences(),
+    val webAccountBound: Boolean = false,
+    val terminalEditingAllowed: Boolean = true,
+    val visitedVenuesPublic: Boolean = true,
+    val webProfileRevision: Long = 0L,
     val setupVersion: Int = 0,
     val revision: Long = 1L,
     val createdAtMillis: Long = System.currentTimeMillis(),

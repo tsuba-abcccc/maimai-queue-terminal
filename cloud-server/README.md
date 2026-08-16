@@ -4,7 +4,7 @@
 
 ## 数据权威关系
 
-- 机厅终端始终是队列和玩家资料的最终数据源。
+- 机厅终端始终是队列操作和轮换结果的最终数据源。未绑定网页账户的玩家资料仍由终端管理；绑定后的账户字段由服务端按资料修订号保护，旧终端快照不能覆盖网页更新。
 - 终端操作先写入本机，再上传服务器；服务器不可用时不影响现场排队。
 - 网站和 QQ Bot 的修改先保存为待执行命令，终端拉取并按本地规则校验，通过后才成为正式数据。
 - 终端可以独立关闭“QQ Bot 联动”；关闭时 Bot 接口停止服务，待执行命令失效，关闭期间不积压通知。
@@ -30,8 +30,15 @@ QUEUE_CORS_ORIGIN=https://example.com
 QUEUE_PUBLIC_SITE_URL=https://example.com
 QUEUE_MOBILE_SESSION_TTL_SECONDS=600
 QUEUE_MOBILE_SESSION_RETENTION_SECONDS=86400
-QUEUE_LATEST_TERMINAL_VERSION=0.11.0
-QUEUE_LATEST_WEBSITE_VERSION=0.11.0
+QUEUE_PLAYER_ACCOUNT_SITE_URL=https://example.com
+QUEUE_PLAYER_SESSION_TTL_SECONDS=2592000
+QUEUE_PLAYER_BINDING_TTL_SECONDS=600
+QUEUE_PLAYER_AUTH_LIMIT_WINDOW_SECONDS=900
+QUEUE_PLAYER_AUTH_LIMIT_BLOCK_SECONDS=900
+QUEUE_PLAYER_AUTH_LIMIT_FAILURES=5
+QUEUE_PLAYER_COOKIE_SECURE=true
+QUEUE_LATEST_TERMINAL_VERSION=0.12.0
+QUEUE_LATEST_WEBSITE_VERSION=0.12.0
 QUEUE_LATEST_BOT_VERSION=0.3.13
 ```
 
@@ -51,6 +58,8 @@ QUEUE_LATEST_BOT_VERSION=0.3.13
 
 `QUEUE_PUBLIC_SITE_URL` 是终端“使用移动设备登记”二维码打开的排队页面。`QUEUE_MOBILE_SESSION_TTL_SECONDS` 控制二维码有效时间，默认 10 分钟；`QUEUE_MOBILE_SESSION_RETENTION_SECONDS` 控制已结束会话和结果的保留时间，默认 24 小时。
 
+`QUEUE_PLAYER_ACCOUNT_SITE_URL` 是终端“绑定网页账户”二维码打开的页面；留空时使用 `QUEUE_PUBLIC_SITE_URL`。公开 HTTPS 部署必须保持 `QUEUE_PLAYER_COOKIE_SECURE=true`。账户会话默认保留 30 天，绑定二维码默认 10 分钟有效；登录、绑定、修改 QQ 或修改密码连续验证失败 5 次后默认限制 15 分钟。
+
 ## 接口边界
 
 公开接口：
@@ -69,6 +78,23 @@ POST /api/queue-online/profile                 {"qq":"<QQ号>"}
 POST /api/queue-online/join                    {"request_id":"<UUID>","qq":"<QQ号>","machine_id":"A"}
 GET  /api/queue-online/commands/<command_id>
 ```
+
+玩家网页账户使用现场终端生成的一次性绑定凭据和浏览器会话，不使用终端或 Bot 令牌：
+
+```text
+POST /api/queue-terminal/player-bindings
+GET  /api/player-account/bindings/<binding_token>
+POST /api/player-account/bindings/<binding_token>/complete
+POST /api/player-account/login
+GET  /api/player-account
+PATCH /api/player-account/profile
+POST /api/player-account/password
+GET  /api/player-account/queue
+POST /api/player-account/queue-commands
+POST /api/player-account/logout
+```
+
+修改资料、密码和排队状态需要会话 Cookie 与 `X-CSRF-Token`。QQ 只能在网页修改，并要求再次输入当前密码。个人排队命令的 QQ 由服务端根据登录账户填写，客户端不能指定或替换；最终操作仍由现场终端校验。
 
 终端二维码对应的移动设备登记接口使用短时会话令牌，不使用 Bot 令牌：
 
@@ -111,7 +137,7 @@ GET   /api/queue-bot/commands/<command_id>
 
 当前允许 QQ 用户修改自己的昵称、性别和默认游玩偏好，并管理与发送者 QQ 对应的本人登记。QQ 是身份键，不能通过普通资料修改命令更换。线上登记尚未在现场签到时只允许退出排队；创建后的 30 分钟签到时限和轮到时自动退出规则由现场终端执行。关闭“允许线上登记”只会隐藏并拒绝新建入口，不影响这些已有功能。
 
-网站只能查询与指定 QQ 对应的单份资料并创建线上登记，不能取得完整玩家资料库，也不能修改已有登记。网站提交成功后只会获得不含命令载荷的状态回执；现场终端仍会重新检查队列批次、资料、机台状态、登记上限和本次偏好。
+未登录网站只能查询与指定 QQ 对应的单份资料并创建线上登记，不能取得完整玩家资料库。绑定并登录本人账户后，可以修改本人资料并管理本人登记；服务端按账户关联资料确定身份，不能通过提交其他 QQ、昵称、玩家编号或登记编号操作他人。网站提交成功后只会获得不含私有命令载荷的状态回执；现场终端仍会重新检查队列批次、资料、机台状态、登记上限和本次偏好。
 
 ### 排队命令
 

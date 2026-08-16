@@ -114,6 +114,308 @@ class QueueStatusApiTest(unittest.TestCase):
         ).get_json()
         self.assertNotEqual("错误机厅", fetched["venue"]["name"])
 
+    def test_player_account_binding_profile_update_and_password_change(self):
+        snapshot = self.remote_ready_snapshot()
+        published = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+
+        self.assertEqual(204, published.status_code)
+        self.assertEqual(201, binding.status_code)
+        token = binding.get_json()["binding_token"]
+        completed = self.client.post(
+            f"/api/player-account/bindings/{token}/complete",
+            json={"password": "first-password"},
+        )
+        self.assertEqual(201, completed.status_code)
+        bound_profile = completed.get_json()["account"]["profile"]
+        self.assertTrue(bound_profile["web_account_bound"])
+        self.assertFalse(bound_profile["terminal_editing_allowed"])
+        self.assertEqual("PUBLIC_WEBSITE", bound_profile["qq_visibility"])
+
+        csrf_cookie = self.client.get_cookie("maimai_q_session_csrf")
+        self.assertIsNotNone(csrf_cookie)
+        csrf_headers = {"X-CSRF-Token": csrf_cookie.value}
+        updated = self.client.patch(
+            "/api/player-account/profile",
+            json={
+                "expected_profile_revision": bound_profile["profile_revision"],
+                "nickname": "网页昵称",
+                "terminal_editing_allowed": True,
+            },
+            headers=csrf_headers,
+        )
+        self.assertEqual(200, updated.status_code)
+        self.assertEqual("网页昵称", updated.get_json()["account"]["profile"]["nickname"])
+        self.assertTrue(
+            updated.get_json()["account"]["profile"]["terminal_editing_allowed"]
+        )
+
+        changed_password = self.client.post(
+            "/api/player-account/password",
+            json={
+                "current_password": "first-password",
+                "new_password": "second-password",
+                "new_password_confirmation": "second-password",
+            },
+            headers=csrf_headers,
+        )
+        self.assertEqual(200, changed_password.status_code)
+
+        fresh_client = self.app.test_client()
+        old_login = fresh_client.post(
+            "/api/player-account/login",
+            json={"qq": "12345678", "password": "first-password"},
+        )
+        new_login = fresh_client.post(
+            "/api/player-account/login",
+            json={"qq": "12345678", "password": "second-password"},
+        )
+        self.assertEqual(401, old_login.status_code)
+        self.assertEqual(200, new_login.status_code)
+
+        queued_snapshot = self.remote_ready_snapshot(
+            revision=5, with_registration=True
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=queued_snapshot, headers=self.headers
+            ).status_code,
+        )
+        fresh_csrf = fresh_client.get_cookie("maimai_q_session_csrf")
+        qq_updated = fresh_client.patch(
+            "/api/player-account/profile",
+            json={
+                "expected_profile_revision": new_login.get_json()["account"]["profile"][
+                    "profile_revision"
+                ],
+                "qq_number": "87654321",
+                "current_password": "second-password",
+            },
+            headers={"X-CSRF-Token": fresh_csrf.value},
+        )
+        self.assertEqual(200, qq_updated.status_code)
+        self.assertEqual(
+            "87654321", qq_updated.get_json()["account"]["profile"]["qq_number"]
+        )
+
+        queue_response = fresh_client.get("/api/player-account/queue")
+        self.assertEqual(200, queue_response.status_code)
+        queue_payload = queue_response.get_json()
+        self.assertEqual(1, len(queue_payload["registrations"]))
+        registration = queue_payload["registrations"][0]
+        queue = queue_payload["queue"]
+        command_payload = {
+            "request_id": "00000000-0000-0000-0000-000000000777",
+            "operation": "DEFER_ONE_ROUND",
+            "expected_queue_id": queue["queue_id"],
+            "expected_registration_id": registration["registration_id"],
+            "expected_machine_id": registration["machine_id"],
+            "expected_position": registration["position"],
+            "expected_fixed_pair_id": registration["fixed_pair_id"],
+            "expected_absence_status": "NONE",
+            "expected_temporary_away_skipped_turns": 0,
+            "expected_pending_check_in": False,
+            "expected_machine_configuration_revision": queue[
+                "machine_configuration_revision"
+            ],
+            "expected_machine_stable_id": registration["machine_stable_id"],
+        }
+        command = fresh_client.post(
+            "/api/player-account/queue-commands",
+            json=command_payload,
+            headers={"X-CSRF-Token": fresh_csrf.value},
+        )
+        forged = fresh_client.post(
+            "/api/player-account/queue-commands",
+            json={**command_payload, "actor_qq": "87654321"},
+            headers={"X-CSRF-Token": fresh_csrf.value},
+        )
+        self.assertEqual(202, command.status_code)
+        self.assertEqual("87654321", command.get_json()["payload"]["actor_qq"])
+        self.assertTrue(command.get_json()["payload"]["profile_identity_verified"])
+        self.assertEqual(400, forged.status_code)
+
+    def test_player_account_rebinding_preserves_settings_and_validation_uses_http_errors(self):
+        snapshot = self.remote_ready_snapshot()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        first_binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        ).get_json()
+        first = self.client.post(
+            f"/api/player-account/bindings/{first_binding['binding_token']}/complete",
+            json={"password": "first-password"},
+        )
+        csrf = self.client.get_cookie("maimai_q_session_csrf").value
+        profile = first.get_json()["account"]["profile"]
+        missing_csrf = self.client.patch(
+            "/api/player-account/profile",
+            json={
+                "expected_profile_revision": profile["profile_revision"],
+                "visited_venues_public": False,
+            },
+        )
+        customized = self.client.patch(
+            "/api/player-account/profile",
+            json={
+                "expected_profile_revision": profile["profile_revision"],
+                "qq_visibility": "TERMINAL_ONLY",
+                "visited_venues_public": False,
+                "terminal_editing_allowed": True,
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(403, missing_csrf.status_code)
+        self.assertEqual("CSRF_TOKEN_INVALID", missing_csrf.get_json()["code"])
+        self.assertEqual(200, customized.status_code)
+
+        obsolete_binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        ).get_json()
+        second_binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        ).get_json()
+        invalidated = self.client.get(
+            f"/api/player-account/bindings/{obsolete_binding['binding_token']}"
+        )
+        too_short = self.client.post(
+            f"/api/player-account/bindings/{second_binding['binding_token']}/complete",
+            json={"password": "short"},
+        )
+        rebound = self.client.post(
+            f"/api/player-account/bindings/{second_binding['binding_token']}/complete",
+            json={"password": "second-password"},
+        )
+        rebound_profile = rebound.get_json()["account"]["profile"]
+        reused = self.client.post(
+            f"/api/player-account/bindings/{second_binding['binding_token']}/complete",
+            json={"password": "third-password"},
+        )
+
+        self.assertEqual(410, invalidated.status_code)
+        self.assertEqual("PLAYER_BINDING_EXPIRED", invalidated.get_json()["code"])
+        self.assertEqual(400, too_short.status_code)
+        self.assertEqual(201, rebound.status_code)
+        self.assertEqual(409, reused.status_code)
+        self.assertEqual("PLAYER_BINDING_USED", reused.get_json()["code"])
+        self.assertEqual("TERMINAL_ONLY", rebound_profile["qq_visibility"])
+        self.assertFalse(rebound_profile["visited_venues_public"])
+        self.assertTrue(rebound_profile["terminal_editing_allowed"])
+
+        rebound_csrf = self.client.get_cookie("maimai_q_session_csrf").value
+        invalid_password_change = self.client.post(
+            "/api/player-account/password",
+            json={
+                "current_password": "second-password",
+                "new_password": "short",
+                "new_password_confirmation": "short",
+            },
+            headers={"X-CSRF-Token": rebound_csrf},
+        )
+        self.assertEqual(400, invalid_password_change.status_code)
+        self.assertEqual("PASSWORD_TOO_SHORT", invalid_password_change.get_json()["code"])
+
+    def test_bound_profile_accepts_only_terminal_confirmed_bot_updates(self):
+        snapshot = self.remote_ready_snapshot(revision=4)
+        self.upgrade_snapshot_to_schema_v7(snapshot)
+        snapshot["schema_version"] = 8
+        venue_id = self.client.get(
+            "/api/queue-terminal/installation", headers=self.headers
+        ).get_json()["venue"]["id"]
+        snapshot["venue"] = {"id": venue_id}
+        schema_eight_headers = self.schema_eight_terminal_headers()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=schema_eight_headers
+            ).status_code,
+        )
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=schema_eight_headers,
+        ).get_json()
+        self.assertEqual(
+            201,
+            self.client.post(
+                f"/api/player-account/bindings/{binding['binding_token']}/complete",
+                json={"password": "account-password"},
+            ).status_code,
+        )
+        synced_profile = self.client.get(
+            "/api/queue-terminal/profiles", headers=schema_eight_headers
+        ).get_json()["profiles"][0]
+
+        command_id = "00000000-0000-0000-0000-000000000776"
+        created = self.client.patch(
+            f"/api/queue-bot/profiles/{self.profile_id}",
+            json={
+                "request_id": command_id,
+                "actor_qq": "12345678",
+                "nickname": "Bot 修改昵称",
+                "notify_queue_changes": False,
+            },
+            headers=self.bot_headers,
+        )
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=schema_eight_headers
+        ).get_json()["commands"]
+        acknowledged = self.client.post(
+            f"/api/queue-terminal/commands/{command_id}/result",
+            json={"status": "APPLIED", "detail": "玩家资料已由终端更新。"},
+            headers=schema_eight_headers,
+        )
+        self.assertEqual(202, created.status_code)
+        self.assertEqual([command_id], [command["command_id"] for command in commands])
+        self.assertEqual(200, acknowledged.status_code)
+
+        updated_snapshot = copy.deepcopy(snapshot)
+        updated_snapshot["revision"] = 5
+        updated_profile = {
+            key: value
+            for key, value in synced_profile.items()
+            if key not in {"public_player_id_aliases", "synced_at"}
+        }
+        updated_profile.update(
+            nickname="Bot 修改昵称",
+            notify_queue_changes=False,
+            profile_revision=synced_profile["profile_revision"] + 1,
+            updated_at=synced_profile["updated_at"] + 1,
+        )
+        updated_snapshot["private_player_profiles"] = [updated_profile]
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status",
+                json=updated_snapshot,
+                headers=schema_eight_headers,
+            ).status_code,
+        )
+        stored = self.client.post(
+            "/api/queue-bot/profiles",
+            json={"qq": "12345678"},
+            headers=self.bot_headers,
+        ).get_json()["profiles"][0]
+        self.assertEqual("Bot 修改昵称", stored["nickname"])
+        self.assertFalse(stored["notify_queue_changes"])
+
     def test_schema_eight_private_terminal_routes_require_the_active_venue(self):
         snapshot = self.remote_ready_snapshot(revision=4)
         self.assertEqual(
@@ -5370,7 +5672,7 @@ class QueueStatusApiTest(unittest.TestCase):
                 json={
                     "bot_qq": "87654321",
                     "bot_version": "0.3.13",
-                    "website_version": "v0.11.0",
+                    "website_version": "v0.12.0",
                 },
                 headers=self.bot_headers,
             )
@@ -5378,7 +5680,7 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertEqual(204, published.status_code)
         self.assertEqual(200, identity.status_code)
-        self.assertEqual("0.11.0", identity.get_json()["website_version"])
+        self.assertEqual("0.12.0", identity.get_json()["website_version"])
         self.assertEqual(200, versions.status_code)
         payload = versions.get_json()
         self.assertEqual(1_234_000, payload["checked_at"])
@@ -5387,7 +5689,7 @@ class QueueStatusApiTest(unittest.TestCase):
             {
                 "name": "现场终端",
                 "current_version": "0.10.0",
-                "latest_version": "0.11.0",
+                "latest_version": "0.12.0",
                 "status": "UPDATE_AVAILABLE",
                 "updated_at": 1_234_000,
             },

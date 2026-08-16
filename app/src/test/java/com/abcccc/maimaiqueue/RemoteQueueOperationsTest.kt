@@ -920,6 +920,44 @@ class RemoteQueueOperationsTest {
         assertTrue(deferred.detail.contains("登记状态已经变化"))
     }
 
+    @Test
+    fun verifiedWebsiteAccountOperationUsesStableProfileIdentityWhileQqSyncs() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = PROFILE_ID
+        )
+        val command = operationCommand(
+            operation = RemoteQueueOperation.LEAVE_QUEUE,
+            registration = player
+        ).copy(
+            actorQq = "87654321",
+            source = RemoteQueueOperationSource.WEBSITE_REMOTE,
+            profileIdentityVerified = true
+        )
+
+        assertTrue(
+            decideRemoteQueueOperation(
+                command,
+                state(machineA = MachineQueue(waiting = listOf(player)), nextKey = 3)
+            ) is RemoteQueueOperationDecision.Apply
+        )
+        assertTrue(
+            decideRemoteQueueOperation(
+                command.copy(profileIdentityVerified = false),
+                state(machineA = MachineQueue(waiting = listOf(player)), nextKey = 3)
+            ) is RemoteQueueOperationDecision.Reject
+        )
+        assertTrue(
+            decideRemoteQueueOperation(
+                joinCommand().copy(
+                    actorQq = "87654321",
+                    profileIdentityVerified = true
+                ),
+                state()
+            ) is RemoteQueueOperationDecision.Reject
+        )
+    }
+
     private fun state(
         machineA: MachineQueue = MachineQueue(),
         machineB: MachineQueue = MachineQueue(),

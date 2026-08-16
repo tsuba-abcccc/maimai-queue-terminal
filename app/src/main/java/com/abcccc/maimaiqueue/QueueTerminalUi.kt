@@ -379,6 +379,12 @@ internal fun RegistrationApp() {
     }
     var mobileRegistrationLoading by remember { mutableStateOf(false) }
     var mobileRegistrationFailureDetail by remember { mutableStateOf<String?>(null) }
+    var playerAccountBindingSession by remember {
+        mutableStateOf<PlayerAccountBindingSession?>(null)
+    }
+    var playerAccountBindingLoading by remember { mutableStateOf(false) }
+    var playerAccountBindingFailureDetail by remember { mutableStateOf<String?>(null) }
+    var playerAccountBindingProfileId by remember { mutableStateOf<String?>(null) }
     var profileJoinPreference by remember { mutableStateOf<PlayPreference?>(null) }
     var rememberProfileJoinPreference by remember { mutableStateOf(false) }
     var playerProfileContext by remember { mutableStateOf(PlayerProfileContext.JOIN_QUEUE) }
@@ -2337,6 +2343,14 @@ internal fun RegistrationApp() {
         profile: PlayerProfile,
         returnScreen: Screen = Screen.PLAYER_LIBRARY
     ) {
+        if (profile.webAccountBound && !profile.terminalEditingAllowed) {
+            Toast.makeText(
+                context,
+                panguSpacing("这份资料已绑定网页账户，请在网页个人设置中编辑。"),
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
         playerProfileEditorReturnScreen = returnScreen
         editingPlayerProfileId = profile.id
         profileNicknameDraft = profile.nickname
@@ -2389,6 +2403,13 @@ internal fun RegistrationApp() {
         val nowMillis = System.currentTimeMillis()
         val existingProfile = editingPlayerProfileId?.let { profileId ->
             playerProfiles.firstOrNull { it.id == profileId }
+        }
+        if (existingProfile?.webAccountBound == true &&
+            normalizedQqNumber != existingProfile.normalizedQqNumber()
+        ) {
+            playerProfileWriteFailureDetail =
+                "这份资料已绑定网页账户，QQ 只能在网页个人设置中修改。"
+            return
         }
         val completedNewSettings = existingProfile?.hasCompleteRequiredDetails != true
         val savedProfile = existingProfile?.copy(
@@ -2800,6 +2821,39 @@ internal fun RegistrationApp() {
                 }
             } finally {
                 mobileRegistrationLoading = false
+            }
+        }
+    }
+
+    fun requestPlayerAccountBinding(profile: PlayerProfile) {
+        if (
+            playerAccountBindingLoading ||
+            !profile.hasValidContact ||
+            !profile.hasCompleteRequiredDetails ||
+            !cloudSyncAvailable ||
+            !queueRuleSettings.websiteSyncEnabled ||
+            !queueCommandClient.isConfigured ||
+            !terminalInstallation.allowsOnlineAccess(queueRuleSettings.queueSyncEndpoint)
+        ) return
+        playerAccountBindingLoading = true
+        playerAccountBindingFailureDetail = null
+        playerAccountBindingProfileId = profile.id
+        coroutineScope.launch {
+            try {
+                val session = queueCommandClient.createPlayerAccountBindingSession(
+                    expectedVenueId = terminalInstallation.expectedServerVenueId,
+                    profileId = profile.id
+                )
+                if (playerProfiles.none { it.id == profile.id }) return@launch
+                if (session == null) {
+                    playerAccountBindingFailureDetail =
+                        queueCommandClient.commandSyncFailureDetail
+                            ?: "暂时无法创建网页账户绑定，请稍后重试。"
+                } else {
+                    playerAccountBindingSession = session
+                }
+            } finally {
+                playerAccountBindingLoading = false
             }
         }
     }
@@ -4444,6 +4498,9 @@ internal fun RegistrationApp() {
                             qqNumber = profileQqDraft,
                             qqAlreadyExists = profileQqDraft.isNotBlank() &&
                                 playerProfileQqExists(profileQqDraft, editingPlayerProfileId),
+                            qqEditable = editingPlayerProfileId?.let { profileId ->
+                                playerProfiles.firstOrNull { it.id == profileId }
+                            }?.webAccountBound != true,
                             qqVisibility = profileQqVisibilityDraft,
                             notificationPreferences = profileNotificationDraft,
                             botQqNumber = botQqNumber,
@@ -4565,12 +4622,34 @@ internal fun RegistrationApp() {
                                             statusFor(machineId).isOperational &&
                                             queueFor(machineId).registrationCount < 20
                                     } == true,
+                                    webAccountBindingEnabled = cloudSyncAvailable &&
+                                        queueRuleSettings.websiteSyncEnabled &&
+                                        queueCommandClient.isConfigured &&
+                                        terminalInstallation.allowsOnlineAccess(
+                                            queueRuleSettings.queueSyncEndpoint
+                                        ),
+                                    webAccountBindingLoading =
+                                        playerAccountBindingLoading &&
+                                            playerAccountBindingProfileId == profile?.id,
+                                    webAccountBindingDisabledReason = when {
+                                        !cloudSyncAvailable ||
+                                            !queueRuleSettings.websiteSyncEnabled ||
+                                            !queueCommandClient.isConfigured ->
+                                            "请先在设置中配置并开启与服务端同步。"
+                                        terminalInstallation.registrationState ==
+                                            TerminalInstallationRegistrationState.VENUE_MISMATCH ->
+                                            "当前服务器属于另一机厅，请先在设置中修正连接。"
+                                        else -> "正在核对服务器所属机厅，完成后才能绑定网页账户。"
+                                    },
                                     onPreferenceChange = { profileJoinPreference = it },
                                     onRememberPreferenceChange = { rememberProfileJoinPreference = it },
                                     onEditProfile = {
                                         profile?.let {
                                             openEditPlayerProfile(it, Screen.PLAYER_PROFILE_DETAIL)
                                         }
+                                    },
+                                    onBindWebAccount = {
+                                        profile?.let(::requestPlayerAccountBinding)
                                     },
                                     onComplete = ::completePlayerProfileRegistration,
                                     onBack = { screen = Screen.PLAYER_LIBRARY }
@@ -6412,6 +6491,42 @@ internal fun RegistrationApp() {
                     )
                 }
 
+                playerAccountBindingSession?.let { session ->
+                    PlayerAccountBindingDialog(
+                        session = session,
+                        nowMillis = nowMillis,
+                        onDismiss = {
+                            playerAccountBindingSession = null
+                            playerAccountBindingProfileId = null
+                        },
+                        onRefresh = {
+                            val profile = playerAccountBindingProfileId?.let { profileId ->
+                                playerProfiles.firstOrNull { it.id == profileId }
+                            }
+                            playerAccountBindingSession = null
+                            if (profile != null) requestPlayerAccountBinding(profile)
+                        }
+                    )
+                }
+
+                playerAccountBindingFailureDetail?.let { detail ->
+                    PlayerAccountBindingFailureDialog(
+                        detail = detail,
+                        retryEnabled = !playerAccountBindingLoading,
+                        onDismiss = {
+                            playerAccountBindingFailureDetail = null
+                            playerAccountBindingProfileId = null
+                        },
+                        onRetry = {
+                            val profile = playerAccountBindingProfileId?.let { profileId ->
+                                playerProfiles.firstOrNull { it.id == profileId }
+                            }
+                            playerAccountBindingFailureDetail = null
+                            if (profile != null) requestPlayerAccountBinding(profile)
+                        }
+                    )
+                }
+
                 botFriendPromptQq?.let { qqNumber ->
                     BotFriendQrDialog(
                         qqNumber = qqNumber,
@@ -6692,11 +6807,13 @@ private fun QueueSettingsNavigation(
                         overflow = TextOverflow.Ellipsis
                     )
                 }
+
                 Spacer(Modifier.width(5.dp))
                 Text("›", color = if (isSelected) SystemBlue else TertiaryText, fontSize = 18.sp)
             }
         }
     }
+
 }
 
 @Composable
@@ -11829,6 +11946,7 @@ private fun PlayerProfileEditorScreen(
     defaultPreference: ProfilePlayPreference,
     qqNumber: String,
     qqAlreadyExists: Boolean,
+    qqEditable: Boolean,
     qqVisibility: QqVisibility,
     notificationPreferences: QueueNotificationPreferences,
     botQqNumber: String?,
@@ -11875,6 +11993,7 @@ private fun PlayerProfileEditorScreen(
     val qqSyntaxValid = normalizedQqNumber != null && isValidQqNumber(normalizedQqNumber)
     val contactValid = qqSyntaxValid && !qqAlreadyExists
     val contactMessage = when {
+        !qqEditable -> "这份资料已绑定网页账户，QQ 只能在网页个人设置中修改。"
         normalizedQqNumber == null -> "请输入 QQ 号。"
         !qqSyntaxValid -> "QQ 号应为 5 至 12 位数字。"
         qqAlreadyExists -> "这个 QQ 号已经用于另一份玩家资料。"
@@ -11963,7 +12082,8 @@ private fun PlayerProfileEditorScreen(
                     label = { Text("QQ 号") },
                     placeholder = { Text("5 至 12 位数字") },
                     singleLine = true,
-                    isError = qqNumber.isNotBlank() && !contactValid,
+                    enabled = qqEditable,
+                    isError = qqEditable && qqNumber.isNotBlank() && !contactValid,
                     keyboardOptions = KeyboardOptions(
                         keyboardType = KeyboardType.Number
                     ),
@@ -11974,7 +12094,7 @@ private fun PlayerProfileEditorScreen(
                 Spacer(Modifier.height(6.dp))
                 Text(
                     contactMessage,
-                    color = if (contactValid) SecondaryText else Destructive,
+                    color = if (contactValid || !qqEditable) SecondaryText else Destructive,
                     fontSize = 10.sp,
                     lineHeight = 14.sp
                 )
@@ -12320,9 +12440,13 @@ private fun PlayerProfileDetailScreen(
     machineAvailable: Boolean,
     machineLabel: String,
     singlePlayerMachine: Boolean,
+    webAccountBindingEnabled: Boolean,
+    webAccountBindingLoading: Boolean,
+    webAccountBindingDisabledReason: String,
     onPreferenceChange: (PlayPreference) -> Unit,
     onRememberPreferenceChange: (Boolean) -> Unit,
     onEditProfile: () -> Unit,
+    onBindWebAccount: () -> Unit,
     onComplete: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -12446,6 +12570,33 @@ private fun PlayerProfileDetailScreen(
                 !machineAvailable -> "$machineLabel 目前无法接收新的登记。"
                 else -> "请先选择本次游玩偏好。"
             }
+        )
+        Spacer(Modifier.height(10.dp))
+        SecondaryButton(
+            when {
+                webAccountBindingLoading -> "正在创建绑定页面"
+                profile.webAccountBound -> "重新绑定网页账户"
+                else -> "绑定网页账户"
+            },
+            onBindWebAccount,
+            Modifier.fillMaxWidth(),
+            enabled = webAccountBindingEnabled && !webAccountBindingLoading,
+            disabledReason = if (webAccountBindingLoading) {
+                "正在向服务端创建一次性绑定页面。"
+            } else {
+                webAccountBindingDisabledReason
+            }
+        )
+        Spacer(Modifier.height(7.dp))
+        Text(
+            if (profile.webAccountBound) {
+                "这份资料已绑定网页账户。重新绑定可以在本人忘记密码时重新设置密码，不会改变现有资料和隐私设置。"
+            } else {
+                "绑定后可在网页管理个人资料。绑定页面只对这份资料有效，且会在短时间后失效。"
+            },
+            color = TertiaryText,
+            fontSize = 10.sp,
+            lineHeight = 15.sp
         )
     }
 }
@@ -15644,6 +15795,120 @@ private fun MobileRegistrationFailureDialog(
             Modifier.fillMaxWidth(),
             enabled = retryEnabled,
             disabledReason = "本次移动设备登记会话已经结束，请关闭后重新进入。"
+        )
+        Spacer(Modifier.height(8.dp))
+        CancelAction(onDismiss)
+    }
+}
+
+@Composable
+private fun PlayerAccountBindingDialog(
+    session: PlayerAccountBindingSession,
+    nowMillis: Long,
+    onDismiss: () -> Unit,
+    onRefresh: () -> Unit
+) {
+    val expired = nowMillis >= session.expiresAtMillis
+    ModalSurface(onDismiss, width = 500.dp) {
+        Text(
+            "绑定网页账户",
+            color = PrimaryText,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(7.dp))
+        Text(
+            if (expired) {
+                "这张二维码已经失效，请重新生成后再扫码。"
+            } else {
+                "请让“${session.profileNickname}”本人使用手机扫码，并在网页中设置账户密码。"
+            },
+            color = if (expired) Destructive else SecondaryText,
+            fontSize = 13.sp,
+            lineHeight = 20.sp
+        )
+        if (!expired) {
+            Spacer(Modifier.height(14.dp))
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                    .background(PageBackground)
+                    .padding(horizontal = 14.dp, vertical = 11.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column {
+                    Text("玩家编号", color = TertiaryText, fontSize = 10.sp)
+                    Text(
+                        session.publicPlayerId ?: "等待服务端分配",
+                        color = PrimaryText,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                Column(horizontalAlignment = Alignment.End) {
+                    Text("QQ", color = TertiaryText, fontSize = 10.sp)
+                    Text(session.qqNumber, color = PrimaryText, fontSize = 14.sp)
+                }
+            }
+            Spacer(Modifier.height(14.dp))
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                QrCodeImage(
+                    content = session.bindingUrl,
+                    contentDescription = "网页账户绑定二维码",
+                    size = 224.dp
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "二维码将在 ${formatClockTime(session.expiresAtMillis)} 失效",
+                color = TertiaryText,
+                fontSize = 11.sp,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "这次绑定只适用于当前玩家资料。网页不会凭 QQ、昵称或玩家编号直接绑定其他资料。重新生成二维码后，旧二维码会立即失效。",
+                color = SecondaryText,
+                fontSize = 12.sp,
+                lineHeight = 19.sp,
+                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                    .background(PageBackground)
+                    .padding(horizontal = 13.dp, vertical = 11.dp)
+            )
+            Spacer(Modifier.height(17.dp))
+            SecondaryButton("关闭", onDismiss, Modifier.fillMaxWidth())
+        } else {
+            Spacer(Modifier.height(18.dp))
+            PrimaryButton("重新生成二维码", onRefresh, Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
+            CancelAction(onDismiss)
+        }
+    }
+}
+
+@Composable
+private fun PlayerAccountBindingFailureDialog(
+    detail: String,
+    retryEnabled: Boolean,
+    onDismiss: () -> Unit,
+    onRetry: () -> Unit
+) {
+    ModalSurface(onDismiss, width = 450.dp) {
+        Text(
+            "无法绑定网页账户",
+            color = PrimaryText,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(detail, color = SecondaryText, fontSize = 13.sp, lineHeight = 20.sp)
+        Spacer(Modifier.height(18.dp))
+        PrimaryButton(
+            "重试",
+            onRetry,
+            Modifier.fillMaxWidth(),
+            enabled = retryEnabled,
+            disabledReason = "正在向服务端创建新的绑定页面。"
         )
         Spacer(Modifier.height(8.dp))
         CancelAction(onDismiss)

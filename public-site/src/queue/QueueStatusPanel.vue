@@ -8,6 +8,7 @@ import {
   RefreshCw,
   TriangleAlert,
   UserPlus,
+  UserRound,
   UserRoundCheck,
   Users,
   WifiOff,
@@ -15,6 +16,7 @@ import {
 } from '@lucide/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import MobileRegistrationFlow from './MobileRegistrationFlow.vue'
+import PlayerAccountDialog from './PlayerAccountDialog.vue'
 import { compactMiddleDots, normalizeMachineConfiguration } from './machineConfiguration.js'
 
 const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL ||
@@ -118,6 +120,8 @@ const onlineJoinResultDetail = ref('')
 const onlineJoinResultRegistrationId = ref(null)
 const onlineJoinTerminalApplied = ref(false)
 const mobileRegistrationToken = ref('')
+const playerAccountBindingToken = ref('')
+const playerAccountDialogVisible = ref(false)
 let refreshTimer
 let clockTimer
 let onlineCommandTimer
@@ -893,6 +897,27 @@ function openVersionDialog() {
 
 function closeVersionDialog() {
   versionDialogVisible.value = false
+}
+
+function openPlayerAccount() {
+  playerAccountDialogVisible.value = true
+}
+
+function closePlayerAccount() {
+  playerAccountDialogVisible.value = false
+  if (playerAccountBindingToken.value) {
+    playerAccountBindingToken.value = ''
+    const url = new URL(window.location.href)
+    url.searchParams.delete('account_binding')
+    window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
+  }
+}
+
+function handlePlayerAccountBound() {
+  playerAccountBindingToken.value = ''
+  const url = new URL(window.location.href)
+  url.searchParams.delete('account_binding')
+  window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
 }
 
 function normalizeLogEvent(source) {
@@ -2060,6 +2085,7 @@ async function submitOnlineJoin() {
 
 function handleKeydown(event) {
   if (event.key !== 'Escape') return
+  if (playerAccountDialogVisible.value) return
   if (onlineJoinVisible.value) closeOnlineJoin()
   else if (versionDialogVisible.value) closeVersionDialog()
   else if (pendingSelfRegistration.value) pendingSelfRegistration.value = null
@@ -2067,8 +2093,15 @@ function handleKeydown(event) {
 }
 
 onMounted(async () => {
-  mobileRegistrationToken.value = new URLSearchParams(window.location.search)
-    .get('mobile_registration') || ''
+  const query = new URLSearchParams(window.location.search)
+  mobileRegistrationToken.value = query.get('mobile_registration') || ''
+  playerAccountBindingToken.value = query.get('account_binding') || ''
+  playerAccountDialogVisible.value = Boolean(playerAccountBindingToken.value)
+  if (playerAccountBindingToken.value) {
+    const url = new URL(window.location.href)
+    url.searchParams.delete('account_binding')
+    window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
+  }
   if (mobileRegistrationToken.value) {
     await nextTick()
     return
@@ -2129,6 +2162,15 @@ onBeforeUnmount(() => {
             </template>
           </div>
           <div class="queue-system-actions">
+            <button
+              class="queue-version-button"
+              type="button"
+              aria-label="打开个人账户"
+              title="个人账户"
+              @click="openPlayerAccount"
+            >
+              <UserRound :size="18" aria-hidden="true" />
+            </button>
             <button
               class="queue-version-button"
               type="button"
@@ -2427,6 +2469,12 @@ onBeforeUnmount(() => {
     </section>
 
     <Teleport to="body">
+      <PlayerAccountDialog
+        v-if="playerAccountDialogVisible"
+        :binding-token="playerAccountBindingToken"
+        @close="closePlayerAccount"
+        @bound="handlePlayerAccountBound"
+      />
       <Transition name="queue-dialog">
         <div v-if="versionDialogVisible" class="queue-detail-backdrop" @click.self="closeVersionDialog">
           <section class="queue-detail-dialog queue-version-dialog" role="dialog" aria-modal="true"

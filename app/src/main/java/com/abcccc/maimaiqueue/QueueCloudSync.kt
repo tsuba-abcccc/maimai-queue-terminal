@@ -182,6 +182,10 @@ internal interface QueueCommandClient {
         machineId: String,
         machineStableId: String
     ): MobileRegistrationSession?
+    suspend fun createPlayerAccountBindingSession(
+        expectedVenueId: String?,
+        profileId: String
+    ): PlayerAccountBindingSession?
     suspend fun complete(
         expectedVenueId: String?,
         commandId: String,
@@ -274,6 +278,15 @@ private data class QueuePublishPayload(
     val displaySettings: QueuePublicDisplaySettings,
     val playerProfiles: List<PlayerProfile>,
     val installationIdentity: TerminalInstallationIdentity?
+)
+
+internal data class PlayerAccountBindingSession(
+    val bindingId: String,
+    val bindingUrl: String,
+    val expiresAtMillis: Long,
+    val profileNickname: String,
+    val publicPlayerId: String?,
+    val qqNumber: String
 )
 
 internal data class QueueConnectionConfiguration(
@@ -765,6 +778,61 @@ internal class HttpQueueCommandClient(
         }
     }
 
+    override suspend fun createPlayerAccountBindingSession(
+        expectedVenueId: String?,
+        profileId: String
+    ): PlayerAccountBindingSession? = withContext(Dispatchers.IO) {
+        runCatching {
+            val requestConfiguration = configuration
+            withSchemaFallback(requestConfiguration, expectedVenueId) { schemaVersion ->
+                val body = JSONObject().apply {
+                    put("profile_id", profileId)
+                }.toString().toByteArray(Charsets.UTF_8)
+                val connection = openConnection(
+                    terminalEndpoint(requestConfiguration, "/queue-terminal/player-bindings"),
+                    "POST",
+                    requestConfiguration.token,
+                    schemaVersion,
+                    expectedVenueId
+                ).apply {
+                    doOutput = true
+                    setFixedLengthStreamingMode(body.size)
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                }
+                try {
+                    connection.outputStream.use { it.write(body) }
+                    requireSuccessfulResponse(connection)
+                    val payload = JSONObject(
+                        connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                    )
+                    val profile = payload.getJSONObject("profile")
+                    PlayerAccountBindingSession(
+                        bindingId = payload.getString("binding_id"),
+                        bindingUrl = payload.getString("binding_url"),
+                        expiresAtMillis = payload.getLong("expires_at"),
+                        profileNickname = profile.getString("nickname"),
+                        publicPlayerId = profile.optionalNonBlankString("public_player_id"),
+                        qqNumber = profile.getString("qq_number")
+                    )
+                } finally {
+                    connection.disconnect()
+                }
+            }
+        }.fold(
+            onSuccess = { session ->
+                commandSyncFailureDetail = null
+                session
+            },
+            onFailure = { error ->
+                if (error is CancellationException) throw error
+                Log.w(LOG_TAG, "Player account binding creation failed", error)
+                commandSyncFailureDetail = queuePublishFailureDetail(error)
+                commandSyncLastErrorAtMillis = System.currentTimeMillis()
+                null
+            }
+        )
+    }
+
     private fun completeOnce(
         requestConfiguration: QueueConnectionConfiguration,
         schemaVersion: Int,
@@ -883,6 +951,11 @@ private fun parseSyncedPlayerProfile(source: JSONObject?): PlayerProfile? {
                 absence = source.optBoolean("notify_absence", true),
                 machineStatus = source.optBoolean("notify_machine_status", false)
             ),
+            webAccountBound = source.optBoolean("web_account_bound", false),
+            terminalEditingAllowed = source.optBoolean("terminal_editing_allowed", true),
+            visitedVenuesPublic = source.optBoolean("visited_venues_public", true),
+            webProfileRevision = source.optLong("web_profile_revision", 0L)
+                .coerceAtLeast(0L),
             setupVersion = source.optInt("setup_version", 0).coerceAtLeast(0),
             revision = source.optLong("profile_revision", 1L).coerceAtLeast(1L),
             createdAtMillis = source.getLong("created_at"),
@@ -1005,6 +1078,7 @@ private fun parseQueueOperation(command: JSONObject?): RemoteQueueOperationComma
             queueId = payload.getString("queue_id"),
             profileId = payload.getString("profile_id"),
             actorQq = payload.getString("actor_qq"),
+            profileIdentityVerified = payload.optBoolean("profile_identity_verified", false),
             operation = RemoteQueueOperation.valueOf(payload.getString("operation")),
             source = RemoteQueueOperationSource.valueOf(
                 payload.getString("operation_source")
@@ -1170,8 +1244,18 @@ private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): 
         !validMachineStableId(command.machineStableId) ||
         !validMachineStableId(command.targetMachineStableId) ||
         !validExpectedContext ||
-        (command.source == RemoteQueueOperationSource.WEBSITE_REMOTE &&
-            command.operation != RemoteQueueOperation.JOIN_QUEUE)
+        (
+            command.source == RemoteQueueOperationSource.WEBSITE_REMOTE &&
+                command.operation != RemoteQueueOperation.JOIN_QUEUE &&
+                !command.profileIdentityVerified
+            ) ||
+        (
+            command.profileIdentityVerified &&
+                (
+                    command.source != RemoteQueueOperationSource.WEBSITE_REMOTE ||
+                        command.operation == RemoteQueueOperation.JOIN_QUEUE
+                    )
+            )
     ) return false
 
     return when (command.operation) {
@@ -1510,6 +1594,12 @@ internal fun buildQueueSyncSnapshot(
                             "notify_machine_status",
                             profile.notificationPreferences.machineStatus
                         )
+                        if (schemaVersion >= 8) {
+                            put("web_account_bound", profile.webAccountBound)
+                            put("terminal_editing_allowed", profile.terminalEditingAllowed)
+                            put("visited_venues_public", profile.visitedVenuesPublic)
+                            put("web_profile_revision", profile.webProfileRevision)
+                        }
                         put("setup_version", profile.setupVersion)
                         put("profile_revision", profile.revision)
                         put("created_at", profile.createdAtMillis)

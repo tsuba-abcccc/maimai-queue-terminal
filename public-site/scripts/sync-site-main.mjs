@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 const projectRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const sharedFiles = [
   'QueueStatusPanel.vue',
+  'PlayerAccountDialog.vue',
   'MobileRegistrationFlow.vue',
   'MobileProfileSettings.vue',
   'machineConfiguration.js'
