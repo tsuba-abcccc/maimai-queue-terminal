@@ -358,6 +358,9 @@ internal fun RegistrationApp() {
     var lastHandledClosingOccurrenceId by remember {
         mutableStateOf(initialHandledClosingOccurrenceId)
     }
+    var businessHoursSyncPending by remember(queueRuleSettingsRepository) {
+        mutableStateOf(queueRuleSettingsRepository.isBusinessHoursSyncPending())
+    }
     var playerProfileSearch by remember { mutableStateOf("") }
     var playerProfileSort by remember { mutableStateOf(ProfileSortMode.RECOMMENDED) }
     var selectedPlayerProfileId by remember { mutableStateOf<String?>(null) }
@@ -788,6 +791,89 @@ internal fun RegistrationApp() {
                     terminalInstallation = failed
                     if (result.venueMismatch) return@LaunchedEffect
                     identityForAttempt = failed
+                    delay(retryDelayMillis)
+                    retryDelayMillis = (retryDelayMillis * 2)
+                        .coerceAtMost(INSTALLATION_PROBE_MAX_RETRY_MILLIS)
+                }
+            }
+        }
+    }
+
+    // Business hours belong to the venue rather than an individual terminal.
+    // Keep this channel separate from queue snapshots so older servers can
+    // continue serving the queue while newer terminals gradually adopt the
+    // venue settings endpoint.
+    LaunchedEffect(
+        foregroundRefreshGeneration,
+        terminalOnlineAccessAllowed,
+        terminalInstallation.venueId,
+        queueRuleSettings.queueSyncEndpoint,
+        queueRuleSettings.queueSyncToken,
+        queueRuleSettings.syncMode,
+        queueRuleSettings.businessHours,
+        businessHoursSyncPending
+    ) {
+        val expectedVenueId = terminalInstallation.venueId ?: return@LaunchedEffect
+        if (
+            queueRuleSettings.syncMode == QueueSyncMode.TEST ||
+            !terminalOnlineAccessAllowed ||
+            !terminalInstallationClient.isConfigured
+        ) {
+            return@LaunchedEffect
+        }
+        var retryDelayMillis = INSTALLATION_PROBE_INITIAL_RETRY_MILLIS
+        while (currentCoroutineContext().isActive) {
+            val result = if (businessHoursSyncPending) {
+                terminalInstallationClient.updateVenueSettings(
+                    settings = queueRuleSettings.businessHours,
+                    expectedVenueId = expectedVenueId
+                )
+            } else {
+                terminalInstallationClient.fetchVenueSettings(expectedVenueId)
+            }
+            currentCoroutineContext().ensureActive()
+            when (result) {
+                is VenueSettingsFetchResult.Success -> {
+                    if (businessHoursSyncPending) {
+                        queueRuleSettingsRepository.clearBusinessHoursSyncPending()
+                        businessHoursSyncPending = false
+                    } else if (result.businessHours == null) {
+                        queueRuleSettingsRepository.markBusinessHoursSyncPending()
+                        businessHoursSyncPending = true
+                    } else {
+                        val remoteSettings = result.businessHours.normalized()
+                        if (remoteSettings != queueRuleSettings.businessHours) {
+                            queueRuleSettings = queueRuleSettings.copy(
+                                businessHours = remoteSettings
+                            )
+                            queueRuleSettingsRepository.saveSettings(queueRuleSettings)
+                            showHomeOperationFeedback(
+                                title = "营业时间已更新",
+                                detail = "已采用服务端保存的机厅营业时间。",
+                                contextLabel = "与服务端同步",
+                                tone = HomeSidePanelFeedbackTone.INFO
+                            )
+                        }
+                    }
+                    retryDelayMillis = INSTALLATION_PROBE_INITIAL_RETRY_MILLIS
+                    delay(INSTALLATION_IDENTITY_REFRESH_INTERVAL_MILLIS)
+                }
+
+                VenueSettingsFetchResult.UnsupportedServer -> {
+                    delay(LEGACY_INSTALLATION_REPROBE_INTERVAL_MILLIS)
+                }
+
+                is VenueSettingsFetchResult.Failure -> {
+                    if (result.venueMismatch) {
+                        val failed = terminalInstallation.copy(
+                            registrationState = TerminalInstallationRegistrationState.VENUE_MISMATCH,
+                            lastError = result.detail,
+                            lastUpdatedAtMillis = System.currentTimeMillis()
+                        )
+                        terminalInstallationRepository.save(failed)
+                        terminalInstallation = failed
+                        return@LaunchedEffect
+                    }
                     delay(retryDelayMillis)
                     retryDelayMillis = (retryDelayMillis * 2)
                         .coerceAtMost(INSTALLATION_PROBE_MAX_RETRY_MILLIS)
@@ -1230,6 +1316,10 @@ internal fun RegistrationApp() {
         }
         queueRuleSettings = settings
         queueRuleSettingsRepository.saveSettings(settings)
+        if (previousSettings.businessHours != settings.businessHours) {
+            queueRuleSettingsRepository.markBusinessHoursSyncPending()
+            businessHoursSyncPending = true
+        }
         if (previousSettings.websiteSyncEnabled != settings.websiteSyncEnabled) {
             cloudSyncController.setEnabled(
                 cloudSyncAvailable &&
@@ -6751,7 +6841,7 @@ private enum class QueueSettingsSection(
 ) {
     VENUE_AND_TERMINAL("机厅与终端", "机厅名称、终端名称与安装身份"),
     SERVER_AND_LINKS("服务端与联动", "服务器连接、同步、线上登记与 QQ Bot"),
-    BUSINESS_HOURS("营业时间", "开闭店时间与每周安排"),
+    BUSINESS_HOURS("营业时间", "机厅共用的开闭店时间与每周安排"),
     QUEUE_RULES("排队规则", "暂缓一次、暂时离开与共同游玩预览"),
     MACHINES_AND_GROUPS("机台与分组", "机台管理、分组与详细配置")
 }
@@ -7307,9 +7397,9 @@ private fun QueueRuleSettingsScreen(
                 QueueRuleSettingRow(
                     title = "设置营业时间",
                     description = if (settings.businessHours.enabled) {
-                        "闭店后停止接收新登记，并为现有队列保留最多 20 分钟的收尾时间；到开店时间不会自动重新开启。"
+                        "营业时间属于当前机厅，并与服务端同步。闭店后停止接收新登记，并为现有队列保留最多 20 分钟的收尾时间；到开店时间不会自动重新开启。"
                     } else {
-                        "不开启时，登记排队不会受到营业时间影响。"
+                        "营业时间属于当前机厅，并与服务端同步。不开启时，登记排队不会受到营业时间影响。"
                     },
                     checked = settings.businessHours.enabled,
                     onCheckedChange = {
@@ -9389,7 +9479,13 @@ private fun AppHeader(
                     color = SecondaryText,
                     fontSize = 13.sp
                 )
-                Text("·", color = TertiaryText, fontSize = 13.sp)
+                Text(
+                    "·",
+                    modifier = Modifier.width(13.dp),
+                    color = TertiaryText,
+                    fontSize = 13.sp,
+                    textAlign = TextAlign.Center
+                )
                 Text(
                     "当前共 $totalRegistrationCount 个登记",
                     color = PrimaryText,

@@ -380,6 +380,17 @@ class LocalQueueRuleSettingsRepository(
             .apply()
     }
 
+    fun isBusinessHoursSyncPending(): Boolean =
+        preferences.getBoolean(KEY_BUSINESS_HOURS_SYNC_PENDING, false)
+
+    fun markBusinessHoursSyncPending() {
+        preferences.edit().putBoolean(KEY_BUSINESS_HOURS_SYNC_PENDING, true).commit()
+    }
+
+    fun clearBusinessHoursSyncPending() {
+        preferences.edit().putBoolean(KEY_BUSINESS_HOURS_SYNC_PENDING, false).commit()
+    }
+
     /**
      * Keep this marker across process death until the server confirms that
      * remote operations are disabled. A synchronous commit is intentional:
@@ -516,6 +527,7 @@ class LocalQueueRuleSettingsRepository(
         const val KEY_DEFAULT_OPENING_MINUTES = "default_opening_minutes"
         const val KEY_DEFAULT_CLOSING_MINUTES = "default_closing_minutes"
         const val KEY_LAST_HANDLED_CLOSING_OCCURRENCE = "last_handled_closing_occurrence"
+        const val KEY_BUSINESS_HOURS_SYNC_PENDING = "business_hours_sync_pending"
         const val KEY_PENDING_SYNC_DISABLE_ENDPOINT = "pending_sync_disable_endpoint"
         const val KEY_PENDING_SYNC_DISABLE_TOKEN = "pending_sync_disable_token"
         const val KEY_PENDING_SYNC_DISABLE_VENUE_ID = "pending_sync_disable_venue_id"

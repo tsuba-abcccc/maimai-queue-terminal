@@ -193,6 +193,7 @@ REQUIRED_DATABASE_COLUMNS = {
         "venue_code",
         "profile_scope_id",
         "display_name",
+        "business_hours_json",
         "created_at",
         "updated_at",
     },
@@ -592,11 +593,19 @@ def initialize_database(database_path: str, *, profile_scope_id: str = "default"
                 venue_code TEXT NOT NULL UNIQUE,
                 profile_scope_id TEXT NOT NULL UNIQUE,
                 display_name TEXT,
+                business_hours_json TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )
             """
         )
+        venue_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(venue)")
+        }
+        if "business_hours_json" not in venue_columns:
+            connection.execute(
+                "ALTER TABLE venue ADD COLUMN business_hours_json TEXT"
+            )
         active_venue = connection.execute(
             "SELECT venue_id FROM venue WHERE profile_scope_id = ?",
             (profile_scope_id,),
@@ -1215,6 +1224,16 @@ def register_routes(app: Flask) -> None:
         if authorization_error is not None:
             return authorization_error
         return read_or_update_terminal_installation()
+
+    @app.route("/api/queue-terminal/venue-settings", methods=["GET", "PUT"])
+    def queue_terminal_venue_settings():
+        authorization_error = authorize_terminal()
+        if authorization_error is not None:
+            return authorization_error
+        venue_error = authorize_terminal_venue()
+        if venue_error is not None:
+            return venue_error
+        return read_or_update_venue_settings()
 
     @app.post("/api/queue-terminal/player-bindings")
     def queue_terminal_create_player_binding():
@@ -3782,6 +3801,7 @@ def read_active_venue(connection: sqlite3.Connection) -> sqlite3.Row:
     venue = connection.execute(
         """
         SELECT venue_id, venue_code, profile_scope_id, display_name,
+               business_hours_json,
                created_at, updated_at
         FROM venue WHERE profile_scope_id = ?
         """,
@@ -3790,6 +3810,64 @@ def read_active_venue(connection: sqlite3.Connection) -> sqlite3.Row:
     if venue is None:
         raise RuntimeError("当前服务实例缺少机厅身份")
     return venue
+
+
+def read_stored_venue_business_hours(venue: sqlite3.Row) -> dict[str, Any] | None:
+    source = venue["business_hours_json"]
+    if not source:
+        return None
+    try:
+        return normalize_venue_business_hours(json.loads(source))
+    except (TypeError, ValueError, json.JSONDecodeError, ValidationError):
+        # A malformed legacy value must never make the venue or queue endpoint
+        # unavailable. Treat it as unconfigured and let the next terminal save
+        # replace it with a validated schedule.
+        return None
+
+
+def read_or_update_venue_settings():
+    source = request.get_json(silent=True) if request.method == "PUT" else None
+    business_hours = None
+    if request.method == "PUT":
+        if not isinstance(source, dict) or set(source) != {"business_hours"}:
+            return jsonify(
+                {"ok": False, "error": "请求内容必须只包含 business_hours"}
+            ), 400
+        try:
+            business_hours = normalize_venue_business_hours(source["business_hours"])
+        except ValidationError as error:
+            return jsonify(validation_error_payload(error)), 400
+
+    now = int(time.time())
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        venue = read_active_venue(connection)
+        if request.method == "PUT":
+            connection.execute(
+                """
+                UPDATE venue
+                SET business_hours_json = ?, updated_at = ?
+                WHERE venue_id = ?
+                """,
+                (
+                    json.dumps(
+                        business_hours,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    now,
+                    venue["venue_id"],
+                ),
+            )
+            venue = read_active_venue(connection)
+        connection.commit()
+    return jsonify(
+        {
+            "ok": True,
+            "venue": serialize_venue(venue),
+            "business_hours": read_stored_venue_business_hours(venue),
+        }
+    )
 
 
 def serialize_venue(venue: sqlite3.Row) -> dict[str, Any]:
@@ -7822,6 +7900,54 @@ def normalize_public_business_hours(source: Any) -> dict[str, Any]:
         **values,
         "closes_at": closes_at,
         "registration_closes_at": registration_closes_at,
+    }
+
+
+def normalize_venue_business_hours(source: Any) -> dict[str, Any]:
+    """Validate the venue-owned weekly schedule, not its computed live state."""
+    if not isinstance(source, dict):
+        raise ValidationError("营业时间配置必须是对象")
+    allowed_fields = {"enabled", "use_weekly_schedule", "default_hours", "weekly_hours"}
+    if set(source) - allowed_fields:
+        raise ValidationError("营业时间配置包含不支持的字段")
+    enabled = source.get("enabled", False)
+    use_weekly = source.get("use_weekly_schedule", False)
+    if type(enabled) is not bool or type(use_weekly) is not bool:
+        raise ValidationError("营业时间开关必须是布尔值")
+
+    def normalize_daily(value: Any, field: str) -> dict[str, int]:
+        if not isinstance(value, dict) or set(value) - {"opening_minutes", "closing_minutes"}:
+            raise ValidationError(f"{field} 必须包含开店和闭店分钟数")
+        opening = value.get("opening_minutes", 600)
+        closing = value.get("closing_minutes", 1320)
+        if (
+            type(opening) is not int
+            or type(closing) is not int
+            or not 0 <= opening < 1440
+            or not 0 <= closing < 1440
+        ):
+            raise ValidationError(f"{field} 的时间必须是 0 至 1439 分钟")
+        return {"opening_minutes": opening, "closing_minutes": closing}
+
+    default_hours = normalize_daily(source.get("default_hours", {}), "default_hours")
+    weekly_source = source.get("weekly_hours", {})
+    if not isinstance(weekly_source, dict):
+        raise ValidationError("weekly_hours 必须是对象")
+    valid_days = {
+        "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY",
+        "FRIDAY", "SATURDAY", "SUNDAY",
+    }
+    if set(weekly_source) - valid_days:
+        raise ValidationError("weekly_hours 包含无效的星期")
+    weekly_hours = {
+        day: normalize_daily(weekly_source.get(day, default_hours), f"weekly_hours.{day}")
+        for day in sorted(valid_days)
+    }
+    return {
+        "enabled": enabled,
+        "use_weekly_schedule": use_weekly,
+        "default_hours": default_hours,
+        "weekly_hours": weekly_hours,
     }
 
 

@@ -1,11 +1,12 @@
 <script setup>
-import { Bell, CircleCheck, LogIn, LogOut, Save, ShieldCheck, UserRound, X } from '@lucide/vue'
+import { Bell, ChevronDown, CircleCheck, LogIn, LogOut, Save, ShieldCheck, UserRound, X } from '@lucide/vue'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 const props = defineProps({
-  bindingToken: { type: String, default: '' }
+  bindingToken: { type: String, default: '' },
+  focusRegistrationId: { type: String, default: '' }
 })
-const emit = defineEmits(['close', 'bound'])
+const emit = defineEmits(['close', 'bound', 'session', 'queue-state'])
 
 const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL ||
   (typeof window !== 'undefined' ? `${window.location.origin}/api/queue-status` : '/api/queue-status')
@@ -49,7 +50,7 @@ let queueCommandTimer
 
 const title = computed(() => {
   if (props.bindingToken && !bindingCompleted.value) return '绑定网页账户'
-  return account.value ? '个人账户' : '登录个人账户'
+  return account.value ? '玩家资料' : '登录玩家资料'
 })
 
 function cookieValue(name) {
@@ -89,6 +90,7 @@ function setAccount(nextAccount) {
   originalProfile.value = draft ? { ...draft } : null
   currentPassword.value = ''
   passwordForm.value = { current: '', next: '', confirmation: '' }
+  emit('session', nextAccount)
 }
 
 function createRequestId() {
@@ -201,6 +203,7 @@ async function logout() {
     setAccount(null)
     csrfToken.value = ''
     queueState.value = null
+    emit('queue-state', null)
     password.value = ''
   } catch (logoutError) {
     error.value = logoutError.message
@@ -210,11 +213,16 @@ async function logout() {
 }
 
 async function loadQueueState() {
-  if (!account.value) return
+  if (!account.value) {
+    queueState.value = null
+    emit('queue-state', null)
+    return
+  }
   queueLoading.value = true
   queueError.value = ''
   try {
     queueState.value = await accountRequest('/queue')
+    emit('queue-state', queueState.value)
   } catch (loadQueueError) {
     queueError.value = loadQueueError.message
   } finally {
@@ -244,8 +252,8 @@ function accountQueueEstimateText(registration) {
 }
 
 function accountQueueStateText(registration) {
-  if (registration.online_registration_pending_check_in) return '线上登记·待签到'
-  if (registration.temporarily_away) return `暂时离开·已轮空 ${registration.temporary_away_skipped_turns || 0} 次`
+  if (registration.online_registration_pending_check_in) return '线上登记 · 待签到'
+  if (registration.temporarily_away) return `暂时离开 · 已轮空 ${registration.temporary_away_skipped_turns || 0} 次`
   if (registration.deferred_once) return '暂缓一次'
   return registration.preference === 'SOLO' ? '单人游玩' : '允许他人加入'
 }
@@ -278,6 +286,93 @@ function finishQueueCommand(message, errorMessage = '') {
   queueNotice.value = message
   queueError.value = errorMessage
   loadQueueState()
+}
+
+function fixedPairSubject(registration) {
+  return registration.fixed_pair ? '固定组合的两份登记' : '这份登记'
+}
+
+function queueActionPrompt(registration, mode) {
+  const subject = fixedPairSubject(registration)
+  if (mode === 'defer') {
+    return {
+      title: registration.fixed_pair ? '确认整组暂缓一次？' : '确认暂缓一次？',
+      detail: registration.position === 'PLAYING'
+        ? `${subject}会离开游玩位置并回到等待顺序前端。这次游玩机会会被跳过，原有顺序保持不变，随后自动解除暂缓。`
+        : `下一次轮到${subject}时不会进入游玩位置。${subject}会保持当前顺序，在跳过这次机会后自动解除暂缓。`,
+      note: '暂缓的登记本轮不会占用共同游玩位置，系统会按照其余在场登记的游玩偏好重新组成下一轮。',
+      confirm: '确认暂缓一次',
+      operation: 'DEFER_ONE_ROUND'
+    }
+  }
+  if (mode === 'temporary_leave') {
+    return {
+      title: registration.fixed_pair ? '确认整组暂时离开？' : '确认暂时离开？',
+      detail: registration.position === 'PLAYING'
+        ? `${subject}会离开游玩位置，并按一次轮空移至当前等待顺序末端。之后每次轮到时仍会移至队尾，状态不会自动解除。`
+        : `下一次轮到${subject}时不会进入游玩位置，而会按一次轮空移至当前等待顺序末端；之后每次轮到时仍会移至队尾。`,
+      note: '暂时离开的登记不会占用共同游玩位置。玩家返回后需要手动取消暂时离开；连续轮空 3 次后仍未取消，第四次轮到时会自动退出排队。',
+      confirm: '确认暂时离开',
+      operation: 'TEMPORARILY_LEAVE'
+    }
+  }
+  if (mode === 'cancel_defer') {
+    return {
+      title: registration.fixed_pair ? '确认整组取消暂缓一次？' : '确认取消暂缓一次？',
+      detail: `${subject}会恢复下一次游玩机会，并保持当前登记顺序。`,
+      confirm: '确认取消暂缓一次',
+      operation: 'CANCEL_DEFER_ONE_ROUND'
+    }
+  }
+  if (mode === 'cancel_temporary_leave') {
+    return {
+      title: registration.fixed_pair ? '确认整组取消暂时离开？' : '确认取消暂时离开？',
+      detail: `${subject}会恢复正常轮候，并将已轮空次数清零。`,
+      confirm: '确认取消暂时离开',
+      operation: 'CANCEL_TEMPORARY_LEAVE'
+    }
+  }
+  if (mode === 'leave') {
+    const details = [`${subject}会退出当前队列，继续游玩时需要重新加入排队。`]
+    if (registration.fixed_pair) {
+      details.push('固定组合会解除；另一份登记保留原位，并恢复为允许他人加入。')
+    }
+    if (registration.position === 'PLAYING') {
+      details.push('游玩位置中的空缺不会自动由等待顺序中的下一组登记补入。')
+    }
+    return {
+      title: '确认退出排队？',
+      detail: details.join(' '),
+      confirm: '确认退出排队',
+      operation: 'LEAVE_QUEUE',
+      danger: true
+    }
+  }
+  return null
+}
+
+function transferPrompt(registration) {
+  const target = queueState.value?.queue?.machines?.find(
+    (machine) => machine.id === queueTargetMachineId.value
+  )
+  if (!target) return null
+  const details = [
+    `这会将“${registration.display_id || registration.displayId}”从${registration.machine_name}移出，并加入${target.name}的登记顺序末端。`,
+    `原机台上的当前位置和排队顺序不会保留；之后即使转回，也只能加入转回时的队尾。`
+  ]
+  if (target.capacity === 1) {
+    details.push(`${target.name}仅能容纳一人游玩，转入后本次登记会使用“单人游玩”；玩家资料中的默认游玩偏好不会改变。`)
+  }
+  if (registration.fixed_pair) {
+    details.push('当前登记属于固定组合，只转移本人会解除固定组合；另一份登记保留原位并恢复为允许他人加入。')
+  }
+  if (registration.deferred_once) details.push('转入后这份登记不再暂缓一次。')
+  if (registration.temporarily_away) details.push('暂时离开状态和已轮空次数会保留，返回后仍需手动取消。')
+  return {
+    title: `转至 ${target.name}？`,
+    detail: details,
+    confirm: `确认转至 ${target.name}`
+  }
 }
 
 async function pollQueueCommand(commandId, attempts = 0) {
@@ -446,7 +541,7 @@ onBeforeUnmount(() => {
           <span>maimai Q</span>
           <h2>{{ title }}</h2>
         </div>
-        <button type="button" aria-label="关闭个人账户" title="关闭" @click="requestClose">
+        <button type="button" aria-label="关闭玩家资料" title="关闭" @click="requestClose">
           <X :size="20" />
         </button>
       </header>
@@ -501,7 +596,7 @@ onBeforeUnmount(() => {
             <strong>{{ account.profile.qq_number }}</strong>
           </div>
         </div>
-        <nav class="account-tabs" aria-label="个人账户内容">
+        <nav class="account-tabs" aria-label="玩家资料内容">
           <button type="button" :class="{ active: activeSection === 'overview' }" @click="activeSection = 'overview'">概览</button>
           <button type="button" :class="{ active: activeSection === 'profile' }" @click="activeSection = 'profile'">资料设置</button>
           <button type="button" :class="{ active: activeSection === 'notifications' }" @click="activeSection = 'notifications'">通知与隐私</button>
@@ -526,7 +621,8 @@ onBeforeUnmount(() => {
           <p v-if="queueLoading" class="account-queue-empty">正在读取排队状态</p>
           <p v-else-if="queueState?.registrations?.length === 0" class="account-queue-empty">当前没有你的登记。</p>
           <p v-else-if="queueState?.registrations?.length > 1" class="account-error account-error-block">当前账户关联到多份登记，为避免操作错误，网页已暂停远程操作。请在现场终端处理。</p>
-          <article v-else-if="queueState?.registrations?.length === 1" class="account-queue-card">
+          <article v-else-if="queueState?.registrations?.length === 1" class="account-queue-card"
+            :class="{ 'is-focused': focusRegistrationId && queueState.registrations[0].registration_id === focusRegistrationId }">
             <template v-for="registration in queueState.registrations" :key="registration.registration_id">
               <div class="account-queue-summary">
                 <div>
@@ -543,7 +639,7 @@ onBeforeUnmount(() => {
               <p v-else-if="!queueState.queue?.remote_actions" class="account-queue-warning">现场未开启网站远程操作，当前只能查看状态。</p>
 
               <div v-if="queueActionMode === 'transfer'" class="account-inline-action">
-                <strong>选择要切换到的机台</strong>
+                <strong>选择要转至的机台</strong>
                 <div class="account-choice-grid">
                   <button v-for="machine in queueState.queue.machines.filter((item) => item.id !== registration.machine_id)"
                     :key="machine.id" type="button" :disabled="!machine.available"
@@ -551,17 +647,21 @@ onBeforeUnmount(() => {
                     {{ machine.name }}
                   </button>
                 </div>
+                <p v-if="transferPrompt(registration)" class="account-action-detail">
+                  {{ transferPrompt(registration).detail.join(' ') }}
+                </p>
                 <div class="account-confirm-actions">
                   <button type="button" @click="queueActionMode = null">取消</button>
                   <button class="primary" type="button" :disabled="!queueTargetMachineId || queueActionSubmitting"
                     @click="submitQueueAction(registration, 'TRANSFER_MACHINE', { target_machine_id: queueTargetMachineId, expected_target_machine_stable_id: targetMachineStableId(queueTargetMachineId) })">
-                    确认切换机台
+                    {{ transferPrompt(registration)?.confirm || '确认转至其他机台' }}
                   </button>
                 </div>
               </div>
 
               <div v-else-if="queueActionMode === 'preference'" class="account-inline-action">
                 <strong>选择本次游玩偏好</strong>
+                <p>这里只修改本次排队的偏好，不会改变玩家资料中的默认偏好。</p>
                 <div class="account-choice-grid account-choice-grid-two">
                   <button type="button" :class="{ active: queuePreference === 'SOLO' }" @click="queuePreference = 'SOLO'">单人游玩</button>
                   <button type="button" :class="{ active: queuePreference === 'OPEN_TO_JOIN' }" @click="queuePreference = 'OPEN_TO_JOIN'">允许他人加入</button>
@@ -575,22 +675,36 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <div v-else-if="queueActionMode === 'leave'" class="account-inline-action">
-                <strong>确认退出排队？</strong>
-                <p>退出后会失去当前队列位置，需要重新登记才能继续排队。</p>
+              <div v-else-if="['defer', 'temporary_leave', 'cancel_defer', 'cancel_temporary_leave', 'leave'].includes(queueActionMode)"
+                class="account-inline-action">
+                <template v-if="queueActionPrompt(registration, queueActionMode)">
+                  <strong>{{ queueActionPrompt(registration, queueActionMode).title }}</strong>
+                  <p class="account-action-detail">{{ queueActionPrompt(registration, queueActionMode).detail }}</p>
+                  <p v-if="queueActionPrompt(registration, queueActionMode).note" class="account-action-note">
+                    {{ queueActionPrompt(registration, queueActionMode).note }}
+                  </p>
+                </template>
                 <div class="account-confirm-actions">
                   <button type="button" @click="queueActionMode = null">取消</button>
-                  <button class="primary is-danger" type="button" :disabled="queueActionSubmitting" @click="submitQueueAction(registration, 'LEAVE_QUEUE')">确认退出排队</button>
+                  <button
+                    class="primary"
+                    :class="{ 'is-danger': queueActionMode === 'leave' }"
+                    type="button"
+                    :disabled="queueActionSubmitting || !queueActionPrompt(registration, queueActionMode)"
+                    @click="submitQueueAction(registration, queueActionPrompt(registration, queueActionMode).operation)"
+                  >
+                    {{ queueActionPrompt(registration, queueActionMode)?.confirm }}
+                  </button>
                 </div>
               </div>
 
               <div v-else class="account-queue-actions">
                 <template v-if="!registration.online_registration_pending_check_in">
-                  <button v-if="registration.deferred_once" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="submitQueueAction(registration, 'CANCEL_DEFER_ONE_ROUND')">取消暂缓一次</button>
-                  <button v-else-if="queueState.queue?.queue_rules?.allow_defer_one_round" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="submitQueueAction(registration, 'DEFER_ONE_ROUND')">暂缓一次</button>
-                  <button v-if="registration.temporarily_away" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="submitQueueAction(registration, 'CANCEL_TEMPORARY_LEAVE')">取消暂时离开</button>
-                  <button v-else-if="queueState.queue?.queue_rules?.allow_temporary_leave" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="submitQueueAction(registration, 'TEMPORARILY_LEAVE')">暂时离开</button>
-                  <button v-if="registration.position !== 'PLAYING' && queueState.queue.machines.some((machine) => machine.id !== registration.machine_id && machine.available)" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueTargetMachineId = ''; queueActionMode = 'transfer'">切换机台</button>
+                  <button v-if="registration.deferred_once" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueActionMode = 'cancel_defer'">取消暂缓一次</button>
+                  <button v-else-if="queueState.queue?.queue_rules?.allow_defer_one_round" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueActionMode = 'defer'">暂缓一次</button>
+                  <button v-if="registration.temporarily_away" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueActionMode = 'cancel_temporary_leave'">取消暂时离开</button>
+                  <button v-else-if="queueState.queue?.queue_rules?.allow_temporary_leave" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueActionMode = 'temporary_leave'">暂时离开</button>
+                  <button v-if="registration.position !== 'PLAYING' && queueState.queue.machines.some((machine) => machine.id !== registration.machine_id && machine.available)" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueTargetMachineId = ''; queueActionMode = 'transfer'">转至其他机台</button>
                   <button v-if="registration.machine_capacity > 1" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queuePreference = registration.preference; queueActionMode = 'preference'">修改游玩偏好</button>
                 </template>
                 <button class="is-danger" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueActionMode = 'leave'">退出排队</button>
@@ -608,11 +722,14 @@ onBeforeUnmount(() => {
           </label>
           <label>
             <span>性别</span>
-            <select v-model="profileDraft.gender">
-              <option value="UNDISCLOSED">不公开</option>
-              <option value="MALE">男</option>
-              <option value="FEMALE">女</option>
-            </select>
+            <span class="account-select-wrap">
+              <select v-model="profileDraft.gender">
+                <option value="UNDISCLOSED">不公开</option>
+                <option value="MALE">男</option>
+                <option value="FEMALE">女</option>
+              </select>
+              <ChevronDown :size="16" aria-hidden="true" />
+            </span>
           </label>
           <fieldset class="account-fieldset">
             <legend>默认游玩偏好</legend>
@@ -632,10 +749,13 @@ onBeforeUnmount(() => {
           </label>
           <label>
             <span>QQ 显示范围</span>
-            <select v-model="profileDraft.qq_visibility">
-              <option value="PUBLIC_WEBSITE">网站公开</option>
-              <option value="TERMINAL_ONLY">仅现场终端</option>
-            </select>
+            <span class="account-select-wrap">
+              <select v-model="profileDraft.qq_visibility">
+                <option value="PUBLIC_WEBSITE">网站公开</option>
+                <option value="TERMINAL_ONLY">仅现场终端</option>
+              </select>
+              <ChevronDown :size="16" aria-hidden="true" />
+            </span>
           </label>
           <p class="account-permission-note">QQ 是账户身份的一部分，修改后会同步更新这份玩家资料的联系方式。</p>
           <p v-if="profileError" class="account-error" role="alert">{{ profileError }}</p>
@@ -729,10 +849,21 @@ onBeforeUnmount(() => {
   width: min(560px, 100%); max-height: calc(100vh - 36px); overflow: auto;
   border: 1px solid var(--queue-separator, #d2d2d7); border-radius: 8px;
   background: var(--queue-card, #fff); color: var(--queue-text, #1d1d1f);
+  --queue-card: #ffffff; --queue-soft: #f5f5f7; --queue-text: #1d1d1f;
+  --queue-secondary: #6e6e73; --queue-tertiary: #8e8e93; --queue-separator: #d2d2d7;
+  --queue-blue: #007aff; --queue-soft-blue: #e8f2ff; --queue-red: #c9342e;
+  --queue-soft-red: #fff1f0; --queue-green: #247a3e; --queue-soft-green: #eaf8ef;
   box-shadow: 0 18px 54px rgb(0 0 0 / 22%); padding: 22px;
 }
+.account-dialog { background: var(--queue-card); color: var(--queue-text); }
+:global(html.dark .account-dialog) {
+  --queue-card: #1c1c1e; --queue-soft: #2c2c2e; --queue-text: #f5f5f7;
+  --queue-secondary: #a1a1a6; --queue-tertiary: #8e8e93; --queue-separator: #38383a;
+  --queue-blue: #0a84ff; --queue-soft-blue: #142b44; --queue-red: #ff453a;
+  --queue-soft-red: #3b2020; --queue-green: #63d8a0; --queue-soft-green: #173b2a;
+}
 .account-dialog header { display: grid; grid-template-columns: 42px 1fr 44px; gap: 12px; align-items: center; }
-.account-title-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 50%; background: #e8f2ff; color: #007aff; }
+.account-title-icon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 50%; background: var(--queue-soft-blue); color: var(--queue-blue); }
 .account-dialog header span { display: block; color: var(--queue-secondary, #6e6e73); font-size: 11px; font-weight: 650; }
 .account-dialog h2 { margin: 2px 0 0; font-size: 21px; letter-spacing: 0; }
 .account-dialog header > button { width: 44px; height: 44px; display: grid; place-items: center; border: 0; border-radius: 50%; background: transparent; color: inherit; cursor: pointer; }
@@ -748,15 +879,15 @@ onBeforeUnmount(() => {
 .account-explanation { margin: 16px 0; }
 .account-footnote { margin: 12px 0 0; text-align: center; }
 .account-dialog form { display: grid; gap: 13px; }
-.account-dialog label span { display: block; margin-bottom: 6px; color: var(--queue-secondary, #6e6e73); font-size: 12px; font-weight: 650; }
+.account-dialog label > span:not(.account-select-wrap) { display: block; margin-bottom: 6px; color: var(--queue-secondary); font-size: 12px; font-weight: 650; }
 .account-dialog input { width: 100%; height: 48px; border: 1px solid var(--queue-separator, #d2d2d7); border-radius: 7px; background: var(--queue-card, #fff); color: inherit; padding: 0 13px; font-size: 15px; }
 .account-primary, .account-secondary { min-height: 48px; display: flex; align-items: center; justify-content: center; gap: 8px; border-radius: 7px; padding: 0 16px; cursor: pointer; font-weight: 700; }
-.account-primary { border: 0; background: #007aff; color: #fff; }
-.account-secondary { width: 100%; margin-top: 17px; border: 1px solid var(--queue-separator, #d2d2d7); background: transparent; color: #007aff; }
+.account-primary { border: 0; background: var(--queue-blue); color: #fff; }
+.account-secondary { width: 100%; margin-top: 17px; border: 1px solid var(--queue-separator); background: transparent; color: var(--queue-blue); }
 .account-primary:disabled, .account-secondary:disabled { opacity: .55; cursor: default; }
-.account-error { margin: 0; color: #c9342e; font-size: 12px; line-height: 1.55; }
-.account-error-block { margin-top: 18px; padding: 12px; border-radius: 7px; background: #fff1f0; }
-.account-success { display: flex; align-items: center; gap: 8px; margin-top: 18px; padding: 11px 13px; border-radius: 7px; background: #eaf8ef; color: #247a3e; font-size: 13px; font-weight: 700; }
+.account-error { margin: 0; color: var(--queue-red); font-size: 12px; line-height: 1.55; }
+.account-error-block { margin-top: 18px; padding: 12px; border-radius: 7px; background: var(--queue-soft-red); }
+.account-success { display: flex; align-items: center; gap: 8px; margin-top: 18px; padding: 11px 13px; border-radius: 7px; background: var(--queue-soft-green); color: var(--queue-green); font-size: 13px; font-weight: 700; }
 .account-details { margin: 14px 0 0; }
 .account-details div { display: flex; justify-content: space-between; gap: 18px; padding: 11px 2px; border-bottom: 1px solid var(--queue-separator, #d2d2d7); }
 .account-details dt { color: var(--queue-secondary, #6e6e73); font-size: 12px; }
@@ -773,6 +904,7 @@ onBeforeUnmount(() => {
 .account-queue-heading button:disabled { color: var(--queue-tertiary, #8e8e93); cursor: default; }
 .account-queue-empty { margin: 12px 0 0; padding: 20px 12px; color: var(--queue-secondary, #6e6e73); background: var(--queue-soft, #f5f5f7); font-size: 11px; text-align: center; }
 .account-queue-card { margin-top: 10px; padding: 14px; border: 1px solid var(--queue-separator, #d2d2d7); border-radius: 8px; }
+.account-queue-card.is-focused { border-color: var(--queue-blue); box-shadow: 0 0 0 3px color-mix(in srgb, var(--queue-blue) 15%, transparent); }
 .account-queue-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .account-queue-summary > div:last-child { text-align: right; }
 .account-queue-summary strong, .account-queue-summary span { display: block; overflow-wrap: anywhere; }
@@ -780,33 +912,37 @@ onBeforeUnmount(() => {
 .account-queue-summary span { margin-top: 3px; color: var(--queue-secondary, #6e6e73); font-size: 10px; }
 .account-queue-warning { margin: 11px 0 0; padding: 9px 10px; border-left: 3px solid #ff9500; color: var(--queue-secondary, #6e6e73); background: #fff7e9; font-size: 10px; line-height: 1.55; }
 .account-queue-actions { display: grid; margin-top: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
-.account-queue-actions button, .account-confirm-actions button { min-height: 42px; padding: 0 9px; border: 0; border-radius: 7px; color: var(--queue-text, #1d1d1f); background: var(--queue-soft, #f5f5f7); cursor: pointer; font-size: 10px; font-weight: 620; }
+.account-queue-actions button, .account-confirm-actions button { min-height: 42px; padding: 0 9px; border: 0; border-radius: 7px; color: var(--queue-text); background: var(--queue-soft); cursor: pointer; font-size: 10px; font-weight: 620; }
 .account-queue-actions button:disabled, .account-confirm-actions button:disabled { color: var(--queue-tertiary, #8e8e93); cursor: default; }
-.account-queue-actions button.is-danger, .account-confirm-actions button.is-danger { color: #c9342e; }
+.account-queue-actions button.is-danger, .account-confirm-actions button.is-danger { color: var(--queue-red); }
 .account-inline-action { display: grid; margin-top: 12px; gap: 9px; padding-top: 12px; border-top: 1px solid var(--queue-separator, #d2d2d7); }
 .account-inline-action > strong { font-size: 12px; }
 .account-inline-action > p { margin: 0; color: var(--queue-secondary, #6e6e73); font-size: 10px; line-height: 1.5; }
+.account-inline-action > .account-action-detail { font-size: 11px; line-height: 1.65; }
+.account-inline-action > .account-action-note { padding: 9px 10px; border-left: 3px solid var(--queue-blue); color: var(--queue-secondary); background: var(--queue-soft-blue); font-size: 10px; line-height: 1.6; }
 .account-confirm-actions { display: grid; grid-template-columns: .8fr 1.2fr; gap: 6px; }
-.account-confirm-actions button.primary { color: #fff; background: #007aff; }
-.account-confirm-actions button.primary.is-danger { background: #c9342e; }
+.account-confirm-actions button.primary { color: #fff; background: var(--queue-blue); }
+.account-confirm-actions button.primary.is-danger { background: var(--queue-red); }
 .account-choice-grid-two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .account-settings-form { display: grid; margin-top: 17px; gap: 14px; }
-.account-dialog select { width: 100%; height: 48px; padding: 0 12px; border: 1px solid var(--queue-separator, #d2d2d7); border-radius: 7px; color: inherit; background: var(--queue-card, #fff); font: inherit; font-size: 14px; }
+.account-select-wrap { position: relative; display: block; margin: 0; color: var(--queue-secondary); }
+.account-select-wrap select { width: 100%; height: 48px; appearance: none; padding: 0 40px 0 12px; border: 1px solid var(--queue-separator); border-radius: 7px; color: inherit; background: var(--queue-card); font: inherit; font-size: 14px; cursor: pointer; }
+.account-select-wrap > svg { position: absolute; top: 50%; right: 13px; pointer-events: none; transform: translateY(-50%); }
 .account-fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
 .account-fieldset legend { display: flex; align-items: center; gap: 5px; margin-bottom: 7px; padding: 0; color: var(--queue-secondary, #6e6e73); font-size: 12px; font-weight: 650; }
 .account-choice-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
-.account-choice-grid button { min-height: 44px; padding: 0 8px; border: 1px solid var(--queue-separator, #d2d2d7); border-radius: 7px; color: var(--queue-secondary, #6e6e73); background: var(--queue-card, #fff); cursor: pointer; font-size: 11px; font-weight: 600; }
-.account-choice-grid button.active { border-color: #007aff; color: #007aff; background: #e8f2ff; }
+.account-choice-grid button { min-height: 44px; padding: 0 8px; border: 1px solid var(--queue-separator); border-radius: 7px; color: var(--queue-secondary); background: var(--queue-card); cursor: pointer; font-size: 11px; font-weight: 600; }
+.account-choice-grid button.active { border-color: var(--queue-blue); color: var(--queue-blue); background: var(--queue-soft-blue); }
 .account-toggle { display: flex; min-height: 42px; padding: 9px 0; align-items: center; gap: 10px; border-bottom: 1px solid var(--queue-separator, #d2d2d7); cursor: pointer; }
 .account-toggle:last-child { border-bottom: 0; }
-.account-toggle input { width: 18px; height: 18px; flex: 0 0 auto; accent-color: #007aff; }
+.account-toggle input { width: 18px; height: 18px; flex: 0 0 auto; accent-color: var(--queue-blue); }
 .account-toggle > span { min-width: 0; font-size: 12px; line-height: 1.45; }
 .account-toggle strong, .account-toggle small { display: block; }
 .account-toggle small { margin-top: 2px; color: var(--queue-secondary, #6e6e73); font-size: 10px; }
 .account-toggle input:disabled + span { color: var(--queue-tertiary, #8e8e93); }
 .account-toggle-primary { padding: 11px 12px; border: 1px solid var(--queue-separator, #d2d2d7); border-radius: 7px; }
 .account-permission-note { margin: -5px 0 0; color: var(--queue-tertiary, #8e8e93); font-size: 10px; line-height: 1.5; }
-.account-notice { margin: 0; padding: 10px 11px; border-radius: 7px; color: #247a3e; background: #eaf8ef; font-size: 11px; line-height: 1.5; }
+.account-notice { margin: 0; padding: 10px 11px; border-radius: 7px; color: var(--queue-green); background: var(--queue-soft-green); font-size: 11px; line-height: 1.5; }
 @media (max-width: 520px) {
   .account-backdrop { align-items: end; padding: 0; }
   .account-dialog { width: 100%; max-height: 92vh; border-radius: 8px 8px 0 0; padding: 18px 16px calc(18px + env(safe-area-inset-bottom)); }

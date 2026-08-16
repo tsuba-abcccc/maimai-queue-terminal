@@ -149,4 +149,8 @@ internal fun panguSpacing(value: AnnotatedString): AnnotatedString {
 }
 
 private fun Char.isAppSpacingCharacter(): Boolean =
-    this != '\n' && this != '\r' && (isWhitespace() || Character.isSpaceChar(this))
+    this != '\n' &&
+        this != '\r' &&
+        this != '\u2028' &&
+        this != '\u2029' &&
+        (this == '\t' || Character.getType(this) == Character.SPACE_SEPARATOR.toInt())

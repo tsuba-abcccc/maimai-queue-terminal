@@ -48,6 +48,14 @@ export function compactMiddleDots(value) {
   return typeof value === 'string' ? value.replace(MIDDLE_DOT_SPACING_REGEX, '·') : value
 }
 
+const HAN_MIDDLE_DOT_REGEX = /(\p{Script=Han})·(?=\p{Script=Han})/gu
+
+export function formatMiddleDots(value) {
+  return typeof value === 'string'
+    ? compactMiddleDots(value).replace(HAN_MIDDLE_DOT_REGEX, '$1 · ')
+    : value
+}
+
 function normalizedInteger(value, fallback) {
   const number = Number(value)
   return Number.isInteger(number) && number >= 1 && number <= 120 ? number : fallback

@@ -222,6 +222,21 @@ class BusinessHoursTest {
         assertNull(evaluateBusinessHours(BusinessHoursSettings(), timestamp(2026, 7, 25, 10, 0)).activeClosingAtMillis)
     }
 
+    @Test
+    fun venueSettingsRoundTripPreservesWeeklySchedule() {
+        val settings = BusinessHoursSettings(
+            enabled = true,
+            useWeeklySchedule = true,
+            defaultHours = DailyBusinessHours(9 * 60, 23 * 60),
+            weeklyHours = defaultWeeklyBusinessHours() +
+                (DayOfWeek.FRIDAY to DailyBusinessHours(10 * 60, 2 * 60))
+        )
+
+        val restored = settings.toVenueSettingsJson().toBusinessHoursSettingsOrNull()
+
+        assertEquals(settings.normalized(), restored)
+    }
+
     private fun timestamp(year: Int, month: Int, day: Int, hour: Int, minute: Int): Long =
         ZonedDateTime.of(year, month, day, hour, minute, 0, 0, zone).toInstant().toEpochMilli()
 }

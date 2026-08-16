@@ -6,6 +6,7 @@ import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneId
 import java.time.ZonedDateTime
+import org.json.JSONObject
 
 internal const val MINUTES_PER_DAY = 24 * 60
 internal const val DEFAULT_OPENING_MINUTES = 10 * 60
@@ -39,6 +40,45 @@ data class BusinessHoursSettings(
             (weeklyHours[day] ?: defaultHours).normalized()
         }
     )
+}
+
+internal fun BusinessHoursSettings.toVenueSettingsJson(): JSONObject = JSONObject().apply {
+    val normalized = normalized()
+    put("enabled", normalized.enabled)
+    put("use_weekly_schedule", normalized.useWeeklySchedule)
+    put("default_hours", normalized.defaultHours.toVenueSettingsJson())
+    put("weekly_hours", JSONObject().apply {
+        DayOfWeek.entries.forEach { day ->
+            put(day.name, normalized.hoursFor(day).toVenueSettingsJson())
+        }
+    })
+}
+
+private fun DailyBusinessHours.toVenueSettingsJson(): JSONObject = JSONObject().apply {
+    val normalized = normalized()
+    put("opening_minutes", normalized.openingMinutes)
+    put("closing_minutes", normalized.closingMinutes)
+}
+
+internal fun JSONObject.toBusinessHoursSettingsOrNull(): BusinessHoursSettings? {
+    if (isNull("enabled")) return null
+    fun readDaily(source: JSONObject?, fallback: DailyBusinessHours): DailyBusinessHours {
+        if (source == null) return fallback
+        return DailyBusinessHours(
+            openingMinutes = source.optInt("opening_minutes", fallback.openingMinutes),
+            closingMinutes = source.optInt("closing_minutes", fallback.closingMinutes)
+        ).normalized()
+    }
+    val defaultHours = readDaily(optJSONObject("default_hours"), DailyBusinessHours())
+    val weekly = optJSONObject("weekly_hours")
+    return BusinessHoursSettings(
+        enabled = optBoolean("enabled", false),
+        useWeeklySchedule = optBoolean("use_weekly_schedule", false),
+        defaultHours = defaultHours,
+        weeklyHours = DayOfWeek.entries.associateWith { day ->
+            readDaily(weekly?.optJSONObject(day.name), defaultHours)
+        }
+    ).normalized()
 }
 
 data class BusinessHoursStatus(

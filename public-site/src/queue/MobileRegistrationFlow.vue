@@ -13,7 +13,7 @@ import {
 } from '@lucide/vue'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import MobileProfileSettings from './MobileProfileSettings.vue'
-import { compactMiddleDots, normalizeMachineConfiguration } from './machineConfiguration.js'
+import { formatMiddleDots, normalizeMachineConfiguration } from './machineConfiguration.js'
 
 const props = defineProps({
   token: { type: String, required: true }
@@ -92,7 +92,7 @@ const machineConfiguration = computed(() => normalizeMachineConfiguration(
   }
 ))
 
-const sessionMachineName = computed(() => compactMiddleDots(
+const sessionMachineName = computed(() => formatMiddleDots(
   String(session.value?.machine_name ?? session.value?.machineName ?? '当前机台')
 ))
 
@@ -576,7 +576,7 @@ onBeforeUnmount(() => {
               :class="{ 'is-remembered': profile.profileId === rememberedProfileId }" @click="selectProfile(profile)">
               <span v-if="profile.profileId === rememberedProfileId" class="mobile-profile-remembered">上次使用</span>
               <strong>{{ profile.nickname }}<em :class="`is-${profile.gender.toLowerCase()}`">{{ genderSymbol(profile.gender) }}</em></strong>
-              <small>{{ preferenceLabel(profile.defaultPreference) }}·{{ recentUsageText(profile) }}</small>
+              <small>{{ formatMiddleDots(`${preferenceLabel(profile.defaultPreference)}·${recentUsageText(profile)}`) }}</small>
               <small v-if="profile.publicPlayerId">玩家编号：{{ profile.publicPlayerId }}</small>
               <small v-if="profile.qqNumber">QQ：{{ profile.qqNumber }}</small>
               <span v-if="!profile.setupComplete" class="mobile-profile-incomplete">需要补全资料</span>

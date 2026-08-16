@@ -76,6 +76,13 @@ internal sealed interface TerminalInstallationFetchResult {
         TerminalInstallationFetchResult
 }
 
+internal sealed interface VenueSettingsFetchResult {
+    data class Success(val businessHours: BusinessHoursSettings?) : VenueSettingsFetchResult
+    data object UnsupportedServer : VenueSettingsFetchResult
+    data class Failure(val detail: String, val venueMismatch: Boolean = false) :
+        VenueSettingsFetchResult
+}
+
 internal class LocalTerminalInstallationRepository(context: Context) {
     private val preferences = context.applicationContext.getSharedPreferences(
         PREFERENCES_NAME,
@@ -323,6 +330,19 @@ internal class HttpTerminalInstallationClient(
         }
     )
 
+    suspend fun fetchVenueSettings(expectedVenueId: String): VenueSettingsFetchResult =
+        requestVenueSettings(body = null, expectedVenueId = expectedVenueId)
+
+    suspend fun updateVenueSettings(
+        settings: BusinessHoursSettings,
+        expectedVenueId: String
+    ): VenueSettingsFetchResult = requestVenueSettings(
+        body = JSONObject().apply {
+            put("business_hours", settings.toVenueSettingsJson())
+        },
+        expectedVenueId = expectedVenueId
+    )
+
     private suspend fun request(body: JSONObject?): TerminalInstallationFetchResult =
         withContext(Dispatchers.IO) {
             val requestConfiguration = configuration
@@ -382,6 +402,67 @@ internal class HttpTerminalInstallationClient(
                 TerminalInstallationFetchResult.Failure(queuePublishFailureDetail(error))
             }
         }
+
+    private suspend fun requestVenueSettings(
+        body: JSONObject?,
+        expectedVenueId: String
+    ): VenueSettingsFetchResult = withContext(Dispatchers.IO) {
+        val requestConfiguration = configuration
+        if (!requestConfiguration.isValid || expectedVenueId.isBlank()) {
+            return@withContext VenueSettingsFetchResult.Failure("服务器连接配置无效。")
+        }
+        runCatching {
+            val endpoint = requestConfiguration.endpoint.trimEnd('/')
+                .substringBeforeLast('/') + "/queue-terminal/venue-settings"
+            val bytes = body?.toString()?.toByteArray(Charsets.UTF_8)
+            val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                requestMethod = if (bytes == null) "GET" else "PUT"
+                connectTimeout = INSTALLATION_NETWORK_TIMEOUT_MILLIS
+                readTimeout = INSTALLATION_NETWORK_TIMEOUT_MILLIS
+                useCaches = false
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("Authorization", "Bearer ${requestConfiguration.token}")
+                setTerminalIdentityHeaders(terminalIdentity)
+                setRequestProperty("X-Queue-Schema-Version", CURRENT_SCHEMA_VERSION.toString())
+                setRequestProperty("X-Queue-Venue-ID", expectedVenueId)
+                if (bytes != null) {
+                    doOutput = true
+                    setFixedLengthStreamingMode(bytes.size)
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                }
+            }
+            try {
+                if (bytes != null) connection.outputStream.use { it.write(bytes) }
+                val responseCode = connection.responseCode
+                if (responseCode == 404 || responseCode == 405) {
+                    return@runCatching VenueSettingsFetchResult.UnsupportedServer
+                }
+                if (responseCode !in 200..299) {
+                    val errorBody = connection.errorStream?.bufferedReader(Charsets.UTF_8)
+                        ?.use { it.readText().take(4_096) }.orEmpty()
+                    val errorPayload = runCatching { JSONObject(errorBody) }.getOrNull()
+                    val detail = errorPayload?.optString("error")
+                        ?.trim()?.takeIf(String::isNotEmpty)
+                        ?: "服务器返回 HTTP $responseCode。"
+                    return@runCatching VenueSettingsFetchResult.Failure(
+                        detail = detail,
+                        venueMismatch = errorPayload?.optString("code") == "VENUE_MISMATCH"
+                    )
+                }
+                val payload = JSONObject(
+                    connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                )
+                val settings = payload.optJSONObject("business_hours")
+                    ?.toBusinessHoursSettingsOrNull()
+                VenueSettingsFetchResult.Success(settings)
+            } finally {
+                connection.disconnect()
+            }
+        }.getOrElse { error ->
+            if (error is CancellationException) throw error
+            VenueSettingsFetchResult.Failure(queuePublishFailureDetail(error))
+        }
+    }
 }
 
 internal fun parseTerminalInstallationIdentity(payload: JSONObject): TerminalInstallationIdentity {

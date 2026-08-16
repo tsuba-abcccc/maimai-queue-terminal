@@ -114,6 +114,48 @@ class QueueStatusApiTest(unittest.TestCase):
         ).get_json()
         self.assertNotEqual("错误机厅", fetched["venue"]["name"])
 
+    def test_venue_business_hours_are_bound_to_the_venue_and_require_schema_eight_identity(self):
+        headers = self.schema_eight_terminal_headers()
+        initial = self.client.get(
+            "/api/queue-terminal/venue-settings", headers=headers
+        )
+        self.assertEqual(200, initial.status_code)
+        self.assertIsNone(initial.get_json()["business_hours"])
+
+        settings = {
+            "enabled": True,
+            "use_weekly_schedule": True,
+            "default_hours": {"opening_minutes": 600, "closing_minutes": 1320},
+            "weekly_hours": {
+                day: {"opening_minutes": 660, "closing_minutes": 1260}
+                for day in (
+                    "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY",
+                    "FRIDAY", "SATURDAY", "SUNDAY",
+                )
+            },
+        }
+        updated = self.client.put(
+            "/api/queue-terminal/venue-settings",
+            json={"business_hours": settings},
+            headers=headers,
+        )
+        self.assertEqual(200, updated.status_code)
+        self.assertEqual(settings, updated.get_json()["business_hours"])
+
+        fetched = self.client.get(
+            "/api/queue-terminal/venue-settings", headers=headers
+        )
+        self.assertEqual(settings, fetched.get_json()["business_hours"])
+
+        missing_venue = {
+            key: value for key, value in headers.items() if key != "X-Queue-Venue-ID"
+        }
+        rejected = self.client.get(
+            "/api/queue-terminal/venue-settings", headers=missing_venue
+        )
+        self.assertEqual(409, rejected.status_code)
+        self.assertEqual("VENUE_ID_REQUIRED", rejected.get_json()["code"])
+
     def test_player_account_binding_profile_update_and_password_change(self):
         snapshot = self.remote_ready_snapshot()
         published = self.client.post(

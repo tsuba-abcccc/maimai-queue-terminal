@@ -48,9 +48,21 @@ internal fun panguSpaceInsertionOffsets(value: String): List<Int> {
                 nextCodePoint
             )
         )
+        val needsMiddleDotSpacing = previousCodePoint != null && (
+            needsSpaceAroundHanMiddleDot(
+                previousPreviousCodePoint,
+                previousCodePoint,
+                codePoint,
+                nextCodePoint
+            )
+        )
         if (
             previousCodePoint != null &&
-            (needsPanguSpace(previousCodePoint, codePoint) || needsOperatorSpacing)
+            (
+                needsPanguSpace(previousCodePoint, codePoint) ||
+                    needsOperatorSpacing ||
+                    needsMiddleDotSpacing
+            )
         ) {
             offsets += index
         }
@@ -60,6 +72,24 @@ internal fun panguSpaceInsertionOffsets(value: String): List<Int> {
     }
     return offsets
 }
+
+private fun needsSpaceAroundHanMiddleDot(
+    previousPreviousCodePoint: Int?,
+    previousCodePoint: Int,
+    currentCodePoint: Int,
+    nextCodePoint: Int?
+): Boolean =
+    (
+        currentCodePoint == APP_MIDDLE_DOT &&
+            nextCodePoint != null &&
+            isHanCodePoint(previousCodePoint) &&
+            isHanCodePoint(nextCodePoint)
+    ) || (
+        previousCodePoint == APP_MIDDLE_DOT &&
+            previousPreviousCodePoint != null &&
+            isHanCodePoint(previousPreviousCodePoint) &&
+            isHanCodePoint(currentCodePoint)
+    )
 
 private fun needsSpaceAfterMixedOperator(
     previousPreviousCodePoint: Int?,
@@ -104,6 +134,9 @@ private fun isAsciiLetterOrDigit(codePoint: Int): Boolean =
 
 private fun isAsciiOperator(codePoint: Int): Boolean = codePoint in ASCII_OPERATORS
 
+private fun isHanCodePoint(codePoint: Int): Boolean =
+    Character.UnicodeScript.of(codePoint) == Character.UnicodeScript.HAN
+
 private fun isCjkCodePoint(codePoint: Int): Boolean = when (codePoint) {
     in 0x2E80..0x2FFF,
     in 0x3040..0x30FF,
@@ -120,7 +153,7 @@ private fun isCjkCodePoint(codePoint: Int): Boolean = when (codePoint) {
 
 private const val APP_MIDDLE_DOT = '·'.code
 private val APP_MIDDLE_DOT_SPACING_REGEX =
-    Regex("[\\p{Z}\\t\\u000B\\f]+(?=·)|(?<=·)[\\p{Z}\\t\\u000B\\f]+")
+    Regex("[\\p{Zs}\\t]+(?=·)|(?<=·)[\\p{Zs}\\t]+")
 private val ASCII_OPERATORS = intArrayOf(
     '+'.code, '-'.code, '*'.code, '/'.code, '='.code,
     '&'.code, '|'.code, '<'.code, '>'.code
