@@ -96,6 +96,7 @@ const markedSelf = ref(null)
 const playerAccount = ref(null)
 const playerAccountQueueState = ref(null)
 const accountSelfIdentity = ref(null)
+const playerAccountSessionReady = ref(false)
 const currentLogs = ref([])
 const currentLogsQueueId = ref(null)
 const currentLogsNextCursor = ref(null)
@@ -109,6 +110,7 @@ const selfStorageAvailable = ref(true)
 const currentTime = ref(Date.now())
 const onlineJoinVisible = ref(false)
 const onlineJoinStep = ref('LOOKUP')
+const onlineJoinAudience = ref('OTHER')
 const onlineJoinQq = ref('')
 const onlineJoinMachineId = ref('A')
 const onlineJoinProfile = ref(null)
@@ -1003,6 +1005,8 @@ async function refreshLoggedInPlayerSession() {
     await refreshLoggedInPlayerQueue()
   } catch {
     // Account detection is best effort and must never block queue status.
+  } finally {
+    playerAccountSessionReady.value = true
   }
 }
 
@@ -1848,10 +1852,11 @@ function firstAvailableOnlineMachineId() {
     onlineJoinMachineOptions.value[0]?.id || machines.value[0]?.id || 'A'
 }
 
-function resetOnlineJoin() {
+function resetOnlineJoin(audience = 'OTHER') {
   if (onlineCommandTimer) window.clearTimeout(onlineCommandTimer)
   onlineCommandTimer = null
   onlineJoinStep.value = 'LOOKUP'
+  onlineJoinAudience.value = audience
   onlineJoinQq.value = ''
   onlineJoinMachineId.value = firstAvailableOnlineMachineId()
   onlineJoinProfile.value = null
@@ -1893,14 +1898,26 @@ function hasRestartedOnlineCheckInWindow(registration) {
     startedAt !== createdAt
 }
 
-function openOnlineJoin() {
+async function openOnlineJoin() {
   if (!onlineRegistrationAvailable.value) return
+  if (!playerAccountSessionReady.value) await refreshLoggedInPlayerSession()
   if (!['PENDING', 'REJECTED'].includes(onlineJoinStep.value)) resetOnlineJoin()
   onlineJoinVisible.value = true
+  if (playerAccount.value?.profile?.qq_number) {
+    onlineJoinAudience.value = 'SELF'
+    onlineJoinQq.value = playerAccount.value.profile.qq_number
+    onlineJoinStep.value = 'SELF_LOADING'
+    queryOnlineProfile()
+  }
 }
 
 function closeOnlineJoin() {
   onlineJoinVisible.value = false
+}
+
+function beginOtherOnlineJoin() {
+  resetOnlineJoin('OTHER')
+  onlineJoinVisible.value = true
 }
 
 function handleOnlineJoinQqInput(event) {
@@ -1981,10 +1998,25 @@ async function queryOnlineProfile() {
         : profile.defaultPreference
     onlineJoinStep.value = onlineJoinExistingRegistration.value ? 'EXISTING' : 'CONFIRM'
   } catch (error) {
+    if (onlineJoinAudience.value === 'SELF' && onlineJoinStep.value === 'SELF_LOADING') {
+      onlineJoinStep.value = 'SELF_ERROR'
+    }
     onlineJoinError.value = error?.message || '暂时无法查询玩家资料，请稍后重试。'
   } finally {
     onlineJoinLoading.value = false
   }
+}
+
+function retryOwnOnlineJoin() {
+  if (!playerAccount.value?.profile?.qq_number) {
+    beginOtherOnlineJoin()
+    return
+  }
+  onlineJoinAudience.value = 'SELF'
+  onlineJoinQq.value = playerAccount.value.profile.qq_number
+  onlineJoinError.value = ''
+  onlineJoinStep.value = 'SELF_LOADING'
+  queryOnlineProfile()
 }
 
 function backToOnlineLookup() {
@@ -2693,12 +2725,16 @@ onBeforeUnmount(() => {
             <header class="queue-detail-header">
               <div>
                 <h2>{{ onlineJoinStep === 'LOOKUP' ? '加入排队'
+                  : onlineJoinStep === 'SELF_LOADING' ? '正在读取本人资料'
+                    : onlineJoinStep === 'SELF_ERROR' ? '无法读取本人资料'
                   : onlineJoinStep === 'CONFIRM' ? '确认登记信息'
                     : onlineJoinStep === 'EXISTING' ? '你已在排队'
                       : onlineJoinStep === 'PENDING' ? '正在提交登记'
                         : onlineJoinStep === 'REJECTED' ? '登记没有执行'
                           : '线上登记已完成' }}</h2>
                 <p v-if="onlineJoinStep === 'LOOKUP'">使用已在现场终端建立的玩家资料</p>
+                <p v-else-if="onlineJoinStep === 'SELF_LOADING'">正在使用当前登录的玩家资料</p>
+                <p v-else-if="onlineJoinStep === 'SELF_ERROR'">当前登录资料暂时无法用于线上登记</p>
                 <p v-else-if="onlineJoinStep === 'CONFIRM'">核对资料，并确认本次排队安排</p>
                 <p v-else-if="onlineJoinStep === 'PENDING'">正在等待现场终端处理</p>
               </div>
@@ -2707,7 +2743,36 @@ onBeforeUnmount(() => {
               </button>
             </header>
 
-            <form v-if="onlineJoinStep === 'LOOKUP'" class="queue-online-form" @submit.prevent="queryOnlineProfile">
+            <section v-if="onlineJoinStep === 'SELF_LOADING'" class="queue-online-result" aria-live="polite">
+              <span class="queue-online-result-icon">
+                <RefreshCw :size="23" class="spinning" />
+              </span>
+              <strong>正在确认你的玩家资料</strong>
+              <p>将使用当前登录的玩家资料，不会显示完整玩家资料库。</p>
+            </section>
+
+            <section v-else-if="onlineJoinStep === 'SELF_ERROR'" class="queue-online-result is-rejected" aria-live="assertive">
+              <span class="queue-online-result-icon is-rejected">
+                <TriangleAlert :size="23" />
+              </span>
+              <strong>暂时无法确认本人资料</strong>
+              <p>{{ onlineJoinError }}</p>
+              <button class="queue-online-primary" type="button" :disabled="onlineJoinLoading" @click="retryOwnOnlineJoin">
+                重新读取本人资料
+              </button>
+              <button class="queue-online-secondary" type="button" @click="beginOtherOnlineJoin">
+                为他人创建线上登记
+              </button>
+            </section>
+
+            <form v-else-if="onlineJoinStep === 'LOOKUP'" class="queue-online-form" @submit.prevent="queryOnlineProfile">
+              <div class="queue-online-other-notice">
+                <TriangleAlert :size="18" aria-hidden="true" />
+                <p>
+                  <strong>为他人创建线上登记</strong>
+                  <span>请先取得本人同意。登记创建后，必须由本人到现场终端点击“已到场”完成签到；创建者不能代替签到，也不能代替他人操作登记。</span>
+                </p>
+              </div>
               <label class="queue-online-field">
                 <span>QQ 号</span>
                 <input :value="onlineJoinQq" inputmode="numeric" autocomplete="off" maxlength="12"
@@ -2814,6 +2879,13 @@ onBeforeUnmount(() => {
                   <span v-if="!onlineJoinProfile.setupComplete">这份玩家资料尚未补全通知偏好和 QQ 显示范围。线上登记可以先创建，但到场后须先在终端补全资料，才能签到。</span>
                 </p>
               </div>
+              <div v-if="onlineJoinAudience === 'OTHER'" class="queue-online-other-notice">
+                <TriangleAlert :size="18" aria-hidden="true" />
+                <p>
+                  <strong>请确认你是在代本人创建</strong>
+                  <span>线上登记只代表排队意向，不代表本人已到场。请把机台和签到规则告知对方，并由对方本人到现场完成签到。</span>
+                </p>
+              </div>
               <p v-if="onlineJoinError" class="queue-online-error" role="alert">{{ onlineJoinError }}</p>
               <div class="queue-online-actions">
                 <button type="button" @click="backToOnlineLookup">返回查询</button>
@@ -2822,6 +2894,10 @@ onBeforeUnmount(() => {
                   {{ onlineJoinLoading ? '正在提交' : '完成并加入排队' }}
                 </button>
               </div>
+              <button v-if="onlineJoinAudience === 'SELF'" class="queue-online-secondary queue-online-other-button"
+                type="button" @click="beginOtherOnlineJoin">
+                为他人创建线上登记
+              </button>
             </div>
 
             <div v-else-if="onlineJoinStep === 'EXISTING'" class="queue-online-result">
@@ -3143,6 +3219,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
   font-weight: 600;
   letter-spacing: 0;
 }
+
 .queue-heading h1 { margin: 0; border: 0; font-size: 34px; font-weight: 660; line-height: 1.15; letter-spacing: 0; }
 .queue-heading p { display: flex; margin: 7px 0 0; flex-wrap: wrap; gap: 0; color: var(--queue-secondary); font-size: 13px; line-height: 1.55; }
 .queue-heading strong { color: var(--queue-text); font-weight: 560; }
@@ -3414,6 +3491,12 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-online-check-in-notice strong, .queue-online-check-in-notice span { display: block; }
 .queue-online-check-in-notice strong { font-size: 11px; font-weight: 640; line-height: 1.45; }
 .queue-online-check-in-notice span { margin-top: 2px; color: var(--queue-secondary); font-size: 10px; line-height: 1.55; }
+.queue-online-other-notice { display: flex; padding: 11px 12px; align-items: flex-start; gap: 9px; border-left: 3px solid var(--queue-orange); color: var(--queue-orange); background: var(--queue-soft-orange); }
+.queue-online-other-notice > svg { margin-top: 1px; flex: 0 0 auto; }
+.queue-online-other-notice p { margin: 0; }
+.queue-online-other-notice strong, .queue-online-other-notice span { display: block; }
+.queue-online-other-notice strong { font-size: 11px; font-weight: 640; line-height: 1.45; }
+.queue-online-other-notice span { margin-top: 2px; color: var(--queue-secondary); font-size: 10px; line-height: 1.55; }
 .queue-online-capacity-notice { display: flex; padding: 11px 12px; align-items: flex-start; gap: 9px; border-left: 3px solid var(--queue-blue); color: var(--queue-blue); background: var(--queue-soft-blue); }
 .queue-online-capacity-notice > svg { margin-top: 1px; flex: 0 0 auto; }
 .queue-online-capacity-notice p { margin: 0; }
@@ -3431,6 +3514,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-online-actions button { min-height: 44px; border: 0; border-radius: 9px; color: var(--queue-text); background: var(--queue-position); cursor: pointer; font-size: 11px; font-weight: 590; }
 .queue-online-actions button.primary { color: #fff; background: var(--queue-blue); }
 .queue-online-actions button:disabled { color: var(--queue-tertiary); background: var(--queue-disabled); cursor: default; }
+.queue-online-other-button { margin-top: 0; border: 1px solid var(--queue-separator); }
 .queue-online-result { display: flex; min-height: 250px; padding: 24px 4px 4px; align-items: center; justify-content: center; flex-direction: column; text-align: center; }
 .queue-online-result-icon { display: grid; width: 48px; height: 48px; place-items: center; border-radius: 50%; color: var(--queue-blue); background: var(--queue-soft-blue); }
 .queue-online-result-icon.is-information { color: var(--queue-online); background: var(--queue-soft-online); }
