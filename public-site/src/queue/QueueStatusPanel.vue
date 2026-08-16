@@ -1300,7 +1300,8 @@ function reconcileSelectedDetail() {
       location.kind === 'PLAYING' ? null : location.estimate,
       location.registrations,
       location.commonPlayPreview,
-      location.kind === 'PLAYING'
+      location.kind === 'PLAYING',
+      true
     )
     return
   }
@@ -1723,8 +1724,7 @@ async function pollDetailQueueAction(commandId, attempts = 0) {
   }
 }
 
-async function submitDetailQueueAction(registration, operation, extra = {}) {
-  const accountRegistration = accountQueueRegistrationFor(registration)
+async function submitDetailQueueAction(accountRegistration, operation, extra = {}) {
   const state = playerAccountQueueState.value
   if (!accountRegistration || !state?.queue || detailActionSubmitting.value) return
   if (!state.queue.remote_actions) {
@@ -1766,9 +1766,10 @@ function openRegistration(
   estimatedWaitMinutes = null,
   locationRegistrations = [],
   commonPlayPreview = null,
-  isPlaying = false
+  isPlaying = false,
+  preserveAction = false
 ) {
-  resetDetailAction()
+  if (!preserveAction) resetDetailAction()
   selectedDetail.value = {
     kind: 'registration',
     title: registration.displayId,
