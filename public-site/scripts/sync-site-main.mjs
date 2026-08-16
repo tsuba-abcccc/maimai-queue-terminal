@@ -18,6 +18,10 @@ function parseTarget() {
   return positional ? resolve(positional) : process.env.SITE_MAIN_DIR ? resolve(process.env.SITE_MAIN_DIR) : null
 }
 
+function readComparableFile(path) {
+  return readFileSync(path, 'utf8').replace(/\r\n?/g, '\n')
+}
+
 const targetRoot = parseTarget()
 if (!targetRoot) {
   console.error('请提供 site-main 路径：pnpm run sync:site-main -- --site-main <路径>')
@@ -36,8 +40,8 @@ for (const file of sharedFiles) {
   const target = join(targetDocs, file)
   if (!existsSync(source)) throw new Error(`缺少公开站点源文件：${source}`)
   const sourceContent = readFileSync(source)
-  const targetContent = existsSync(target) ? readFileSync(target) : null
-  if (!targetContent || !sourceContent.equals(targetContent)) different = true
+  const targetContent = existsSync(target) ? readComparableFile(target) : null
+  if (!targetContent || sourceContent.toString().replace(/\r\n?/g, '\n') !== targetContent) different = true
   if (!process.argv.includes('--check')) {
     mkdirSync(targetDocs, { recursive: true })
     copyFileSync(source, target)
