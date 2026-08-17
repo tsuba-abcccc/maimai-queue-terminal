@@ -1759,6 +1759,21 @@ function openDetailAction(mode) {
   detailActionNotice.value = ''
 }
 
+function requestDetailAction(mode) {
+  const state = playerAccountQueueState.value
+  if (!state?.queue?.terminal_online) {
+    detailActionError.value = '现场终端暂时离线，无法执行这项操作。终端恢复同步后即可重试。'
+    detailActionNotice.value = ''
+    return
+  }
+  if (!state.queue.remote_actions) {
+    detailActionError.value = '现场未开启网站远程操作，当前只能查看状态。'
+    detailActionNotice.value = ''
+    return
+  }
+  openDetailAction(mode)
+}
+
 function openRegistration(
   machine,
   registration,
@@ -3463,19 +3478,26 @@ onBeforeUnmount(() => {
                   <div v-else class="queue-detail-action-buttons">
                     <template v-if="!accountQueueRegistrationFor(selectedDetail.registration).online_registration_pending_check_in">
                       <button v-if="accountQueueRegistrationFor(selectedDetail.registration).deferred_once" type="button"
-                        :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="openDetailAction('cancel_defer')">取消暂缓一次</button>
+                        :disabled="detailActionSubmitting"
+                        :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" @click="requestDetailAction('cancel_defer')">取消暂缓一次</button>
                       <button v-else-if="playerAccountQueueState.queue?.queue_rules?.allow_defer_one_round" type="button"
-                        :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="openDetailAction('defer')">暂缓一次</button>
+                        :disabled="detailActionSubmitting"
+                        :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" @click="requestDetailAction('defer')">暂缓一次</button>
                       <button v-if="accountQueueRegistrationFor(selectedDetail.registration).temporarily_away" type="button"
-                        :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="openDetailAction('cancel_temporary_leave')">取消暂时离开</button>
+                        :disabled="detailActionSubmitting"
+                        :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" @click="requestDetailAction('cancel_temporary_leave')">取消暂时离开</button>
                       <button v-else-if="playerAccountQueueState.queue?.queue_rules?.allow_temporary_leave" type="button"
-                        :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="openDetailAction('temporary_leave')">暂时离开</button>
+                        :disabled="detailActionSubmitting"
+                        :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" @click="requestDetailAction('temporary_leave')">暂时离开</button>
                       <button v-if="accountQueueRegistrationFor(selectedDetail.registration).position !== 'PLAYING' && playerAccountQueueState.queue.machines.some((machine) => machine.id !== accountQueueRegistrationFor(selectedDetail.registration).machine_id && machine.available)" type="button"
-                        :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="detailActionTargetMachineId = ''; openDetailAction('transfer')">转至其他机台</button>
+                        :disabled="detailActionSubmitting"
+                        :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" @click="detailActionTargetMachineId = ''; requestDetailAction('transfer')">转至其他机台</button>
                       <button v-if="accountQueueRegistrationFor(selectedDetail.registration).machine_capacity > 1" type="button"
-                        :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="detailActionPreference = accountQueueRegistrationFor(selectedDetail.registration).preference; openDetailAction('preference')">修改游玩偏好</button>
+                        :disabled="detailActionSubmitting"
+                        :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" @click="detailActionPreference = accountQueueRegistrationFor(selectedDetail.registration).preference; requestDetailAction('preference')">修改游玩偏好</button>
                     </template>
-                    <button class="is-danger" type="button" :disabled="!playerAccountQueueState.queue?.remote_actions || detailActionSubmitting" @click="openDetailAction('leave')">退出排队</button>
+                    <button class="is-danger" :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" type="button"
+                      :disabled="detailActionSubmitting" @click="requestDetailAction('leave')">退出排队</button>
                   </div>
                   <p v-if="detailActionError" class="queue-detail-action-error" role="alert">{{ detailActionError }}</p>
                   <p v-if="detailActionNotice" class="queue-detail-action-notice" role="status">{{ detailActionNotice }}</p>
@@ -3793,6 +3815,7 @@ button { font: inherit; letter-spacing: 0; -webkit-tap-highlight-color: transpar
 .queue-detail-action-buttons { display: grid; margin-top: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
 .queue-detail-action-buttons button, .queue-detail-action-confirm button { min-height: 40px; padding: 7px 9px; border: 1px solid var(--queue-separator); border-radius: 8px; color: var(--queue-text); background: var(--queue-position); cursor: pointer; font-size: 11px; line-height: 1.35; }
 .queue-detail-action-buttons button.is-danger, .queue-detail-action-confirm button.is-danger { color: var(--queue-red); }
+.queue-detail-action-buttons button.is-unavailable { color: var(--queue-tertiary); background: var(--queue-disabled); }
 .queue-detail-action-buttons button:disabled, .queue-detail-action-confirm button:disabled { color: var(--queue-tertiary); background: var(--queue-disabled); cursor: default; }
 .queue-detail-action-title { display: block; margin-top: 13px; font-size: 12px; font-weight: 620; }
 .queue-detail-action-detail, .queue-detail-action-note { margin: 7px 0 0; color: var(--queue-secondary); font-size: 10px; line-height: 1.6; }
