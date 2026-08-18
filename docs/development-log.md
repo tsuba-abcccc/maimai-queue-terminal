@@ -4,7 +4,7 @@
 
 本文件记录可审阅、可复核的工程依据，不记录模型内部隐藏推理过程。正式对外发布内容仍以版本更新日志和 GitHub Release 为准。
 
-## 2026-08-18 · 0.12.0 账户边界与网页操作审查
+## 2026-08-18 至 2026-08-19 · 0.12.1 账户边界与网页操作审查
 
 ### 本轮实现与审查结论
 
@@ -18,7 +18,7 @@
 
 - 服务端 `144` 项测试通过，包含旧账户会话失效、孤立账户重新绑定、QQ 冲突清理、网页登录玩家本人登记退出排队和线上登记待处理状态恢复。
 - Koishi Bot `80` 项测试通过；Android/队列核心 `:app:test` 与 `:queue-core:test` 通过；公开站点 Vite 构建和 `site-main` VitePress 构建通过。
-- `git diff --check` 通过。`output/apk/maimai-Q-0.12.0-local.apk` 与 `maimai-Q-0.12.0-terminal.apk` 是 Debug 联调包；公开附件由同一源码重新构建为非 Debug Release，并使用既有长期发布证书签名。联网 Release 的内置服务端地址和令牌均为空，可以由部署者安装后自行配置。
+- `git diff --check` 通过。`output/apk/maimai-Q-0.12.1-local.apk` 与 `maimai-Q-0.12.1-terminal.apk` 是 Debug 联调包；公开附件由同一源码重新构建为非 Debug Release，并使用既有长期发布证书签名。联网 Release 的内置服务端地址和令牌均为空，可以由部署者安装后自行配置。
 
 ### 未改变的核心规则
 

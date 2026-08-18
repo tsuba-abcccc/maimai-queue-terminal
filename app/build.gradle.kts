@@ -32,7 +32,7 @@ val terminalQueueSyncUrl = if (terminalBuildEnabled.get() && embedTerminalSyncCo
 val terminalQueueSyncToken = if (terminalBuildEnabled.get() && embedTerminalSyncConfig.get()) {
     queueSyncToken.get()
 } else ""
-val appVersionName = "0.12.0"
+val appVersionName = "0.12.1"
 
 android {
     namespace = "com.abcccc.maimaiqueue"
@@ -46,7 +46,7 @@ android {
         applicationId = "com.abcccc.maimaiqueue"
         minSdk = 29
         targetSdk = 36
-        versionCode = 62
+        versionCode = 63
         versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
