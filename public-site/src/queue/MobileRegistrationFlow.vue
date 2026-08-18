@@ -134,7 +134,7 @@ function createNewProfileDraft() {
     gender: 'UNDISCLOSED',
     default_preference: 'ASK_EVERY_TIME',
     qq_number: '',
-    qq_visibility: 'TERMINAL_ONLY',
+    qq_visibility: 'PUBLIC_WEBSITE',
     ...DEFAULT_NOTIFICATIONS
   }
 }

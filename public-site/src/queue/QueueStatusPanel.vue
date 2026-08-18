@@ -1615,6 +1615,11 @@ function detailActionPrompt(registration, mode) {
     const details = [`${subject}会退出当前队列，继续游玩时需要重新加入排队。`]
     if (registration.fixed_pair) {
       details.push('固定组合会解除；另一份登记保留原位，并恢复为允许他人加入。')
+      if (registration.deferred_once) {
+        details.push('另一份登记仍保持暂缓一次，并会在下一次轮到后自动解除。')
+      } else if (registration.temporarily_away) {
+        details.push(`另一份登记仍保持暂时离开和已轮空 ${registration.temporary_away_skipped_turns || 0} 次，返回后需要手动取消。`)
+      }
     }
     if (registration.position === 'PLAYING') {
       details.push('游玩位置中的空缺不会自动由等待顺序中的下一组登记补入。')
@@ -1645,8 +1650,16 @@ function detailTransferPrompt(registration) {
   if (registration.fixed_pair) {
     details.push('当前登记属于固定组合，只转移本人会解除固定组合；另一份登记保留原位并恢复为允许他人加入。')
   }
-  if (registration.deferred_once) details.push('转入后这份登记不再暂缓一次。')
-  if (registration.temporarily_away) details.push('暂时离开状态和已轮空次数会保留，返回后仍需手动取消。')
+  if (registration.deferred_once) {
+    details.push(registration.fixed_pair
+      ? '转入登记不再暂缓；留在原机台的登记仍会暂缓一次。'
+      : '转入后这份登记不再暂缓一次。')
+  }
+  if (registration.temporarily_away) {
+    details.push(registration.fixed_pair
+      ? `两份登记的暂时离开状态和已轮空 ${registration.temporary_away_skipped_turns || 0} 次都会保留；转入后仍需手动取消。`
+      : `暂时离开状态和已轮空 ${registration.temporary_away_skipped_turns || 0} 次会保留；转入后仍需手动取消。`)
+  }
   return {
     title: `转至 ${target.name}？`,
     detail: details.join(' '),
@@ -1727,8 +1740,10 @@ async function pollDetailQueueAction(commandId, attempts = 0) {
 async function submitDetailQueueAction(accountRegistration, operation, extra = {}) {
   const state = playerAccountQueueState.value
   if (!accountRegistration || !state?.queue || detailActionSubmitting.value) return
-  if (!state.queue.remote_actions) {
-    detailActionError.value = '现场未开启网站远程操作，当前只能查看状态。'
+  const unavailableReason = detailActionUnavailableReason(accountRegistration)
+  if (unavailableReason) {
+    detailActionError.value = unavailableReason
+    detailActionNotice.value = ''
     return
   }
   detailActionSubmitting.value = true
@@ -1760,18 +1775,30 @@ function openDetailAction(mode) {
 }
 
 function requestDetailAction(mode) {
-  const state = playerAccountQueueState.value
-  if (!state?.queue?.terminal_online) {
-    detailActionError.value = '现场终端暂时离线，无法执行这项操作。终端恢复同步后即可重试。'
-    detailActionNotice.value = ''
-    return
-  }
-  if (!state.queue.remote_actions) {
-    detailActionError.value = '现场未开启网站远程操作，当前只能查看状态。'
+  const registration = selectedDetail.value?.kind === 'registration'
+    ? accountQueueRegistrationFor(selectedDetail.value.registration)
+    : null
+  const unavailableReason = detailActionUnavailableReason(registration)
+  if (unavailableReason) {
+    detailActionError.value = unavailableReason
     detailActionNotice.value = ''
     return
   }
   openDetailAction(mode)
+}
+
+function detailActionUnavailableReason(registration) {
+  const state = playerAccountQueueState.value
+  if (!state?.queue?.terminal_online) {
+    return '现场终端暂时离线，无法执行这项操作。终端恢复同步后即可重试。'
+  }
+  if (registration?.machine_operational === false) {
+    return '登记所在机台已停止使用，恢复正常使用后才能操作这份登记。'
+  }
+  if (!state.queue.remote_actions) {
+    return '现场未开启网站远程操作，当前只能查看状态。'
+  }
+  return ''
 }
 
 function openRegistration(
@@ -2109,7 +2136,7 @@ function resetOnlineJoin(audience = 'OTHER') {
 
 function invalidateOnlineJoinConfirmation(message) {
   if (!['CONFIRM', 'EXISTING'].includes(onlineJoinStep.value)) return
-  onlineJoinStep.value = 'LOOKUP'
+  onlineJoinStep.value = onlineJoinAudience.value === 'SELF' ? 'SELF_ERROR' : 'LOOKUP'
   onlineJoinProfile.value = null
   onlineJoinMachines.value = []
   onlineJoinGroups.value = []
@@ -2134,10 +2161,16 @@ function hasRestartedOnlineCheckInWindow(registration) {
 async function openOnlineJoin() {
   if (!onlineRegistrationAvailable.value) return
   if (!playerAccountSessionReady.value) await refreshLoggedInPlayerSession()
-  if (!['PENDING', 'REJECTED'].includes(onlineJoinStep.value)) resetOnlineJoin()
+  const desiredAudience = playerAccount.value?.profile?.qq_number ? 'SELF' : 'OTHER'
+  const canResumeCurrentResult = onlineJoinAudience.value === desiredAudience &&
+    ['PENDING', 'REJECTED'].includes(onlineJoinStep.value)
+  if (canResumeCurrentResult) {
+    onlineJoinVisible.value = true
+    return
+  }
+  resetOnlineJoin(desiredAudience)
   onlineJoinVisible.value = true
-  if (playerAccount.value?.profile?.qq_number) {
-    onlineJoinAudience.value = 'SELF'
+  if (desiredAudience === 'SELF') {
     onlineJoinQq.value = playerAccount.value.profile.qq_number
     onlineJoinStep.value = 'SELF_LOADING'
     queryOnlineProfile()
@@ -2253,6 +2286,7 @@ function retryOwnOnlineJoin() {
 }
 
 function backToOnlineLookup() {
+  onlineJoinAudience.value = 'OTHER'
   onlineJoinStep.value = 'LOOKUP'
   onlineJoinProfile.value = null
   onlineJoinMachines.value = []
@@ -2265,6 +2299,14 @@ function backToOnlineLookup() {
   onlineJoinResultRegistrationId.value = null
   onlineJoinTerminalApplied.value = false
   onlineJoinError.value = ''
+}
+
+function retryRejectedOnlineJoin() {
+  if (onlineJoinAudience.value === 'SELF') {
+    retryOwnOnlineJoin()
+  } else {
+    backToOnlineLookup()
+  }
 }
 
 function playerGenderText(gender) {
@@ -3173,7 +3215,9 @@ onBeforeUnmount(() => {
               </div>
               <p v-if="onlineJoinError" class="queue-online-error" role="alert">{{ onlineJoinError }}</p>
               <div class="queue-online-actions">
-                <button type="button" @click="backToOnlineLookup">返回查询</button>
+                <button type="button" @click="onlineJoinAudience === 'SELF' ? closeOnlineJoin() : backToOnlineLookup()">
+                  {{ onlineJoinAudience === 'SELF' ? '取消' : '返回查询' }}
+                </button>
                 <button class="primary" type="button" :disabled="onlineJoinLoading || !onlineJoinCanSubmit"
                   @click="submitOnlineJoin">
                   {{ onlineJoinLoading ? '正在提交' : '完成并加入排队' }}
@@ -3216,7 +3260,9 @@ onBeforeUnmount(() => {
               <span class="queue-online-result-icon" aria-hidden="true"><TriangleAlert :size="23" /></span>
               <strong>这次线上登记没有执行</strong>
               <p>{{ onlineJoinResultDetail }}</p>
-              <button class="queue-online-primary" type="button" @click="backToOnlineLookup">重新查询</button>
+              <button class="queue-online-primary" type="button" @click="retryRejectedOnlineJoin">
+                {{ onlineJoinAudience === 'SELF' ? '重新读取本人资料' : '重新查询' }}
+              </button>
             </div>
 
             <div v-else class="queue-online-result" :class="onlineJoinPostApplyEvent ? 'is-rejected' : 'is-success'" aria-live="polite">
@@ -3416,6 +3462,9 @@ onBeforeUnmount(() => {
                   <p v-if="!playerAccountQueueState.queue?.terminal_online" class="queue-detail-action-warning">
                     现场终端暂时离线，当前只能查看状态。
                   </p>
+                  <p v-else-if="accountQueueRegistrationFor(selectedDetail.registration).machine_operational === false" class="queue-detail-action-warning">
+                    登记所在机台已停止使用，恢复正常使用后才能操作这份登记。
+                  </p>
                   <p v-else-if="!playerAccountQueueState.queue?.remote_actions" class="queue-detail-action-warning">
                     现场未开启网站远程操作，当前只能查看状态。
                   </p>
@@ -3423,12 +3472,16 @@ onBeforeUnmount(() => {
                     <strong class="queue-detail-action-title">选择要转至的机台</strong>
                     <div class="queue-detail-action-choices">
                       <button v-for="machine in playerAccountQueueState.queue.machines.filter((item) => item.id !== accountQueueRegistrationFor(selectedDetail.registration).machine_id)"
-                        :key="machine.id" type="button" :disabled="machine.available !== true || detailActionSubmitting"
+                        :key="machine.id" type="button"
+                        :disabled="machine.available !== true || detailActionSubmitting || (accountQueueRegistrationFor(selectedDetail.registration).fixed_pair && machine.capacity === 1)"
+                        :title="accountQueueRegistrationFor(selectedDetail.registration).fixed_pair && machine.capacity === 1 ? '容量为 1 的机台不能接收固定组合，请先修改本次游玩偏好解除组合。' : ''"
                         :class="{ active: detailActionTargetMachineId === machine.id }"
                         @click="detailActionTargetMachineId = machine.id">
                         {{ machine.name }}
                       </button>
                     </div>
+                    <p v-if="accountQueueRegistrationFor(selectedDetail.registration).fixed_pair && playerAccountQueueState.queue.machines.some((machine) => machine.id !== accountQueueRegistrationFor(selectedDetail.registration).machine_id && machine.available && machine.capacity === 1)"
+                      class="queue-detail-action-note">容量为 1 的机台不能接收固定组合。请先修改本次游玩偏好解除组合，再转至该机台。</p>
                     <p v-if="detailTransferPrompt(accountQueueRegistrationFor(selectedDetail.registration))" class="queue-detail-action-detail">
                       {{ detailTransferPrompt(accountQueueRegistrationFor(selectedDetail.registration)).detail }}
                     </p>
@@ -3444,6 +3497,11 @@ onBeforeUnmount(() => {
                   <template v-else-if="detailActionMode === 'preference'">
                     <strong class="queue-detail-action-title">选择本次游玩偏好</strong>
                     <p class="queue-detail-action-detail">这里只修改本次排队的偏好，不会改变玩家资料中的默认偏好。</p>
+                    <p v-if="accountQueueRegistrationFor(selectedDetail.registration).fixed_pair" class="queue-detail-action-note">
+                      修改后会解除当前固定组合；另一份登记保留原位，并恢复为允许他人加入。
+                      <template v-if="accountQueueRegistrationFor(selectedDetail.registration).deferred_once">两份登记的“暂缓一次”安排不会因解除组合而取消。</template>
+                      <template v-else-if="accountQueueRegistrationFor(selectedDetail.registration).temporarily_away">两份登记当前的暂时离开状态和已轮空 {{ accountQueueRegistrationFor(selectedDetail.registration).temporary_away_skipped_turns || 0 }} 次不会因解除组合而清除。</template>
+                    </p>
                     <div class="queue-detail-action-choices is-two">
                       <button type="button" :class="{ active: detailActionPreference === 'SOLO' }"
                         :disabled="detailActionSubmitting" @click="detailActionPreference = 'SOLO'">单人游玩</button>
@@ -3479,24 +3537,26 @@ onBeforeUnmount(() => {
                     <template v-if="!accountQueueRegistrationFor(selectedDetail.registration).online_registration_pending_check_in">
                       <button v-if="accountQueueRegistrationFor(selectedDetail.registration).deferred_once" type="button"
                         :disabled="detailActionSubmitting"
-                        :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" @click="requestDetailAction('cancel_defer')">取消暂缓一次</button>
-                      <button v-else-if="playerAccountQueueState.queue?.queue_rules?.allow_defer_one_round" type="button"
+                        :class="{ 'is-unavailable': detailActionUnavailableReason(accountQueueRegistrationFor(selectedDetail.registration)) }" @click="requestDetailAction('cancel_defer')">取消暂缓一次</button>
+                      <button v-else-if="accountQueueRegistrationFor(selectedDetail.registration).temporarily_away" type="button"
                         :disabled="detailActionSubmitting"
-                        :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" @click="requestDetailAction('defer')">暂缓一次</button>
-                      <button v-if="accountQueueRegistrationFor(selectedDetail.registration).temporarily_away" type="button"
-                        :disabled="detailActionSubmitting"
-                        :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" @click="requestDetailAction('cancel_temporary_leave')">取消暂时离开</button>
-                      <button v-else-if="playerAccountQueueState.queue?.queue_rules?.allow_temporary_leave" type="button"
-                        :disabled="detailActionSubmitting"
-                        :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" @click="requestDetailAction('temporary_leave')">暂时离开</button>
+                        :class="{ 'is-unavailable': detailActionUnavailableReason(accountQueueRegistrationFor(selectedDetail.registration)) }" @click="requestDetailAction('cancel_temporary_leave')">取消暂时离开</button>
+                      <template v-else>
+                        <button v-if="playerAccountQueueState.queue?.queue_rules?.allow_defer_one_round" type="button"
+                          :disabled="detailActionSubmitting"
+                          :class="{ 'is-unavailable': detailActionUnavailableReason(accountQueueRegistrationFor(selectedDetail.registration)) }" @click="requestDetailAction('defer')">暂缓一次</button>
+                        <button v-if="playerAccountQueueState.queue?.queue_rules?.allow_temporary_leave" type="button"
+                          :disabled="detailActionSubmitting"
+                          :class="{ 'is-unavailable': detailActionUnavailableReason(accountQueueRegistrationFor(selectedDetail.registration)) }" @click="requestDetailAction('temporary_leave')">暂时离开</button>
+                      </template>
                       <button v-if="accountQueueRegistrationFor(selectedDetail.registration).position !== 'PLAYING' && playerAccountQueueState.queue.machines.some((machine) => machine.id !== accountQueueRegistrationFor(selectedDetail.registration).machine_id && machine.available)" type="button"
                         :disabled="detailActionSubmitting"
-                        :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" @click="detailActionTargetMachineId = ''; requestDetailAction('transfer')">转至其他机台</button>
+                        :class="{ 'is-unavailable': detailActionUnavailableReason(accountQueueRegistrationFor(selectedDetail.registration)) }" @click="detailActionTargetMachineId = ''; requestDetailAction('transfer')">转至其他机台</button>
                       <button v-if="accountQueueRegistrationFor(selectedDetail.registration).machine_capacity > 1" type="button"
                         :disabled="detailActionSubmitting"
-                        :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" @click="detailActionPreference = accountQueueRegistrationFor(selectedDetail.registration).preference; requestDetailAction('preference')">修改游玩偏好</button>
+                        :class="{ 'is-unavailable': detailActionUnavailableReason(accountQueueRegistrationFor(selectedDetail.registration)) }" @click="detailActionPreference = accountQueueRegistrationFor(selectedDetail.registration).preference; requestDetailAction('preference')">修改游玩偏好</button>
                     </template>
-                    <button class="is-danger" :class="{ 'is-unavailable': !playerAccountQueueState.queue?.remote_actions }" type="button"
+                    <button class="is-danger" :class="{ 'is-unavailable': detailActionUnavailableReason(accountQueueRegistrationFor(selectedDetail.registration)) }" type="button"
                       :disabled="detailActionSubmitting" @click="requestDetailAction('leave')">退出排队</button>
                   </div>
                   <p v-if="detailActionError" class="queue-detail-action-error" role="alert">{{ detailActionError }}</p>

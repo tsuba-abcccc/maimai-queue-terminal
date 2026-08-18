@@ -175,6 +175,7 @@ class PlayerProfilesTest {
         assertEquals("小雨", first.nickname)
         assertEquals("12345678", first.qqNumber)
         assertTrue(first.hasValidContact)
+        assertEquals(QqVisibility.PUBLIC_WEBSITE, first.qqVisibility)
         assertNotEquals(first.id, second.id)
         assertEquals(700L, first.updatedAtMillis)
     }

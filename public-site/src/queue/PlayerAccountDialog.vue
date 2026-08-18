@@ -239,7 +239,42 @@ function registrationAbsenceStatus(registration) {
 function accountQueuePositionText(registration) {
   return registration.position === 'PLAYING'
     ? `游玩位置 ${registration.machine_id}`
-    : `位置 ${registration.machine_id}${registration.position_index || ''}`
+    : `队列位置 ${registration.machine_id}${registration.position_index || ''}`
+}
+
+function queueActionUnavailableReason(registration) {
+  if (!queueState.value?.queue?.terminal_online) {
+    return '现场终端暂时离线，无法执行这项操作。终端恢复同步后即可重试。'
+  }
+  if (registration?.machine_operational === false) {
+    return '登记所在机台已停止使用，恢复正常使用后才能操作这份登记。'
+  }
+  if (!queueState.value.queue.remote_actions) {
+    return '现场未开启网站远程操作，当前只能查看状态。'
+  }
+  return ''
+}
+
+function requestQueueAction(registration, mode) {
+  const reason = queueActionUnavailableReason(registration)
+  if (reason) {
+    queueError.value = reason
+    queueNotice.value = ''
+    return false
+  }
+  queueError.value = ''
+  queueNotice.value = ''
+  queueActionMode.value = mode
+  return true
+}
+
+function requestQueueTransfer(registration) {
+  if (requestQueueAction(registration, 'transfer')) queueTargetMachineId.value = ''
+}
+
+function requestQueuePreference(registration) {
+  if (!requestQueueAction(registration, 'preference')) return
+  queuePreference.value = registration.preference
 }
 
 function accountQueueEstimateText(registration) {
@@ -341,6 +376,11 @@ function queueActionPrompt(registration, mode) {
     const details = [`${subject}会退出当前队列，继续游玩时需要重新加入排队。`]
     if (registration.fixed_pair) {
       details.push('固定组合会解除；另一份登记保留原位，并恢复为允许他人加入。')
+      if (registration.deferred_once) {
+        details.push('另一份登记仍保持暂缓一次，并会在下一次轮到后自动解除。')
+      } else if (registration.temporarily_away) {
+        details.push(`另一份登记仍保持暂时离开和已轮空 ${registration.temporary_away_skipped_turns || 0} 次，返回后需要手动取消。`)
+      }
     }
     if (registration.position === 'PLAYING') {
       details.push('游玩位置中的空缺不会自动由等待顺序中的下一组登记补入。')
@@ -371,8 +411,16 @@ function transferPrompt(registration) {
   if (registration.fixed_pair) {
     details.push('当前登记属于固定组合，只转移本人会解除固定组合；另一份登记保留原位并恢复为允许他人加入。')
   }
-  if (registration.deferred_once) details.push('转入后这份登记不再暂缓一次。')
-  if (registration.temporarily_away) details.push('暂时离开状态和已轮空次数会保留，返回后仍需手动取消。')
+  if (registration.deferred_once) {
+    details.push(registration.fixed_pair
+      ? '转入登记不再暂缓；留在原机台的登记仍会暂缓一次。'
+      : '转入后这份登记不再暂缓一次。')
+  }
+  if (registration.temporarily_away) {
+    details.push(registration.fixed_pair
+      ? `两份登记的暂时离开状态和已轮空 ${registration.temporary_away_skipped_turns || 0} 次都会保留；转入后仍需手动取消。`
+      : `暂时离开状态和已轮空 ${registration.temporary_away_skipped_turns || 0} 次会保留；转入后仍需手动取消。`)
+  }
   return {
     title: `转至 ${target.name}？`,
     detail: details,
@@ -408,7 +456,13 @@ async function pollQueueCommand(commandId, attempts = 0) {
 }
 
 async function submitQueueAction(registration, operation, extra = {}) {
-  if (queueActionSubmitting.value || !queueState.value?.queue?.remote_actions) return
+  if (queueActionSubmitting.value) return
+  const unavailableReason = queueActionUnavailableReason(registration)
+  if (unavailableReason) {
+    queueError.value = unavailableReason
+    queueNotice.value = ''
+    return
+  }
   queueActionSubmitting.value = true
   queueError.value = ''
   queueNotice.value = '操作已提交，正在等待现场终端确认。'
@@ -580,7 +634,7 @@ onBeforeUnmount(() => {
           </label>
           <p v-if="error" class="account-error" role="alert">{{ error }}</p>
           <button class="account-primary" type="submit" :disabled="submitting">
-            <ShieldCheck :size="17" />{{ submitting ? '正在绑定' : binding.rebind ? '重新绑定并设置密码' : '确认绑定' }}
+            <ShieldCheck :size="17" />{{ submitting ? '正在绑定' : '确认绑定' }}
           </button>
         </form>
         <p v-else-if="error" class="account-error account-error-block" role="alert">{{ error }}</p>
@@ -615,7 +669,7 @@ onBeforeUnmount(() => {
             <div><dt>通知总开关</dt><dd>{{ account.profile.notification_enabled ? '已开启' : '已关闭' }}</dd></div>
             <div><dt>终端编辑</dt><dd>{{ account.profile.terminal_editing_allowed ? '允许' : '仅网页' }}</dd></div>
           </dl>
-          <p class="account-explanation">网页账户绑定的是当前机厅的玩家资料。跨端同步可能需要终端下一次连接服务端后才会完成。</p>
+          <p class="account-explanation">网页登录绑定的是当前机厅的玩家资料。跨端同步可能需要终端下一次连接服务端后才会完成。</p>
           <div class="account-queue-heading">
             <div>
               <strong>我的排队</strong>
@@ -641,17 +695,21 @@ onBeforeUnmount(() => {
               </div>
               <p v-if="registration.online_registration_pending_check_in" class="account-queue-warning">请在创建登记后的 30 分钟内到现场终端完成签到；轮到进入游玩位置时仍未签到，登记也会自动退出排队。</p>
               <p v-if="!queueState.queue?.terminal_online" class="account-queue-warning">现场终端暂时离线，当前状态可能已经变化，暂不能远程操作。</p>
+              <p v-else-if="registration.machine_operational === false" class="account-queue-warning">登记所在机台已停止使用，恢复正常使用后才能操作这份登记。</p>
               <p v-else-if="!queueState.queue?.remote_actions" class="account-queue-warning">现场未开启网站远程操作，当前只能查看状态。</p>
 
               <div v-if="queueActionMode === 'transfer'" class="account-inline-action">
                 <strong>选择要转至的机台</strong>
                 <div class="account-choice-grid">
                   <button v-for="machine in queueState.queue.machines.filter((item) => item.id !== registration.machine_id)"
-                    :key="machine.id" type="button" :disabled="!machine.available"
+                    :key="machine.id" type="button" :disabled="!machine.available || (registration.fixed_pair && machine.capacity === 1)"
+                    :title="registration.fixed_pair && machine.capacity === 1 ? '容量为 1 的机台不能接收固定组合，请先修改本次游玩偏好解除组合。' : ''"
                     :class="{ active: queueTargetMachineId === machine.id }" @click="queueTargetMachineId = machine.id">
                     {{ machine.name }}
                   </button>
                 </div>
+                <p v-if="registration.fixed_pair && queueState.queue.machines.some((machine) => machine.id !== registration.machine_id && machine.available && machine.capacity === 1)"
+                  class="account-action-note">容量为 1 的机台不能接收固定组合。请先修改本次游玩偏好解除组合，再转至该机台。</p>
                 <p v-if="transferPrompt(registration)" class="account-action-detail">
                   {{ transferPrompt(registration).detail.join(' ') }}
                 </p>
@@ -667,6 +725,11 @@ onBeforeUnmount(() => {
               <div v-else-if="queueActionMode === 'preference'" class="account-inline-action">
                 <strong>选择本次游玩偏好</strong>
                 <p>这里只修改本次排队的偏好，不会改变玩家资料中的默认偏好。</p>
+                <p v-if="registration.fixed_pair" class="account-action-note">
+                  修改后会解除当前固定组合；另一份登记保留原位，并恢复为允许他人加入。
+                  <template v-if="registration.deferred_once">两份登记的“暂缓一次”安排不会因解除组合而取消。</template>
+                  <template v-else-if="registration.temporarily_away">两份登记当前的暂时离开状态和已轮空 {{ registration.temporary_away_skipped_turns || 0 }} 次不会因解除组合而清除。</template>
+                </p>
                 <div class="account-choice-grid account-choice-grid-two">
                   <button type="button" :class="{ active: queuePreference === 'SOLO' }" @click="queuePreference = 'SOLO'">单人游玩</button>
                   <button type="button" :class="{ active: queuePreference === 'OPEN_TO_JOIN' }" @click="queuePreference = 'OPEN_TO_JOIN'">允许他人加入</button>
@@ -705,14 +768,16 @@ onBeforeUnmount(() => {
 
               <div v-else class="account-queue-actions">
                 <template v-if="!registration.online_registration_pending_check_in">
-                  <button v-if="registration.deferred_once" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueActionMode = 'cancel_defer'">取消暂缓一次</button>
-                  <button v-else-if="queueState.queue?.queue_rules?.allow_defer_one_round" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueActionMode = 'defer'">暂缓一次</button>
-                  <button v-if="registration.temporarily_away" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueActionMode = 'cancel_temporary_leave'">取消暂时离开</button>
-                  <button v-else-if="queueState.queue?.queue_rules?.allow_temporary_leave" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueActionMode = 'temporary_leave'">暂时离开</button>
-                  <button v-if="registration.position !== 'PLAYING' && queueState.queue.machines.some((machine) => machine.id !== registration.machine_id && machine.available)" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueTargetMachineId = ''; queueActionMode = 'transfer'">转至其他机台</button>
-                  <button v-if="registration.machine_capacity > 1" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queuePreference = registration.preference; queueActionMode = 'preference'">修改游玩偏好</button>
+                  <button v-if="registration.deferred_once" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration) }" @click="requestQueueAction(registration, 'cancel_defer')">取消暂缓一次</button>
+                  <button v-else-if="registration.temporarily_away" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration) }" @click="requestQueueAction(registration, 'cancel_temporary_leave')">取消暂时离开</button>
+                  <template v-else>
+                    <button v-if="queueState.queue?.queue_rules?.allow_defer_one_round" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration) }" @click="requestQueueAction(registration, 'defer')">暂缓一次</button>
+                    <button v-if="queueState.queue?.queue_rules?.allow_temporary_leave" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration) }" @click="requestQueueAction(registration, 'temporary_leave')">暂时离开</button>
+                  </template>
+                  <button v-if="registration.position !== 'PLAYING' && queueState.queue.machines.some((machine) => machine.id !== registration.machine_id && machine.available)" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration) }" @click="requestQueueTransfer(registration)">转至其他机台</button>
+                  <button v-if="registration.machine_capacity > 1" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration) }" @click="requestQueuePreference(registration)">修改游玩偏好</button>
                 </template>
-                <button class="is-danger" type="button" :disabled="!queueState.queue?.remote_actions || queueActionSubmitting" @click="queueActionMode = 'leave'">退出排队</button>
+                <button class="is-danger" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration) }" @click="requestQueueAction(registration, 'leave')">退出排队</button>
               </div>
             </template>
           </article>
@@ -919,6 +984,7 @@ onBeforeUnmount(() => {
 .account-queue-actions { display: grid; margin-top: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 .account-queue-actions button, .account-confirm-actions button { min-height: 42px; padding: 0 9px; border: 0; border-radius: 7px; color: var(--queue-text); background: var(--queue-soft); cursor: pointer; font-size: 10px; font-weight: 620; }
 .account-queue-actions button:disabled, .account-confirm-actions button:disabled { color: var(--queue-tertiary, #8e8e93); cursor: default; }
+.account-queue-actions button.is-unavailable { color: var(--queue-tertiary, #8e8e93); }
 .account-queue-actions button.is-danger, .account-confirm-actions button.is-danger { color: var(--queue-red); }
 .account-inline-action { display: grid; margin-top: 12px; gap: 9px; padding-top: 12px; border-top: 1px solid var(--queue-separator, #d2d2d7); }
 .account-inline-action > strong { font-size: 12px; }

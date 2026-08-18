@@ -247,6 +247,50 @@ class QueueStatusApiTest(unittest.TestCase):
             "87654321", qq_updated.get_json()["account"]["profile"]["qq_number"]
         )
 
+        old_qq_queue = self.client.post(
+            "/api/queue-bot/players",
+            json={"qq": "12345678"},
+            headers=self.bot_headers,
+        ).get_json()["players"]
+        new_qq_queue = self.client.post(
+            "/api/queue-bot/players",
+            json={"qq": "87654321"},
+            headers=self.bot_headers,
+        ).get_json()["players"]
+        self.assertEqual([], old_qq_queue)
+        self.assertEqual(1, len(new_qq_queue))
+        self.assertEqual(self.profile_id, new_qq_queue[0]["profile_id"])
+
+        # A current profile row is authoritative even if a legacy or damaged
+        # profile no longer has a QQ. Do not expose its active registration
+        # through the old queue-contact fallback.
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE player_profile SET qq_number = NULL WHERE profile_id = ?",
+                (self.profile_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertEqual(
+            [],
+            self.client.post(
+                "/api/queue-bot/players",
+                json={"qq": "12345678"},
+                headers=self.bot_headers,
+            ).get_json()["players"],
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE player_profile SET qq_number = ? WHERE profile_id = ?",
+                ("87654321", self.profile_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
         queue_response = fresh_client.get("/api/player-account/queue")
         self.assertEqual(200, queue_response.status_code)
         queue_payload = queue_response.get_json()
@@ -294,7 +338,7 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("PENDING", command_status.get_json()["status"])
         self.assertEqual(404, anonymous_status.status_code)
 
-    def test_player_account_rebinding_preserves_settings_and_validation_uses_http_errors(self):
+    def test_bound_player_account_cannot_be_rebound_and_validation_uses_http_errors(self):
         snapshot = self.remote_ready_snapshot()
         self.assertEqual(
             204,
@@ -302,6 +346,11 @@ class QueueStatusApiTest(unittest.TestCase):
                 "/api/queue-status", json=snapshot, headers=self.headers
             ).status_code,
         )
+        stale_binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        ).get_json()
         first_binding = self.client.post(
             "/api/queue-terminal/player-bindings",
             json={"profile_id": self.profile_id},
@@ -334,55 +383,244 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("CSRF_TOKEN_INVALID", missing_csrf.get_json()["code"])
         self.assertEqual(200, customized.status_code)
 
-        obsolete_binding = self.client.post(
+        repeated_binding = self.client.post(
             "/api/queue-terminal/player-bindings",
             json={"profile_id": self.profile_id},
             headers=self.headers,
-        ).get_json()
-        second_binding = self.client.post(
-            "/api/queue-terminal/player-bindings",
-            json={"profile_id": self.profile_id},
-            headers=self.headers,
-        ).get_json()
-        invalidated = self.client.get(
-            f"/api/player-account/bindings/{obsolete_binding['binding_token']}"
         )
-        too_short = self.client.post(
-            f"/api/player-account/bindings/{second_binding['binding_token']}/complete",
-            json={"password": "short"},
+        self.assertEqual(409, repeated_binding.status_code)
+        self.assertEqual(
+            "PLAYER_ACCOUNT_ALREADY_BOUND", repeated_binding.get_json()["code"]
         )
-        rebound = self.client.post(
-            f"/api/player-account/bindings/{second_binding['binding_token']}/complete",
+
+        # Simulate a binding page issued before another request completed the binding.
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE player_binding_session SET invalidated_at = NULL WHERE token_hash IS NOT NULL AND consumed_at IS NULL"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        stale_page = self.client.get(
+            f"/api/player-account/bindings/{stale_binding['binding_token']}"
+        )
+        stale_completion = self.client.post(
+            f"/api/player-account/bindings/{stale_binding['binding_token']}/complete",
             json={"password": "second-password"},
         )
-        rebound_profile = rebound.get_json()["account"]["profile"]
-        reused = self.client.post(
-            f"/api/player-account/bindings/{second_binding['binding_token']}/complete",
-            json={"password": "third-password"},
+        self.assertEqual(409, stale_page.status_code)
+        self.assertEqual("PLAYER_ACCOUNT_ALREADY_BOUND", stale_page.get_json()["code"])
+        self.assertEqual(409, stale_completion.status_code)
+        self.assertEqual(
+            "PLAYER_ACCOUNT_ALREADY_BOUND", stale_completion.get_json()["code"]
         )
 
-        self.assertEqual(410, invalidated.status_code)
-        self.assertEqual("PLAYER_BINDING_EXPIRED", invalidated.get_json()["code"])
-        self.assertEqual(400, too_short.status_code)
-        self.assertEqual(201, rebound.status_code)
-        self.assertEqual(409, reused.status_code)
-        self.assertEqual("PLAYER_BINDING_USED", reused.get_json()["code"])
-        self.assertEqual("TERMINAL_ONLY", rebound_profile["qq_visibility"])
-        self.assertFalse(rebound_profile["visited_venues_public"])
-        self.assertTrue(rebound_profile["terminal_editing_allowed"])
-
-        rebound_csrf = self.client.get_cookie("maimai_q_session_csrf").value
         invalid_password_change = self.client.post(
             "/api/player-account/password",
             json={
-                "current_password": "second-password",
+                "current_password": "first-password",
                 "new_password": "short",
                 "new_password_confirmation": "short",
             },
-            headers={"X-CSRF-Token": rebound_csrf},
+            headers={"X-CSRF-Token": csrf},
         )
         self.assertEqual(400, invalid_password_change.status_code)
         self.assertEqual("PASSWORD_TOO_SHORT", invalid_password_change.get_json()["code"])
+
+        fresh_client = self.app.test_client()
+        original_login = fresh_client.post(
+            "/api/player-account/login",
+            json={"qq": "12345678", "password": "first-password"},
+        )
+        attacker_login = self.app.test_client().post(
+            "/api/player-account/login",
+            json={"qq": "12345678", "password": "second-password"},
+        )
+        self.assertEqual(200, original_login.status_code)
+        self.assertEqual(401, attacker_login.status_code)
+
+    def test_unbound_profile_invalidates_stale_account_and_sessions(self):
+        snapshot = self.remote_ready_snapshot()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        ).get_json()
+        completed = self.client.post(
+            f"/api/player-account/bindings/{binding['binding_token']}/complete",
+            json={"password": "bound-password"},
+        )
+        self.assertEqual(201, completed.status_code)
+
+        # A stale imported database can retain credentials after the profile
+        # itself has been marked unbound. The next profile sync must remove the
+        # orphaned account and revoke the session instead of leaving a login
+        # path that bypasses the current binding state.
+        connection = sqlite3.connect(self.database_path)
+        try:
+            profile_scope_id = connection.execute(
+                """
+                SELECT profile_scope_id FROM player_account
+                WHERE profile_id = ?
+                """,
+                (self.profile_id,),
+            ).fetchone()[0]
+            connection.execute(
+                """
+                UPDATE player_profile
+                SET web_account_bound = 0,
+                    terminal_editing_allowed = 1,
+                    web_profile_revision = 0
+                WHERE device_id = ? AND profile_id = ?
+                """,
+                (profile_scope_id, self.profile_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            self.assertIsNone(
+                connection.execute(
+                    """
+                    SELECT account_id FROM player_account
+                    WHERE profile_scope_id = ? AND profile_id = ?
+                    """,
+                    (profile_scope_id, self.profile_id),
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+        current = self.client.get("/api/player-account")
+        self.assertEqual(401, current.status_code, current.get_json())
+        fresh_login = self.app.test_client().post(
+            "/api/player-account/login",
+            json={"qq": "12345678", "password": "bound-password"},
+        )
+        self.assertEqual(401, fresh_login.status_code)
+
+        # The profile can be bound again after the stale account is removed.
+        rebound = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+        self.assertEqual(201, rebound.status_code)
+
+    def test_binding_cleans_an_orphan_account_before_recreating_session(self):
+        snapshot = self.remote_ready_snapshot()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                """
+                INSERT INTO player_account
+                    (account_id, profile_scope_id, profile_id, password_salt,
+                     password_hash, created_at, updated_at, password_changed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "orphan-account",
+                    self.app.config["PROFILE_SCOPE_ID"],
+                    self.profile_id,
+                    b"orphan-salt",
+                    b"orphan-hash",
+                    1,
+                    1,
+                    1,
+                ),
+            )
+            connection.execute(
+                "UPDATE player_profile SET web_account_bound = 0 WHERE profile_id = ?",
+                (self.profile_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        binding_response = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+        self.assertEqual(201, binding_response.status_code)
+        completed = self.client.post(
+            f"/api/player-account/bindings/{binding_response.get_json()['binding_token']}/complete",
+            json={"password": "recreated-password"},
+        )
+        self.assertEqual(201, completed.status_code)
+        self.assertEqual(
+            "12345678",
+            completed.get_json()["account"]["profile"]["qq_number"],
+        )
+
+    def test_logged_in_player_can_submit_leave_queue_with_confirmed_registration_state(self):
+        snapshot = self.remote_ready_snapshot(with_registration=True)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        ).get_json()
+        completed = self.client.post(
+            f"/api/player-account/bindings/{binding['binding_token']}/complete",
+            json={"password": "player-password"},
+        )
+        self.assertEqual(201, completed.status_code)
+
+        queue_payload = self.client.get("/api/player-account/queue").get_json()
+        queue = queue_payload["queue"]
+        registration = queue_payload["registrations"][0]
+        csrf = self.client.get_cookie("maimai_q_session_csrf").value
+        command = self.client.post(
+            "/api/player-account/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000778",
+                "operation": "LEAVE_QUEUE",
+                "expected_queue_id": queue["queue_id"],
+                "expected_registration_id": registration["registration_id"],
+                "expected_machine_id": registration["machine_id"],
+                "expected_position": registration["position"],
+                "expected_fixed_pair_id": registration["fixed_pair_id"],
+                "expected_absence_status": "NONE",
+                "expected_temporary_away_skipped_turns": 0,
+                "expected_pending_check_in": False,
+                "expected_machine_configuration_revision": queue[
+                    "machine_configuration_revision"
+                ],
+                "expected_machine_stable_id": registration["machine_stable_id"],
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        self.assertEqual(202, command.status_code)
+        self.assertEqual("LEAVE_QUEUE", command.get_json()["payload"]["operation"])
+        self.assertTrue(command.get_json()["payload"]["profile_identity_verified"])
 
     def test_bound_profile_accepts_only_terminal_confirmed_bot_updates(self):
         snapshot = self.remote_ready_snapshot(revision=4)
@@ -665,6 +903,42 @@ class QueueStatusApiTest(unittest.TestCase):
             public_ids[self.profile_id],
             public_ids["00000000-0000-0000-0000-000000000902"],
         )
+
+    def test_profile_bound_on_another_server_is_unbound_and_synced_back(self):
+        snapshot = self.remote_ready_snapshot(revision=4)
+        self.upgrade_snapshot_to_schema_v7(snapshot)
+        snapshot["schema_version"] = 8
+        snapshot["venue"] = {
+            "id": self.client.get(
+                "/api/queue-terminal/installation", headers=self.headers
+            ).get_json()["venue"]["id"]
+        }
+        profile = snapshot["private_player_profiles"][0]
+        profile.update(
+            public_player_id="012345",
+            web_account_bound=True,
+            terminal_editing_allowed=False,
+            visited_venues_public=False,
+            web_profile_revision=3,
+        )
+
+        published = self.client.post(
+            "/api/queue-status",
+            json=snapshot,
+            headers=self.schema_eight_terminal_headers(),
+        )
+        synced = self.client.get(
+            "/api/queue-terminal/profiles",
+            headers=self.schema_eight_terminal_headers(),
+        ).get_json()["profiles"][0]
+
+        self.assertEqual(204, published.status_code)
+        self.assertFalse(synced["web_account_bound"])
+        self.assertTrue(synced["terminal_editing_allowed"])
+        self.assertTrue(synced["visited_venues_public"])
+        self.assertEqual(0, synced["web_profile_revision"])
+        self.assertEqual(profile["profile_revision"] + 1, synced["profile_revision"])
+        self.assertGreaterEqual(synced["updated_at"], profile["updated_at"])
 
     def test_historical_player_public_id_is_never_promoted_back_to_current(self):
         snapshot = self.remote_ready_snapshot(revision=4)

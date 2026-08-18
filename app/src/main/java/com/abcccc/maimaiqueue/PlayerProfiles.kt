@@ -103,7 +103,7 @@ fun createPlayerProfile(
     gender: PlayerGender,
     defaultPreference: ProfilePlayPreference,
     qqNumber: String? = null,
-    qqVisibility: QqVisibility = QqVisibility.TERMINAL_ONLY,
+    qqVisibility: QqVisibility = QqVisibility.PUBLIC_WEBSITE,
     notificationPreferences: QueueNotificationPreferences = QueueNotificationPreferences(),
     setupVersion: Int = CURRENT_PLAYER_PROFILE_SETUP_VERSION,
     createdAtMillis: Long = System.currentTimeMillis()

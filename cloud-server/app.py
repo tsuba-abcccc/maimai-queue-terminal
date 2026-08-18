@@ -1399,6 +1399,56 @@ def player_account_token_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def invalidate_player_account_for_profile(
+    connection: sqlite3.Connection,
+    *,
+    profile_scope_id: str,
+    profile_id: str,
+    now: int,
+) -> None:
+    """Invalidate stale web credentials when a profile is no longer bound.
+
+    A profile can be imported from another terminal or database snapshot with
+    ``web_account_bound`` cleared while the account tables still contain the
+    old credential. Revoke every session and pending binding before removing
+    the account row so the profile can be bound again without an orphaned
+    login path.
+    """
+    account_rows = connection.execute(
+        """
+        SELECT account_id FROM player_account
+        WHERE profile_scope_id = ? AND profile_id = ?
+        """,
+        (profile_scope_id, profile_id),
+    ).fetchall()
+    account_ids = [row["account_id"] for row in account_rows]
+    if account_ids:
+        connection.executemany(
+            """
+            UPDATE player_web_session
+            SET revoked_at = COALESCE(revoked_at, ?)
+            WHERE account_id = ?
+            """,
+            [(now, account_id) for account_id in account_ids],
+        )
+    connection.execute(
+        """
+        UPDATE player_binding_session
+        SET invalidated_at = COALESCE(invalidated_at, ?)
+        WHERE profile_scope_id = ? AND profile_id = ?
+          AND consumed_at IS NULL
+        """,
+        (now, profile_scope_id, profile_id),
+    )
+    connection.execute(
+        """
+        DELETE FROM player_account
+        WHERE profile_scope_id = ? AND profile_id = ?
+        """,
+        (profile_scope_id, profile_id),
+    )
+
+
 def validate_player_account_password(value: Any) -> str:
     if not isinstance(value, str):
         raise ValidationError("请输入账户密码。", code="PASSWORD_REQUIRED", field="password")
@@ -1616,6 +1666,7 @@ def current_player_account_session(
         JOIN player_profile AS profile
           ON profile.device_id = account.profile_scope_id
          AND profile.profile_id = account.profile_id
+         AND profile.web_account_bound = 1
         JOIN venue ON venue.profile_scope_id = account.profile_scope_id
         WHERE account.account_id = ?
         """,
@@ -1742,7 +1793,8 @@ def create_player_binding_session():
             ), 409
         profile = connection.execute(
             """
-            SELECT profile_id, public_player_id, nickname, qq_number, setup_version
+            SELECT profile_id, public_player_id, nickname, qq_number, setup_version,
+                   web_account_bound
             FROM player_profile
             WHERE device_id = ? AND profile_id = ?
               AND profile_id IN (
@@ -1764,6 +1816,33 @@ def create_player_binding_session():
                     "error": "请先在现场终端补全玩家资料，再绑定网页账户。",
                 }
             ), 409
+        account = connection.execute(
+            """
+            SELECT account_id FROM player_account
+            WHERE profile_scope_id = ? AND profile_id = ?
+            """,
+            (venue["profile_scope_id"], profile_id),
+        ).fetchone()
+        if account is not None and profile["web_account_bound"]:
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "PLAYER_ACCOUNT_ALREADY_BOUND",
+                    "error": "这份玩家资料已经绑定网页账户，请直接登录；资料和密码请在网页玩家资料中管理。",
+                }
+            ), 409
+        if account is not None:
+            # An imported profile may have lost its binding flag while the
+            # account row survived. Remove that orphan before issuing a new
+            # binding, otherwise completion could create a session for an
+            # account id that the upsert would silently replace.
+            invalidate_player_account_for_profile(
+                connection,
+                profile_scope_id=venue["profile_scope_id"],
+                profile_id=profile_id,
+                now=now,
+            )
         binding_token = secrets.token_urlsafe(PLAYER_ACCOUNT_BINDING_TOKEN_BYTES)
         binding_id = str(uuid4())
         expires_at = now + max(
@@ -1837,6 +1916,7 @@ def read_player_binding_row(
         LEFT JOIN player_account AS account
           ON account.profile_scope_id = binding.profile_scope_id
          AND account.profile_id = binding.profile_id
+         AND profile.web_account_bound = 1
         WHERE binding.token_hash = ?
         """,
         (player_account_token_hash(binding_token),),
@@ -1862,6 +1942,14 @@ def player_binding_state_error(binding: sqlite3.Row | None, now: int):
                 "error": "绑定页面已经失效，请在现场终端重新生成。",
             }
         ), 410
+    if binding["account_id"] is not None:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "PLAYER_ACCOUNT_ALREADY_BOUND",
+                "error": "这份玩家资料已经绑定网页账户，请直接登录；资料和密码请在网页玩家资料中管理。",
+            }
+        ), 409
     if binding["setup_version"] <= 0 or binding["qq_number"] is None:
         return jsonify(
             {
@@ -1884,7 +1972,6 @@ def read_player_binding_session(binding_token: str):
         {
             "binding_id": binding["binding_id"],
             "expires_at": binding["expires_at"] * 1000,
-            "rebind": binding["account_id"] is not None,
             "profile": {
                 "profile_id": binding["profile_id"],
                 "public_player_id": binding["public_player_id"],
@@ -2031,6 +2118,7 @@ def current_player_account_session_for_id(
         JOIN player_profile AS profile
           ON profile.device_id = account.profile_scope_id
          AND profile.profile_id = account.profile_id
+         AND profile.web_account_bound = 1
         JOIN venue ON venue.profile_scope_id = account.profile_scope_id
         WHERE account.account_id = ?
         """,
@@ -2068,6 +2156,7 @@ def login_player_account():
             JOIN player_profile AS profile
               ON profile.device_id = account.profile_scope_id
              AND profile.profile_id = account.profile_id
+             AND profile.web_account_bound = 1
             JOIN current_player_profile AS current_profile
               ON current_profile.profile_scope_id = account.profile_scope_id
              AND current_profile.profile_id = account.profile_id
@@ -3575,6 +3664,12 @@ def upsert_player_profiles(
                     "visited_venues_public": True,
                     "web_profile_revision": 0,
                 }
+                invalidate_player_account_for_profile(
+                    connection,
+                    profile_scope_id=profile_scope_id,
+                    profile_id=profile["profile_id"],
+                    now=max(received_at, int(time.time())),
+                )
             connection.execute(
                 """
                 UPDATE player_profile SET received_at = ?
@@ -3628,6 +3723,12 @@ def upsert_player_profiles(
                     ) + 1,
                 }
         else:
+            detached_from_another_server = bool(
+                profile["web_account_bound"]
+                or not profile["terminal_editing_allowed"]
+                or not profile["visited_venues_public"]
+                or profile["web_profile_revision"] > 0
+            )
             profile = {
                 **profile,
                 "web_account_bound": False,
@@ -3635,6 +3736,22 @@ def upsert_player_profiles(
                 "visited_venues_public": True,
                 "web_profile_revision": 0,
             }
+            if detached_from_another_server:
+                # A web account belongs to the server that created it. Advance
+                # the profile revision so the terminal accepts this server's
+                # unbound state instead of retaining a same-revision flag from
+                # its previous endpoint.
+                profile = {
+                    **profile,
+                    "profile_revision": profile["profile_revision"] + 1,
+                    "updated_at": max(profile["updated_at"], received_at * 1000),
+                }
+            invalidate_player_account_for_profile(
+                connection,
+                profile_scope_id=profile_scope_id,
+                profile_id=profile["profile_id"],
+                now=max(received_at, int(time.time())),
+            )
 
         qq_number = profile["qq_number"]
         if qq_number is not None:
@@ -3668,6 +3785,12 @@ def upsert_player_profiles(
                     """,
                     (profile_scope_id, conflicting["profile_id"]),
                 ).fetchone()["public_player_id"]
+                invalidate_player_account_for_profile(
+                    connection,
+                    profile_scope_id=profile_scope_id,
+                    profile_id=conflicting["profile_id"],
+                    now=max(received_at, int(time.time())),
+                )
                 connection.execute(
                     """
                     DELETE FROM player_profile
@@ -3683,11 +3806,22 @@ def upsert_player_profiles(
                     created_at=received_at,
                     previous_profile_id=conflicting["profile_id"],
                 )
-            else:
+            elif conflicting is not None:
+                invalidate_player_account_for_profile(
+                    connection,
+                    profile_scope_id=profile_scope_id,
+                    profile_id=conflicting["profile_id"],
+                    now=max(received_at, int(time.time())),
+                )
                 connection.execute(
                     """
                     UPDATE player_profile
-                    SET qq_number = NULL, profile_revision = profile_revision + 1
+                    SET qq_number = NULL,
+                        web_account_bound = 0,
+                        terminal_editing_allowed = 1,
+                        visited_venues_public = 1,
+                        web_profile_revision = 0,
+                        profile_revision = profile_revision + 1
                     WHERE device_id = ? AND profile_id != ? AND qq_number = ?
                     """,
                     (profile_scope_id, profile["profile_id"], qq_number),
@@ -4384,17 +4518,25 @@ def read_bot_players():
         if snapshot_row is None:
             return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
         snapshot = json.loads(snapshot_row["payload"])
-        queue_storage_id, _ = snapshot_storage_context(snapshot_row, snapshot)
+        queue_storage_id, profile_scope_id = snapshot_storage_context(
+            snapshot_row, snapshot
+        )
         query = """
-            SELECT registration_id, player_id, qq_number, updated_at
-            FROM queue_private_contact
-            WHERE queue_id = ?
+            SELECT contact.registration_id, contact.player_id,
+                   CASE WHEN profile.profile_id IS NOT NULL
+                        THEN profile.qq_number ELSE contact.qq_number END AS qq_number,
+                   contact.updated_at
+            FROM queue_private_contact AS contact
+            LEFT JOIN player_profile AS profile
+              ON profile.device_id = ? AND profile.profile_id = contact.player_id
+            WHERE contact.queue_id = ?
         """
-        parameters: list[Any] = [queue_storage_id]
+        parameters: list[Any] = [profile_scope_id, queue_storage_id]
         if qq_number:
-            query += " AND qq_number = ?"
+            query += " AND CASE WHEN profile.profile_id IS NOT NULL"
+            query += " THEN profile.qq_number ELSE contact.qq_number END = ?"
             parameters.append(qq_number)
-        query += " ORDER BY registration_id"
+        query += " ORDER BY contact.registration_id"
         contacts = connection.execute(query, parameters).fetchall()
 
     last_seen_seconds = max(0, int(time.time()) - snapshot_row["received_at"])
@@ -6528,14 +6670,20 @@ def find_qq_registration_contexts(
     snapshot: dict[str, Any],
     qq_number: str,
 ) -> list[dict[str, Any]]:
+    profile_scope_id = active_profile_scope_id(connection)
     registration_ids = {
         row["registration_id"]
         for row in connection.execute(
             """
-            SELECT registration_id FROM queue_private_contact
-            WHERE queue_id = ? AND qq_number = ?
+            SELECT contact.registration_id
+            FROM queue_private_contact AS contact
+            LEFT JOIN player_profile AS profile
+              ON profile.device_id = ? AND profile.profile_id = contact.player_id
+            WHERE contact.queue_id = ?
+              AND CASE WHEN profile.profile_id IS NOT NULL
+                       THEN profile.qq_number ELSE contact.qq_number END = ?
             """,
-            (queue_id, qq_number),
+            (profile_scope_id, queue_id, qq_number),
         ).fetchall()
     }
     indexed = index_snapshot_registrations(snapshot)

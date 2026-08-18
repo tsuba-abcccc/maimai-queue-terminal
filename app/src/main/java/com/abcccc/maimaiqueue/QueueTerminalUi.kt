@@ -370,7 +370,7 @@ internal fun RegistrationApp() {
     var profilePreferenceDraft by remember { mutableStateOf(ProfilePlayPreference.ASK_EVERY_TIME) }
     var profileQqDraft by remember { mutableStateOf("") }
     var profileQqVisibilityDraft by remember {
-        mutableStateOf(QqVisibility.TERMINAL_ONLY)
+        mutableStateOf(QqVisibility.PUBLIC_WEBSITE)
     }
     var profileNotificationDraft by remember {
         mutableStateOf(QueueNotificationPreferences())
@@ -2422,7 +2422,7 @@ internal fun RegistrationApp() {
         profileGenderDraft = PlayerGender.UNDISCLOSED
         profilePreferenceDraft = ProfilePlayPreference.ASK_EVERY_TIME
         profileQqDraft = ""
-        profileQqVisibilityDraft = QqVisibility.TERMINAL_ONLY
+        profileQqVisibilityDraft = QqVisibility.PUBLIC_WEBSITE
         profileNotificationDraft = QueueNotificationPreferences()
         initialPlayerProfileDraft = currentPlayerProfileDraft()
         discardPlayerProfileDraftConfirmationVisible = false
@@ -2436,7 +2436,7 @@ internal fun RegistrationApp() {
         if (profile.webAccountBound && !profile.terminalEditingAllowed) {
             Toast.makeText(
                 context,
-                panguSpacing("这份资料已绑定网页账户，请在网页个人设置中编辑。"),
+                panguSpacing("这份资料已绑定网页账户，请在网页玩家资料中编辑。"),
                 Toast.LENGTH_SHORT
             ).show()
             return
@@ -2498,7 +2498,7 @@ internal fun RegistrationApp() {
             normalizedQqNumber != existingProfile.normalizedQqNumber()
         ) {
             playerProfileWriteFailureDetail =
-                "这份资料已绑定网页账户，QQ 只能在网页个人设置中修改。"
+                "这份资料已绑定网页账户，QQ 只能在网页玩家资料中修改。"
             return
         }
         val completedNewSettings = existingProfile?.hasCompleteRequiredDetails != true
@@ -12089,7 +12089,7 @@ private fun PlayerProfileEditorScreen(
     val qqSyntaxValid = normalizedQqNumber != null && isValidQqNumber(normalizedQqNumber)
     val contactValid = qqSyntaxValid && !qqAlreadyExists
     val contactMessage = when {
-        !qqEditable -> "这份资料已绑定网页账户，QQ 只能在网页个人设置中修改。"
+        !qqEditable -> "这份资料已绑定网页账户，QQ 只能在网页玩家资料中修改。"
         normalizedQqNumber == null -> "请输入 QQ 号。"
         !qqSyntaxValid -> "QQ 号应为 5 至 12 位数字。"
         qqAlreadyExists -> "这个 QQ 号已经用于另一份玩家资料。"
@@ -12668,25 +12668,23 @@ private fun PlayerProfileDetailScreen(
             }
         )
         Spacer(Modifier.height(10.dp))
-        SecondaryButton(
-            when {
-                webAccountBindingLoading -> "正在创建绑定页面"
-                profile.webAccountBound -> "重新绑定网页账户"
-                else -> "绑定网页账户"
-            },
-            onBindWebAccount,
-            Modifier.fillMaxWidth(),
-            enabled = webAccountBindingEnabled && !webAccountBindingLoading,
-            disabledReason = if (webAccountBindingLoading) {
-                "正在向服务端创建一次性绑定页面。"
-            } else {
-                webAccountBindingDisabledReason
-            }
-        )
+        if (!profile.webAccountBound) {
+            SecondaryButton(
+                if (webAccountBindingLoading) "正在创建绑定页面" else "绑定网页账户",
+                onBindWebAccount,
+                Modifier.fillMaxWidth(),
+                enabled = webAccountBindingEnabled && !webAccountBindingLoading,
+                disabledReason = if (webAccountBindingLoading) {
+                    "正在向服务端创建一次性绑定页面。"
+                } else {
+                    webAccountBindingDisabledReason
+                }
+            )
+        }
         Spacer(Modifier.height(7.dp))
         Text(
             if (profile.webAccountBound) {
-                "这份资料已绑定网页账户。重新绑定可以在本人忘记密码时重新设置密码，不会改变现有资料和隐私设置。"
+                "这份资料已绑定网页账户。资料和密码请由玩家登录网页后管理。"
             } else {
                 "绑定后可在网页管理个人资料。绑定页面只对这份资料有效，且会在短时间后失效。"
             },
