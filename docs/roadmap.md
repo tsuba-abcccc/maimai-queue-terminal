@@ -2,7 +2,7 @@
 
 本文件记录已确认的版本安排，包括近期已发布版本和后续功能路线。补丁版本只处理已经完成的修复和发布阻断问题；大型功能按下列版本边界开发，不提前混入补丁版本。
 
-当前公开测试版本为 `0.12.1`；网页玩家资料的功能方案见 [`releases/0.12.0-plan.md`](releases/0.12.0-plan.md)，补丁更新见 [`releases/0.12.1-public-beta.md`](releases/0.12.1-public-beta.md)。
+当前公开测试版本为 `0.12.2`；网页玩家资料的功能方案见 [`releases/0.12.0-plan.md`](releases/0.12.0-plan.md)，补丁更新见 [`releases/0.12.2-public-beta.md`](releases/0.12.2-public-beta.md)。
 
 ## 0.8.1 · 同步与跨端操作可靠性
 
