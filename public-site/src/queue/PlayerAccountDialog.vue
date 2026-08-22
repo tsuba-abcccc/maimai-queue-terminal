@@ -12,10 +12,11 @@ const QUEUE_API_URL = import.meta.env.VITE_QUEUE_STATUS_API_URL ||
   (typeof window !== 'undefined' ? `${window.location.origin}/api/queue-status` : '/api/queue-status')
 const ACCOUNT_API_URL = import.meta.env.VITE_PLAYER_ACCOUNT_API_URL ||
   QUEUE_API_URL.replace(/queue-status\/?(?:\?.*)?$/, 'player-account')
-const QUEUE_COMMAND_STATUS_API_URL = QUEUE_API_URL.replace(
-  /queue-status\/?(?:\?.*)?$/,
-  'queue-online/commands'
-)
+const QUEUE_COMMAND_STATUS_API_URL = import.meta.env.VITE_QUEUE_ONLINE_COMMAND_API_BASE ||
+  QUEUE_API_URL.replace(
+    /queue-status\/?(?:\?.*)?$/,
+    'queue-online/commands'
+  )
 
 const loading = ref(true)
 const submitting = ref(false)
@@ -91,6 +92,17 @@ function setAccount(nextAccount) {
   currentPassword.value = ''
   passwordForm.value = { current: '', next: '', confirmation: '' }
   emit('session', nextAccount)
+}
+
+function clearAccountSession() {
+  if (queueCommandTimer) {
+    window.clearTimeout(queueCommandTimer)
+    queueCommandTimer = undefined
+  }
+  setAccount(null)
+  csrfToken.value = ''
+  queueState.value = null
+  emit('queue-state', null)
 }
 
 function createRequestId() {
@@ -224,7 +236,12 @@ async function loadQueueState() {
     queueState.value = await accountRequest('/queue')
     emit('queue-state', queueState.value)
   } catch (loadQueueError) {
-    queueError.value = loadQueueError.message
+    if (loadQueueError.code === 'ACCOUNT_LOGIN_REQUIRED') {
+      clearAccountSession()
+      queueError.value = '登录状态已失效，请重新登录。'
+    } else {
+      queueError.value = loadQueueError.message
+    }
   } finally {
     queueLoading.value = false
   }
@@ -434,7 +451,11 @@ async function pollQueueCommand(commandId, attempts = 0) {
       credentials: 'include', cache: 'no-store', headers: { Accept: 'application/json' }
     })
     const payload = await response.json().catch(() => ({}))
-    if (!response.ok) throw new Error(payload.error || '暂时无法读取现场处理结果。')
+    if (!response.ok) {
+      const pollError = new Error(payload.error || '暂时无法读取现场处理结果。')
+      pollError.code = payload.code
+      throw pollError
+    }
     if (payload.status === 'PENDING' && attempts < 30) {
       queueCommandTimer = window.setTimeout(() => pollQueueCommand(commandId, attempts + 1), 1500)
       return
@@ -447,6 +468,11 @@ async function pollQueueCommand(commandId, attempts = 0) {
       finishQueueCommand('', payload.result_detail || '现场终端没有执行这次操作。')
     }
   } catch (pollError) {
+    if (pollError.code === 'ACCOUNT_LOGIN_REQUIRED') {
+      clearAccountSession()
+      finishQueueCommand('', '登录状态已失效，请重新登录。')
+      return
+    }
     if (attempts < 30) {
       queueCommandTimer = window.setTimeout(() => pollQueueCommand(commandId, attempts + 1), 1500)
     } else {

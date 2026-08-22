@@ -16489,7 +16489,7 @@ private fun TerminalInstallationDetailsDialog(
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
         Triple(
-            "0.12.2",
+            "0.12.3",
             "跨端反馈与安全刷新",
             "网页登录玩家显示明确的本人登记状态，并保留最近三条操作结果。风险操作失败时只能刷新最新队列和资料，不会自动重复提交；终端、网站与 QQ Bot 继续统一动作结果和同步状态文案。估时说明展开与队列分享暂不加入。"
         ),
