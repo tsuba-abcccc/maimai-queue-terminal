@@ -359,6 +359,59 @@ class QueueCloudCommandTest {
         assertTrue(decision is PlayerProfileCommandDecision.Reject)
     }
 
+    @Test
+    fun managementProfileUpdateCanChangeSensitivePolicyWithoutPlayerQqIdentity() {
+        val original = profile().copy(qqNumber = null)
+        val decision = decidePlayerProfileUpdate(
+            command = command().copy(
+                qqNumber = "",
+                source = RemoteQueueOperationSource.MANAGEMENT_APP,
+                terminalEditingAllowed = false,
+                visitedVenuesPublic = false
+            ),
+            profiles = listOf(original),
+            nicknameConflictsWithQueue = { _, _ -> false },
+            nowMillis = 2_000L
+        )
+
+        assertTrue(decision is PlayerProfileCommandDecision.Apply)
+        val updated = (decision as PlayerProfileCommandDecision.Apply).profile
+        assertTrue(!updated.terminalEditingAllowed)
+        assertTrue(!updated.visitedVenuesPublic)
+    }
+
+    @Test
+    fun managementQueueCommandParserAcceptsCreateRegistrationWithoutQq() {
+        val parsed = parseRemoteTerminalCommands(
+            """
+            {
+              "commands": [{
+                "command_id": "00000000-0000-0000-0000-000000000498",
+                "type": "QUEUE_OPERATION",
+                "created_at": 2000,
+                "payload": {
+                  "queue_id": "00000000-0000-0000-0000-000000000001",
+                  "profile_id": "00000000-0000-0000-0000-000000000901",
+                  "actor_qq": "",
+                  "operation": "CREATE_REGISTRATION",
+                  "operation_source": "MANAGEMENT_APP",
+                  "machine_id": "A",
+                  "machine_stable_id": "10000000000000000000000000000001",
+                  "machine_configuration_revision": 1,
+                  "preference": "OPEN_TO_JOIN"
+                }
+              }]
+            }
+            """.trimIndent()
+        )
+
+        assertEquals(1, parsed.size)
+        val command = parsed.single() as RemoteQueueOperationCommand
+        assertEquals(RemoteQueueOperation.CREATE_REGISTRATION, command.operation)
+        assertEquals(RemoteQueueOperationSource.MANAGEMENT_APP, command.source)
+        assertEquals("", command.actorQq)
+    }
+
     private fun profile(
         id: String = "00000000-0000-0000-0000-000000000901"
     ) = PlayerProfile(

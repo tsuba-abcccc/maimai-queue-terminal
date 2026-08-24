@@ -8,17 +8,22 @@ internal enum class RemoteQueueOperation {
     CANCEL_TEMPORARY_LEAVE,
     TRANSFER_MACHINE,
     CHANGE_PLAY_PREFERENCE,
-    LEAVE_QUEUE
+    LEAVE_QUEUE,
+    CHECK_IN,
+    CREATE_REGISTRATION,
+    REORDER_QUEUE
 }
 
 internal enum class RemoteQueueOperationSource {
     QQ_BOT,
-    WEBSITE_REMOTE;
+    WEBSITE_REMOTE,
+    MANAGEMENT_APP;
 
     val auditLogSource: AuditLogSource
         get() = when (this) {
             QQ_BOT -> AuditLogSource.QQ_BOT
             WEBSITE_REMOTE -> AuditLogSource.WEBSITE_REMOTE
+            MANAGEMENT_APP -> AuditLogSource.MANAGEMENT_APP
         }
 }
 
@@ -31,7 +36,7 @@ internal data class RemoteQueueOperationCommand(
     override val commandId: String,
     val createdAtMillis: Long,
     val queueId: String,
-    val profileId: String,
+    val profileId: String?,
     val actorQq: String,
     val profileIdentityVerified: Boolean = false,
     val operation: RemoteQueueOperation,
@@ -47,7 +52,9 @@ internal data class RemoteQueueOperationCommand(
     val expectedAbsenceStatus: QueueAbsenceStatus? = null,
     val expectedTemporaryAwaySkippedTurns: Int? = null,
     val expectedPendingCheckIn: Boolean? = null,
-    val machineConfigurationRevision: Long? = null
+    val machineConfigurationRevision: Long? = null,
+    val expectedRegistrationOrder: List<String>? = null,
+    val registrationOrder: List<String>? = null
 ) : RemoteTerminalCommand
 
 internal data class RemoteQueueExecutionState(
@@ -115,6 +122,7 @@ private val RemoteQueueOperationSource.queueActionOrigin: QueueActionOrigin
     get() = when (this) {
         RemoteQueueOperationSource.QQ_BOT -> QueueActionOrigin.QQ_BOT
         RemoteQueueOperationSource.WEBSITE_REMOTE -> QueueActionOrigin.WEBSITE
+        RemoteQueueOperationSource.MANAGEMENT_APP -> QueueActionOrigin.MANAGEMENT_APP
     }
 
 internal sealed interface RemoteQueueOperationDecision {
@@ -148,7 +156,16 @@ internal fun decideRemoteQueueOperation(
     if (command.queueId != state.queueId) {
         return reject("排队批次已经变化，请重新查询后再操作。")
     }
-    if (command.operation == RemoteQueueOperation.JOIN_QUEUE) {
+    if (
+        command.operation == RemoteQueueOperation.CREATE_REGISTRATION &&
+        command.commandId in appliedRegistrationCommandIds
+    ) {
+        return already("这项管理后台新建登记命令已经由现场终端执行。")
+    }
+    if (
+        command.operation == RemoteQueueOperation.JOIN_QUEUE ||
+        command.operation == RemoteQueueOperation.CREATE_REGISTRATION
+    ) {
         val exactRegistration = state.queues.values.asSequence()
             .flatMap { it.allRegistrations.asSequence() }
             .firstOrNull { it.originatingCommandId == command.commandId }
@@ -167,10 +184,117 @@ internal fun decideRemoteQueueOperation(
                     )
                 }
             return already(
-                "线上登记已经加入等待顺序。请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。",
+                if (command.operation == RemoteQueueOperation.CREATE_REGISTRATION) {
+                    "管理后台新建的登记已经在队列中。"
+                } else {
+                    "线上登记已经加入等待顺序。请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动退出排队。"
+                },
                 updatedProfile = profileToPersist
             )
         }
+    }
+
+    if (command.operation == RemoteQueueOperation.CREATE_REGISTRATION) {
+        if (command.source != RemoteQueueOperationSource.MANAGEMENT_APP) {
+            return reject("只有管理后台可以新建登记。")
+        }
+        val profile = state.playerProfiles.firstOrNull { it.id == command.profileId }
+            ?: return reject("玩家资料已不存在。")
+        if (
+            command.machineConfigurationRevision != null &&
+            command.machineConfigurationRevision != state.machineConfigurationRevision
+        ) {
+            return reject("机台配置已经更新，请重新查询后再操作。")
+        }
+        if (
+            command.machineStableId != null &&
+            state.machineStableIds[command.machineId] != command.machineStableId
+        ) {
+            return reject("所选机台已经变化，请重新查询后再操作。")
+        }
+        if (!state.acceptingNewRegistrations) {
+            return reject("现场当前没有使用登记排队，暂不能新建登记。")
+        }
+        val machineId = command.machineId ?: return reject("没有指定登记机台。")
+        val queue = state.queues[machineId] ?: return reject("所选机台不存在。")
+        if (state.machineStatuses[machineId]?.isOperational != true) {
+            return reject("机台 $machineId 已停止使用，暂不能新建登记。")
+        }
+        if (queue.registrationCount >= MAX_REGISTRATIONS_PER_MACHINE) {
+            return reject("机台 $machineId 的登记已满，请选择其他机台。")
+        }
+        val alreadyRegistered = state.queues.values.any { currentQueue ->
+            currentQueue.allRegistrations.any { registration ->
+                registration.playerProfileId == profile.id ||
+                    registration.displayId.equals(profile.nickname, ignoreCase = true)
+            }
+        }
+        if (alreadyRegistered) {
+            return reject("这名玩家已经有一份正在排队的登记。")
+        }
+        val singlePlayerMachine = state.machineCapacity(machineId) == 1
+        val resolvedPreference = if (singlePlayerMachine) {
+            PlayPreference.SOLO
+        } else {
+            when (profile.defaultPreference) {
+                ProfilePlayPreference.ASK_EVERY_TIME -> command.preference
+                    ?: return reject("请选择本次游玩偏好。")
+                ProfilePlayPreference.SOLO -> PlayPreference.SOLO
+                ProfilePlayPreference.OPEN_TO_JOIN -> PlayPreference.OPEN_TO_JOIN
+            }
+        }
+        if (
+            !singlePlayerMachine &&
+            profile.defaultPreference != ProfilePlayPreference.ASK_EVERY_TIME &&
+            command.preference != null && command.preference != resolvedPreference
+        ) {
+            return reject("玩家资料的默认游玩偏好已经变化，请重新确认后再新建。")
+        }
+        val registration = Registration(
+            key = state.nextRegistrationKey,
+            displayId = profile.nickname,
+            preference = resolvedPreference,
+            isTemporary = false,
+            createdAtMillis = appliedAtMillis,
+            gender = profile.gender,
+            playerProfileId = profile.id,
+            requiresOnSiteCheckIn = false,
+            originatingCommandId = command.commandId
+        )
+        val queueAction = QueueAction.AddRegistrations(
+            machineId = machineId,
+            registrations = listOf(registration),
+            placement = RegistrationPlacement.ADVANCE_IF_UNAMBIGUOUS
+        )
+        val execution = state.executeQueueAction(
+            action = queueAction,
+            origin = command.source.queueActionOrigin,
+            atMillis = appliedAtMillis
+        ) as? QueueActionExecution.Applied
+        val updatedQueue = execution?.state?.queue(machineId)
+        if (execution == null || updatedQueue == null ||
+            updatedQueue.registrationCount != queue.registrationCount + 1
+        ) {
+            return reject("终端未能新建登记，请重新查询后再试。")
+        }
+        val usedProfile = if ((profile.lastUsedAtMillis ?: Long.MIN_VALUE) < appliedAtMillis) {
+            profile.recordUsage(
+                atMillis = maxOf(appliedAtMillis, profile.updatedAtMillis + 1L)
+            )
+        } else null
+        return RemoteQueueOperationDecision.Apply(
+            state = state.copy(
+                queues = execution.state.queues,
+                nextRegistrationKey = state.nextRegistrationKey + 1
+            ),
+            detail = buildString {
+                append("管理后台已在机台 $machineId 新建登记。")
+                if (singlePlayerMachine) append("该机台仅能容纳一人游玩，本次已使用“单人游玩”。")
+            },
+            changedMachineIds = setOf(machineId),
+            action = queueAction,
+            updatedProfile = usedProfile
+        )
     }
     if (command.commandId in appliedRegistrationCommandIds) {
         return already(
@@ -206,22 +330,85 @@ internal fun decideRemoteQueueOperation(
         RemoteQueueOperationSource.QQ_BOT -> if (!state.oneBotSyncEnabled) {
             return reject("现场终端已关闭 QQ Bot 联动。")
         }
+        RemoteQueueOperationSource.MANAGEMENT_APP -> Unit
     }
 
-    val profile = state.playerProfiles.firstOrNull { it.id == command.profileId }
-        ?: return reject("玩家资料已不存在。")
+    if (command.operation == RemoteQueueOperation.REORDER_QUEUE) {
+        if (command.source != RemoteQueueOperationSource.MANAGEMENT_APP) {
+            return reject("只有管理后台可以调整队列顺序。")
+        }
+        val machineId = command.machineId ?: return reject("没有指定要调整的机台。")
+        val queue = state.queues[machineId] ?: return reject("目标机台不存在。")
+        val expectedOrder = command.expectedRegistrationOrder
+            ?: return reject("命令缺少当前登记顺序。")
+        val desiredOrder = command.registrationOrder
+            ?: return reject("命令缺少新的登记顺序。")
+        val currentOrder = queue.allRegistrations.map {
+            publicRegistrationId(state.queueId, it.key)
+        }
+        if (currentOrder != expectedOrder) {
+            return reject("队列顺序已经变化，请重新查询后再调整。")
+        }
+        if (desiredOrder.toSet() != currentOrder.toSet()) {
+            return reject("新的登记顺序与当前队列不一致。")
+        }
+        val playingCount = queue.playing.size
+        if (desiredOrder.take(playingCount) != currentOrder.take(playingCount)) {
+            return reject("当前游玩位置不能调整顺序。")
+        }
+        if (desiredOrder == currentOrder) {
+            return already("队列已经是所选顺序。")
+        }
+        val registrationsById = queue.allRegistrations.associateBy {
+            publicRegistrationId(state.queueId, it.key)
+        }
+        val reordered = desiredOrder.mapNotNull { registrationsById[it] }
+        if (reordered.size != desiredOrder.size) {
+            return reject("新的登记顺序包含不存在的登记。")
+        }
+        val queueAction = QueueAction.ReplaceOrder(machineId, reordered)
+        val execution = state.executeQueueAction(
+            action = queueAction,
+            origin = command.source.queueActionOrigin,
+            atMillis = appliedAtMillis
+        ) as? QueueActionExecution.Applied
+        val updatedQueue = execution?.state?.queue(machineId)
+        if (execution == null || updatedQueue == null || updatedQueue == queue) {
+            return reject("队列状态已经变化，这次调整没有执行。")
+        }
+        return RemoteQueueOperationDecision.Apply(
+            state = state.copy(queues = execution.state.queues),
+            detail = "管理后台已调整机台 $machineId 的等待顺序。",
+            changedMachineIds = setOf(machineId),
+            action = queueAction
+        )
+    }
+
+    val profile = command.profileId?.let { profileId ->
+        state.playerProfiles.firstOrNull { it.id == profileId }
+    }
+    if (profile == null && (
+            command.source != RemoteQueueOperationSource.MANAGEMENT_APP ||
+                command.operation == RemoteQueueOperation.JOIN_QUEUE ||
+                command.operation == RemoteQueueOperation.CREATE_REGISTRATION
+            )
+    ) {
+        return reject("玩家资料已不存在。")
+    }
     val websiteAccountIdentityVerified =
         command.source == RemoteQueueOperationSource.WEBSITE_REMOTE &&
             command.operation != RemoteQueueOperation.JOIN_QUEUE &&
             command.profileIdentityVerified
     if (
-        profile.normalizedQqNumber() != command.actorQq &&
-        !websiteAccountIdentityVerified
+        profile != null && profile.normalizedQqNumber() != command.actorQq &&
+        !websiteAccountIdentityVerified &&
+        command.source != RemoteQueueOperationSource.MANAGEMENT_APP
     ) {
         return reject("玩家资料绑定的 QQ 已发生变化，请重新查询后再操作。")
     }
 
     if (command.operation == RemoteQueueOperation.JOIN_QUEUE) {
+        val profile = profile ?: return reject("玩家资料已不存在。")
         if (!state.allowOnlineRegistration) {
             return reject("现场规则暂不允许线上登记。")
         }
@@ -336,7 +523,7 @@ internal fun decideRemoteQueueOperation(
     }
     fun registrationSubject(single: String, fixedGroup: String): String =
         if (affectsFixedGroup) fixedGroup else single
-    if (registration.playerProfileId != profile.id) {
+    if (profile != null && registration.playerProfileId != profile.id) {
         return reject("这份登记已不再关联当前玩家资料。")
     }
     val alreadyAppliedDetail = when (command.operation) {
@@ -379,6 +566,12 @@ internal fun decideRemoteQueueOperation(
             ) {
                 "这份登记已经使用所选游玩偏好。"
             } else null
+        RemoteQueueOperation.CHECK_IN ->
+            if (!registration.requiresOnSiteCheckIn) {
+                "这份线上登记已经完成现场签到。"
+            } else null
+        RemoteQueueOperation.CREATE_REGISTRATION -> null
+        RemoteQueueOperation.REORDER_QUEUE -> null
         RemoteQueueOperation.JOIN_QUEUE,
         RemoteQueueOperation.LEAVE_QUEUE -> null
     }
@@ -417,8 +610,49 @@ internal fun decideRemoteQueueOperation(
     if (state.machineStatuses[actualMachineId]?.isOperational != true) {
         return reject("机台 $actualMachineId 已停止使用，恢复正常使用后才能操作这份登记。")
     }
-    if (registration.requiresOnSiteCheckIn && command.operation != RemoteQueueOperation.LEAVE_QUEUE) {
+    if (
+        registration.requiresOnSiteCheckIn &&
+        command.operation != RemoteQueueOperation.LEAVE_QUEUE &&
+        !(command.source == RemoteQueueOperationSource.MANAGEMENT_APP &&
+            command.operation == RemoteQueueOperation.CHECK_IN)
+    ) {
         return reject("线上登记完成现场签到后，才能进行这项操作。")
+    }
+
+    if (command.operation == RemoteQueueOperation.CHECK_IN) {
+        if (command.source != RemoteQueueOperationSource.MANAGEMENT_APP) {
+            return reject("只有管理后台可以立即完成线上登记签到。")
+        }
+        if (command.expectedPosition != RemoteRegistrationPosition.WAITING) {
+            return reject("只有等待顺序中的线上登记可以立即签到。")
+        }
+        if (!registration.requiresOnSiteCheckIn) {
+            return already("这份线上登记已经完成现场签到。")
+        }
+        val queueAction = QueueAction.CheckIn(actualMachineId, registration.key)
+        val execution = state.executeQueueAction(
+            action = queueAction,
+            origin = command.source.queueActionOrigin,
+            atMillis = appliedAtMillis
+        ) as? QueueActionExecution.Applied
+        val updatedQueue = execution?.state?.queue(actualMachineId)
+        val updatedRegistration = updatedQueue?.allRegistrations?.firstOrNull {
+            it.key == registration.key
+        }
+        if (
+            execution == null ||
+            updatedQueue == null ||
+            updatedRegistration == null ||
+            updatedRegistration.requiresOnSiteCheckIn
+        ) {
+            return reject("终端未能完成线上登记签到，请重新查询后再试。")
+        }
+        return RemoteQueueOperationDecision.Apply(
+            state = state.copy(queues = execution.state.queues),
+            detail = "管理员已立即完成现场签到。",
+            changedMachineIds = setOf(actualMachineId),
+            action = queueAction
+        )
     }
 
     if (command.operation == RemoteQueueOperation.TRANSFER_MACHINE) {
@@ -590,7 +824,10 @@ internal fun decideRemoteQueueOperation(
             setOf(registration.key)
         )
         RemoteQueueOperation.JOIN_QUEUE,
-        RemoteQueueOperation.TRANSFER_MACHINE -> error("operation handled above")
+        RemoteQueueOperation.TRANSFER_MACHINE,
+        RemoteQueueOperation.CHECK_IN,
+        RemoteQueueOperation.CREATE_REGISTRATION,
+        RemoteQueueOperation.REORDER_QUEUE -> error("operation handled above")
     }
     val execution = state.executeQueueAction(
         action = action,
@@ -656,6 +893,9 @@ internal fun decideRemoteQueueOperation(
                 append("游玩位置中的空缺不会自动由等待登记补入。")
             }
         }
+        RemoteQueueOperation.CHECK_IN -> "管理员已立即完成现场签到。"
+        RemoteQueueOperation.CREATE_REGISTRATION -> "管理后台已新建登记。"
+        RemoteQueueOperation.REORDER_QUEUE -> "管理后台已调整队列顺序。"
         else -> "队列操作已完成。"
     }
     return RemoteQueueOperationDecision.Apply(

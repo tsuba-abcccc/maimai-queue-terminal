@@ -22,7 +22,8 @@ enum class AuditLogSource {
     QQ_BOT,
     SYSTEM_AUTOMATIC,
     WEBSITE_REMOTE,
-    MOBILE_DEVICE
+    MOBILE_DEVICE,
+    MANAGEMENT_APP
 }
 
 enum class PublicQueueEventType {

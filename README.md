@@ -1,6 +1,6 @@
 # maimai Q
 
-[![Version](https://img.shields.io/badge/version-0.12.3-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
+[![Version](https://img.shields.io/badge/version-0.13.0-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
 [![Android](https://img.shields.io/badge/Android-10%2B-34C759?logo=android&logoColor=white)](https://developer.android.com/about/versions/10)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-007AFF)](https://developer.android.com/compose)
@@ -17,7 +17,8 @@
 - [独立公开队列页说明](public-site/README.md)
 - [玩家使用手册](docs/user-manual.md)
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
-- [0.1.0 至 0.12.3 更新日志](docs/update.md)
+- [0.1.0 至 0.13.0 更新日志](docs/update.md)
+- [0.13.0 管理后台发布说明](docs/releases/0.13.0-management-app.md)
 - [后续版本路线](docs/roadmap.md)
 - [开发与交付记录](docs/development-log.md)
 - [云端同步协议](docs/cloud-queue-sync.md)
@@ -113,6 +114,15 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将现�
 - 机台数量和游玩容量只允许在关闭登记后修改。关闭登记会清空当前批次，再次开启时重新载入最新配置和机台状态，并生成新的排队批次。
 - 重要操作使用确认弹窗、状态动画和克制的操作音效。
 
+### 管理后台（0.13.0）
+
+- 提供独立的 Android 手机竖屏管理 App，显示全部机台、当前游玩、等待位置、线上待签到、固定组合、暂缓一次和暂时离开状态。
+- 管理员可以立即签到线上登记、新建正式登记、编辑任意登记、退出排队、暂缓一次、暂时离开、修改本次游玩偏好、转移机台和调整等待顺序。
+- 管理后台可以查看和编辑玩家资料，并为已绑定网页账户的玩家修改密码；密码修改会撤销旧网页会话。
+- 管理后台可以接管已支持的终端敏感策略。绑定后，终端不能再编辑这些策略；正常拖动全队列排序属于日常队列操作，始终保持可用。
+- 管理命令由服务端生成并由现场终端和 `queue-core` 最终校验执行；管理 App 不直接写入队列快照。
+- 机台完整配置、营业时间、同步故障恢复、日志浏览和其他尚未接入的终端设置保留在后续管理版本，不在本版本伪装为已开放能力。
+
 ### 与服务端同步
 
 - 现场变化先保存到本机，再异步上传公开快照。
@@ -205,7 +215,7 @@ app/build/outputs/apk/local/debug/app-local-debug.apk
 .\gradlew.bat :app:packageLocalDebugApk
 ```
 
-文件会复制到 `output/apk/maimai-Q-0.12.3-local.apk`。
+文件会复制到 `output/apk/maimai-Q-0.13.0-local.apk`。
 
 macOS 或 Linux 使用：
 
@@ -293,7 +303,17 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 
 签名后还应检查其应用 ID 为 `com.abcccc.maimaiqueue`、包含联网权限、不是 Debug 构建，并确认 APK 中没有任何实际域名或令牌。
 
-现场终端文件会复制到 `output/apk/maimai-Q-0.12.3-terminal.apk`。只有不含预置连接信息且经过正式签名和校验的构建，才可以作为 GitHub 公开 Release 附件。
+现场终端文件会复制到 `output/apk/maimai-Q-0.13.0-terminal.apk`。只有不含预置连接信息且经过正式签名和校验的构建，才可以作为 GitHub 公开 Release 附件。
+
+### 管理后台构建
+
+管理后台使用独立的 `management` flavor，必须使用单独的 `QUEUE_MANAGEMENT_TOKEN`。管理令牌是高权限凭据，不能写入公开仓库或公开 APK：
+
+```powershell
+.\gradlew.bat :app:packageManagementDebugApk
+```
+
+未提供 `QUEUE_MANAGEMENT_URL` 和 `QUEUE_MANAGEMENT_TOKEN` 时，生成的管理 APK 会在首次启动时要求管理员输入连接信息。仅供受控现场测试的预置配置包可以显式传入这两个 Gradle 参数；该包不得上传公开 Release，令牌泄露后应立即在服务端轮换。公开管理 APK 安装后再输入令牌即可使用。
 
 ## 部署队列 API
 
@@ -302,7 +322,7 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 ```bash
 cd cloud-server
 cp .env.example .env
-# 编辑 .env，分别设置 QUEUE_SYNC_TOKEN、QUEUE_BOT_TOKEN 和资料库作用域
+# 编辑 .env，分别设置 QUEUE_SYNC_TOKEN、QUEUE_BOT_TOKEN、QUEUE_MANAGEMENT_TOKEN 和资料库作用域
 docker compose up -d --build
 ```
 

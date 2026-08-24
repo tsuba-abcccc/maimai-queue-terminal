@@ -32,7 +32,19 @@ val terminalQueueSyncUrl = if (terminalBuildEnabled.get() && embedTerminalSyncCo
 val terminalQueueSyncToken = if (terminalBuildEnabled.get() && embedTerminalSyncConfig.get()) {
     queueSyncToken.get()
 } else ""
-val appVersionName = "0.12.3"
+val queueManagementUrl = providers.gradleProperty("QUEUE_MANAGEMENT_URL")
+    .orElse(providers.environmentVariable("QUEUE_MANAGEMENT_URL"))
+    .orElse("")
+val queueManagementToken = providers.gradleProperty("QUEUE_MANAGEMENT_TOKEN")
+    .orElse(providers.environmentVariable("QUEUE_MANAGEMENT_TOKEN"))
+    .orElse("")
+val managementBuildEnabled = providers.gradleProperty("ENABLE_MANAGEMENT_BUILD")
+    .orElse(providers.environmentVariable("ENABLE_MANAGEMENT_BUILD"))
+    .map { it.equals("true", ignoreCase = true) }
+    .orElse(true)
+val managementApiUrl = if (managementBuildEnabled.get()) queueManagementUrl.get() else ""
+val managementApiToken = if (managementBuildEnabled.get()) queueManagementToken.get() else ""
+val appVersionName = "0.13.0"
 
 android {
     namespace = "com.abcccc.maimaiqueue"
@@ -46,7 +58,7 @@ android {
         applicationId = "com.abcccc.maimaiqueue"
         minSdk = 29
         targetSdk = 36
-        versionCode = 65
+        versionCode = 66
         versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -61,6 +73,9 @@ android {
             buildConfigField("Boolean", "CLOUD_SYNC_AVAILABLE", "false")
             buildConfigField("String", "QUEUE_SYNC_URL", "\"\"")
             buildConfigField("String", "QUEUE_SYNC_TOKEN", "\"\"")
+            buildConfigField("Boolean", "MANAGEMENT_APP", "false")
+            buildConfigField("String", "MANAGEMENT_API_URL", "\"\"")
+            buildConfigField("String", "MANAGEMENT_API_TOKEN", "\"\"")
         }
         create("terminal") {
             dimension = "deployment"
@@ -68,6 +83,20 @@ android {
             buildConfigField("Boolean", "CLOUD_SYNC_AVAILABLE", "true")
             buildConfigField("String", "QUEUE_SYNC_URL", terminalQueueSyncUrl.asBuildConfigString())
             buildConfigField("String", "QUEUE_SYNC_TOKEN", terminalQueueSyncToken.asBuildConfigString())
+            buildConfigField("Boolean", "MANAGEMENT_APP", "false")
+            buildConfigField("String", "MANAGEMENT_API_URL", "\"\"")
+            buildConfigField("String", "MANAGEMENT_API_TOKEN", "\"\"")
+        }
+        create("management") {
+            dimension = "deployment"
+            applicationIdSuffix = ".management"
+            resValue("string", "app_name", "maimai Q 管理后台")
+            buildConfigField("Boolean", "CLOUD_SYNC_AVAILABLE", "false")
+            buildConfigField("String", "QUEUE_SYNC_URL", "\"\"")
+            buildConfigField("String", "QUEUE_SYNC_TOKEN", "\"\"")
+            buildConfigField("Boolean", "MANAGEMENT_APP", "true")
+            buildConfigField("String", "MANAGEMENT_API_URL", managementApiUrl.asBuildConfigString())
+            buildConfigField("String", "MANAGEMENT_API_TOKEN", managementApiToken.asBuildConfigString())
         }
     }
 
@@ -93,6 +122,9 @@ androidComponents {
     beforeVariants(selector().withFlavor("deployment" to "terminal")) { variantBuilder ->
         variantBuilder.enable = terminalBuildEnabled.get()
     }
+    beforeVariants(selector().withFlavor("deployment" to "management")) { variantBuilder ->
+        variantBuilder.enable = managementBuildEnabled.get()
+    }
 }
 
 tasks.register<Copy>("packageLocalDebugApk") {
@@ -107,6 +139,13 @@ tasks.register<Copy>("packageTerminalDebugApk") {
     from(layout.buildDirectory.file("outputs/apk/terminal/debug/app-terminal-debug.apk"))
     into(rootProject.layout.projectDirectory.dir("output/apk"))
     rename("app-terminal-debug\\.apk", "maimai-Q-$appVersionName-terminal.apk")
+}
+
+tasks.register<Copy>("packageManagementDebugApk") {
+    dependsOn("assembleManagementDebug")
+    from(layout.buildDirectory.file("outputs/apk/management/debug/app-management-debug.apk"))
+    into(rootProject.layout.projectDirectory.dir("output/apk"))
+    rename("app-management-debug\\.apk", "maimai-Q-$appVersionName-management.apk")
 }
 
 dependencies {

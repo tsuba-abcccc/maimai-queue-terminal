@@ -16,6 +16,7 @@ class QueueStatusApiTest(unittest.TestCase):
     profile_id = "00000000-0000-0000-0000-000000000901"
     sync_token = "s" * 32
     bot_token = "b" * 32
+    management_token = "m" * 32
 
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -26,6 +27,7 @@ class QueueStatusApiTest(unittest.TestCase):
                 "DATABASE_PATH": self.database_path,
                 "SYNC_TOKEN": self.sync_token,
                 "BOT_TOKEN": self.bot_token,
+                "MANAGEMENT_TOKEN": self.management_token,
                 "ALLOWED_DEVICE_ID": "terminal-1",
                 "CORS_ORIGIN": "https://queue.example.test",
                 "PUBLIC_SITE_URL": "https://queue.example.test/queue-status",
@@ -40,6 +42,9 @@ class QueueStatusApiTest(unittest.TestCase):
             "X-Queue-Schema-Version": "1",
         }
         self.bot_headers = {"Authorization": f"Bearer {self.bot_token}"}
+        self.management_headers = {
+            "Authorization": f"Bearer {self.management_token}"
+        }
 
     def test_middle_dot_compaction_does_not_consume_line_breaks(self):
         self.assertEqual("甲·乙\n丙·丁", compact_middle_dots("甲 · 乙\n丙 \u3000·\u00a0丁"))
@@ -5568,6 +5573,242 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(409, deferred.status_code)
         self.assertIn("完成现场签到后", deferred.get_json()["error"])
         self.assertEqual(202, left.status_code)
+
+    def management_schema_eight_snapshot(self, *, with_registration=False, pending_check_in=False):
+        snapshot = self.remote_ready_snapshot(
+            with_registration=with_registration,
+            pending_check_in=pending_check_in,
+        )
+        self.upgrade_snapshot_to_schema_v7(snapshot)
+        snapshot["schema_version"] = 8
+        venue_id = self.client.get(
+            "/api/queue-terminal/installation", headers=self.headers
+        ).get_json()["venue"]["id"]
+        snapshot["venue"] = {"id": venue_id}
+        return snapshot, self.schema_eight_terminal_headers()
+
+    def test_management_overview_requires_its_own_token_and_contains_private_queue_data(self):
+        snapshot, terminal_headers = self.management_schema_eight_snapshot(
+            with_registration=True,
+            pending_check_in=True,
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=terminal_headers
+            ).status_code,
+        )
+        missing = self.client.get("/api/queue-management/overview")
+        wrong = self.client.get(
+            "/api/queue-management/overview",
+            headers={"Authorization": "Bearer " + "x" * 32},
+        )
+        overview = self.client.get(
+            "/api/queue-management/overview", headers=self.management_headers
+        )
+
+        self.assertEqual(401, missing.status_code)
+        self.assertEqual(401, wrong.status_code)
+        self.assertEqual(200, overview.status_code)
+        payload = overview.get_json()
+        self.assertEqual(snapshot["queue_id"], payload["queue"]["queue_id"])
+        self.assertEqual(self.profile_id, payload["profiles"][0]["profile_id"])
+        registration = payload["queue"]["machines"][0]["waiting_positions"][0][
+            "registrations"
+        ][0]
+        self.assertEqual("a" * 24, registration["registration_id"])
+        self.assertTrue(registration["online_registration_pending_check_in"])
+        self.assertTrue(payload["capabilities"]["PROFILE_EDIT_ALL"])
+
+    def test_management_check_in_command_is_idempotent_and_terminal_scoped(self):
+        snapshot, terminal_headers = self.management_schema_eight_snapshot(
+            with_registration=True,
+            pending_check_in=True,
+        )
+        self.client.post("/api/queue-status", json=snapshot, headers=terminal_headers)
+        body = {
+            "request_id": "00000000-0000-0000-0000-000000000971",
+            "operation": "CHECK_IN",
+            "registration_id": "a" * 24,
+            "expected_queue_id": snapshot["queue_id"],
+            "expected_machine_id": "A",
+            "expected_position": "WAITING",
+            "expected_pending_check_in": True,
+            "expected_machine_configuration_revision": 1,
+        }
+        created = self.client.post(
+            "/api/queue-management/commands",
+            json=body,
+            headers=self.management_headers,
+        )
+        repeated = self.client.post(
+            "/api/queue-management/commands",
+            json=body,
+            headers=self.management_headers,
+        )
+        self.assertEqual(202, created.status_code)
+        self.assertEqual(200, repeated.status_code)
+        self.assertEqual(
+            "MANAGEMENT_APP", created.get_json()["payload"]["operation_source"]
+        )
+        self.assertEqual(
+            created.get_json()["command_id"], repeated.get_json()["command_id"]
+        )
+
+    def test_management_queue_command_can_edit_any_profile_registration(self):
+        snapshot, terminal_headers = self.management_schema_eight_snapshot(
+            with_registration=True,
+            pending_check_in=False,
+        )
+        self.client.post("/api/queue-status", json=snapshot, headers=terminal_headers)
+        response = self.client.post(
+            "/api/queue-management/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000974",
+                "profile_id": self.profile_id,
+                "operation": "LEAVE_QUEUE",
+                "expected_queue_id": snapshot["queue_id"],
+                "expected_registration_id": "a" * 24,
+                "expected_machine_id": "A",
+                "expected_position": "WAITING",
+                "expected_fixed_pair_id": None,
+                "expected_absence_status": "NONE",
+                "expected_temporary_away_skipped_turns": 0,
+                "expected_pending_check_in": False,
+                "expected_machine_configuration_revision": 1,
+                "expected_machine_stable_id": "00000000000000000000000000000001",
+            },
+            headers=self.management_headers,
+        )
+        self.assertEqual(202, response.status_code)
+        self.assertEqual(
+            "MANAGEMENT_APP", response.get_json()["payload"]["operation_source"]
+        )
+        self.assertEqual("", response.get_json()["payload"]["actor_qq"])
+
+    def test_management_can_edit_temporary_registration_and_reorder_waiting_queue(self):
+        snapshot, terminal_headers = self.management_schema_eight_snapshot(
+            with_registration=True,
+            pending_check_in=False,
+        )
+        temporary = self.registration("c" * 24, "临时登记")
+        temporary["registration_type"] = "TEMPORARY"
+        snapshot["machines"]["A"]["waiting_positions"][0]["registrations"].append(
+            temporary
+        )
+        snapshot["machines"]["A"]["registration_count"] = 2
+        self.client.post("/api/queue-status", json=snapshot, headers=terminal_headers)
+
+        leave = self.client.post(
+            "/api/queue-management/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000975",
+                "operation": "LEAVE_QUEUE",
+                "expected_queue_id": snapshot["queue_id"],
+                "expected_registration_id": "c" * 24,
+                "expected_machine_id": "A",
+                "expected_position": "WAITING",
+                "expected_fixed_pair_id": None,
+                "expected_absence_status": "NONE",
+                "expected_temporary_away_skipped_turns": 0,
+                "expected_pending_check_in": False,
+                "expected_machine_configuration_revision": 1,
+                "expected_machine_stable_id": "00000000000000000000000000000001",
+            },
+            headers=self.management_headers,
+        )
+        self.assertEqual(202, leave.status_code)
+        self.assertNotIn("profile_id", leave.get_json()["payload"])
+
+        reorder_body = {
+            "request_id": "00000000-0000-0000-0000-000000000976",
+            "expected_queue_id": snapshot["queue_id"],
+            "machine_id": "A",
+            "expected_machine_stable_id": "00000000000000000000000000000001",
+            "expected_machine_configuration_revision": 1,
+            "expected_registration_order": ["a" * 24, "c" * 24],
+            "registration_order": ["c" * 24, "a" * 24],
+        }
+        reordered = self.client.post(
+            "/api/queue-management/queue-reorders",
+            json=reorder_body,
+            headers=self.management_headers,
+        )
+        repeated = self.client.post(
+            "/api/queue-management/queue-reorders",
+            json=reorder_body,
+            headers=self.management_headers,
+        )
+        self.assertEqual(202, reordered.status_code)
+        self.assertEqual(200, repeated.status_code)
+        self.assertEqual(
+            "REORDER_QUEUE", reordered.get_json()["payload"]["operation"]
+        )
+
+    def test_management_can_create_registration_without_opening_mobile_registration(self):
+        snapshot, terminal_headers = self.management_schema_eight_snapshot()
+        self.client.post("/api/queue-status", json=snapshot, headers=terminal_headers)
+        response = self.client.post(
+            "/api/queue-management/registrations",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000972",
+                "profile_id": self.profile_id,
+                "expected_queue_id": snapshot["queue_id"],
+                "expected_machine_id": "A",
+                "expected_machine_stable_id": "00000000000000000000000000000001",
+                "expected_machine_configuration_revision": 1,
+            },
+            headers=self.management_headers,
+        )
+        self.assertEqual(202, response.status_code)
+        payload = response.get_json()["payload"]
+        self.assertEqual("CREATE_REGISTRATION", payload["operation"])
+        self.assertEqual("MANAGEMENT_APP", payload["operation_source"])
+        self.assertEqual(self.profile_id, payload["profile_id"])
+        self.assertEqual("A", payload["machine_id"])
+
+    def test_management_profile_update_and_password_reset_are_separate_from_bot_auth(self):
+        snapshot, terminal_headers = self.management_schema_eight_snapshot()
+        self.client.post("/api/queue-status", json=snapshot, headers=terminal_headers)
+        update = self.client.patch(
+            f"/api/queue-management/profiles/{self.profile_id}",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000973",
+                "nickname": "管理昵称",
+                "terminal_editing_allowed": False,
+                "visited_venues_public": False,
+            },
+            headers=self.management_headers,
+        )
+        self.assertEqual(202, update.status_code)
+        self.assertEqual(
+            "MANAGEMENT_APP", update.get_json()["payload"]["operation_source"]
+        )
+        self.assertFalse(update.get_json()["payload"]["terminal_editing_allowed"])
+
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=terminal_headers,
+        )
+        self.assertEqual(201, binding.status_code)
+        self.assertEqual(
+            201,
+            self.client.post(
+                f"/api/player-account/bindings/{binding.get_json()['binding_token']}/complete",
+                json={"password": "initial-password"},
+            ).status_code,
+        )
+        password = self.client.post(
+            f"/api/queue-management/profiles/{self.profile_id}/password",
+            json={
+                "new_password": "management-password",
+                "new_password_confirmation": "management-password",
+            },
+            headers=self.management_headers,
+        )
+        self.assertEqual(200, password.status_code)
+        self.assertIn("已修改", password.get_json()["detail"])
 
     def test_bot_confirmation_context_rejects_a_changed_registration_state(self):
         snapshot = self.remote_ready_snapshot(with_registration=True)

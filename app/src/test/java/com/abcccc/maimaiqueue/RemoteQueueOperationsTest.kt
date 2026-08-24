@@ -958,6 +958,82 @@ class RemoteQueueOperationsTest {
         )
     }
 
+    @Test
+    fun managementCheckInWorksWhenWebsiteAndBotRemoteTogglesAreOff() {
+        val pending = pendingRegistration()
+        val command = operationCommand(RemoteQueueOperation.CHECK_IN, pending).copy(
+            source = RemoteQueueOperationSource.MANAGEMENT_APP,
+            expectedPosition = RemoteRegistrationPosition.WAITING,
+            expectedFixedPairId = null,
+            expectedAbsenceStatus = QueueAbsenceStatus.NONE,
+            expectedTemporaryAwaySkippedTurns = 0,
+            expectedPendingCheckIn = true,
+            machineConfigurationRevision = 1L
+        )
+        val result = decideRemoteQueueOperation(
+            command,
+            state(machineA = MachineQueue(waiting = listOf(pending))).copy(
+                websiteRemoteEnabled = false,
+                oneBotSyncEnabled = false
+            )
+        )
+
+        assertTrue(result is RemoteQueueOperationDecision.Apply)
+        result as RemoteQueueOperationDecision.Apply
+        assertFalse(result.state.queues.getValue("A").waiting.single().requiresOnSiteCheckIn)
+        assertTrue(result.action is QueueAction.CheckIn)
+    }
+
+    @Test
+    fun managementCheckInIsAlreadyAppliedWhenTheRegistrationIsNoLongerPending() {
+        val checkedIn = pendingRegistration().copy(requiresOnSiteCheckIn = false)
+        val command = operationCommand(RemoteQueueOperation.CHECK_IN, checkedIn).copy(
+            source = RemoteQueueOperationSource.MANAGEMENT_APP,
+            expectedPosition = RemoteRegistrationPosition.WAITING,
+            expectedFixedPairId = null,
+            expectedAbsenceStatus = QueueAbsenceStatus.NONE,
+            expectedTemporaryAwaySkippedTurns = 0,
+            expectedPendingCheckIn = true,
+            machineConfigurationRevision = 1L
+        )
+
+        val result = decideRemoteQueueOperation(
+            command,
+            state(machineA = MachineQueue(waiting = listOf(checkedIn)), nextKey = 3)
+        )
+
+        assertTrue(result is RemoteQueueOperationDecision.AlreadyApplied)
+    }
+
+    @Test
+    fun managementCreateRegistrationIsImmediateAndDoesNotRequireAQq() {
+        val command = RemoteQueueOperationCommand(
+            commandId = "00000000-0000-0000-0000-000000000498",
+            createdAtMillis = 2_000L,
+            queueId = QUEUE_ID,
+            profileId = PROFILE_ID,
+            actorQq = "",
+            operation = RemoteQueueOperation.CREATE_REGISTRATION,
+            source = RemoteQueueOperationSource.MANAGEMENT_APP,
+            machineId = "A",
+            preference = PlayPreference.OPEN_TO_JOIN,
+            machineConfigurationRevision = 1L
+        )
+        val result = decideRemoteQueueOperation(
+            command,
+            state().copy(
+                playerProfiles = listOf(profile().copy(qqNumber = null))
+            )
+        )
+
+        assertTrue(result is RemoteQueueOperationDecision.Apply)
+        result as RemoteQueueOperationDecision.Apply
+        val registration = result.state.queues.getValue("A").allRegistrations.single()
+        assertFalse(registration.requiresOnSiteCheckIn)
+        assertEquals(PROFILE_ID, registration.playerProfileId)
+        assertEquals(2, result.state.nextRegistrationKey)
+    }
+
     private fun state(
         machineA: MachineQueue = MachineQueue(),
         machineB: MachineQueue = MachineQueue(),

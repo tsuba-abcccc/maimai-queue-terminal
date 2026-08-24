@@ -6,6 +6,7 @@ enum class QueueActionOrigin {
     MOBILE_DEVICE,
     WEBSITE,
     QQ_BOT,
+    MANAGEMENT_APP,
     SYSTEM
 }
 

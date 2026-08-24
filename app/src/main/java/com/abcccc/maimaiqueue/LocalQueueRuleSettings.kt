@@ -71,7 +71,14 @@ data class QueueRuleSettings(
     val machineGroups: List<MachineGroupConfiguration> = DEFAULT_MACHINE_GROUPS,
     val defaultMachineGroupId: String = DEFAULT_MACHINE_GROUP_ID,
     val machineConfigurationRevision: Long = 1L,
-    val businessHours: BusinessHoursSettings = BusinessHoursSettings()
+    val businessHours: BusinessHoursSettings = BusinessHoursSettings(),
+    /**
+     * Once a management app takes ownership, sensitive queue-rule controls
+     * become read-only on the terminal. The terminal still owns execution of
+     * every queue action, including ordinary drag reordering.
+     */
+    val managementAppBound: Boolean = false,
+    val managementPolicyRevision: Long = 0L
 ) {
     val allowsAnyAbsenceAction: Boolean
         get() = allowDeferOneRound || allowTemporaryLeave
@@ -268,7 +275,15 @@ class LocalQueueRuleSettingsRepository(
                         closingKey = weekdayKey(day, "closing")
                     )
                 }
-            ).normalized()
+            ).normalized(),
+            managementAppBound = preferences.getBoolean(
+                KEY_MANAGEMENT_APP_BOUND,
+                false
+            ),
+            managementPolicyRevision = preferences.getLong(
+                KEY_MANAGEMENT_POLICY_REVISION,
+                0L
+            ).coerceAtLeast(0L)
         )
         return normalizeMachineLayoutSettings(settings)
     }
@@ -309,6 +324,14 @@ class LocalQueueRuleSettingsRepository(
             .putInt(
                 KEY_DEFAULT_CLOSING_MINUTES,
                 normalizedSettings.businessHours.defaultHours.closingMinutes
+            )
+            .putBoolean(
+                KEY_MANAGEMENT_APP_BOUND,
+                normalizedSettings.managementAppBound
+            )
+            .putLong(
+                KEY_MANAGEMENT_POLICY_REVISION,
+                normalizedSettings.managementPolicyRevision.coerceAtLeast(0L)
             )
             .also { editor ->
                 MachineId.entries.forEach { machineId ->
@@ -528,6 +551,8 @@ class LocalQueueRuleSettingsRepository(
         const val KEY_DEFAULT_CLOSING_MINUTES = "default_closing_minutes"
         const val KEY_LAST_HANDLED_CLOSING_OCCURRENCE = "last_handled_closing_occurrence"
         const val KEY_BUSINESS_HOURS_SYNC_PENDING = "business_hours_sync_pending"
+        const val KEY_MANAGEMENT_APP_BOUND = "management_app_bound"
+        const val KEY_MANAGEMENT_POLICY_REVISION = "management_policy_revision"
         const val KEY_PENDING_SYNC_DISABLE_ENDPOINT = "pending_sync_disable_endpoint"
         const val KEY_PENDING_SYNC_DISABLE_TOKEN = "pending_sync_disable_token"
         const val KEY_PENDING_SYNC_DISABLE_VENUE_ID = "pending_sync_disable_venue_id"

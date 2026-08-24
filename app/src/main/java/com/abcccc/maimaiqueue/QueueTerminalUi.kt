@@ -583,6 +583,9 @@ internal fun RegistrationApp() {
             allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
             allowOnlineRegistration = queueRuleSettings.allowOnlineRegistration,
             showCommonPlayPreview = queueRuleSettings.showCommonPlayPreview,
+            managementPolicySupported = true,
+            managementAppBound = queueRuleSettings.managementAppBound,
+            managementPolicyRevision = queueRuleSettings.managementPolicyRevision,
             businessHours = QueuePublicBusinessHours(
                 enabled = currentBusinessHoursStatus.enabled,
                 outsideBusinessHours = currentBusinessHoursStatus.outsideBusinessHours,
@@ -594,6 +597,49 @@ internal fun RegistrationApp() {
                         ?.takeIf { currentClosingGracePeriod }
             )
         )
+    }
+
+    /**
+     * Finish the first-run flow from the same state boundary that the normal
+     * settings screen uses. The onboarding screen can otherwise navigate to
+     * HOME before the publisher, installation identity and Compose effects
+     * have observed the new connection, leaving the first snapshot unsent
+     * until the next app launch.
+     */
+    fun completeOnboardingAndResumeSync() {
+        val completedIdentity = terminalInstallationRepository.completePreparedOnboarding()
+        val latestSettings = normalizeQueueRuleSettingsForRuntime(
+            queueRuleSettingsRepository.getSettings(),
+            cloudSyncAvailable
+        )
+        queueRuleSettings = latestSettings
+        terminalInstallation = completedIdentity
+        queueStatePublisher.updateConfiguration(
+            endpoint = latestSettings.queueSyncEndpoint,
+            token = latestSettings.queueSyncToken
+        )
+        queueCommandClient.updateConfiguration(
+            queueStatusEndpoint = latestSettings.queueSyncEndpoint,
+            token = latestSettings.queueSyncToken
+        )
+        terminalInstallationClient.updateConfiguration(
+            queueStatusEndpoint = latestSettings.queueSyncEndpoint,
+            token = latestSettings.queueSyncToken
+        )
+        val onlineAccessAllowed = cloudSyncAvailable &&
+            latestSettings.websiteSyncEnabled &&
+            completedIdentity.allowsOnlineAccess(latestSettings.queueSyncEndpoint)
+        cloudSyncController.setEnabled(onlineAccessAllowed)
+        if (onlineAccessAllowed) {
+            cloudSyncController.submit(
+                state = currentPersistedQueueState(),
+                auditLogs = auditLogs,
+                displaySettings = currentPublicDisplaySettings(),
+                playerProfiles = playerProfiles,
+                installationIdentity = completedIdentity
+            )
+        }
+        screen = Screen.HOME
     }
 
     suspend fun persistQueueStateBeforeRemoteAcknowledgement() {
@@ -891,6 +937,7 @@ internal fun RegistrationApp() {
     }
 
     LaunchedEffect(
+        screen,
         queuePersistenceReady,
         playerProfilesLoaded,
         pendingQueueRestore,
@@ -1116,8 +1163,29 @@ internal fun RegistrationApp() {
         coroutineScope.launch { auditLogRepository.append(queueScopedEntry) }
     }
 
-    fun updateQueueRuleSettings(requestedSettings: QueueRuleSettings): Boolean {
+    fun updateQueueRuleSettings(
+        requestedSettings: QueueRuleSettings,
+        fromManagementCommand: Boolean = false
+    ): Boolean {
         val previousSettings = queueRuleSettings
+        val managementSensitiveChanged =
+            previousSettings.allowOnlineRegistration != requestedSettings.allowOnlineRegistration ||
+                previousSettings.allowDeferOneRound != requestedSettings.allowDeferOneRound ||
+                previousSettings.allowTemporaryLeave != requestedSettings.allowTemporaryLeave ||
+                previousSettings.oneBotSyncEnabled != requestedSettings.oneBotSyncEnabled ||
+                previousSettings.managementAppBound != requestedSettings.managementAppBound ||
+                previousSettings.managementPolicyRevision != requestedSettings.managementPolicyRevision
+        if (previousSettings.managementAppBound &&
+            managementSensitiveChanged &&
+            !fromManagementCommand
+        ) {
+            Toast.makeText(
+                context,
+                panguSpacing("终端敏感设置已由管理后台接管，请从管理后台修改。"),
+                Toast.LENGTH_LONG
+            ).show()
+            return false
+        }
         val requestedConnectionChanged =
             requestedSettings.queueSyncEndpoint != previousSettings.queueSyncEndpoint ||
                 requestedSettings.queueSyncToken != previousSettings.queueSyncToken
@@ -1170,7 +1238,10 @@ internal fun RegistrationApp() {
             ).show()
             return false
         }
-        if (remoteCommandBoundaryChanged && remoteTerminalCommandPollMutex.isLocked) {
+        if (remoteCommandBoundaryChanged &&
+            remoteTerminalCommandPollMutex.isLocked &&
+            !fromManagementCommand
+        ) {
             Toast.makeText(
                 context,
                 panguSpacing("终端正在处理远程操作，请稍后再修改同步设置。"),
@@ -1372,7 +1443,12 @@ internal fun RegistrationApp() {
                 title = "更新应用设置",
                 detail = changeDescriptions.takeIf { it.isNotEmpty() }
                     ?.joinToString(separator = "；", postfix = "。")
-                    ?: "应用设置已更新。"
+                    ?: "应用设置已更新。",
+                source = if (fromManagementCommand) {
+                    AuditLogSource.MANAGEMENT_APP
+                } else {
+                    AuditLogSource.ON_SITE_TERMINAL
+                }
             )
         )
         return true
@@ -3381,8 +3457,72 @@ internal fun RegistrationApp() {
                             continue
                         }
                         when (command) {
+                            is TerminalPolicyUpdateCommand -> {
+                                val detail = when {
+                                    command.queueId != queueId ->
+                                        "终端策略所属队列已经变化，请管理后台刷新后重试。"
+                                    command.expectedPolicyRevision !=
+                                        queueRuleSettings.managementPolicyRevision ->
+                                        "终端敏感策略已经更新，请管理后台刷新后重试。"
+                                    command.nextPolicyRevision !=
+                                        command.expectedPolicyRevision + 1L ->
+                                        "终端策略版本无效，未应用这次修改。"
+                                    else -> null
+                                }
+                                val applied = if (detail == null) {
+                                    updateQueueRuleSettings(
+                                        queueRuleSettings.copy(
+                                            allowOnlineRegistration =
+                                                command.allowOnlineRegistration,
+                                            allowDeferOneRound = command.allowDeferOneRound,
+                                            allowTemporaryLeave = command.allowTemporaryLeave,
+                                            oneBotSyncEnabled = command.oneBotSyncEnabled,
+                                            managementAppBound = command.managementAppBound,
+                                            managementPolicyRevision = command.nextPolicyRevision
+                                        ),
+                                        fromManagementCommand = true
+                                    )
+                                } else {
+                                    false
+                                }
+                                val resultDetail = if (applied) {
+                                    if (command.managementAppBound) {
+                                        "终端敏感策略已由管理后台更新并接管。"
+                                    } else {
+                                        "终端敏感策略已解除管理后台接管。"
+                                    }
+                                } else {
+                                    detail ?: "终端敏感策略未能写入本机。"
+                                }
+                                if (!persistTerminalCommandReceipt(
+                                        TerminalCommandReceipt(
+                                            commandId = command.commandId,
+                                            applied = applied,
+                                            detail = resultDetail
+                                        )
+                                    )
+                                ) {
+                                    localWriteFailureDetail =
+                                        "终端策略命令的执行结果暂时无法写入本机，应用将继续重试。"
+                                    localWriteFailureAtMillis = System.currentTimeMillis()
+                                    continue
+                                }
+                                if (applied) {
+                                    persistQueueStateBeforeRemoteAcknowledgement()
+                                    localWriteFailureDetail = null
+                                }
+                                completeRemoteCommand(
+                                    command.commandId,
+                                    applied = applied,
+                                    detail = resultDetail
+                                )
+                            }
+
                             is PlayerProfileUpdateCommand -> {
-                                if (!queueRuleSettings.oneBotSyncEnabled) {
+                                if (
+                                    command.source != RemoteQueueOperationSource.MANAGEMENT_APP &&
+                                    !queueRuleSettings.oneBotSyncEnabled
+                                ) {
                                     val detail = "现场终端已关闭 QQ Bot 联动。"
                                     if (!persistTerminalCommandReceipt(
                                             TerminalCommandReceipt(
@@ -3412,7 +3552,7 @@ internal fun RegistrationApp() {
                                     onPersisted = { profile ->
                                         applyPlayerProfileToState(
                                             profile,
-                                            source = AuditLogSource.QQ_BOT
+                                            source = command.source.auditLogSource
                                         )
                                     }
                                 )) {
@@ -3579,8 +3719,8 @@ internal fun RegistrationApp() {
                                         }
                                         if (result.changedMachineIds.isNotEmpty()) {
                                             queueSoundPlayer.play(
-                                                if (command.operation ==
-                                                    RemoteQueueOperation.JOIN_QUEUE
+                                                if (command.operation == RemoteQueueOperation.JOIN_QUEUE ||
+                                                    command.operation == RemoteQueueOperation.CREATE_REGISTRATION
                                                 ) {
                                                     QueueSoundCue.CONFIRM
                                                 } else {
@@ -3588,7 +3728,9 @@ internal fun RegistrationApp() {
                                                 }
                                             )
                                         }
-                                        if (command.operation == RemoteQueueOperation.JOIN_QUEUE) {
+                                        if (command.operation == RemoteQueueOperation.JOIN_QUEUE ||
+                                            command.operation == RemoteQueueOperation.CREATE_REGISTRATION
+                                        ) {
                                             val machineName = result.changedMachineIds.singleOrNull()
                                             val machineId = MachineId.entries.firstOrNull {
                                                 it.name == machineName
@@ -3659,7 +3801,8 @@ internal fun RegistrationApp() {
                                             }
                                         }
                                         val resultRegistrationId = if (
-                                            command.operation == RemoteQueueOperation.JOIN_QUEUE
+                                            command.operation == RemoteQueueOperation.JOIN_QUEUE ||
+                                                command.operation == RemoteQueueOperation.CREATE_REGISTRATION
                                         ) {
                                             result.state.queues.values.asSequence()
                                                 .flatMap { it.allRegistrations.asSequence() }
@@ -4327,16 +4470,7 @@ internal fun RegistrationApp() {
                                 terminalInstallation = identity
                             },
                             onComplete = {
-                                terminalInstallation = terminalInstallationRepository
-                                    .completePreparedOnboarding()
-                                cloudSyncController.setEnabled(
-                                    cloudSyncAvailable &&
-                                        queueRuleSettings.websiteSyncEnabled &&
-                                        terminalInstallation.allowsOnlineAccess(
-                                            queueRuleSettings.queueSyncEndpoint
-                                        )
-                                )
-                                screen = Screen.HOME
+                                completeOnboardingAndResumeSync()
                             }
                         )
 
@@ -6721,7 +6855,8 @@ private fun AuditLogScreen(
         AuditLogSource.QQ_BOT to "QQ Bot",
         AuditLogSource.SYSTEM_AUTOMATIC to "系统自动",
         AuditLogSource.WEBSITE_REMOTE to "网站远程",
-        AuditLogSource.MOBILE_DEVICE to "移动设备"
+        AuditLogSource.MOBILE_DEVICE to "移动设备",
+        AuditLogSource.MANAGEMENT_APP to "管理后台"
     )
     val displayedLogs = logs.filter { entry ->
         (selectedFilter.machineStableId?.let { it == entry.machineStableId }
@@ -6981,6 +7116,7 @@ private fun QueueRuleSettingsScreen(
     val queueConnectionConfigured = queueSyncEndpointValid && queueSyncTokenValid
     val queueConnectionEditable = !registrationOpen &&
         !persistedSettings.websiteSyncEnabled && !settings.websiteSyncEnabled
+    val managementSensitiveControlsLocked = persistedSettings.managementAppBound
     val queueConnectionChanged = hasQueueConnectionDraftChanged(
         persistedEndpoint = persistedSettings.queueSyncEndpoint,
         persistedToken = persistedSettings.queueSyncToken,
@@ -7358,6 +7494,8 @@ private fun QueueRuleSettingsScreen(
                     QueueRuleSettingRow(
                         title = "允许线上登记",
                         description = when {
+                            managementSensitiveControlsLocked ->
+                                "已由管理后台接管，只能从管理后台修改。"
                             !settings.websiteSyncEnabled ->
                                 "与服务端同步关闭期间不会接收新的线上登记；重新开启后将按照此设置执行。"
                             settings.allowOnlineRegistration ->
@@ -7366,6 +7504,7 @@ private fun QueueRuleSettingsScreen(
                                 "网站和 QQ Bot 仍可查询队列、管理已有登记，但不能创建新的线上登记。"
                         },
                         checked = settings.allowOnlineRegistration,
+                        enabled = !managementSensitiveControlsLocked,
                         onCheckedChange = {
                             updateDraft(settings.copy(allowOnlineRegistration = it))
                         }
@@ -7374,6 +7513,8 @@ private fun QueueRuleSettingsScreen(
                     QueueRuleSettingRow(
                         title = "QQ Bot 联动",
                         description = when {
+                            managementSensitiveControlsLocked ->
+                                "已由管理后台接管，只能从管理后台修改。"
                             !settings.websiteSyncEnabled ->
                                 "需要先开启与服务端同步，QQ Bot 才能读取队列、修改玩家资料和发送通知。"
                             settings.oneBotSyncEnabled ->
@@ -7382,7 +7523,7 @@ private fun QueueRuleSettingsScreen(
                                 "QQ Bot 无法读取队列或修改资料，也不会补发关闭期间产生的通知。"
                         },
                         checked = settings.oneBotSyncEnabled,
-                        enabled = settings.websiteSyncEnabled,
+                        enabled = settings.websiteSyncEnabled && !managementSensitiveControlsLocked,
                         onCheckedChange = {
                             updateDraft(settings.copy(oneBotSyncEnabled = it))
                         }
@@ -7527,10 +7668,25 @@ private fun QueueRuleSettingsScreen(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
                     .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
             ) {
+                if (managementSensitiveControlsLocked) {
+                    Text(
+                        "暂缓、暂时离开等敏感规则已由管理后台接管。终端仍保留正常拖动排序和现场执行。",
+                        color = Color(0xFF9A5B00),
+                        fontSize = 11.sp,
+                        lineHeight = 16.sp,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                    )
+                    HorizontalDivider(color = Separator.copy(alpha = .72f))
+                }
                 QueueRuleSettingRow(
                     title = "允许暂缓一次",
-                    description = "允许玩家跳过一次游玩机会，并保留当前等待顺序。",
+                    description = if (managementSensitiveControlsLocked) {
+                        "已由管理后台接管，只能从管理后台修改。"
+                    } else {
+                        "允许玩家跳过一次游玩机会，并保留当前等待顺序。"
+                    },
                     checked = settings.allowDeferOneRound,
+                    enabled = !managementSensitiveControlsLocked,
                     onCheckedChange = {
                         updateDraft(settings.copy(allowDeferOneRound = it))
                     }
@@ -7538,8 +7694,13 @@ private fun QueueRuleSettingsScreen(
                 HorizontalDivider(color = Separator.copy(alpha = .72f))
                 QueueRuleSettingRow(
                     title = "允许暂时离开",
-                    description = "允许玩家在返回前持续轮空，并在返回后手动恢复。",
+                    description = if (managementSensitiveControlsLocked) {
+                        "已由管理后台接管，只能从管理后台修改。"
+                    } else {
+                        "允许玩家在返回前持续轮空，并在返回后手动恢复。"
+                    },
                     checked = settings.allowTemporaryLeave,
+                    enabled = !managementSensitiveControlsLocked,
                     onCheckedChange = {
                         updateDraft(settings.copy(allowTemporaryLeave = it))
                     }
@@ -9044,6 +9205,7 @@ private fun auditLogSourceLabel(source: AuditLogSource): String = when (source) 
     AuditLogSource.SYSTEM_AUTOMATIC -> "系统自动"
     AuditLogSource.WEBSITE_REMOTE -> "网站远程"
     AuditLogSource.MOBILE_DEVICE -> "移动设备"
+    AuditLogSource.MANAGEMENT_APP -> "管理后台"
 }
 
 private fun remoteQueueOperationFeedbackTitle(operation: RemoteQueueOperation): String =
@@ -9056,12 +9218,16 @@ private fun remoteQueueOperationFeedbackTitle(operation: RemoteQueueOperation): 
         RemoteQueueOperation.TRANSFER_MACHINE -> "登记已切换机台"
         RemoteQueueOperation.CHANGE_PLAY_PREFERENCE -> "游玩偏好已修改"
         RemoteQueueOperation.LEAVE_QUEUE -> "登记已退出排队"
+        RemoteQueueOperation.CHECK_IN -> "线上登记已签到"
+        RemoteQueueOperation.CREATE_REGISTRATION -> "管理后台已新建登记"
+        RemoteQueueOperation.REORDER_QUEUE -> "队列顺序已调整"
     }
 
 private fun remoteQueueOperationSourceLabel(source: RemoteQueueOperationSource): String =
     when (source) {
         RemoteQueueOperationSource.QQ_BOT -> "QQ Bot"
         RemoteQueueOperationSource.WEBSITE_REMOTE -> "网站远程"
+        RemoteQueueOperationSource.MANAGEMENT_APP -> "管理后台"
     }
 
 private fun formatAuditLogTimestamp(timestampMillis: Long): String =
@@ -11909,25 +12075,31 @@ private fun PlayerLibraryScreen(
                     }
                 }
             } else {
-                val columnCount = 4
-                val profileRows = displayedProfiles.chunked(columnCount)
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.fillMaxWidth().weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(9.dp)
-                ) {
-                    itemsIndexed(profileRows, key = { _, row -> row.joinToString("|") { it.id } }) { _, row ->
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                            row.forEach { profile ->
-                                PlayerProfileCard(
-                                    profile = profile,
-                                    onClick = { onProfileClick(profile) },
-                                    onEdit = { onEditProfile(profile) },
-                                    modifier = Modifier.weight(1f)
-                                )
-                            }
-                            repeat(columnCount - row.size) {
-                                Spacer(Modifier.weight(1f))
+                BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
+                    val columnCount = when {
+                        maxWidth < 560.dp -> 1
+                        maxWidth < 840.dp -> 2
+                        else -> 4
+                    }
+                    val profileRows = displayedProfiles.chunked(columnCount)
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        itemsIndexed(profileRows, key = { _, row -> row.joinToString("|") { it.id } }) { _, row ->
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                row.forEach { profile ->
+                                    PlayerProfileCard(
+                                        profile = profile,
+                                        onClick = { onProfileClick(profile) },
+                                        onEdit = { onEditProfile(profile) },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                                repeat(columnCount - row.size) {
+                                    Spacer(Modifier.weight(1f))
+                                }
                             }
                         }
                     }
@@ -11976,15 +12148,24 @@ private fun PlayerProfileCard(
     modifier: Modifier = Modifier
 ) {
     Row(
-        modifier.height(80.dp).clip(RoundedCornerShape(ControlRadius)).background(CardBackground)
+        modifier.height(104.dp).clip(RoundedCornerShape(ControlRadius)).background(CardBackground)
             .border(1.dp, Separator.copy(alpha = .78f), RoundedCornerShape(ControlRadius))
-            .clickable(onClick = onClick).padding(start = 11.dp, end = 6.dp, top = 9.dp, bottom = 9.dp),
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        PlayerAvatar(profile, 44.dp)
-        Spacer(Modifier.width(8.dp))
-        Column(Modifier.weight(1f)) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(52.dp), contentAlignment = Alignment.Center) {
+            PlayerAvatar(profile, 50.dp)
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(
+            Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Row(
+                Modifier.fillMaxWidth().height(22.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Text(
                     profile.nickname,
                     color = PrimaryText,
@@ -11992,12 +12173,11 @@ private fun PlayerProfileCard(
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false)
+                    modifier = Modifier.weight(1f)
                 )
-                Spacer(Modifier.width(5.dp))
+                Spacer(Modifier.width(6.dp))
                 PlayerGenderMark(profile.gender, hideUndisclosed = false)
             }
-            Spacer(Modifier.height(4.dp))
             Text(
                 if (profile.hasValidContact && profile.hasCompleteRequiredDetails) {
                     profilePreferenceLabel(profile.defaultPreference)
@@ -12007,21 +12187,24 @@ private fun PlayerProfileCard(
                 color = if (
                     profile.hasValidContact && profile.hasCompleteRequiredDetails
                 ) SecondaryText else Color(0xFF9A5B00),
-                fontSize = 10.sp,
+                fontSize = 11.sp,
+                lineHeight = 16.sp,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.fillMaxWidth()
             )
-            profile.publicPlayerId?.let { publicPlayerId ->
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    "玩家编号 $publicPlayerId",
-                    color = TertiaryText,
-                    fontSize = 9.sp,
-                    maxLines = 1
-                )
-            }
+            Text(
+                profile.publicPlayerId?.let { publicPlayerId -> "玩家编号 $publicPlayerId" }
+                ?: "玩家编号 —",
+                color = TertiaryText,
+                fontSize = 10.sp,
+                lineHeight = 14.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.fillMaxWidth()
+            )
         }
-        IconButton(onClick = onEdit, modifier = Modifier.size(48.dp)) {
+        IconButton(onClick = onEdit, modifier = Modifier.size(42.dp)) {
             Icon(
                 imageVector = Icons.Default.Edit,
                 contentDescription = panguSpacing("编辑“${profile.nickname}”的玩家资料"),
@@ -12029,8 +12212,9 @@ private fun PlayerProfileCard(
                 modifier = Modifier.size(18.dp)
             )
         }
-        Spacer(Modifier.width(2.dp))
-        Text("›", color = TertiaryText, fontSize = 18.sp)
+        Box(Modifier.size(width = 20.dp, height = 42.dp), contentAlignment = Alignment.Center) {
+            Text("›", color = TertiaryText, fontSize = 18.sp)
+        }
     }
 }
 
@@ -12583,25 +12767,55 @@ private fun PlayerProfileDetailScreen(
                 .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp)).padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            PlayerAvatar(profile, 64.dp)
+            Box(Modifier.size(68.dp), contentAlignment = Alignment.Center) {
+                PlayerAvatar(profile, 64.dp)
+            }
             Spacer(Modifier.width(16.dp))
-            Column(Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(profile.nickname, color = PrimaryText, fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(
+                    Modifier.fillMaxWidth().height(24.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        profile.nickname,
+                        color = PrimaryText,
+                        fontSize = 21.sp,
+                        lineHeight = 24.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
                     Spacer(Modifier.width(8.dp))
                     PlayerGenderMark(profile.gender, hideUndisclosed = false, fontSize = 20.sp)
                 }
-                Spacer(Modifier.height(5.dp))
                 Text(
                     "默认偏好：${profilePreferenceLabel(profile.defaultPreference)}",
                     color = SecondaryText,
-                    fontSize = 12.sp
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
-                Spacer(Modifier.height(3.dp))
-                Text(profileContactSummary(profile), color = SecondaryText, fontSize = 11.sp)
+                profileContactSummary(profile).takeIf { it.isNotBlank() }?.let { contactSummary ->
+                    Text(
+                        contactSummary,
+                        color = SecondaryText,
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
                 profile.publicPlayerId?.let { publicPlayerId ->
-                    Spacer(Modifier.height(3.dp))
-                    Text("玩家编号：$publicPlayerId", color = TertiaryText, fontSize = 11.sp)
+                    Text(
+                        "玩家编号：$publicPlayerId",
+                        color = TertiaryText,
+                        fontSize = 11.sp,
+                        lineHeight = 14.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
             }
         }
@@ -12739,25 +12953,55 @@ private fun FriendPairPlayerProfileDetailScreen(
                 .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp)).padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            PlayerAvatar(profile, 64.dp)
+            Box(Modifier.size(68.dp), contentAlignment = Alignment.Center) {
+                PlayerAvatar(profile, 64.dp)
+            }
             Spacer(Modifier.width(16.dp))
-            Column(Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(profile.nickname, color = PrimaryText, fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(
+                    Modifier.fillMaxWidth().height(24.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        profile.nickname,
+                        color = PrimaryText,
+                        fontSize = 21.sp,
+                        lineHeight = 24.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
                     Spacer(Modifier.width(8.dp))
                     PlayerGenderMark(profile.gender, hideUndisclosed = false, fontSize = 20.sp)
                 }
-                Spacer(Modifier.height(5.dp))
                 Text(
                     "默认偏好：${profilePreferenceLabel(profile.defaultPreference)}",
                     color = SecondaryText,
-                    fontSize = 12.sp
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
-                Spacer(Modifier.height(3.dp))
-                Text(profileContactSummary(profile), color = SecondaryText, fontSize = 11.sp)
+                profileContactSummary(profile).takeIf { it.isNotBlank() }?.let { contactSummary ->
+                    Text(
+                        contactSummary,
+                        color = SecondaryText,
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
                 profile.publicPlayerId?.let { publicPlayerId ->
-                    Spacer(Modifier.height(3.dp))
-                    Text("玩家编号：$publicPlayerId", color = TertiaryText, fontSize = 11.sp)
+                    Text(
+                        "玩家编号：$publicPlayerId",
+                        color = TertiaryText,
+                        fontSize = 11.sp,
+                        lineHeight = 14.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
             }
         }
@@ -12876,25 +13120,55 @@ private fun ClaimPlayerProfileDetailScreen(
                 .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp)).padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            PlayerAvatar(profile, 60.dp)
+            Box(Modifier.size(64.dp), contentAlignment = Alignment.Center) {
+                PlayerAvatar(profile, 60.dp)
+            }
             Spacer(Modifier.width(15.dp))
-            Column(Modifier.weight(1f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(profile.nickname, color = PrimaryText, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(
+                    Modifier.fillMaxWidth().height(24.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        profile.nickname,
+                        color = PrimaryText,
+                        fontSize = 20.sp,
+                        lineHeight = 24.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
                     Spacer(Modifier.width(8.dp))
                     PlayerGenderMark(profile.gender, hideUndisclosed = false, fontSize = 19.sp)
                 }
-                Spacer(Modifier.height(4.dp))
                 Text(
                     "资料默认偏好：${profilePreferenceLabel(profile.defaultPreference)}",
                     color = SecondaryText,
-                    fontSize = 12.sp
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
-                Spacer(Modifier.height(3.dp))
-                Text(profileContactSummary(profile), color = SecondaryText, fontSize = 11.sp)
+                profileContactSummary(profile).takeIf { it.isNotBlank() }?.let { contactSummary ->
+                    Text(
+                        contactSummary,
+                        color = SecondaryText,
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
                 profile.publicPlayerId?.let { publicPlayerId ->
-                    Spacer(Modifier.height(3.dp))
-                    Text("玩家编号：$publicPlayerId", color = TertiaryText, fontSize = 11.sp)
+                    Text(
+                        "玩家编号：$publicPlayerId",
+                        color = TertiaryText,
+                        fontSize = 11.sp,
+                        lineHeight = 14.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
             }
         }
@@ -12963,14 +13237,29 @@ private fun IncompletePlayerProfileScreen(
                 .padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            PlayerAvatar(profile, 58.dp)
+            Box(Modifier.size(62.dp), contentAlignment = Alignment.Center) {
+                PlayerAvatar(profile, 58.dp)
+            }
             Spacer(Modifier.width(15.dp))
-            Column(Modifier.weight(1f)) {
-                Text(profile.nickname, color = PrimaryText, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(4.dp))
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    profile.nickname,
+                    color = PrimaryText,
+                    fontSize = 20.sp,
+                    lineHeight = 24.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
                 profile.publicPlayerId?.let { publicPlayerId ->
-                    Text("玩家编号：$publicPlayerId", color = TertiaryText, fontSize = 11.sp)
-                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        "玩家编号：$publicPlayerId",
+                        color = TertiaryText,
+                        fontSize = 11.sp,
+                        lineHeight = 14.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
                 Text(
                     if (!profile.hasValidContact) {
@@ -12979,7 +13268,8 @@ private fun IncompletePlayerProfileScreen(
                         "需要确认 QQ 显示范围和排队通知设置。"
                     },
                     color = Destructive,
-                    fontSize = 12.sp
+                    fontSize = 12.sp,
+                    lineHeight = 18.sp
                 )
             }
         }

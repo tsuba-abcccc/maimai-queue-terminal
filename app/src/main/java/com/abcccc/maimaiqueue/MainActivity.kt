@@ -24,7 +24,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        requestedOrientation = if (BuildConfig.MANAGEMENT_APP) {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         // Compose form screens use IME insets to keep their active content and
         // fixed action areas above the keyboard. ADJUST_RESIZE is also required
@@ -35,7 +39,11 @@ class MainActivity : ComponentActivity() {
         hideSystemBars()
         setContent {
             MaimaiQueueTheme(darkTheme = false, dynamicColor = false) {
-                RegistrationApp()
+                if (BuildConfig.MANAGEMENT_APP) {
+                    ManagementApp()
+                } else {
+                    RegistrationApp()
+                }
             }
         }
     }

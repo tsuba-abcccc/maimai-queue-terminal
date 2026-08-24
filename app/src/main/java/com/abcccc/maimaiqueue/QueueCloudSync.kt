@@ -96,6 +96,7 @@ internal data class PlayerProfileUpdateCommand(
     override val commandId: String,
     val profileId: String,
     val qqNumber: String,
+    val source: RemoteQueueOperationSource = RemoteQueueOperationSource.QQ_BOT,
     val expectedUpdatedAtMillis: Long,
     val nickname: String,
     val gender: PlayerGender,
@@ -103,8 +104,24 @@ internal data class PlayerProfileUpdateCommand(
     val qqVisibility: QqVisibility = QqVisibility.TERMINAL_ONLY,
     val notificationPreferences: QueueNotificationPreferences =
         QueueNotificationPreferences(),
+    val terminalEditingAllowed: Boolean? = null,
+    val visitedVenuesPublic: Boolean? = null,
     val setupVersion: Int = 0,
     val expectedRevision: Long = 1L
+) : RemoteTerminalCommand
+
+internal data class TerminalPolicyUpdateCommand(
+    override val commandId: String,
+    val createdAtMillis: Long,
+    val queueId: String,
+    val expectedPolicyRevision: Long,
+    val nextPolicyRevision: Long,
+    val managementAppBound: Boolean,
+    val allowOnlineRegistration: Boolean,
+    val allowDeferOneRound: Boolean,
+    val allowTemporaryLeave: Boolean,
+    val oneBotSyncEnabled: Boolean,
+    val reason: String?
 ) : RemoteTerminalCommand
 
 internal sealed interface PlayerProfileCommandDecision {
@@ -121,7 +138,10 @@ internal fun decidePlayerProfileUpdate(
 ): PlayerProfileCommandDecision {
     val profile = profiles.firstOrNull { it.id == command.profileId }
         ?: return PlayerProfileCommandDecision.Reject("玩家资料已不存在。")
-    if (profile.normalizedQqNumber() != command.qqNumber) {
+    if (
+        command.source != RemoteQueueOperationSource.MANAGEMENT_APP &&
+        profile.normalizedQqNumber() != command.qqNumber
+    ) {
         return PlayerProfileCommandDecision.Reject("玩家资料绑定的 QQ 已发生变化。")
     }
     val desiredAlreadyPresent = profile.nickname == command.nickname &&
@@ -129,6 +149,10 @@ internal fun decidePlayerProfileUpdate(
         profile.defaultPreference == command.defaultPreference &&
         profile.qqVisibility == command.qqVisibility &&
         profile.notificationPreferences == command.notificationPreferences &&
+        (command.terminalEditingAllowed == null ||
+            profile.terminalEditingAllowed == command.terminalEditingAllowed) &&
+        (command.visitedVenuesPublic == null ||
+            profile.visitedVenuesPublic == command.visitedVenuesPublic) &&
         profile.setupVersion == command.setupVersion
     if (
         profile.revision != command.expectedRevision ||
@@ -159,6 +183,10 @@ internal fun decidePlayerProfileUpdate(
                 defaultPreference = command.defaultPreference,
                 qqVisibility = command.qqVisibility,
                 notificationPreferences = command.notificationPreferences,
+                terminalEditingAllowed = command.terminalEditingAllowed
+                    ?: profile.terminalEditingAllowed,
+                visitedVenuesPublic = command.visitedVenuesPublic
+                    ?: profile.visitedVenuesPublic,
                 setupVersion = command.setupVersion,
                 revision = profile.revision + 1L,
                 updatedAtMillis = nowMillis
@@ -233,6 +261,9 @@ internal data class QueuePublicDisplaySettings(
     val allowTemporaryLeave: Boolean = true,
     val allowOnlineRegistration: Boolean = true,
     val showCommonPlayPreview: Boolean = true,
+    val managementPolicySupported: Boolean = false,
+    val managementAppBound: Boolean = false,
+    val managementPolicyRevision: Long = 0L,
     val businessHours: QueuePublicBusinessHours = QueuePublicBusinessHours()
 ) {
     fun machineConfiguration(machineId: MachineId): MachineConfiguration =
@@ -1013,6 +1044,7 @@ private const val MAX_PROFILE_ALIASES = 500
 private const val PROFILE_UPDATE_COMMAND = "UPDATE_PLAYER_PROFILE"
 private const val QUEUE_OPERATION_COMMAND = "QUEUE_OPERATION"
 private const val MOBILE_REGISTRATION_COMMAND = "MOBILE_DEVICE_REGISTRATION"
+private const val TERMINAL_POLICY_COMMAND = "UPDATE_TERMINAL_POLICY"
 
 internal fun parseRemoteTerminalCommands(response: String): List<RemoteTerminalCommand> {
     val commands = JSONObject(response).getJSONArray("commands")
@@ -1023,6 +1055,7 @@ internal fun parseRemoteTerminalCommands(response: String): List<RemoteTerminalC
                 PROFILE_UPDATE_COMMAND -> parsePlayerProfileUpdate(source)
                 QUEUE_OPERATION_COMMAND -> parseQueueOperation(source)
                 MOBILE_REGISTRATION_COMMAND -> parseMobileDeviceRegistration(source)
+                TERMINAL_POLICY_COMMAND -> parseTerminalPolicyUpdate(source)
                 else -> null
             }?.let(::add)
         }
@@ -1037,6 +1070,12 @@ private fun parsePlayerProfileUpdate(command: JSONObject?): PlayerProfileUpdateC
             commandId = command.getString("command_id"),
             profileId = payload.getString("profile_id"),
             qqNumber = payload.getString("qq_number"),
+            source = RemoteQueueOperationSource.valueOf(
+                payload.optString(
+                    "operation_source",
+                    RemoteQueueOperationSource.QQ_BOT.name
+                )
+            ),
             expectedUpdatedAtMillis = payload.getLong("expected_updated_at"),
             nickname = payload.getString("nickname").trim(),
             gender = PlayerGender.valueOf(payload.getString("gender")),
@@ -1054,17 +1093,65 @@ private fun parsePlayerProfileUpdate(command: JSONObject?): PlayerProfileUpdateC
                 absence = payload.optBoolean("notify_absence", true),
                 machineStatus = payload.optBoolean("notify_machine_status", false)
             ),
+            terminalEditingAllowed = if (payload.has("terminal_editing_allowed")) {
+                payload.getBoolean("terminal_editing_allowed")
+            } else {
+                null
+            },
+            visitedVenuesPublic = if (payload.has("visited_venues_public")) {
+                payload.getBoolean("visited_venues_public")
+            } else {
+                null
+            },
             setupVersion = payload.optInt("setup_version", 0).coerceAtLeast(0),
             expectedRevision = payload.optLong("expected_profile_revision", 1L)
         )
     }.getOrNull()?.takeIf { parsed ->
         runCatching { UUID.fromString(parsed.commandId) }.isSuccess &&
             runCatching { UUID.fromString(parsed.profileId) }.isSuccess &&
-            isValidQqNumber(parsed.qqNumber) &&
+            (
+                if (parsed.source == RemoteQueueOperationSource.MANAGEMENT_APP) {
+                    parsed.qqNumber.isBlank() || isValidQqNumber(parsed.qqNumber)
+                } else {
+                    isValidQqNumber(parsed.qqNumber)
+                }
+            ) &&
             parsed.expectedUpdatedAtMillis > 0L &&
             parsed.expectedRevision > 0L &&
             parsed.nickname.isNotBlank() &&
             parsed.nickname.codePointCount(0, parsed.nickname.length) <= 18
+    }
+}
+
+private fun parseTerminalPolicyUpdate(command: JSONObject?): TerminalPolicyUpdateCommand? {
+    if (command == null || command.optString("type") != TERMINAL_POLICY_COMMAND) return null
+    val payload = command.optJSONObject("payload") ?: return null
+    return runCatching {
+        check(
+            RemoteQueueOperationSource.valueOf(
+                payload.getString("operation_source")
+            ) == RemoteQueueOperationSource.MANAGEMENT_APP
+        )
+        TerminalPolicyUpdateCommand(
+            commandId = command.getString("command_id"),
+            createdAtMillis = command.getLong("created_at"),
+            queueId = payload.getString("queue_id"),
+            expectedPolicyRevision = payload.getLong("expected_policy_revision"),
+            nextPolicyRevision = payload.getLong("next_policy_revision"),
+            managementAppBound = payload.getBoolean("management_app_bound"),
+            allowOnlineRegistration = payload.getBoolean("allow_online_registration"),
+            allowDeferOneRound = payload.getBoolean("allow_defer_one_round"),
+            allowTemporaryLeave = payload.getBoolean("allow_temporary_leave"),
+            oneBotSyncEnabled = payload.getBoolean("onebot_sync_enabled"),
+            reason = payload.optionalNonBlankString("reason")
+        )
+    }.getOrNull()?.takeIf { parsed ->
+        isUuid(parsed.commandId) &&
+            isUuid(parsed.queueId) &&
+            parsed.createdAtMillis > 0L &&
+            parsed.expectedPolicyRevision >= 0L &&
+            parsed.nextPolicyRevision == parsed.expectedPolicyRevision + 1L &&
+            (parsed.reason == null || parsed.reason.codePointCount(0, parsed.reason.length) <= 200)
     }
 }
 
@@ -1076,7 +1163,7 @@ private fun parseQueueOperation(command: JSONObject?): RemoteQueueOperationComma
             commandId = command.getString("command_id"),
             createdAtMillis = command.getLong("created_at"),
             queueId = payload.getString("queue_id"),
-            profileId = payload.getString("profile_id"),
+            profileId = payload.optionalNonBlankString("profile_id"),
             actorQq = payload.getString("actor_qq"),
             profileIdentityVerified = payload.optBoolean("profile_identity_verified", false),
             operation = RemoteQueueOperation.valueOf(payload.getString("operation")),
@@ -1114,7 +1201,11 @@ private fun parseQueueOperation(command: JSONObject?): RemoteQueueOperationComma
             },
             machineConfigurationRevision = payload.optionalPositiveLong(
                 "machine_configuration_revision"
-            )
+            ),
+            expectedRegistrationOrder = payload.optionalRegistrationOrder(
+                "expected_registration_order"
+            ),
+            registrationOrder = payload.optionalRegistrationOrder("registration_order")
         )
     }.getOrNull()?.takeIf(::isValidQueueOperationCommand)
 }
@@ -1217,8 +1308,19 @@ private fun JSONObject.optionalNonBlankString(name: String): String? =
 private fun JSONObject.optionalPositiveLong(name: String): Long? =
     if (!has(name) || isNull(name)) null else getLong(name).also { require(it > 0L) }
 
+private fun JSONObject.optionalRegistrationOrder(name: String): List<String>? {
+    if (!has(name) || isNull(name)) return null
+    val source = getJSONArray(name)
+    return buildList {
+        repeat(source.length()) {
+            add(source.getString(it).trim())
+        }
+    }
+}
+
 private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): Boolean {
     val validUuid = { value: String -> runCatching { UUID.fromString(value) }.isSuccess }
+    val validProfileId = command.profileId == null || validUuid(command.profileId)
     val validMachineId = { value: String? ->
         value != null && value.matches(Regex("[A-Z][A-Z0-9_-]{0,7}"))
     }
@@ -1226,6 +1328,11 @@ private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): 
         value == null || value.matches(Regex("[0-9a-f]{32}"))
     }
     val validRegistrationId = command.registrationId?.matches(Regex("[0-9a-f]{24}")) == true
+    val validRegistrationOrder = { value: List<String>? ->
+        value != null && value.size <= 20 &&
+            value.distinct().size == value.size &&
+            value.all { it.matches(Regex("[0-9a-f]{24}")) }
+    }
     val hasExpectedContext = command.expectedPosition != null
     val validExpectedContext = !hasExpectedContext || (
         command.expectedAbsenceStatus != null &&
@@ -1237,9 +1344,16 @@ private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): 
     if (
         !validUuid(command.commandId) ||
         !validUuid(command.queueId) ||
-        !validUuid(command.profileId) ||
+        !validProfileId ||
+        (
+            command.profileId == null &&
+                command.source != RemoteQueueOperationSource.MANAGEMENT_APP
+        ) ||
         command.createdAtMillis <= 0L ||
-        command.actorQq.isBlank() ||
+        (
+            command.actorQq.isBlank() &&
+                command.source != RemoteQueueOperationSource.MANAGEMENT_APP
+        ) ||
         !isValidQqNumber(command.actorQq) ||
         !validMachineStableId(command.machineStableId) ||
         !validMachineStableId(command.targetMachineStableId) ||
@@ -1258,9 +1372,15 @@ private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): 
             )
     ) return false
 
+    if (
+        command.source == RemoteQueueOperationSource.MANAGEMENT_APP &&
+        command.profileIdentityVerified
+    ) return false
+
     return when (command.operation) {
         RemoteQueueOperation.JOIN_QUEUE ->
             validMachineId(command.machineId) &&
+                command.profileId != null &&
                 command.targetMachineId == null && command.registrationId == null
         RemoteQueueOperation.TRANSFER_MACHINE ->
             validMachineId(command.machineId) && validMachineId(command.targetMachineId) &&
@@ -1268,6 +1388,25 @@ private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): 
         RemoteQueueOperation.CHANGE_PLAY_PREFERENCE ->
             validMachineId(command.machineId) && validRegistrationId &&
                 command.targetMachineId == null && command.preference != null
+        RemoteQueueOperation.CHECK_IN ->
+            validMachineId(command.machineId) && validRegistrationId &&
+                command.targetMachineId == null && command.preference == null &&
+                command.expectedPosition == RemoteRegistrationPosition.WAITING
+        RemoteQueueOperation.CREATE_REGISTRATION ->
+            validMachineId(command.machineId) &&
+                command.profileId != null &&
+                command.targetMachineId == null && command.registrationId == null
+        RemoteQueueOperation.REORDER_QUEUE ->
+            command.source == RemoteQueueOperationSource.MANAGEMENT_APP &&
+                command.profileId == null &&
+                validMachineId(command.machineId) &&
+                command.targetMachineId == null &&
+                command.registrationId == null &&
+                command.preference == null &&
+                command.expectedPosition == null &&
+                validRegistrationOrder(command.expectedRegistrationOrder) &&
+                validRegistrationOrder(command.registrationOrder) &&
+                command.expectedRegistrationOrder!!.toSet() == command.registrationOrder!!.toSet()
         else ->
             validMachineId(command.machineId) && validRegistrationId &&
                 command.targetMachineId == null && command.preference == null
@@ -1739,6 +1878,21 @@ internal fun buildPublicQueueSnapshot(
     )
     put("website_remote_enabled", displaySettings.websiteRemoteEnabled)
     put("onebot_sync_enabled", displaySettings.oneBotSyncEnabled)
+    put("management_policy_supported", displaySettings.managementPolicySupported)
+    put("management_app_bound", displaySettings.managementAppBound)
+    put(
+        "management_policy_revision",
+        displaySettings.managementPolicyRevision.coerceAtLeast(0L)
+    )
+    put(
+        "management_policy",
+        JSONObject().apply {
+            put("allow_online_registration", displaySettings.allowOnlineRegistration)
+            put("allow_defer_one_round", displaySettings.allowDeferOneRound)
+            put("allow_temporary_leave", displaySettings.allowTemporaryLeave)
+            put("onebot_sync_enabled", displaySettings.oneBotSyncEnabled)
+        }
+    )
     put(
         "queue_rules",
         JSONObject().apply {

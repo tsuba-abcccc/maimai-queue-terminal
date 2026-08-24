@@ -10,13 +10,14 @@
 - 终端可以独立关闭“QQ Bot 联动”；关闭时 Bot 接口停止服务，待执行命令失效，关闭期间不积压通知。
 - 终端可以独立关闭“允许线上登记”；关闭后只拒绝新建线上登记，队列查询、通知、资料同步和已有登记管理保持可用。
 - `GET /api/queue-status` 与 `GET /api/queue-logs` 是公开接口。只有玩家选择“允许网站显示”后，队列状态才为其当前有效登记返回 QQ；性别、资料 UUID、完整资料库和私有命令不会公开。
-- Bot 和终端私有接口分别使用独立令牌，不能在网页前端暴露。
+- Bot、终端和管理后台私有接口分别使用独立令牌，不能在网页前端暴露。
 
 ## 环境变量
 
 ```dotenv
 QUEUE_SYNC_TOKEN=<终端写入令牌，至少 32 个 UTF-8 字节的随机值>
 QUEUE_BOT_TOKEN=<Koishi Bot 令牌，至少 32 个 UTF-8 字节且与终端令牌不同>
+QUEUE_MANAGEMENT_TOKEN=<管理后台令牌，至少 32 个 UTF-8 字节且与前两者不同>
 QUEUE_PROFILE_SCOPE_ID=maimai-q-main
 QUEUE_DEVICE_ID=
 QUEUE_PRIMARY_DEVICE_ID=
@@ -37,7 +38,7 @@ QUEUE_PLAYER_AUTH_LIMIT_WINDOW_SECONDS=900
 QUEUE_PLAYER_AUTH_LIMIT_BLOCK_SECONDS=900
 QUEUE_PLAYER_AUTH_LIMIT_FAILURES=5
 QUEUE_PLAYER_COOKIE_SECURE=true
-QUEUE_LATEST_TERMINAL_VERSION=0.12.3
+QUEUE_LATEST_TERMINAL_VERSION=0.13.0
 QUEUE_LATEST_WEBSITE_VERSION=0.12.3
 QUEUE_LATEST_BOT_VERSION=0.3.13
 ```
@@ -46,7 +47,7 @@ QUEUE_LATEST_BOT_VERSION=0.3.13
 
 公开/自建部署必须显式填写 `QUEUE_CORS_ORIGIN` 和 `QUEUE_PUBLIC_SITE_URL`。服务端不会再默认使用维护者的网站地址；前者用于浏览器跨域校验，后者会编码进终端生成的移动设备登记二维码。Docker Compose 会在缺少任一必需地址时拒绝启动配置。
 
-每份鉴权令牌在启用对应私有接口时都必须达到 32 个 UTF-8 字节；两份令牌都配置时不能相同。某份配置缺失或过短时，对应私有接口统一返回 `503`；两份配置相同时，终端与 Bot 私有接口都会返回 `503`。健康检查仍会响应，服务不会降级为未鉴权访问。可使用 `openssl rand -hex 32` 分别生成两份独立令牌。
+每份鉴权令牌在启用对应私有接口时都必须达到 32 个 UTF-8 字节；三份令牌不能相同。某份配置缺失或过短时，对应私有接口统一返回 `503`；角色令牌相同时，相关私有接口都会返回 `503`。健康检查仍会响应，服务不会降级为未鉴权访问。可使用 `openssl rand -hex 32` 分别生成三份独立令牌。管理令牌可以读取和修改完整队列与私有玩家资料，必须只保存在受控管理设备和服务端环境文件中。
 
 `QUEUE_COMMAND_TIMEOUT_SECONDS` 是资料或队列命令等待终端处理的最长时间，默认 10 分钟。超时命令会被拒绝，玩家可以重新提交；当前权威终端发生接管时，仍在有效期内的命令会自动转交给新终端。
 
@@ -129,6 +130,22 @@ POST  /api/queue-bot/identity
 GET   /api/queue-bot/commands/<command_id>
 ```
 
+管理后台接口，使用独立的 `QUEUE_MANAGEMENT_TOKEN`，请求统一带有 `Authorization: Bearer <QUEUE_MANAGEMENT_TOKEN>`：
+
+```text
+GET   /api/queue-management/overview
+POST  /api/queue-management/commands
+POST  /api/queue-management/queue-commands
+POST  /api/queue-management/queue-reorders
+POST  /api/queue-management/registrations
+GET   /api/queue-management/commands/<command_id>
+PATCH /api/queue-management/profiles/<profile_id>
+POST  /api/queue-management/profiles/<profile_id>/password
+PATCH /api/queue-management/terminal-policy
+```
+
+管理命令只进入待执行命令表，不直接改写 `queue_snapshot`。现场终端会复核队列批次、登记上下文、机台稳定身份和配置修订号；过期或冲突请求返回拒绝结果。`/api/queue-management/overview` 返回完整私有队列和玩家资料，只能从受控管理 App 调用。
+
 当公开快照中的 `onebot_sync_enabled` 为 `false` 时，上述所有 Bot 接口返回 `503 QQ Bot 联动已关闭`。服务器保留玩家资料，但会拒绝待执行命令、清除当前通知收件关系，并且不会在重新开启后补发关闭期间的事件。
 
 按 QQ 筛选一律使用 HTTPS POST JSON 请求体，避免 QQ 进入 Nginx、Gunicorn 或监控系统的 URL 访问日志。GET 仅用于不含 QQ 查询条件的全量读取。
@@ -208,7 +225,7 @@ Windows PowerShell 激活命令为 `.venv\Scripts\Activate.ps1`。
 
 ## Docker 部署
 
-1. 复制 `.env.example` 为 `.env`，分别生成终端令牌与 Bot 令牌。
+1. 复制 `.env.example` 为 `.env`，分别生成终端、Bot 和管理后台令牌。
 2. 设置稳定的 `QUEUE_PROFILE_SCOPE_ID`。
 3. 运行 `docker compose up -d --build`。
 4. 将 `nginx-location.conf.example` 中的 location 加入自己的 HTTPS 站点。
@@ -225,11 +242,11 @@ Windows PowerShell 激活命令为 `.venv\Scripts\Activate.ps1`。
 
 服务单元使用 `UMask=0077`，确保以后创建的 SQLite 数据库、WAL 和 SHM 文件不会被其他本机用户读取。调整既有文件权限后应重启服务，并确认 `ls -la /var/lib/maimai-queue-status` 中目录为 `drwx------`、文件为 `-rw-------`。
 
-不要提交 `.env`、生产数据库或任何令牌。`QUEUE_BOT_TOKEN` 只应存在于 Koishi 服务端配置中，不能发送到群聊、浏览器或公开仓库。
+不要提交 `.env`、生产数据库或任何令牌。`QUEUE_BOT_TOKEN` 只应存在于 Koishi 服务端配置中；`QUEUE_MANAGEMENT_TOKEN` 只应存在于管理 App 的受控配置或管理员输入中，不能发送到群聊、浏览器或公开仓库。
 
 ## 已有服务器升级与首次联调
 
-不要在旧后端上直接启用 Koishi 插件。Bot 需要新版 `app.py`、独立的 Bot 令牌和 Nginx 的 `/api/queue-bot/` 路由同时生效；只更新其中一项仍然无法使用。
+不要在旧后端上直接启用 Koishi 插件或管理 App。Bot 需要新版 `app.py`、独立的 Bot 令牌和 Nginx 的 `/api/queue-bot/` 路由同时生效；管理 App 还需要 `/api/queue-management/` 路由和独立管理令牌；只更新其中一项仍然无法使用。
 
 ### 1. 升级后端
 
@@ -267,7 +284,7 @@ docker compose logs --tail=100 maimai-queue-status
 
 ### 2. 更新 Nginx 路由
 
-把当前 [nginx-location.conf.example](./nginx-location.conf.example) 中的 `/api/queue-online/`、`/api/queue-mobile/`、`/api/queue-bot/` 和 `/api/queue-terminal/` location 合并到现有 HTTPS 站点。不要用示例文件覆盖站点中的证书、静态网站或其他 location。随后执行：
+把当前 [nginx-location.conf.example](./nginx-location.conf.example) 中的 `/api/queue-online/`、`/api/queue-mobile/`、`/api/queue-bot/`、`/api/queue-terminal/` 和 `/api/queue-management/` location 合并到现有 HTTPS 站点。不要用示例文件覆盖站点中的证书、静态网站或其他 location。随后执行：
 
 ```bash
 sudo nginx -t
@@ -280,13 +297,14 @@ sudo systemctl reload nginx
 
 ```bash
 curl -i https://example.com/queue-api-healthz
+curl -i https://example.com/api/queue-management/overview
 curl -i -X POST -H 'Content-Type: application/json' \
   -d '{"qq":"00000"}' https://example.com/api/queue-online/profile
 curl -i https://example.com/api/queue-mobile/sessions/invalid-token
 curl -i 'https://example.com/api/queue-bot/events?after=0&limit=1'
 ```
 
-第一条应返回 `200`。第二条应返回后端 JSON；测试 QQ 不存在时通常为 `404 PROFILE_NOT_FOUND`，这证明网站线上登记路由已经生效。第三条应返回后端 JSON `404` 和“没有找到这次移动设备登记”，证明移动登记路由已经生效。第四条故意不带令牌，应返回 `401` 和“Bot 认证失败”，这说明 Bot 路由已经到达新版后端。其他结果的含义如下：
+第一条应返回 `200`。第二条故意不带管理令牌，应返回 `401` 和“管理后台认证失败”；带正确管理令牌时应返回 `200` 或现场终端尚未上传新版快照时的明确状态。第三条应返回后端 JSON；测试 QQ 不存在时通常为 `404 PROFILE_NOT_FOUND`，这证明网站线上登记路由已经生效。第四条应返回后端 JSON `404` 和“没有找到这次移动设备登记”，证明移动登记路由已经生效。随后无令牌访问 Bot 路由应返回 `401` 和“Bot 认证失败”。其他结果的含义如下：
 
 - `404 接口不存在`：新版 `app.py` 或 Nginx 的 `/api/queue-bot/` 路由尚未部署。
 - `503 服务器鉴权配置无效`：Bot 令牌缺失、少于 32 字节，或与终端令牌相同。
