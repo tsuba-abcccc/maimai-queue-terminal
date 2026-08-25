@@ -235,7 +235,7 @@ macOS 或 Linux 使用：
 .\gradlew.bat :app:assembleLocalRelease
 ```
 
-当前项目没有在 Gradle 中保存正式签名配置，因此该命令生成的是尚未签名、不能直接发布的候选文件：
+Gradle 不在仓库中保存签名密码和 keystore。发布者使用受控环境中的长期发布证书对该候选文件进行对齐和签名；直接执行上面的 Gradle 命令仍只会生成尚未签名的候选文件：
 
 ```text
 app/build/outputs/apk/local/release/app-local-release-unsigned.apk
@@ -264,7 +264,7 @@ $signedApk = 'app\build\outputs\apk\local\release\app-local-release-signed.apk'
 & '<Android SDK>\build-tools\<已安装版本>\apksigner.bat' verify --verbose --print-certs $signedApk
 ```
 
-公开渠道只能上传已经验证签名的 Release APK。`localRelease` 是完全离线版；自建服务端的测试者还需要下文所述、不含预置地址和令牌的公开 `terminalRelease`。禁止上传 Debug、未签名 APK，或任何预置了机厅私有连接信息的终端包。
+公开渠道只能上传已经验证签名的 Release APK。`localRelease` 是完全离线版；自建服务端的测试者还需要下文所述、不含预置地址和令牌的公开 `terminalRelease`。禁止上传 Debug、未签名 APK，或任何预置了机厅私有连接信息的终端包。0.13.0 的公开 APK 使用既有长期证书签名，证书 SHA-256 指纹为 `daa2e919d2f8d956c0a93417aae601e6ec658edc5ae7c9673830c53f649ec925`。
 
 ### 配置与服务端同步
 
