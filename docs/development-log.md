@@ -23,7 +23,7 @@
 - 使用自 0.7.0 起的长期发布证书完成 local、terminal、management 三个 Release APK 的 `zipalign` 和 v3 签名；证书 SHA-256 指纹为 `daa2e919d2f8d956c0a93417aae601e6ec658edc5ae7c9673830c53f649ec925`。
 - 三个公开 APK 均通过 `apksigner verify --verbose --print-certs`、`zipalign -c -p 4` 和 `aapt2 dump badging` 校验，版本为 `0.13.0`、构建号为 `66`。
 - 三个公开 APK 均未发现现场域名、终端同步令牌或管理令牌；预置现场令牌的 `management-test` 包不进入公开 Release。
-- 发布附件校验值写入 `output/release-0.13.0/SHA256SUMS-0.13.0.txt`，待 GitHub Release 创建后作为同一 Release 附件上传。
+- 发布附件校验值写入 `output/release-0.13.0/SHA256SUMS-0.13.0.txt`，并已随公开 GitHub Release `v0.13.0` 上传；远端资产的 SHA-256 已与本地校验文件复核一致。
 
 ## 2026-08-19 · 0.12.2 跨端反馈与安全刷新
 
