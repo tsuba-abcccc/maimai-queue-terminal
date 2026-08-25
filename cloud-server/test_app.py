@@ -6256,7 +6256,7 @@ class QueueStatusApiTest(unittest.TestCase):
             {
                 "name": "现场终端",
                 "current_version": "0.10.0",
-                "latest_version": "0.13.0",
+                "latest_version": "0.13.1",
                 "status": "UPDATE_AVAILABLE",
                 "updated_at": 1_234_000,
             },

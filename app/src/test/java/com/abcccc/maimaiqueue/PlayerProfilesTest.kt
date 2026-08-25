@@ -28,6 +28,15 @@ class PlayerProfilesTest {
     )
 
     @Test
+    fun terminalEditingIsLockedOnlyForBoundProfilesThatDisableIt() {
+        val profile = profile("1", "测试玩家")
+
+        assertTrue(profile.copy(webAccountBound = false, terminalEditingAllowed = false).canEditOnTerminal)
+        assertTrue(profile.copy(webAccountBound = true, terminalEditingAllowed = true).canEditOnTerminal)
+        assertFalse(profile.copy(webAccountBound = true, terminalEditingAllowed = false).canEditOnTerminal)
+    }
+
+    @Test
     fun notificationDefaultsEnableOnlyTheRequestedCategories() {
         val preferences = QueueNotificationPreferences()
 

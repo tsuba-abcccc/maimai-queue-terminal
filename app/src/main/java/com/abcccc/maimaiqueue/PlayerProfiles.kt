@@ -98,6 +98,9 @@ data class PlayerProfile(
     )
 }
 
+val PlayerProfile.canEditOnTerminal: Boolean
+    get() = !webAccountBound || terminalEditingAllowed
+
 fun createPlayerProfile(
     nickname: String,
     gender: PlayerGender,

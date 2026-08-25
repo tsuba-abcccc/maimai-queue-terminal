@@ -1,6 +1,6 @@
 # maimai Q
 
-[![Version](https://img.shields.io/badge/version-0.13.0-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
+[![Version](https://img.shields.io/badge/version-0.13.1-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
 [![Android](https://img.shields.io/badge/Android-10%2B-34C759?logo=android&logoColor=white)](https://developer.android.com/about/versions/10)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-007AFF)](https://developer.android.com/compose)
@@ -17,7 +17,8 @@
 - [独立公开队列页说明](public-site/README.md)
 - [玩家使用手册](docs/user-manual.md)
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
-- [0.1.0 至 0.13.0 更新日志](docs/update.md)
+- [0.1.0 至 0.13.1 更新日志](docs/update.md)
+- [0.13.1 现场终端补丁发布说明](docs/releases/0.13.1-terminal-profile-edit.md)
 - [0.13.0 管理后台发布说明](docs/releases/0.13.0-management-app.md)
 - [后续版本路线](docs/roadmap.md)
 - [开发与交付记录](docs/development-log.md)
@@ -215,7 +216,7 @@ app/build/outputs/apk/local/debug/app-local-debug.apk
 .\gradlew.bat :app:packageLocalDebugApk
 ```
 
-文件会复制到 `output/apk/maimai-Q-0.13.0-local.apk`。
+文件会复制到 `output/apk/maimai-Q-0.13.1-local.apk`。
 
 macOS 或 Linux 使用：
 
@@ -264,7 +265,7 @@ $signedApk = 'app\build\outputs\apk\local\release\app-local-release-signed.apk'
 & '<Android SDK>\build-tools\<已安装版本>\apksigner.bat' verify --verbose --print-certs $signedApk
 ```
 
-公开渠道只能上传已经验证签名的 Release APK。`localRelease` 是完全离线版；自建服务端的测试者还需要下文所述、不含预置地址和令牌的公开 `terminalRelease`。禁止上传 Debug、未签名 APK，或任何预置了机厅私有连接信息的终端包。0.13.0 的公开 APK 使用既有长期证书签名，证书 SHA-256 指纹为 `daa2e919d2f8d956c0a93417aae601e6ec658edc5ae7c9673830c53f649ec925`。
+公开渠道只能上传已经验证签名的 Release APK。`localRelease` 是完全离线版；自建服务端的测试者还需要下文所述、不含预置地址和令牌的公开 `terminalRelease`。禁止上传 Debug、未签名 APK，或任何预置了机厅私有连接信息的终端包。0.13.1 的公开 APK 使用既有长期证书签名，证书 SHA-256 指纹为 `daa2e919d2f8d956c0a93417aae601e6ec658edc5ae7c9673830c53f649ec925`。
 
 ### 配置与服务端同步
 
@@ -303,7 +304,7 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 
 签名后还应检查其应用 ID 为 `com.abcccc.maimaiqueue`、包含联网权限、不是 Debug 构建，并确认 APK 中没有任何实际域名或令牌。
 
-现场终端文件会复制到 `output/apk/maimai-Q-0.13.0-terminal.apk`。只有不含预置连接信息且经过正式签名和校验的构建，才可以作为 GitHub 公开 Release 附件。
+现场终端文件会复制到 `output/apk/maimai-Q-0.13.1-terminal.apk`。只有不含预置连接信息且经过正式签名和校验的构建，才可以作为 GitHub 公开 Release 附件。
 
 ### 管理后台构建
 

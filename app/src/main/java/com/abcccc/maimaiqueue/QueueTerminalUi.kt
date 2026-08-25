@@ -118,6 +118,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
@@ -2509,10 +2510,10 @@ internal fun RegistrationApp() {
         profile: PlayerProfile,
         returnScreen: Screen = Screen.PLAYER_LIBRARY
     ) {
-        if (profile.webAccountBound && !profile.terminalEditingAllowed) {
+        if (!profile.canEditOnTerminal) {
             Toast.makeText(
                 context,
-                panguSpacing("这份资料已绑定网页账户，请在网页玩家资料中编辑。"),
+                panguSpacing(terminalProfileEditingDisabledReason),
                 Toast.LENGTH_SHORT
             ).show()
             return
@@ -4695,9 +4696,6 @@ internal fun RegistrationApp() {
                             onSortModeChange = { playerProfileSort = it },
                             onNewProfile = ::openNewPlayerProfile,
                             onProfileClick = ::openPlayerProfile,
-                            onEditProfile = {
-                                openEditPlayerProfile(it, Screen.PLAYER_LIBRARY)
-                            },
                             onBack = {
                                 when (playerProfileContext) {
                                     PlayerProfileContext.CLAIM_REGISTRATION ->
@@ -12011,7 +12009,6 @@ private fun PlayerLibraryScreen(
     onSortModeChange: (ProfileSortMode) -> Unit,
     onNewProfile: () -> Unit,
     onProfileClick: (PlayerProfile) -> Unit,
-    onEditProfile: (PlayerProfile) -> Unit,
     onBack: () -> Unit
 ) {
     BackHandler(onBack = onBack)
@@ -12093,7 +12090,6 @@ private fun PlayerLibraryScreen(
                                     PlayerProfileCard(
                                         profile = profile,
                                         onClick = { onProfileClick(profile) },
-                                        onEdit = { onEditProfile(profile) },
                                         modifier = Modifier.weight(1f)
                                     )
                                 }
@@ -12144,7 +12140,6 @@ private fun ProfileSortControl(
 private fun PlayerProfileCard(
     profile: PlayerProfile,
     onClick: () -> Unit,
-    onEdit: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Row(
@@ -12202,14 +12197,6 @@ private fun PlayerProfileCard(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.fillMaxWidth()
-            )
-        }
-        IconButton(onClick = onEdit, modifier = Modifier.size(42.dp)) {
-            Icon(
-                imageVector = Icons.Default.Edit,
-                contentDescription = panguSpacing("编辑“${profile.nickname}”的玩家资料"),
-                tint = SystemBlue,
-                modifier = Modifier.size(18.dp)
             )
         }
         Box(Modifier.size(width = 20.dp, height = 42.dp), contentAlignment = Alignment.Center) {
@@ -12882,23 +12869,34 @@ private fun PlayerProfileDetailScreen(
             }
         )
         Spacer(Modifier.height(10.dp))
-        if (!profile.webAccountBound) {
-            SecondaryButton(
-                if (webAccountBindingLoading) "正在创建绑定页面" else "绑定网页账户",
-                onBindWebAccount,
-                Modifier.fillMaxWidth(),
-                enabled = webAccountBindingEnabled && !webAccountBindingLoading,
-                disabledReason = if (webAccountBindingLoading) {
-                    "正在向服务端创建一次性绑定页面。"
-                } else {
-                    webAccountBindingDisabledReason
-                }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            PlayerProfileEditButton(
+                profile = profile,
+                onEditProfile = onEditProfile,
+                modifier = Modifier.weight(1f)
             )
+            if (!profile.webAccountBound) {
+                SecondaryButton(
+                    if (webAccountBindingLoading) "正在创建绑定页面" else "绑定网页账户",
+                    onBindWebAccount,
+                    Modifier.weight(1f),
+                    enabled = webAccountBindingEnabled && !webAccountBindingLoading,
+                    disabledReason = if (webAccountBindingLoading) {
+                        "正在向服务端创建一次性绑定页面。"
+                    } else {
+                        webAccountBindingDisabledReason
+                    }
+                )
+            }
         }
         Spacer(Modifier.height(7.dp))
         Text(
             if (profile.webAccountBound) {
-                "这份资料已绑定网页账户。资料和密码请由玩家登录网页后管理。"
+                if (profile.canEditOnTerminal) {
+                    "这份资料已绑定网页账户，并允许现场终端编辑资料；QQ 和密码仍需由玩家登录网页后管理。"
+                } else {
+                    "这份资料已绑定网页账户，且未允许现场终端编辑。玩家可以登录网页重新开放终端编辑权限。"
+                }
             } else {
                 "绑定后可在网页管理个人资料。绑定页面只对这份资料有效，且会在短时间后失效。"
             },
@@ -13073,6 +13071,12 @@ private fun FriendPairPlayerProfileDetailScreen(
                 else -> "请先确认两位玩家都同意组成固定组合。"
             }
         )
+        Spacer(Modifier.height(10.dp))
+        PlayerProfileEditButton(
+            profile = profile,
+            onEditProfile = onEditProfile,
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
 
@@ -13215,6 +13219,12 @@ private fun ClaimPlayerProfileDetailScreen(
                 "当前机台已停止使用，暂时不能认领登记。"
             }
         )
+        Spacer(Modifier.height(10.dp))
+        PlayerProfileEditButton(
+            profile = profile,
+            onEditProfile = onEditProfile,
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
 
@@ -13274,10 +13284,35 @@ private fun IncompletePlayerProfileScreen(
             }
         }
         Spacer(Modifier.height(16.dp))
-        PrimaryButton("前往补全玩家资料", onEditProfile, Modifier.fillMaxWidth())
+        PrimaryButton(
+            "前往补全玩家资料",
+            onEditProfile,
+            Modifier.fillMaxWidth(),
+            enabled = profile.canEditOnTerminal,
+            disabledReason = terminalProfileEditingDisabledReason
+        )
         Spacer(Modifier.height(9.dp))
         SecondaryButton("返回玩家资料库", onBack, Modifier.fillMaxWidth())
     }
+}
+
+private const val terminalProfileEditingDisabledReason =
+    "这份资料已绑定网页账户，且未允许现场终端编辑。请由玩家登录网页重新开放终端编辑权限。"
+
+@Composable
+private fun PlayerProfileEditButton(
+    profile: PlayerProfile,
+    onEditProfile: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    SecondaryButton(
+        text = "编辑玩家资料",
+        onClick = onEditProfile,
+        modifier = modifier,
+        enabled = profile.canEditOnTerminal,
+        disabledReason = terminalProfileEditingDisabledReason,
+        leadingIcon = Icons.Default.Edit
+    )
 }
 
 private fun profileContactSummary(profile: PlayerProfile): String =
@@ -18492,7 +18527,8 @@ private fun SecondaryButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
-    disabledReason: String? = null
+    disabledReason: String? = null,
+    leadingIcon: ImageVector? = null
 ) {
     val context = LocalContext.current
     Box(
@@ -18509,13 +18545,34 @@ private fun SecondaryButton(
             }.padding(horizontal = 18.dp),
         contentAlignment = Alignment.Center
     ) {
-        Text(
-            text,
-            color = if (enabled) SystemBlue else TertiaryText,
-            fontSize = 14.sp,
-            fontWeight = FontWeight.SemiBold,
-            textAlign = TextAlign.Center
-        )
+        if (leadingIcon != null) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = leadingIcon,
+                    contentDescription = null,
+                    tint = if (enabled) SystemBlue else TertiaryText,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text,
+                    color = if (enabled) SystemBlue else TertiaryText,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    textAlign = TextAlign.Center,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        } else {
+            Text(
+                text,
+                color = if (enabled) SystemBlue else TertiaryText,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center
+            )
+        }
     }
 }
 
