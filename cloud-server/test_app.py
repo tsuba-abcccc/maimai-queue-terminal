@@ -6256,11 +6256,14 @@ class QueueStatusApiTest(unittest.TestCase):
             {
                 "name": "现场终端",
                 "current_version": "0.10.0",
-                "latest_version": "0.12.3",
+                "latest_version": "0.13.0",
                 "status": "UPDATE_AVAILABLE",
                 "updated_at": 1_234_000,
             },
             payload["components"]["terminal"],
+        )
+        self.assertEqual(
+            "0.12.3", payload["components"]["website"]["latest_version"]
         )
         self.assertEqual("LATEST", payload["components"]["website"]["status"])
         self.assertEqual("LATEST", payload["components"]["bot"]["status"])

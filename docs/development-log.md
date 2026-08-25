@@ -4,6 +4,14 @@
 
 本文件记录可审阅、可复核的工程依据，不记录模型内部隐藏推理过程。正式对外发布内容仍以版本更新日志和 GitHub Release 为准。
 
+## 2026-08-25 · 版本信息补发与生产校正
+
+- 核对最近两周主项目发布记录后确认，Android/管理端组件已公开发布 `0.13.0`，队列网站组件仍为 `0.12.3`，QQ Bot 为 `0.3.13`；网站不因管理 App 发布而冒充 `0.13.0`。
+- 修正服务端默认配置、Compose 示例和部署文档中的终端最新版本，网站最新版本保持 `0.12.3`。同步 `public-site` 与 `D:\site-main` 的五个共享队列组件，并将主站版本 manifest 从 `0.12.2` 补发为 `0.12.3`。
+- 生产部署前备份 `/etc/maimai-queue-status.env`、两个站点当前 `dist` 和 API 运行目录；API 重启后核对 `/healthz`、`/api/queue-status` 与 `/api/queue-versions`，Bot 重新读取网站 manifest 并上报网站版本。
+- 本次生产备份保存于 `/var/backups/maimai-queue-status/20260825-155225-version-info`，包含环境文件、API 源码、SQLite 在线备份和两个站点切换前的 `dist`。新目录使用 `dist-previous-20260825-155225` 保留回滚点，队列 ID `cf647330-f8b5-4d73-bd6f-bff4bb3b0815`、修订号 `6014` 未改变。
+- `https://abcccc.top` 与 `https://queue.abcccc.top` 的 `/queue-api-healthz`、`/api/queue-status`、`/api/queue-versions` 均返回 200；最终版本矩阵为终端 `0.12.3 → 0.13.0 UPDATE_AVAILABLE`、网站 `0.12.3 → 0.12.3 LATEST`、Bot `0.3.13 → 0.3.13 LATEST`。API 与 Koishi systemd 服务均为 active，Nginx 语法检查成功。
+
 ## 2026-08-25 · 0.13.0 管理后台交付与现场部署
 
 - 新增手机竖屏管理 App 和独立管理 API。总览、线上登记立即签到、新建登记、任意登记操作、玩家资料编辑、密码修改、等待顺序调整和终端敏感策略接管均通过服务端命令执行，现场终端与 `queue-core` 继续拥有最终校验权。
