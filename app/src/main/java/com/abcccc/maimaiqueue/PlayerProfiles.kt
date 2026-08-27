@@ -1,6 +1,7 @@
 package com.abcccc.maimaiqueue
 
 import java.text.Collator
+import java.net.URI
 import java.util.Locale
 import java.util.UUID
 
@@ -100,6 +101,15 @@ data class PlayerProfile(
 
 val PlayerProfile.canEditOnTerminal: Boolean
     get() = !webAccountBound || terminalEditingAllowed
+
+internal fun normalizePlayerAvatarReference(value: String?): String? {
+    val normalized = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    if (normalized.length > 512) return null
+    val uri = runCatching { URI(normalized) }.getOrNull() ?: return null
+    if (uri.scheme?.lowercase(Locale.ROOT) !in setOf("http", "https")) return null
+    if (uri.host.isNullOrBlank() || uri.userInfo != null || uri.fragment != null) return null
+    return uri.toASCIIString()
+}
 
 fun createPlayerProfile(
     nickname: String,

@@ -44,6 +44,54 @@ class QueueRuleSettingsTest {
     }
 
     @Test
+    fun managementTakeoverDoesNotLockTerminalConnectionRecoverySettings() {
+        val original = QueueRuleSettings(
+            managementAppBound = true,
+            managementPolicyRevision = 4L,
+            managementSettingsRevision = 7L
+        )
+        val connectionChange = original.copy(
+            websiteSyncEnabled = false,
+            syncMode = QueueSyncMode.TEST,
+            queueSyncEndpoint = "https://backup.example.com/api/queue-status",
+            queueSyncToken = "b".repeat(32),
+            managementAppBound = false,
+            managementPolicyRevision = 99L,
+            managementSettingsRevision = 101L
+        )
+
+        assertEquals(
+            original.managementControlledContent(),
+            connectionChange.managementControlledContent()
+        )
+    }
+
+    @Test
+    fun managementTakeoverStillCoversEveryRemotelyEditableSettingsArea() {
+        val original = QueueRuleSettings()
+        val policyChange = original.copy(allowOnlineRegistration = false)
+        val displayChange = original.copy(showCommonPlayPreview = false)
+        val botChange = original.copy(oneBotSyncEnabled = false)
+        val businessHoursChange = original.copy(
+            businessHours = original.businessHours.copy(enabled = true)
+        )
+        val machineChange = original.copy(configuredMachineCount = 3)
+
+        listOf(
+            policyChange,
+            displayChange,
+            botChange,
+            businessHoursChange,
+            machineChange
+        ).forEach { updated ->
+            assertTrue(
+                original.managementControlledContent() !=
+                    updated.managementControlledContent()
+            )
+        }
+    }
+
+    @Test
     fun queueBehaviorConfigurationIsRiskSensitiveButMetadataIsNot() {
         val original = QueueRuleSettings()
 
@@ -500,7 +548,23 @@ class QueueRuleSettingsTest {
             cloudSyncAvailable = true
         )
         assertFalse(invalid.websiteSyncEnabled)
-        assertFalse(invalid.oneBotSyncEnabled)
+        assertTrue(invalid.oneBotSyncEnabled)
+    }
+
+    @Test
+    fun disablingServerSyncPreservesTheManagedBotPolicy() {
+        val settings = normalizeQueueRuleSettingsForRuntime(
+            settings = QueueRuleSettings(
+                websiteSyncEnabled = false,
+                oneBotSyncEnabled = true,
+                queueSyncEndpoint = "https://example.com/api/queue-status",
+                queueSyncToken = "a".repeat(32)
+            ),
+            cloudSyncAvailable = true
+        )
+
+        assertFalse(settings.websiteSyncEnabled)
+        assertTrue(settings.oneBotSyncEnabled)
     }
 
     @Test

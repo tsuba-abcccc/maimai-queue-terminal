@@ -22,6 +22,7 @@ QUEUE_PROFILE_SCOPE_ID=maimai-q-main
 QUEUE_DEVICE_ID=
 QUEUE_PRIMARY_DEVICE_ID=
 QUEUE_DATABASE_PATH=/var/lib/maimai-queue-status/queue.db
+QUEUE_PLAYER_AVATAR_DIRECTORY=/var/lib/maimai-queue-status/player-avatars
 QUEUE_ONLINE_TIMEOUT_SECONDS=90
 QUEUE_COMMAND_TIMEOUT_SECONDS=600
 QUEUE_COMMAND_CLAIM_LEASE_SECONDS=15
@@ -38,8 +39,8 @@ QUEUE_PLAYER_AUTH_LIMIT_WINDOW_SECONDS=900
 QUEUE_PLAYER_AUTH_LIMIT_BLOCK_SECONDS=900
 QUEUE_PLAYER_AUTH_LIMIT_FAILURES=5
 QUEUE_PLAYER_COOKIE_SECURE=true
-QUEUE_LATEST_TERMINAL_VERSION=0.13.1
-QUEUE_LATEST_WEBSITE_VERSION=0.12.3
+QUEUE_LATEST_TERMINAL_VERSION=0.13.2
+QUEUE_LATEST_WEBSITE_VERSION=0.13.2
 QUEUE_LATEST_BOT_VERSION=0.3.13
 ```
 
@@ -60,6 +61,8 @@ QUEUE_LATEST_BOT_VERSION=0.3.13
 `QUEUE_PUBLIC_SITE_URL` 是终端“使用移动设备登记”二维码打开的排队页面。`QUEUE_MOBILE_SESSION_TTL_SECONDS` 控制二维码有效时间，默认 10 分钟；`QUEUE_MOBILE_SESSION_RETENTION_SECONDS` 控制已结束会话和结果的保留时间，默认 24 小时。
 
 `QUEUE_PLAYER_ACCOUNT_SITE_URL` 是终端“绑定网页账户”二维码打开的页面；留空时使用 `QUEUE_PUBLIC_SITE_URL`。公开 HTTPS 部署必须保持 `QUEUE_PLAYER_COOKIE_SECURE=true`。账户会话默认保留 30 天，绑定二维码默认 10 分钟有效；登录、绑定、修改 QQ 或修改密码连续验证失败 5 次后默认限制 15 分钟。
+
+`QUEUE_PLAYER_AVATAR_DIRECTORY` 保存网页账户上传后统一生成的 512 × 512 WebP。该目录必须与 SQLite 一起持久化和备份，只允许 API 服务账户写入；不要放在每次部署都会替换的源码目录。未显式配置时默认使用数据库同级的 `avatars` 目录。头像处理依赖 `requirements.txt` 中的 Pillow。
 
 ## 接口边界
 
@@ -89,13 +92,15 @@ POST /api/player-account/bindings/<binding_token>/complete
 POST /api/player-account/login
 GET  /api/player-account
 PATCH /api/player-account/profile
+POST /api/player-account/avatar
 POST /api/player-account/password
 GET  /api/player-account/queue
 POST /api/player-account/queue-commands
 POST /api/player-account/logout
+GET  /api/player-avatars/<64 位小写十六进制引用>.webp
 ```
 
-修改资料、密码和排队状态需要会话 Cookie 与 `X-CSRF-Token`。QQ 只能在网页修改，并要求再次输入当前密码。个人排队命令的 QQ 由服务端根据登录账户填写，客户端不能指定或替换；最终操作仍由现场终端校验。
+修改资料、头像、密码和排队状态需要会话 Cookie 与 `X-CSRF-Token`。头像上传还要求当前资料修订号，原图最大 8 MB；服务端解码、中心裁切并重新编码，不直接公开原始文件。QQ 只能在网页修改，并要求再次输入当前密码。个人排队命令的 QQ 由服务端根据登录账户填写，客户端不能指定或替换；最终操作仍由现场终端校验。
 
 终端二维码对应的移动设备登记接口使用短时会话令牌，不使用 Bot 令牌：
 
@@ -142,9 +147,13 @@ GET   /api/queue-management/commands/<command_id>
 PATCH /api/queue-management/profiles/<profile_id>
 POST  /api/queue-management/profiles/<profile_id>/password
 PATCH /api/queue-management/terminal-policy
+PATCH /api/queue-management/terminal-settings
+PATCH /api/queue-management/registration-availability
+PATCH /api/queue-management/machine-status
+GET   /api/queue-management/logs
 ```
 
-管理命令只进入待执行命令表，不直接改写 `queue_snapshot`。现场终端会复核队列批次、登记上下文、机台稳定身份和配置修订号；过期或冲突请求返回拒绝结果。`/api/queue-management/overview` 返回完整私有队列和玩家资料，只能从受控管理 App 调用。
+管理命令只进入待执行命令表，不直接改写 `queue_snapshot`。现场终端会复核队列批次、登记上下文、机台稳定身份和配置修订号；过期或冲突请求返回拒绝结果。设置接口覆盖登记开放状态、营业时间、机台分组与完整配置、机台停止状态和已经开放的终端策略。同步总开关、同步模式、服务地址和终端令牌仍由现场终端维护，不通过管理 API 迁移。`/api/queue-management/overview` 和 `/logs` 返回完整私有数据，只能从受控管理 App 调用。
 
 当公开快照中的 `onebot_sync_enabled` 为 `false` 时，上述所有 Bot 接口返回 `503 QQ Bot 联动已关闭`。服务器保留玩家资料，但会拒绝待执行命令、清除当前通知收件关系，并且不会在重新开启后补发关闭期间的事件。
 
@@ -226,8 +235,8 @@ Windows PowerShell 激活命令为 `.venv\Scripts\Activate.ps1`。
 ## Docker 部署
 
 1. 复制 `.env.example` 为 `.env`，分别生成终端、Bot 和管理后台令牌。
-2. 设置稳定的 `QUEUE_PROFILE_SCOPE_ID`。
-3. 运行 `docker compose up -d --build`。
+2. 设置稳定的 `QUEUE_PROFILE_SCOPE_ID`；默认 `/app/data/player-avatars` 会与 SQLite 共用 `queue-status-data` 持久卷。
+3. 运行 `docker compose up -d --build`，确认镜像已经安装 Pillow。
 4. 将 `nginx-location.conf.example` 中的 location 加入自己的 HTTPS 站点。
 5. 执行 `nginx -t` 并重载 Nginx。
 6. 访问 `https://example.com/queue-api-healthz` 验证服务（将域名替换为自己的域名）。
@@ -237,7 +246,7 @@ Windows PowerShell 激活命令为 `.venv\Scripts\Activate.ps1`。
 1. 将 `app.py` 和 `requirements.txt` 部署到 `/opt/maimai-queue-status`。
 2. 在该目录创建 `venv` 并安装依赖。
 3. 创建仅 root 可读的 `/etc/maimai-queue-status.env`，填写上述环境变量。
-4. 创建仅 `maimaiqueue` 可访问的数据目录：`install -d -o maimaiqueue -g maimaiqueue -m 0700 /var/lib/maimai-queue-status`。若已有 `queue.db`、`queue.db-wal` 或 `queue.db-shm`，将它们的属主改为 `maimaiqueue:maimaiqueue`，权限改为 `0600`。
+4. 创建仅 `maimaiqueue` 可访问的数据目录和头像目录：`install -d -o maimaiqueue -g maimaiqueue -m 0700 /var/lib/maimai-queue-status /var/lib/maimai-queue-status/player-avatars`。若已有 `queue.db`、`queue.db-wal` 或 `queue.db-shm`，将它们的属主改为 `maimaiqueue:maimaiqueue`，权限改为 `0600`。
 5. 安装 `maimai-queue-status.service`，执行 `systemctl daemon-reload` 和 `systemctl enable --now maimai-queue-status`。
 
 服务单元使用 `UMask=0077`，确保以后创建的 SQLite 数据库、WAL 和 SHM 文件不会被其他本机用户读取。调整既有文件权限后应重启服务，并确认 `ls -la /var/lib/maimai-queue-status` 中目录为 `drwx------`、文件为 `-rw-------`。
@@ -284,7 +293,7 @@ docker compose logs --tail=100 maimai-queue-status
 
 ### 2. 更新 Nginx 路由
 
-把当前 [nginx-location.conf.example](./nginx-location.conf.example) 中的 `/api/queue-online/`、`/api/queue-mobile/`、`/api/queue-bot/`、`/api/queue-terminal/` 和 `/api/queue-management/` location 合并到现有 HTTPS 站点。不要用示例文件覆盖站点中的证书、静态网站或其他 location。随后执行：
+把当前 [nginx-location.conf.example](./nginx-location.conf.example) 中的 `/api/queue-online/`、`/api/queue-mobile/`、`/api/queue-bot/`、`/api/queue-terminal/`、`/api/queue-management/`、`/api/player-account/` 和 `/api/player-avatars/` location 合并到现有 HTTPS 站点。头像上传的精确路径 `/api/player-account/avatar` 需要 `client_max_body_size 9m`，其他账户接口继续使用 `1m`。不要用示例文件覆盖站点中的证书、静态网站或其他 location。随后执行：
 
 ```bash
 sudo nginx -t
@@ -298,13 +307,15 @@ sudo systemctl reload nginx
 ```bash
 curl -i https://example.com/queue-api-healthz
 curl -i https://example.com/api/queue-management/overview
+curl -i -X POST https://example.com/api/player-account/avatar
+curl -i https://example.com/api/player-avatars/0000000000000000000000000000000000000000000000000000000000000000.webp
 curl -i -X POST -H 'Content-Type: application/json' \
   -d '{"qq":"00000"}' https://example.com/api/queue-online/profile
 curl -i https://example.com/api/queue-mobile/sessions/invalid-token
 curl -i 'https://example.com/api/queue-bot/events?after=0&limit=1'
 ```
 
-第一条应返回 `200`。第二条故意不带管理令牌，应返回 `401` 和“管理后台认证失败”；带正确管理令牌时应返回 `200` 或现场终端尚未上传新版快照时的明确状态。第三条应返回后端 JSON；测试 QQ 不存在时通常为 `404 PROFILE_NOT_FOUND`，这证明网站线上登记路由已经生效。第四条应返回后端 JSON `404` 和“没有找到这次移动设备登记”，证明移动登记路由已经生效。随后无令牌访问 Bot 路由应返回 `401` 和“Bot 认证失败”。其他结果的含义如下：
+第一条应返回 `200`。第二条故意不带管理令牌，应返回 `401` 和“管理后台认证失败”；带正确管理令牌时应返回 `200` 或现场终端尚未上传新版快照时的明确状态。第三条未登录上传头像应返回 JSON `401`；第四条不存在的头像应返回 JSON `404`。随后线上登记测试 QQ 不存在时通常返回 `404 PROFILE_NOT_FOUND`，移动登记无效令牌返回 JSON `404`，无令牌访问 Bot 路由返回 `401` 和“Bot 认证失败”。其他结果的含义如下：
 
 - `404 接口不存在`：新版 `app.py` 或 Nginx 的 `/api/queue-bot/` 路由尚未部署。
 - `503 服务器鉴权配置无效`：Bot 令牌缺失、少于 32 字节，或与终端令牌相同。

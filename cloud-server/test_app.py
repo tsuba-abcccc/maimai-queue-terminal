@@ -4,12 +4,20 @@ import tempfile
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 from threading import Barrier
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+from urllib.parse import urlsplit
 from uuid import UUID
 
-from app import compact_middle_dots, create_app, initialize_database
+from app import (
+    ValidationError,
+    compact_middle_dots,
+    create_app,
+    initialize_database,
+    normalize_avatar_upload,
+)
 
 
 class QueueStatusApiTest(unittest.TestCase):
@@ -342,6 +350,154 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(200, command_status.status_code)
         self.assertEqual("PENDING", command_status.get_json()["status"])
         self.assertEqual(404, anonymous_status.status_code)
+
+    def test_player_account_avatar_upload_is_processed_and_synced_to_terminal(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed in this test environment")
+        snapshot = self.remote_ready_snapshot()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        ).get_json()
+        completed = self.client.post(
+            f"/api/player-account/bindings/{binding['binding_token']}/complete",
+            json={"password": "avatar-password"},
+        )
+        profile = completed.get_json()["account"]["profile"]
+        csrf = self.client.get_cookie("maimai_q_session_csrf").value
+
+        with self.app.test_client() as anonymous_client:
+            unauthenticated = anonymous_client.post(
+                "/api/player-account/avatar",
+                data={
+                    "expected_profile_revision": str(profile["profile_revision"]),
+                    "avatar": (BytesIO(b"not-an-image"), "avatar.png"),
+                },
+                content_type="multipart/form-data",
+            )
+        self.assertEqual(401, unauthenticated.status_code)
+
+        missing_csrf = self.client.post(
+            "/api/player-account/avatar",
+            data={
+                "expected_profile_revision": str(profile["profile_revision"]),
+                "avatar": (BytesIO(b"not-an-image"), "avatar.png"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(403, missing_csrf.status_code)
+
+        invalid = self.client.post(
+            "/api/player-account/avatar",
+            data={
+                "expected_profile_revision": str(profile["profile_revision"]),
+                "avatar": (BytesIO(b"not-an-image"), "avatar.png"),
+            },
+            headers={"X-CSRF-Token": csrf},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(400, invalid.status_code)
+        self.assertEqual("AVATAR_INVALID", invalid.get_json()["code"])
+
+        source = BytesIO()
+        Image.new("RGB", (900, 450), (32, 116, 190)).save(source, format="PNG")
+        uploaded = self.client.post(
+            "/api/player-account/avatar",
+            data={
+                "expected_profile_revision": str(profile["profile_revision"]),
+                "avatar": (BytesIO(source.getvalue()), "gallery-image.png"),
+            },
+            headers={"X-CSRF-Token": csrf},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(200, uploaded.status_code)
+        uploaded_profile = uploaded.get_json()["account"]["profile"]
+        self.assertEqual(profile["profile_revision"] + 1, uploaded_profile["profile_revision"])
+        avatar_url = uploaded_profile["avatar_url"]
+        self.assertTrue(avatar_url.startswith("https://queue.example.test/api/player-avatars/"))
+
+        avatar_response = self.client.get(urlsplit(avatar_url).path)
+        self.assertEqual(200, avatar_response.status_code)
+        self.assertEqual("image/webp", avatar_response.mimetype)
+        self.assertIn("immutable", avatar_response.headers["Cache-Control"])
+        self.assertEqual("nosniff", avatar_response.headers["X-Content-Type-Options"])
+        avatar_bytes = avatar_response.get_data()
+        avatar_response.close()
+        with Image.open(BytesIO(avatar_bytes)) as processed:
+            self.assertEqual("WEBP", processed.format)
+            self.assertEqual((512, 512), processed.size)
+
+        terminal_profiles = self.client.get(
+            "/api/queue-terminal/profiles", headers=self.headers
+        )
+        self.assertEqual(200, terminal_profiles.status_code)
+        self.assertEqual(
+            avatar_url,
+            terminal_profiles.get_json()["profiles"][0]["avatar_url"],
+        )
+        current = self.client.get("/api/player-account")
+        self.assertEqual(avatar_url, current.get_json()["account"]["profile"]["avatar_url"])
+
+        reuploaded = self.client.post(
+            "/api/player-account/avatar",
+            data={
+                "expected_profile_revision": str(uploaded_profile["profile_revision"]),
+                "avatar": (BytesIO(source.getvalue()), "gallery-image.png"),
+            },
+            headers={"X-CSRF-Token": csrf},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(200, reuploaded.status_code)
+        reuploaded_profile = reuploaded.get_json()["account"]["profile"]
+        self.assertNotEqual(avatar_url, reuploaded_profile["avatar_url"])
+        self.assertEqual(
+            uploaded_profile["profile_revision"] + 1,
+            reuploaded_profile["profile_revision"],
+        )
+        old_avatar_response = self.client.get(urlsplit(avatar_url).path)
+        self.assertEqual(200, old_avatar_response.status_code)
+        old_avatar_response.close()
+        terminal_profiles = self.client.get(
+            "/api/queue-terminal/profiles", headers=self.headers
+        )
+        self.assertEqual(
+            reuploaded_profile["avatar_url"],
+            terminal_profiles.get_json()["profiles"][0]["avatar_url"],
+        )
+
+    def test_avatar_pixel_limit_is_checked_before_image_decode(self):
+        source = MagicMock(width=5001, height=5001)
+
+        with patch("PIL.Image.open", return_value=source):
+            with self.assertRaises(ValidationError) as raised:
+                normalize_avatar_upload(b"image-header")
+
+        self.assertEqual("AVATAR_INVALID", raised.exception.code)
+        source.load.assert_not_called()
+
+    def test_avatar_decompression_bomb_warning_is_reported_as_invalid(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed in this test environment")
+
+        with patch(
+            "PIL.Image.open",
+            side_effect=Image.DecompressionBombWarning("suspicious image dimensions"),
+        ):
+            with self.assertRaises(ValidationError) as raised:
+                normalize_avatar_upload(b"image-header")
+
+        self.assertEqual("AVATAR_INVALID", raised.exception.code)
 
     def test_bound_player_account_cannot_be_rebound_and_validation_uses_http_errors(self):
         snapshot = self.remote_ready_snapshot()
@@ -5587,6 +5743,369 @@ class QueueStatusApiTest(unittest.TestCase):
         snapshot["venue"] = {"id": venue_id}
         return snapshot, self.schema_eight_terminal_headers()
 
+    @staticmethod
+    def management_business_hours():
+        default_hours = {"opening_minutes": 600, "closing_minutes": 1320}
+        return {
+            "enabled": False,
+            "use_weekly_schedule": False,
+            "default_hours": default_hours,
+            "weekly_hours": {
+                day: dict(default_hours)
+                for day in (
+                    "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY",
+                    "FRIDAY", "SATURDAY", "SUNDAY",
+                )
+            },
+        }
+
+    def management_control_snapshot(
+        self,
+        *,
+        bound=True,
+        registration_open=True,
+        with_registration=False,
+    ):
+        snapshot, terminal_headers = self.management_schema_eight_snapshot(
+            with_registration=with_registration,
+            pending_check_in=False,
+        )
+        snapshot.update(
+            {
+                "registration_open": registration_open,
+                "management_policy_supported": True,
+                "management_app_bound": bound,
+                "management_policy_revision": 2,
+                "management_policy": {
+                    "allow_online_registration": True,
+                    "allow_defer_one_round": True,
+                    "allow_temporary_leave": True,
+                    "onebot_sync_enabled": True,
+                },
+                "management_settings_supported": True,
+                "management_settings_revision": 3,
+                "show_common_play_preview": True,
+                "registration_control_open": registration_open,
+                "business_hours_settings": self.management_business_hours(),
+            }
+        )
+        return snapshot, terminal_headers
+
+    def management_terminal_settings_body(self, snapshot, request_id):
+        machines = {
+            machine_id: {
+                "stable_id": machine["stable_id"],
+                "group_id": machine["group_id"],
+                "remark": machine["remark"],
+                "configuration": copy.deepcopy(machine["configuration"]),
+            }
+            for machine_id, machine in snapshot["machines"].items()
+        }
+        return {
+            "request_id": request_id,
+            "expected_queue_id": snapshot["queue_id"],
+            "expected_settings_revision": snapshot["management_settings_revision"],
+            "expected_policy_revision": snapshot["management_policy_revision"],
+            "expected_machine_configuration_revision": snapshot[
+                "machine_configuration_revision"
+            ],
+            "expected_registration_open": snapshot["registration_control_open"],
+            "show_common_play_preview": False,
+            "business_hours": copy.deepcopy(snapshot["business_hours_settings"]),
+            "machine_groups": copy.deepcopy(snapshot["machine_groups"]),
+            "default_machine_group_id": snapshot["default_machine_group_id"],
+            "machines": machines,
+            "reason": "管理后台更新终端设置",
+        }
+
+    def management_registration_availability_body(
+        self, snapshot, request_id, *, registration_open
+    ):
+        return {
+            "request_id": request_id,
+            "expected_queue_id": snapshot["queue_id"],
+            "expected_queue_revision": snapshot["revision"],
+            "expected_machine_configuration_revision": snapshot[
+                "machine_configuration_revision"
+            ],
+            "expected_registration_open": snapshot["registration_control_open"],
+            "registration_open": registration_open,
+            "expected_registration_ids": sorted(
+                registration["registration_id"]
+                for machine in snapshot["machines"].values()
+                for registration in (
+                    machine["playing"]
+                    + [
+                        item
+                        for position in machine["waiting_positions"]
+                        for item in position["registrations"]
+                    ]
+                )
+            ),
+            "confirm_clear_queue": not registration_open,
+            "reason": (
+                "管理后台开启登记排队"
+                if registration_open
+                else "管理后台关闭登记排队"
+            ),
+        }
+
+    def management_machine_status_body(self, snapshot, request_id):
+        machine = snapshot["machines"]["A"]
+        return {
+            "request_id": request_id,
+            "expected_queue_id": snapshot["queue_id"],
+            "expected_machine_configuration_revision": snapshot[
+                "machine_configuration_revision"
+            ],
+            "machine_id": "A",
+            "expected_machine_stable_id": machine["stable_id"],
+            "expected_operational": True,
+            "operational": False,
+            "stop_reason": "OTHER",
+            "stop_reason_detail": "临时检修",
+            "reason": "管理后台停止机台",
+        }
+
+    def test_management_sensitive_settings_require_takeover_and_logs_use_management_auth(self):
+        snapshot, terminal_headers = self.management_control_snapshot(bound=False)
+        snapshot["recent_events"] = [
+            self.event(
+                "00000000-0000-0000-0000-000000000980",
+                "REGISTRATION_UPDATED",
+                1_000_100,
+            )
+        ]
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=terminal_headers
+            ).status_code,
+        )
+
+        settings = self.client.patch(
+            "/api/queue-management/terminal-settings",
+            json=self.management_terminal_settings_body(
+                snapshot, "00000000-0000-0000-0000-000000000981"
+            ),
+            headers=self.management_headers,
+        )
+        registration = self.client.patch(
+            "/api/queue-management/registration-availability",
+            json=self.management_registration_availability_body(
+                snapshot,
+                "00000000-0000-0000-0000-000000000982",
+                registration_open=False,
+            ),
+            headers=self.management_headers,
+        )
+        machine = self.client.patch(
+            "/api/queue-management/machine-status",
+            json=self.management_machine_status_body(
+                snapshot, "00000000-0000-0000-0000-000000000983"
+            ),
+            headers=self.management_headers,
+        )
+        for response in (settings, registration, machine):
+            self.assertEqual(409, response.status_code)
+            self.assertIn("接管", response.get_json()["error"])
+
+        self.assertEqual(
+            401,
+            self.client.get("/api/queue-management/logs").status_code,
+        )
+        self.assertEqual(
+            401,
+            self.client.get(
+                "/api/queue-management/logs", headers=self.bot_headers
+            ).status_code,
+        )
+        logs = self.client.get(
+            "/api/queue-management/logs", headers=self.management_headers
+        )
+        self.assertEqual(200, logs.status_code)
+        self.assertEqual("REGISTRATION_UPDATED", logs.get_json()["logs"][0]["type"])
+
+    def test_management_registration_availability_is_confirmed_context_bound_and_idempotent(self):
+        snapshot, terminal_headers = self.management_control_snapshot(
+            with_registration=True
+        )
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=terminal_headers
+            ).status_code,
+        )
+        body = self.management_registration_availability_body(
+            snapshot,
+            "00000000-0000-0000-0000-000000000984",
+            registration_open=False,
+        )
+
+        duplicate_ids = copy.deepcopy(body)
+        duplicate_ids["expected_registration_ids"].append(
+            duplicate_ids["expected_registration_ids"][0]
+        )
+        self.assertEqual(
+            400,
+            self.client.patch(
+                "/api/queue-management/registration-availability",
+                json=duplicate_ids,
+                headers=self.management_headers,
+            ).status_code,
+        )
+        missing_confirmation = copy.deepcopy(body)
+        missing_confirmation["confirm_clear_queue"] = False
+        self.assertEqual(
+            400,
+            self.client.patch(
+                "/api/queue-management/registration-availability",
+                json=missing_confirmation,
+                headers=self.management_headers,
+            ).status_code,
+        )
+        stale_context = copy.deepcopy(body)
+        stale_context["expected_queue_revision"] += 1
+        self.assertEqual(
+            409,
+            self.client.patch(
+                "/api/queue-management/registration-availability",
+                json=stale_context,
+                headers=self.management_headers,
+            ).status_code,
+        )
+
+        created = self.client.patch(
+            "/api/queue-management/registration-availability",
+            json=body,
+            headers=self.management_headers,
+        )
+        repeated = self.client.patch(
+            "/api/queue-management/registration-availability",
+            json=body,
+            headers=self.management_headers,
+        )
+        self.assertEqual(202, created.status_code)
+        self.assertEqual(200, repeated.status_code)
+        payload = created.get_json()["payload"]
+        self.assertEqual("MANAGEMENT_APP", payload["operation_source"])
+        self.assertTrue(payload["confirm_clear_queue"])
+        self.assertEqual(
+            created.get_json()["command_id"], repeated.get_json()["command_id"]
+        )
+
+    def test_management_terminal_settings_validate_layout_revision_and_risk(self):
+        snapshot, terminal_headers = self.management_control_snapshot()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=terminal_headers
+            ).status_code,
+        )
+        body = self.management_terminal_settings_body(
+            snapshot, "00000000-0000-0000-0000-000000000985"
+        )
+
+        malformed = copy.deepcopy(body)
+        malformed["machines"]["B"] = malformed["machines"].pop("A")
+        self.assertEqual(
+            400,
+            self.client.patch(
+                "/api/queue-management/terminal-settings",
+                json=malformed,
+                headers=self.management_headers,
+            ).status_code,
+        )
+        stale_revision = copy.deepcopy(body)
+        stale_revision["expected_settings_revision"] += 1
+        self.assertEqual(
+            409,
+            self.client.patch(
+                "/api/queue-management/terminal-settings",
+                json=stale_revision,
+                headers=self.management_headers,
+            ).status_code,
+        )
+        risk_sensitive = copy.deepcopy(body)
+        risk_sensitive["machines"]["A"]["configuration"]["capacity"] = 1
+        self.assertEqual(
+            409,
+            self.client.patch(
+                "/api/queue-management/terminal-settings",
+                json=risk_sensitive,
+                headers=self.management_headers,
+            ).status_code,
+        )
+
+        created = self.client.patch(
+            "/api/queue-management/terminal-settings",
+            json=body,
+            headers=self.management_headers,
+        )
+        repeated = self.client.patch(
+            "/api/queue-management/terminal-settings",
+            json=body,
+            headers=self.management_headers,
+        )
+        self.assertEqual(202, created.status_code)
+        self.assertEqual(200, repeated.status_code)
+        self.assertEqual(4, created.get_json()["payload"]["next_settings_revision"])
+        self.assertEqual(
+            created.get_json()["command_id"], repeated.get_json()["command_id"]
+        )
+
+    def test_management_machine_status_validates_identity_detail_and_idempotency(self):
+        snapshot, terminal_headers = self.management_control_snapshot()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=terminal_headers
+            ).status_code,
+        )
+        body = self.management_machine_status_body(
+            snapshot, "00000000-0000-0000-0000-000000000986"
+        )
+
+        overlong_detail = copy.deepcopy(body)
+        overlong_detail["stop_reason_detail"] = "字" * 41
+        self.assertEqual(
+            400,
+            self.client.patch(
+                "/api/queue-management/machine-status",
+                json=overlong_detail,
+                headers=self.management_headers,
+            ).status_code,
+        )
+        changed_identity = copy.deepcopy(body)
+        changed_identity["expected_machine_stable_id"] = "f" * 32
+        self.assertEqual(
+            409,
+            self.client.patch(
+                "/api/queue-management/machine-status",
+                json=changed_identity,
+                headers=self.management_headers,
+            ).status_code,
+        )
+
+        created = self.client.patch(
+            "/api/queue-management/machine-status",
+            json=body,
+            headers=self.management_headers,
+        )
+        repeated = self.client.patch(
+            "/api/queue-management/machine-status",
+            json=body,
+            headers=self.management_headers,
+        )
+        self.assertEqual(202, created.status_code)
+        self.assertEqual(200, repeated.status_code)
+        payload = created.get_json()["payload"]
+        self.assertEqual("OTHER", payload["stop_reason"])
+        self.assertEqual("临时检修", payload["stop_reason_detail"])
+        self.assertEqual(
+            created.get_json()["command_id"], repeated.get_json()["command_id"]
+        )
+
     def test_management_overview_requires_its_own_token_and_contains_private_queue_data(self):
         snapshot, terminal_headers = self.management_schema_eight_snapshot(
             with_registration=True,
@@ -6239,7 +6758,7 @@ class QueueStatusApiTest(unittest.TestCase):
                 json={
                     "bot_qq": "87654321",
                     "bot_version": "0.3.13",
-                    "website_version": "v0.12.3",
+                    "website_version": "v0.13.2",
                 },
                 headers=self.bot_headers,
             )
@@ -6247,7 +6766,7 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertEqual(204, published.status_code)
         self.assertEqual(200, identity.status_code)
-        self.assertEqual("0.12.3", identity.get_json()["website_version"])
+        self.assertEqual("0.13.2", identity.get_json()["website_version"])
         self.assertEqual(200, versions.status_code)
         payload = versions.get_json()
         self.assertEqual(1_234_000, payload["checked_at"])
@@ -6256,14 +6775,14 @@ class QueueStatusApiTest(unittest.TestCase):
             {
                 "name": "现场终端",
                 "current_version": "0.10.0",
-                "latest_version": "0.13.1",
+                "latest_version": "0.13.2",
                 "status": "UPDATE_AVAILABLE",
                 "updated_at": 1_234_000,
             },
             payload["components"]["terminal"],
         )
         self.assertEqual(
-            "0.12.3", payload["components"]["website"]["latest_version"]
+            "0.13.2", payload["components"]["website"]["latest_version"]
         )
         self.assertEqual("LATEST", payload["components"]["website"]["status"])
         self.assertEqual("LATEST", payload["components"]["bot"]["status"])

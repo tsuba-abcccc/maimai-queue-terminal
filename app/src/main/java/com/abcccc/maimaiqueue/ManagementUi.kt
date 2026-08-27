@@ -117,6 +117,9 @@ internal fun ManagementApp() {
     var reorderMachine by remember { mutableStateOf<ManagementMachine?>(null) }
     var creatingRegistration by remember { mutableStateOf(false) }
     var updatingTerminalPolicy by remember { mutableStateOf(false) }
+    var updatingTerminalSettings by remember { mutableStateOf(false) }
+    var updatingRegistrationAvailability by remember { mutableStateOf(false) }
+    var updatingMachineStatus by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     fun refresh() {
@@ -188,7 +191,7 @@ internal fun ManagementApp() {
                 containerColor = CardBackground,
                 contentColor = SystemBlue
             ) {
-                listOf("队列", "玩家资料", "权限").forEachIndexed { index, label ->
+                listOf("队列", "玩家资料", "设置", "日志").forEachIndexed { index, label ->
                     Tab(
                         selected = selectedTab == index,
                         onClick = { selectedTab = index },
@@ -281,44 +284,126 @@ internal fun ManagementApp() {
                     onEdit = { editingProfile = it },
                     onPassword = { passwordProfile = it }
                 )
-                else -> ManagementCapabilitiesPage(
+                2 -> ManagementSettingsPage(
                     overview = overview,
                     loading = loading,
-                    busy = updatingTerminalPolicy,
-                    onSubmit = { policy ->
+                    settingsBusy = updatingTerminalSettings,
+                    registrationBusy = updatingRegistrationAvailability,
+                    statusBusy = updatingMachineStatus,
+                    policyBusy = updatingTerminalPolicy,
+                    onPolicySubmit = { policy ->
                         overview?.let { currentOverview ->
                             updatingTerminalPolicy = true
                             scope.launch {
-                            runCatching {
-                                ManagementApi(endpoint, token).updateTerminalPolicy(
-                                    expectedQueueId = currentOverview.queueId,
-                                    expectedPolicyRevision = currentOverview.terminalPolicy.revision,
-                                    managementAppBound = policy.managementAppBound,
-                                    allowOnlineRegistration = policy.allowOnlineRegistration,
-                                    allowDeferOneRound = policy.allowDeferOneRound,
-                                    allowTemporaryLeave = policy.allowTemporaryLeave,
-                                    oneBotSyncEnabled = policy.oneBotSyncEnabled,
-                                    reason = if (policy.managementAppBound) {
-                                        "管理后台接管终端敏感策略"
-                                    } else {
-                                        "管理后台解除终端敏感策略接管"
-                                    }
-                                )
-                            }.onSuccess { result ->
-                                error = if (result.status.equals("REJECTED", true)) {
-                                    result.detail ?: "终端策略修改未执行"
-                                } else {
-                                    "终端策略命令已发送，等待现场终端处理。"
+                                runCatching {
+                                    ManagementApi(endpoint, token).updateTerminalPolicy(
+                                        expectedQueueId = currentOverview.queueId,
+                                        expectedPolicyRevision = currentOverview.terminalPolicy.revision,
+                                        managementAppBound = policy.managementAppBound,
+                                        allowOnlineRegistration = policy.allowOnlineRegistration,
+                                        allowDeferOneRound = policy.allowDeferOneRound,
+                                        allowTemporaryLeave = policy.allowTemporaryLeave,
+                                        oneBotSyncEnabled = policy.oneBotSyncEnabled,
+                                        reason = if (policy.managementAppBound) "管理后台接管终端敏感策略" else "管理后台解除终端敏感策略接管"
+                                    )
+                                }.onSuccess { result ->
+                                    error = if (result.status.equals("REJECTED", true)) result.detail ?: "终端策略修改未执行" else "终端策略命令已发送，等待现场终端处理。"
+                                    refresh()
+                                }.onFailure { throwable ->
+                                    error = throwable.message ?: "终端策略修改请求失败"
                                 }
-                                refresh()
-                            }.onFailure { throwable ->
-                                error = throwable.message ?: "终端策略修改请求失败"
-                            }
                                 updatingTerminalPolicy = false
+                            }
+                        }
+                    },
+                    onRegistrationOpenChange = { registrationOpen ->
+                        overview?.let { currentOverview ->
+                            updatingRegistrationAvailability = true
+                            scope.launch {
+                                runCatching {
+                                    ManagementApi(endpoint, token).updateRegistrationAvailability(
+                                        expectedQueueId = currentOverview.queueId,
+                                        expectedQueueRevision = currentOverview.queueRevision,
+                                        expectedMachineConfigurationRevision = currentOverview.machineConfigurationRevision,
+                                        expectedRegistrationOpen = currentOverview.registrationOpen,
+                                        registrationOpen = registrationOpen,
+                                        expectedRegistrationIds = currentOverview.machines.flatMap { machine ->
+                                            machine.playing.map { it.registrationId } + machine.waiting.map { it.registrationId }
+                                        },
+                                        confirmClearQueue = !registrationOpen,
+                                        reason = if (registrationOpen) "管理后台开启登记排队" else "管理后台关闭登记排队"
+                                    )
+                                }.onSuccess { result ->
+                                    error = if (result.status.equals("REJECTED", true)) result.detail ?: "登记开关未执行" else "登记开关命令已发送，等待现场终端处理。"
+                                    refresh()
+                                }.onFailure { throwable ->
+                                    error = throwable.message ?: "登记开关请求失败"
+                                }
+                                updatingRegistrationAvailability = false
+                            }
+                        }
+                    },
+                    onSave = { draft ->
+                        overview?.let { currentOverview ->
+                            updatingTerminalSettings = true
+                            scope.launch {
+                                runCatching {
+                                    ManagementApi(endpoint, token).updateTerminalSettings(
+                                        expectedQueueId = currentOverview.queueId,
+                                        expectedSettingsRevision = currentOverview.terminalSettings.revision,
+                                        expectedPolicyRevision = currentOverview.terminalPolicy.revision,
+                                        expectedMachineConfigurationRevision = currentOverview.machineConfigurationRevision,
+                                        expectedRegistrationOpen = currentOverview.registrationOpen,
+                                        showCommonPlayPreview = draft.showCommonPlayPreview,
+                                        businessHours = draft.businessHours,
+                                        machineGroups = draft.machineGroups,
+                                        defaultMachineGroupId = draft.defaultMachineGroupId,
+                                        machines = draft.machines,
+                                        reason = "管理后台更新营业时间、预览和机台设置"
+                                    )
+                                }.onSuccess { result ->
+                                    error = if (result.status.equals("REJECTED", true)) result.detail ?: "终端设置未执行" else "终端设置命令已发送，等待现场终端处理。"
+                                    refresh()
+                                }.onFailure { throwable ->
+                                    error = throwable.message ?: "终端设置请求失败"
+                                }
+                                updatingTerminalSettings = false
+                            }
+                        }
+                    },
+                    onMachineStatus = { machine, operational, reason, detail ->
+                        overview?.let { currentOverview ->
+                            updatingMachineStatus = true
+                            scope.launch {
+                                runCatching {
+                                    ManagementApi(endpoint, token).updateMachineStatus(
+                                        expectedQueueId = currentOverview.queueId,
+                                        expectedMachineConfigurationRevision = currentOverview.machineConfigurationRevision,
+                                        machine = machine,
+                                        operational = operational,
+                                        stopReason = reason,
+                                        stopReasonDetail = detail,
+                                        reason = if (operational) "管理后台恢复机台" else "管理后台停止机台"
+                                    )
+                                }.onSuccess { result ->
+                                    error = if (result.status.equals("REJECTED", true)) result.detail ?: "机台状态未执行" else "机台状态命令已发送，等待现场终端处理。"
+                                    refresh()
+                                }.onFailure { throwable ->
+                                    error = throwable.message ?: "机台状态请求失败"
+                                }
+                                updatingMachineStatus = false
                             }
                         }
                     }
                 )
+                3 -> ManagementLogsPage(
+                    endpoint = endpoint,
+                    token = token,
+                    overview = overview,
+                    loadingOverview = loading,
+                    onError = { detail -> if (detail != null) error = detail }
+                )
+                else -> EmptyManagementPage("请选择管理页面")
             }
         }
     }
@@ -1809,20 +1894,20 @@ private fun ManagementPolicySwitchRow(
 }
 
 @Composable
-private fun LoadingManagementPage() {
+internal fun LoadingManagementPage() {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         CircularProgressIndicator(color = SystemBlue)
     }
 }
 
 @Composable
-private fun EmptyManagementPage(text: String) {
+internal fun EmptyManagementPage(text: String) {
     Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
         Text(text, color = SecondaryText, style = MaterialTheme.typography.bodyMedium)
     }
 }
 
-private fun formatManagementTime(millis: Long): String {
+internal fun formatManagementTime(millis: Long): String {
     if (millis <= 0L) return "尚未同步"
     return SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(millis))
 }

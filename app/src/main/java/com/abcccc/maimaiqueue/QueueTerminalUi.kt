@@ -111,6 +111,7 @@ import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
@@ -587,6 +588,9 @@ internal fun RegistrationApp() {
             managementPolicySupported = true,
             managementAppBound = queueRuleSettings.managementAppBound,
             managementPolicyRevision = queueRuleSettings.managementPolicyRevision,
+            managementSettingsSupported = true,
+            managementSettingsRevision = queueRuleSettings.managementSettingsRevision,
+            businessHoursSettings = queueRuleSettings.businessHours,
             businessHours = QueuePublicBusinessHours(
                 enabled = currentBusinessHoursStatus.enabled,
                 outsideBusinessHours = currentBusinessHoursStatus.outsideBusinessHours,
@@ -1169,15 +1173,11 @@ internal fun RegistrationApp() {
         fromManagementCommand: Boolean = false
     ): Boolean {
         val previousSettings = queueRuleSettings
-        val managementSensitiveChanged =
-            previousSettings.allowOnlineRegistration != requestedSettings.allowOnlineRegistration ||
-                previousSettings.allowDeferOneRound != requestedSettings.allowDeferOneRound ||
-                previousSettings.allowTemporaryLeave != requestedSettings.allowTemporaryLeave ||
-                previousSettings.oneBotSyncEnabled != requestedSettings.oneBotSyncEnabled ||
-                previousSettings.managementAppBound != requestedSettings.managementAppBound ||
-                previousSettings.managementPolicyRevision != requestedSettings.managementPolicyRevision
+        val managementControlledSettingsChanged =
+            previousSettings.managementControlledContent() !=
+                requestedSettings.managementControlledContent()
         if (previousSettings.managementAppBound &&
-            managementSensitiveChanged &&
+            managementControlledSettingsChanged &&
             !fromManagementCommand
         ) {
             Toast.makeText(
@@ -1231,7 +1231,10 @@ internal fun RegistrationApp() {
             ).show()
             return false
         }
-        if (riskSensitiveConfigurationChanged && remoteTerminalCommandPollMutex.isLocked) {
+        if (riskSensitiveConfigurationChanged &&
+            remoteTerminalCommandPollMutex.isLocked &&
+            !fromManagementCommand
+        ) {
             Toast.makeText(
                 context,
                 panguSpacing("终端正在处理远程操作，请稍后再保存机台配置。"),
@@ -1250,9 +1253,23 @@ internal fun RegistrationApp() {
             ).show()
             return false
         }
-        val settings = withUpdatedMachineConfigurationRevision(
+        val settingsWithoutManagementRevision = withUpdatedMachineConfigurationRevision(
             previous = previousSettings,
             updated = normalizedSettings
+        )
+        val normalizedManagedSettingsChanged =
+            previousSettings.managementControlledContent() !=
+                settingsWithoutManagementRevision.managementControlledContent()
+        val settings = settingsWithoutManagementRevision.copy(
+            managementSettingsRevision = when {
+                !normalizedManagedSettingsChanged ->
+                    previousSettings.managementSettingsRevision.coerceAtLeast(0L)
+                fromManagementCommand &&
+                    settingsWithoutManagementRevision.managementSettingsRevision ==
+                    previousSettings.managementSettingsRevision + 1L ->
+                    settingsWithoutManagementRevision.managementSettingsRevision
+                else -> (previousSettings.managementSettingsRevision + 1L).coerceAtLeast(0L)
+            }
         )
         if (settings == queueRuleSettings) return true
         val newStableIds = settings.configuredMachineIds
@@ -1887,7 +1904,8 @@ internal fun RegistrationApp() {
     fun reportMachineStopped(
         machineId: MachineId,
         reason: MachineStopReason,
-        reasonDetail: String? = null
+        reasonDetail: String? = null,
+        source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL
     ) {
         val currentStatus = statusFor(machineId)
         val stoppedStatus = currentStatus.stop(reason, System.currentTimeMillis(), reasonDetail)
@@ -1919,6 +1937,7 @@ internal fun RegistrationApp() {
                     )
                     append(stoppedQueueDetail)
                 },
+                source = source,
                 publicEventType = PublicQueueEventType.MACHINE_STOPPED,
                 affectedRegistrationKeys = registrations.map { it.key }
             )
@@ -1937,7 +1956,10 @@ internal fun RegistrationApp() {
         screen = Screen.HOME
     }
 
-    fun restoreMachine(machineId: MachineId) {
+    fun restoreMachine(
+        machineId: MachineId,
+        source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL
+    ) {
         val stoppedStatus = statusFor(machineId)
         if (stoppedStatus.isOperational) return
         val restoredAtMillis = System.currentTimeMillis()
@@ -1972,6 +1994,7 @@ internal fun RegistrationApp() {
                 category = auditCategoryFor(machineId),
                 title = "${configuredMachineName(machineId)} 已恢复正常使用",
                 detail = restoredQueueDetail,
+                source = source,
                 publicEventType = PublicQueueEventType.MACHINE_RESTORED,
                 affectedRegistrationKeys = restoredQueue.allRegistrations.map { it.key }
             )
@@ -2226,7 +2249,9 @@ internal fun RegistrationApp() {
         }
     }
 
-    fun reopenRegistration() {
+    fun reopenRegistration(
+        source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL
+    ) {
         if (registrationOpen) return
         val refreshedSettings = normalizeQueueRuleSettingsForRuntime(
             settings = queueRuleSettingsRepository.getSettings(),
@@ -2253,17 +2278,21 @@ internal fun RegistrationApp() {
                 category = AuditLogCategory.SYSTEM,
                 title = "重新开放登记排队",
                 detail = "已重新载入机台配置和状态，并开始新的空队列；现在可以创建新的排队登记。",
+                source = source,
                 publicEventType = PublicQueueEventType.REGISTRATION_OPENED
             )
         )
         showHomeOperationFeedback(
             title = "登记排队已启用",
             detail = "机台配置和状态已刷新，现在可以创建新的排队登记。",
-            contextLabel = "现场终端"
+            contextLabel = if (source == AuditLogSource.MANAGEMENT_APP) "管理后台" else "现场终端"
         )
     }
 
-    fun closeRegistration(businessHoursTrigger: BusinessHoursCloseTrigger? = null) {
+    fun closeRegistration(
+        businessHoursTrigger: BusinessHoursCloseTrigger? = null,
+        source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL
+    ) {
         if (!registrationOpen) return
         val automaticBusinessHours = businessHoursTrigger != null
         val removedRegistrations = configuredMachineIds.flatMap { queueFor(it).allRegistrations }
@@ -2275,10 +2304,10 @@ internal fun RegistrationApp() {
                 configuredMachineIds.mapTo(mutableSetOf()) { it.name }
             ),
             context = QueueActionContext(
-                origin = if (automaticBusinessHours) {
-                    QueueActionOrigin.SYSTEM
-                } else {
-                    QueueActionOrigin.ON_SITE_TERMINAL
+                origin = when {
+                    automaticBusinessHours -> QueueActionOrigin.SYSTEM
+                    source == AuditLogSource.MANAGEMENT_APP -> QueueActionOrigin.MANAGEMENT_APP
+                    else -> QueueActionOrigin.ON_SITE_TERMINAL
                 },
                 policy = currentQueueEnginePolicy()
             )
@@ -2319,7 +2348,7 @@ internal fun RegistrationApp() {
                 source = if (automaticBusinessHours) {
                     AuditLogSource.SYSTEM_AUTOMATIC
                 } else {
-                    AuditLogSource.ON_SITE_TERMINAL
+                    source
                 },
                 publicEventType = PublicQueueEventType.REGISTRATION_CLOSED,
                 affectedRegistrationKeys = removedRegistrationKeys
@@ -2328,7 +2357,11 @@ internal fun RegistrationApp() {
         showHomeOperationFeedback(
             title = if (automaticBusinessHours) "营业结束，登记排队已关闭" else "登记排队已关闭",
             detail = detail,
-            contextLabel = if (automaticBusinessHours) "系统自动" else "现场终端",
+            contextLabel = when {
+                automaticBusinessHours -> "系统自动"
+                source == AuditLogSource.MANAGEMENT_APP -> "管理后台"
+                else -> "现场终端"
+            },
             tone = HomeSidePanelFeedbackTone.WARNING
         )
     }
@@ -3519,6 +3552,218 @@ internal fun RegistrationApp() {
                                 )
                             }
 
+                            is RegistrationAvailabilityCommand -> {
+                                val currentRegistrationIds = configuredMachineIds
+                                    .flatMap { machineId -> queueFor(machineId).allRegistrations }
+                                    .mapTo(mutableSetOf()) { registration ->
+                                        publicRegistrationId(queueId, registration.key)
+                                    }
+                                val detail = when {
+                                    command.queueId != queueId ->
+                                        "登记开关所属队列已经变化，请管理后台刷新后重试。"
+                                    !queueRuleSettings.managementAppBound ->
+                                        "现场终端已经解除管理后台接管，请重新绑定后再提交。"
+                                    command.expectedQueueRevision != queueRevision.get() ->
+                                        "现场队列已经更新，请管理后台刷新后重试。"
+                                    command.expectedMachineConfigurationRevision !=
+                                        queueRuleSettings.machineConfigurationRevision ->
+                                        "现场机台配置已经更新，请管理后台刷新后重试。"
+                                    command.expectedRegistrationOpen != registrationOpen ->
+                                        "登记开放状态已经更新，请管理后台刷新后重试。"
+                                    command.expectedRegistrationIds != currentRegistrationIds ->
+                                        "当前队列登记已经更新，请管理后台重新确认。"
+                                    else -> null
+                                }
+                                val applied = if (detail == null) {
+                                    if (command.registrationOpen) {
+                                        reopenRegistration(AuditLogSource.MANAGEMENT_APP)
+                                    } else {
+                                        closeRegistration(
+                                            source = AuditLogSource.MANAGEMENT_APP
+                                        )
+                                    }
+                                    registrationOpen == command.registrationOpen
+                                } else {
+                                    false
+                                }
+                                val resultDetail = if (applied) {
+                                    if (command.registrationOpen) {
+                                        "登记排队已由管理后台开启，并开始新的空队列。"
+                                    } else {
+                                        "登记排队已由管理后台关闭，确认时的队列登记已全部清空。"
+                                    }
+                                } else {
+                                    detail ?: "登记开放状态未能在终端更新。"
+                                }
+                                if (!persistTerminalCommandReceipt(
+                                        TerminalCommandReceipt(
+                                            commandId = command.commandId,
+                                            applied = applied,
+                                            detail = resultDetail
+                                        )
+                                    )
+                                ) {
+                                    localWriteFailureDetail =
+                                        "登记开关命令的执行结果暂时无法写入本机，应用将继续重试。"
+                                    localWriteFailureAtMillis = System.currentTimeMillis()
+                                    continue
+                                }
+                                localWriteFailureDetail = null
+                                completeRemoteCommand(
+                                    command.commandId,
+                                    applied = applied,
+                                    detail = resultDetail
+                                )
+                            }
+
+                            is TerminalSettingsUpdateCommand -> {
+                                val detail = when {
+                                    command.queueId != queueId ->
+                                        "终端设置所属队列已经变化，请管理后台刷新后重试。"
+                                    !queueRuleSettings.managementAppBound ->
+                                        "现场终端已经解除管理后台接管，请重新绑定后再提交。"
+                                    command.expectedPolicyRevision !=
+                                        queueRuleSettings.managementPolicyRevision ->
+                                        "终端接管策略已经更新，请管理后台刷新后重试。"
+                                    command.expectedSettingsRevision !=
+                                        queueRuleSettings.managementSettingsRevision ->
+                                        "终端设置已经更新，请管理后台刷新后重试。"
+                                    command.nextSettingsRevision !=
+                                        command.expectedSettingsRevision + 1L ->
+                                        "终端设置版本无效，未应用这次修改。"
+                                    command.expectedMachineConfigurationRevision !=
+                                        queueRuleSettings.machineConfigurationRevision ->
+                                        "现场机台配置已经更新，请管理后台刷新后重试。"
+                                    command.expectedRegistrationOpen != registrationOpen ->
+                                        "登记开放状态已经更新，请管理后台刷新后重试。"
+                                    else -> null
+                                }
+                                val applied = if (detail == null) {
+                                    val requested = queueRuleSettings.copy(
+                                        showCommonPlayPreview = command.showCommonPlayPreview,
+                                        businessHours = command.businessHours,
+                                        configuredMachineCount = command.configuredMachineCount,
+                                        machineConfigurations = MachineId.entries.associateWith {
+                                            machineId ->
+                                            command.machineConfigurations[machineId]
+                                                ?: DEFAULT_MACHINE_CONFIGURATIONS.getValue(machineId)
+                                        },
+                                        machineStableIds = MachineId.entries.associateWith {
+                                            machineId ->
+                                            command.machineStableIds[machineId]
+                                                ?: defaultMachineStableId(machineId)
+                                        },
+                                        machineGroupAssignments = MachineId.entries.associateWith {
+                                            machineId ->
+                                            command.machineGroupAssignments[machineId]
+                                                ?: command.defaultMachineGroupId
+                                        },
+                                        machineGroups = command.machineGroups,
+                                        defaultMachineGroupId = command.defaultMachineGroupId,
+                                        managementSettingsRevision = command.nextSettingsRevision
+                                    )
+                                    updateQueueRuleSettings(
+                                        requested,
+                                        fromManagementCommand = true
+                                    ) &&
+                                        queueRuleSettings.managementSettingsRevision ==
+                                        command.nextSettingsRevision
+                                } else {
+                                    false
+                                }
+                                val resultDetail = if (applied) {
+                                    "营业时间、机台配置和队列显示设置已由管理后台更新。"
+                                } else {
+                                    detail ?: "终端设置未能写入本机。"
+                                }
+                                if (!persistTerminalCommandReceipt(
+                                        TerminalCommandReceipt(
+                                            commandId = command.commandId,
+                                            applied = applied,
+                                            detail = resultDetail
+                                        )
+                                    )
+                                ) {
+                                    localWriteFailureDetail =
+                                        "终端设置命令的执行结果暂时无法写入本机，应用将继续重试。"
+                                    localWriteFailureAtMillis = System.currentTimeMillis()
+                                    continue
+                                }
+                                localWriteFailureDetail = null
+                                completeRemoteCommand(
+                                    command.commandId,
+                                    applied = applied,
+                                    detail = resultDetail
+                                )
+                            }
+
+                            is MachineStatusUpdateCommand -> {
+                                val currentStatus = statusFor(command.machineId)
+                                val detail = when {
+                                    command.queueId != queueId ->
+                                        "机台状态命令所属队列已经变化，请管理后台刷新后重试。"
+                                    !queueRuleSettings.managementAppBound ->
+                                        "现场终端已经解除管理后台接管，请重新绑定后再提交。"
+                                    command.machineId !in configuredMachineIds ->
+                                        "目标机台已经不存在，请管理后台刷新后重试。"
+                                    command.expectedMachineConfigurationRevision !=
+                                        queueRuleSettings.machineConfigurationRevision ->
+                                        "现场机台配置已经更新，请管理后台刷新后重试。"
+                                    command.machineStableId !=
+                                        queueRuleSettings.machineStableId(command.machineId) ->
+                                        "目标机台身份已经更新，请管理后台刷新后重试。"
+                                    command.expectedOperational != currentStatus.isOperational ->
+                                        "机台状态已经更新，请管理后台刷新后重试。"
+                                    else -> null
+                                }
+                                val applied = if (detail == null) {
+                                    if (command.operational) {
+                                        restoreMachine(
+                                            command.machineId,
+                                            AuditLogSource.MANAGEMENT_APP
+                                        )
+                                    } else {
+                                        reportMachineStopped(
+                                            command.machineId,
+                                            command.stopReason ?: MachineStopReason.OTHER,
+                                            command.stopReasonDetail,
+                                            AuditLogSource.MANAGEMENT_APP
+                                        )
+                                    }
+                                    statusFor(command.machineId).isOperational == command.operational
+                                } else {
+                                    false
+                                }
+                                val resultDetail = if (applied) {
+                                    if (command.operational) {
+                                        "${configuredMachineName(command.machineId)}已由管理后台恢复正常使用。"
+                                    } else {
+                                        "${configuredMachineName(command.machineId)}已由管理后台停止使用。"
+                                    }
+                                } else {
+                                    detail ?: "机台状态未能在终端更新。"
+                                }
+                                if (!persistTerminalCommandReceipt(
+                                        TerminalCommandReceipt(
+                                            commandId = command.commandId,
+                                            applied = applied,
+                                            detail = resultDetail
+                                        )
+                                    )
+                                ) {
+                                    localWriteFailureDetail =
+                                        "机台状态命令的执行结果暂时无法写入本机，应用将继续重试。"
+                                    localWriteFailureAtMillis = System.currentTimeMillis()
+                                    continue
+                                }
+                                localWriteFailureDetail = null
+                                completeRemoteCommand(
+                                    command.commandId,
+                                    applied = applied,
+                                    detail = resultDetail
+                                )
+                            }
+
                             is PlayerProfileUpdateCommand -> {
                                 if (
                                     command.source != RemoteQueueOperationSource.MANAGEMENT_APP &&
@@ -4448,9 +4693,7 @@ internal fun RegistrationApp() {
                                 val updated = queueRuleSettings.copy(
                                     queueSyncEndpoint = endpoint,
                                     queueSyncToken = token,
-                                    websiteSyncEnabled = syncEnabled,
-                                    oneBotSyncEnabled = syncEnabled &&
-                                        queueRuleSettings.oneBotSyncEnabled
+                                    websiteSyncEnabled = syncEnabled
                                 )
                                 queueRuleSettings = normalizeQueueRuleSettingsForRuntime(
                                     updated,
@@ -7470,8 +7713,7 @@ private fun QueueRuleSettingsScreen(
                         onCheckedChange = {
                             updateDraft(
                                 settings.copy(
-                                    websiteSyncEnabled = it,
-                                    oneBotSyncEnabled = settings.oneBotSyncEnabled && it
+                                    websiteSyncEnabled = it
                                 )
                             )
                         }
@@ -7520,7 +7762,7 @@ private fun QueueRuleSettingsScreen(
                             else ->
                                 "QQ Bot 无法读取队列或修改资料，也不会补发关闭期间产生的通知。"
                         },
-                        checked = settings.oneBotSyncEnabled,
+                        checked = settings.websiteSyncEnabled && settings.oneBotSyncEnabled,
                         enabled = settings.websiteSyncEnabled && !managementSensitiveControlsLocked,
                         onCheckedChange = {
                             updateDraft(settings.copy(oneBotSyncEnabled = it))
@@ -13399,8 +13641,23 @@ private fun PlayerAvatar(profile: PlayerProfile, size: Dp) {
     )
     val color = colors[(profile.id.hashCode() and Int.MAX_VALUE) % colors.size]
     val initial = profile.nickname.takeFirstCodePoint()
+    var avatar by remember(profile.avatarReference) {
+        mutableStateOf(PlayerAvatarImageLoader.cached(profile.avatarReference))
+    }
+    LaunchedEffect(profile.avatarReference) {
+        if (avatar == null) avatar = PlayerAvatarImageLoader.load(profile.avatarReference)
+    }
     Box(Modifier.size(size).clip(CircleShape).background(color), contentAlignment = Alignment.Center) {
-        Text(initial, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+        if (avatar == null) {
+            Text(initial, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+        } else {
+            Image(
+                bitmap = avatar!!,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
     }
 }
 
@@ -16813,6 +17070,16 @@ private fun TerminalInstallationDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.13.2",
+            "自定义头像与管理后台收尾",
+            "已绑定网页账户的玩家可以在网页个人资料顶部点击头像，从系统图库上传自定义头像；现场终端只在原有玩家头像位置显示，加载失败时继续使用昵称首字。管理后台补齐登记开关、营业时间、机台配置与状态、终端策略和日志管理。"
+        ),
+        Triple(
+            "0.13.1",
+            "玩家资料编辑入口调整",
+            "玩家资料库列表移除铅笔按钮，为长昵称释放空间；编辑入口移到具体玩家资料页，并在网页账户禁止终端编辑时提前置灰。"
+        ),
         Triple(
             "0.12.3",
             "跨端反馈与安全刷新",

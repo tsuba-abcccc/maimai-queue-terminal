@@ -1,5 +1,5 @@
 <script setup>
-import { Bell, ChevronDown, CircleCheck, LogIn, LogOut, Save, ShieldCheck, UserRound, X } from '@lucide/vue'
+import { Bell, Camera, ChevronDown, CircleCheck, LogIn, LogOut, Save, ShieldCheck, UserRound, X } from '@lucide/vue'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 const props = defineProps({
@@ -38,6 +38,11 @@ const passwordForm = ref({ current: '', next: '', confirmation: '' })
 const passwordSubmitting = ref(false)
 const passwordError = ref('')
 const passwordNotice = ref('')
+const avatarInput = ref(null)
+const avatarSubmitting = ref(false)
+const avatarError = ref('')
+const avatarNotice = ref('')
+const avatarLoadFailed = ref(false)
 const csrfToken = ref('')
 const queueLoading = ref(false)
 const queueError = ref('')
@@ -86,6 +91,7 @@ function createProfileDraft(profile) {
 
 function setAccount(nextAccount) {
   account.value = nextAccount
+  avatarLoadFailed.value = false
   const draft = createProfileDraft(nextAccount?.profile)
   profileDraft.value = draft
   originalProfile.value = draft ? { ...draft } : null
@@ -116,10 +122,11 @@ function createRequestId() {
 
 async function accountRequest(path = '', options = {}) {
   const { headers = {}, ...requestOptions } = options
+  const isMultipart = typeof FormData !== 'undefined' && requestOptions.body instanceof FormData
   const response = await fetch(`${ACCOUNT_API_URL}${path}`, {
     credentials: 'include',
     ...requestOptions,
-    headers: { 'Content-Type': 'application/json', ...headers }
+    headers: { ...(isMultipart ? {} : { 'Content-Type': 'application/json' }), ...headers }
   })
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) {
@@ -204,7 +211,7 @@ async function completeBinding() {
 }
 
 async function logout() {
-  if (submitting.value) return
+  if (submitting.value || avatarSubmitting.value) return
   submitting.value = true
   error.value = ''
   try {
@@ -515,6 +522,56 @@ function profileChanged() {
   ))
 }
 
+function avatarInitial(profile) {
+  const nickname = String(profile?.nickname || '').trim()
+  return nickname ? Array.from(nickname)[0] : '?'
+}
+
+function openAvatarPicker() {
+  if (avatarSubmitting.value || !account.value) return
+  avatarError.value = ''
+  avatarNotice.value = ''
+  avatarInput.value?.click()
+}
+
+function handleAvatarLoadError() {
+  avatarLoadFailed.value = true
+}
+
+async function handleAvatarInput(event) {
+  const file = event.target.files?.[0]
+  event.target.value = ''
+  if (!file || !account.value?.profile) return
+  avatarError.value = ''
+  avatarNotice.value = ''
+  if (!file.type.startsWith('image/')) {
+    avatarError.value = '请选择图片文件。'
+    return
+  }
+  if (file.size > 8 * 1024 * 1024) {
+    avatarError.value = '头像文件不能超过 8 MB。'
+    return
+  }
+  avatarSubmitting.value = true
+  try {
+    const body = new FormData()
+    body.append('expected_profile_revision', String(account.value.profile.profile_revision))
+    body.append('avatar', file, file.name || 'avatar')
+    const response = await accountRequest('/avatar', {
+      method: 'POST',
+      headers: csrfHeaders(),
+      body
+    })
+    setAccount(response.account)
+    avatarNotice.value = response.changed ? '头像已更新。' : '头像没有变化。'
+  } catch (uploadError) {
+    avatarError.value = uploadError.message
+    if (uploadError.code === 'PLAYER_PROFILE_CHANGED') await load()
+  } finally {
+    avatarSubmitting.value = false
+  }
+}
+
 function hasUnsavedAccountForm() {
   if (profileChanged()) return true
   if (binding.value && !bindingCompleted.value) {
@@ -529,6 +586,7 @@ function hasUnsavedAccountForm() {
 }
 
 function requestClose() {
+  if (avatarSubmitting.value) return
   if (
     hasUnsavedAccountForm() &&
     !window.confirm('当前页面有未保存的内容，确定关闭吗？')
@@ -626,7 +684,13 @@ onBeforeUnmount(() => {
           <span>maimai Q</span>
           <h2>{{ title }}</h2>
         </div>
-        <button type="button" aria-label="关闭玩家资料" title="关闭" @click="requestClose">
+        <button
+          type="button"
+          :disabled="avatarSubmitting"
+          aria-label="关闭玩家资料"
+          title="关闭"
+          @click="requestClose"
+        >
           <X :size="20" />
         </button>
       </header>
@@ -670,6 +734,36 @@ onBeforeUnmount(() => {
         <div class="account-success">
           <CircleCheck :size="20" aria-hidden="true" />
           <span>{{ bindingCompleted ? '网页账户已绑定' : '当前已登录' }}</span>
+        </div>
+        <div class="account-avatar-editor">
+          <button
+            class="account-avatar-button"
+            type="button"
+            :disabled="avatarSubmitting"
+            aria-label="修改头像"
+            title="点击头像修改"
+            @click="openAvatarPicker"
+          >
+            <img
+              v-if="account.profile.avatar_url && !avatarLoadFailed"
+              :src="account.profile.avatar_url"
+              alt=""
+              class="account-avatar-image"
+              @error="handleAvatarLoadError"
+            />
+            <span v-else class="account-avatar-fallback">{{ avatarInitial(account.profile) }}</span>
+            <span class="account-avatar-camera" aria-hidden="true"><Camera :size="15" /></span>
+          </button>
+          <input
+            ref="avatarInput"
+            class="account-avatar-input"
+            type="file"
+            accept="image/*"
+            @change="handleAvatarInput"
+          />
+          <p>点击头像修改头像</p>
+          <p v-if="avatarError" class="account-error" role="alert">{{ avatarError }}</p>
+          <p v-else-if="avatarNotice" class="account-notice" role="status">{{ avatarNotice }}</p>
         </div>
         <div class="account-profile-summary">
           <div>
@@ -909,7 +1003,12 @@ onBeforeUnmount(() => {
         </form>
 
         <p v-if="error" class="account-error" role="alert">{{ error }}</p>
-        <button class="account-secondary" type="button" :disabled="submitting || profileSubmitting" @click="logout">
+        <button
+          class="account-secondary"
+          type="button"
+          :disabled="submitting || profileSubmitting || avatarSubmitting"
+          @click="logout"
+        >
           <LogOut :size="17" />{{ submitting ? '正在退出' : '退出登录' }}
         </button>
       </template>
@@ -964,7 +1063,17 @@ onBeforeUnmount(() => {
 .account-dialog h2 { margin: 2px 0 0; font-size: 21px; letter-spacing: 0; }
 .account-dialog header > button { width: 44px; height: 44px; display: grid; place-items: center; border: 0; border-radius: 50%; background: transparent; color: inherit; cursor: pointer; }
 .account-dialog header > button:hover { background: var(--queue-soft, #f5f5f7); }
+.account-dialog header > button:disabled { opacity: .45; cursor: default; }
 .account-loading { padding: 42px 0 26px; color: var(--queue-secondary, #6e6e73); text-align: center; }
+.account-avatar-editor { display: grid; justify-items: center; gap: 6px; margin-top: 18px; }
+.account-avatar-button { position: relative; width: 104px; height: 104px; display: grid; place-items: center; padding: 0; overflow: hidden; border: 1px solid var(--queue-separator); border-radius: 50%; color: #fff; background: var(--queue-blue); cursor: pointer; }
+.account-avatar-button:disabled { opacity: .62; cursor: default; }
+.account-avatar-image { width: 100%; height: 100%; display: block; object-fit: cover; }
+.account-avatar-fallback { font-size: 42px; font-weight: 700; line-height: 1; }
+.account-avatar-camera { position: absolute; right: 4px; bottom: 4px; width: 28px; height: 28px; display: grid; place-items: center; border: 2px solid var(--queue-card); border-radius: 50%; color: #fff; background: var(--queue-blue); }
+.account-avatar-input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; pointer-events: none; }
+.account-avatar-editor > p { margin: 0; color: var(--queue-secondary); font-size: 11px; line-height: 1.45; text-align: center; }
+.account-avatar-editor > p.account-error, .account-avatar-editor > p.account-notice { width: 100%; margin-top: 3px; }
 .account-profile-summary { display: flex; justify-content: space-between; gap: 16px; margin-top: 20px; padding: 15px; border-radius: 8px; background: var(--queue-soft, #f5f5f7); }
 .account-profile-summary > div { min-width: 0; }
 .account-profile-summary > div:last-child { text-align: right; }

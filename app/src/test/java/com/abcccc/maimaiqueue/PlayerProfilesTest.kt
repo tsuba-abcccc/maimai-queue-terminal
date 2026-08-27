@@ -8,6 +8,26 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PlayerProfilesTest {
+    @Test
+    fun avatarReferencesAcceptOnlyBoundedHttpUrls() {
+        assertEquals(
+            "https://queue.example.test/api/player-avatars/avatar.webp",
+            normalizePlayerAvatarReference(
+                " https://queue.example.test/api/player-avatars/avatar.webp "
+            )
+        )
+        assertEquals(
+            "http://192.0.2.1:8080/api/player-avatars/avatar.webp",
+            normalizePlayerAvatarReference(
+                "http://192.0.2.1:8080/api/player-avatars/avatar.webp"
+            )
+        )
+        assertEquals(null, normalizePlayerAvatarReference("file:///tmp/avatar.webp"))
+        assertEquals(null, normalizePlayerAvatarReference("https://user@example.test/avatar.webp"))
+        assertEquals(null, normalizePlayerAvatarReference("https://example.test/avatar.webp#fragment"))
+        assertEquals(null, normalizePlayerAvatarReference("https://${"a".repeat(520)}.test/avatar"))
+    }
+
     private fun profile(
         id: String,
         nickname: String,

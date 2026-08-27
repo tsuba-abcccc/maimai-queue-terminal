@@ -78,7 +78,14 @@ data class QueueRuleSettings(
      * every queue action, including ordinary drag reordering.
      */
     val managementAppBound: Boolean = false,
-    val managementPolicyRevision: Long = 0L
+    val managementPolicyRevision: Long = 0L,
+    /**
+     * Optimistic-lock revision for settings managed outside ordinary queue
+     * operations. It is intentionally separate from the machine configuration
+     * revision so harmless changes such as a remark do not invalidate queue
+     * commands that only depend on capacity and machine identity.
+     */
+    val managementSettingsRevision: Long = 0L
 ) {
     val allowsAnyAbsenceAction: Boolean
         get() = allowDeferOneRound || allowTemporaryLeave
@@ -130,6 +137,17 @@ data class QueueRuleSettings(
         configuredMachineIds.filter { machineGroupId(it) == groupId }
 }
 
+internal fun QueueRuleSettings.managementControlledContent(): QueueRuleSettings =
+    copy(
+        websiteSyncEnabled = false,
+        syncMode = QueueSyncMode.UNSPECIFIED,
+        queueSyncEndpoint = "",
+        queueSyncToken = "",
+        managementAppBound = false,
+        managementPolicyRevision = 0L,
+        managementSettingsRevision = 0L
+    )
+
 data class PendingSyncDisableSnapshot(
     val endpoint: String,
     val token: String,
@@ -169,8 +187,7 @@ class LocalQueueRuleSettingsRepository(
                 true
             ),
             websiteSyncEnabled = websiteSyncEnabled,
-            oneBotSyncEnabled = websiteSyncEnabled &&
-                preferences.getBoolean(KEY_ONEBOT_SYNC_ENABLED, true),
+            oneBotSyncEnabled = preferences.getBoolean(KEY_ONEBOT_SYNC_ENABLED, true),
             syncMode = runCatching {
                 QueueSyncMode.valueOf(
                     preferences.getString(
@@ -283,6 +300,10 @@ class LocalQueueRuleSettingsRepository(
             managementPolicyRevision = preferences.getLong(
                 KEY_MANAGEMENT_POLICY_REVISION,
                 0L
+            ).coerceAtLeast(0L),
+            managementSettingsRevision = preferences.getLong(
+                KEY_MANAGEMENT_SETTINGS_REVISION,
+                0L
             ).coerceAtLeast(0L)
         )
         return normalizeMachineLayoutSettings(settings)
@@ -290,15 +311,13 @@ class LocalQueueRuleSettingsRepository(
 
     fun saveSettings(settings: QueueRuleSettings) {
         val normalizedSettings = normalizeMachineLayoutSettings(settings)
-        val oneBotSyncEnabled = normalizedSettings.websiteSyncEnabled &&
-            normalizedSettings.oneBotSyncEnabled
         preferences.edit()
             .putBoolean(KEY_ALLOW_DEFER_ONE_ROUND, normalizedSettings.allowDeferOneRound)
             .putBoolean(KEY_ALLOW_TEMPORARY_LEAVE, normalizedSettings.allowTemporaryLeave)
             .putBoolean(KEY_ALLOW_ONLINE_REGISTRATION, normalizedSettings.allowOnlineRegistration)
             .putBoolean(KEY_SHOW_COMMON_PLAY_PREVIEW, normalizedSettings.showCommonPlayPreview)
             .putBoolean(KEY_WEBSITE_SYNC_ENABLED, normalizedSettings.websiteSyncEnabled)
-            .putBoolean(KEY_ONEBOT_SYNC_ENABLED, oneBotSyncEnabled)
+            .putBoolean(KEY_ONEBOT_SYNC_ENABLED, normalizedSettings.oneBotSyncEnabled)
             .putString(KEY_SYNC_MODE, normalizedSettings.syncMode.name)
             .putString(KEY_QUEUE_SYNC_ENDPOINT, normalizedSettings.queueSyncEndpoint.trim())
             .putString(KEY_QUEUE_SYNC_TOKEN, normalizedSettings.queueSyncToken.trim())
@@ -332,6 +351,10 @@ class LocalQueueRuleSettingsRepository(
             .putLong(
                 KEY_MANAGEMENT_POLICY_REVISION,
                 normalizedSettings.managementPolicyRevision.coerceAtLeast(0L)
+            )
+            .putLong(
+                KEY_MANAGEMENT_SETTINGS_REVISION,
+                normalizedSettings.managementSettingsRevision.coerceAtLeast(0L)
             )
             .also { editor ->
                 MachineId.entries.forEach { machineId ->
@@ -553,6 +576,7 @@ class LocalQueueRuleSettingsRepository(
         const val KEY_BUSINESS_HOURS_SYNC_PENDING = "business_hours_sync_pending"
         const val KEY_MANAGEMENT_APP_BOUND = "management_app_bound"
         const val KEY_MANAGEMENT_POLICY_REVISION = "management_policy_revision"
+        const val KEY_MANAGEMENT_SETTINGS_REVISION = "management_settings_revision"
         const val KEY_PENDING_SYNC_DISABLE_ENDPOINT = "pending_sync_disable_endpoint"
         const val KEY_PENDING_SYNC_DISABLE_TOKEN = "pending_sync_disable_token"
         const val KEY_PENDING_SYNC_DISABLE_VENUE_ID = "pending_sync_disable_venue_id"
@@ -875,7 +899,6 @@ internal fun normalizeQueueRuleSettingsForRuntime(
     val websiteSyncEnabled = normalizedSettings.websiteSyncEnabled && connectionConfigured
     return normalizedSettings.copy(
         websiteSyncEnabled = websiteSyncEnabled,
-        oneBotSyncEnabled = websiteSyncEnabled && normalizedSettings.oneBotSyncEnabled,
         queueSyncEndpoint = endpoint,
         queueSyncToken = token
     )

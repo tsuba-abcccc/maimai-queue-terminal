@@ -1,5 +1,7 @@
 package com.abcccc.maimaiqueue
 
+import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -42,6 +44,7 @@ class QueueCloudCommandTest {
                 "gender": "UNDISCLOSED",
                 "default_preference": "OPEN_TO_JOIN",
                 "qq_number": null,
+                "avatar_url": "https://queue.example.test/api/player-avatars/${"a".repeat(64)}.webp",
                 "usage_count": 3,
                 "last_used_at": null,
                 "qq_visibility": "TERMINAL_ONLY",
@@ -69,6 +72,10 @@ class QueueCloudCommandTest {
 
         assertEquals(mapOf(validSourceId to canonicalId), parsed.profileAliases)
         assertEquals(canonicalId, parsed.profiles.single().id)
+        assertEquals(
+            "https://queue.example.test/api/player-avatars/${"a".repeat(64)}.webp",
+            parsed.profiles.single().avatarReference
+        )
         assertEquals("12345678", parsed.botQqNumber)
     }
 
@@ -412,6 +419,130 @@ class QueueCloudCommandTest {
         assertEquals("", command.actorQq)
     }
 
+    @Test
+    fun managementSettingsCommandsParseCompleteValidPayloads() {
+        val parsed = parseRemoteTerminalCommands(
+            JSONObject().put(
+                "commands",
+                JSONArray()
+                    .put(managementRegistrationAvailabilityCommand())
+                    .put(managementTerminalSettingsCommand())
+                    .put(managementMachineStatusCommand())
+            ).toString()
+        )
+
+        assertEquals(3, parsed.size)
+        val availability = parsed[0] as RegistrationAvailabilityCommand
+        assertTrue(!availability.registrationOpen)
+        assertEquals(setOf("a".repeat(24)), availability.expectedRegistrationIds)
+
+        val settings = parsed[1] as TerminalSettingsUpdateCommand
+        assertEquals(1, settings.configuredMachineCount)
+        assertEquals("1".repeat(32), settings.machineStableIds[MachineId.A])
+        assertEquals(2, settings.machineConfigurations[MachineId.A]?.capacity)
+
+        val machine = parsed[2] as MachineStatusUpdateCommand
+        assertEquals(MachineId.A, machine.machineId)
+        assertEquals(MachineStopReason.OTHER, machine.stopReason)
+        assertEquals("临时检修", machine.stopReasonDetail)
+    }
+
+    @Test
+    fun managementRegistrationAvailabilityRejectsUnsafeConfirmationPayloads() {
+        val wrongSource = managementRegistrationAvailabilityCommand().apply {
+            getJSONObject("payload").put("operation_source", "QQ_BOT")
+        }
+        val duplicateRegistrations = managementRegistrationAvailabilityCommand().apply {
+            getJSONObject("payload").put(
+                "expected_registration_ids",
+                JSONArray().put("a".repeat(24)).put("a".repeat(24))
+            )
+        }
+        val missingConfirmation = managementRegistrationAvailabilityCommand().apply {
+            getJSONObject("payload").remove("confirm_clear_queue")
+        }
+        val incorrectConfirmation = managementRegistrationAvailabilityCommand().apply {
+            getJSONObject("payload").put("confirm_clear_queue", false)
+        }
+        val opensWithExistingRegistrations = managementRegistrationAvailabilityCommand().apply {
+            getJSONObject("payload")
+                .put("expected_registration_open", false)
+                .put("registration_open", true)
+                .put("confirm_clear_queue", false)
+        }
+
+        listOf(
+            wrongSource,
+            duplicateRegistrations,
+            missingConfirmation,
+            incorrectConfirmation,
+            opensWithExistingRegistrations
+        ).forEach { command ->
+            assertTrue(parseManagementCommand(command).isEmpty())
+        }
+    }
+
+    @Test
+    fun managementTerminalSettingsRejectMalformedMachineLayouts() {
+        val wrongSource = managementTerminalSettingsCommand().apply {
+            getJSONObject("payload").put("operation_source", "ON_SITE_TERMINAL")
+        }
+        val skippedMachine = managementTerminalSettingsCommand().apply {
+            val machines = getJSONObject("payload").getJSONObject("machines")
+            machines.put("B", machines.remove("A"))
+        }
+        val invalidStableId = managementTerminalSettingsCommand().apply {
+            getJSONObject("payload").getJSONObject("machines")
+                .getJSONObject("A").put("stable_id", "not-a-stable-id")
+        }
+        val nonContiguousRevision = managementTerminalSettingsCommand().apply {
+            getJSONObject("payload").put("next_settings_revision", 5)
+        }
+        val emptyGroup = managementTerminalSettingsCommand().apply {
+            getJSONObject("payload").getJSONArray("machine_groups")
+                .put(JSONObject().put("id", "2".repeat(32)).put("name", "空分组"))
+        }
+
+        listOf(
+            wrongSource,
+            skippedMachine,
+            invalidStableId,
+            nonContiguousRevision,
+            emptyGroup
+        ).forEach { command ->
+            assertTrue(parseManagementCommand(command).isEmpty())
+        }
+    }
+
+    @Test
+    fun managementMachineStatusRejectsUnsafeOrInconsistentPayloads() {
+        val wrongSource = managementMachineStatusCommand().apply {
+            getJSONObject("payload").put("operation_source", "WEBSITE_REMOTE")
+        }
+        val invalidStableId = managementMachineStatusCommand().apply {
+            getJSONObject("payload").put("machine_stable_id", "1".repeat(31))
+        }
+        val unchangedState = managementMachineStatusCommand().apply {
+            getJSONObject("payload").put("expected_operational", false)
+        }
+        val missingOtherDetail = managementMachineStatusCommand().apply {
+            getJSONObject("payload").put("stop_reason_detail", JSONObject.NULL)
+        }
+        val overlongDetail = managementMachineStatusCommand().apply {
+            getJSONObject("payload").put("stop_reason_detail", "字".repeat(41))
+        }
+
+        listOf(
+            wrongSource,
+            invalidStableId,
+            unchangedState,
+            missingOtherDetail,
+            overlongDetail
+        ).forEach { command ->
+            assertTrue(parseManagementCommand(command).isEmpty())
+        }
+    }
+
     private fun profile(
         id: String = "00000000-0000-0000-0000-000000000901"
     ) = PlayerProfile(
@@ -432,5 +563,98 @@ class QueueCloudCommandTest {
         nickname = "新昵称",
         gender = PlayerGender.FEMALE,
         defaultPreference = ProfilePlayPreference.SOLO
+    )
+
+    private fun parseManagementCommand(command: JSONObject): List<RemoteTerminalCommand> =
+        parseRemoteTerminalCommands(JSONObject().put("commands", JSONArray().put(command)).toString())
+
+    private fun managementRegistrationAvailabilityCommand() = JSONObject(
+        """
+        {
+          "command_id": "00000000-0000-0000-0000-000000000981",
+          "type": "SET_REGISTRATION_AVAILABILITY",
+          "created_at": 2000,
+          "payload": {
+            "operation_source": "MANAGEMENT_APP",
+            "queue_id": "00000000-0000-0000-0000-000000000001",
+            "expected_queue_revision": 4,
+            "expected_machine_configuration_revision": 1,
+            "expected_registration_open": true,
+            "registration_open": false,
+            "expected_registration_ids": ["${"a".repeat(24)}"],
+            "confirm_clear_queue": true,
+            "reason": "管理后台关闭登记"
+          }
+        }
+        """.trimIndent()
+    )
+
+    private fun managementTerminalSettingsCommand() = JSONObject(
+        """
+        {
+          "command_id": "00000000-0000-0000-0000-000000000982",
+          "type": "UPDATE_TERMINAL_SETTINGS",
+          "created_at": 2000,
+          "payload": {
+            "operation_source": "MANAGEMENT_APP",
+            "queue_id": "00000000-0000-0000-0000-000000000001",
+            "expected_settings_revision": 3,
+            "next_settings_revision": 4,
+            "expected_policy_revision": 2,
+            "expected_machine_configuration_revision": 1,
+            "expected_registration_open": false,
+            "show_common_play_preview": true,
+            "business_hours": {
+              "enabled": false,
+              "use_weekly_schedule": false,
+              "default_hours": {"opening_minutes": 600, "closing_minutes": 1320},
+              "weekly_hours": {}
+            },
+            "machine_groups": [{"id": "${"2".repeat(32)}", "name": "主区域"}],
+            "default_machine_group_id": "${"2".repeat(32)}",
+            "machines": {
+              "A": {
+                "stable_id": "${"1".repeat(32)}",
+                "group_id": "${"2".repeat(32)}",
+                "remark": "左侧",
+                "configuration": {
+                  "game_type": "MAIMAI_DX",
+                  "custom_game_type": null,
+                  "server": "HIDDEN",
+                  "custom_server": null,
+                  "game_version": null,
+                  "game_version_visible": false,
+                  "capacity": 2,
+                  "solo_round_minutes": 12,
+                  "shared_round_minutes": 15
+                }
+              }
+            },
+            "reason": "管理后台更新终端设置"
+          }
+        }
+        """.trimIndent()
+    )
+
+    private fun managementMachineStatusCommand() = JSONObject(
+        """
+        {
+          "command_id": "00000000-0000-0000-0000-000000000983",
+          "type": "UPDATE_MACHINE_STATUS",
+          "created_at": 2000,
+          "payload": {
+            "operation_source": "MANAGEMENT_APP",
+            "queue_id": "00000000-0000-0000-0000-000000000001",
+            "expected_machine_configuration_revision": 1,
+            "machine_id": "A",
+            "machine_stable_id": "${"1".repeat(32)}",
+            "expected_operational": true,
+            "operational": false,
+            "stop_reason": "OTHER",
+            "stop_reason_detail": "临时检修",
+            "reason": "管理后台停止机台"
+          }
+        }
+        """.trimIndent()
     )
 }

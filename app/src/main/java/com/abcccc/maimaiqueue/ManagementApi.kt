@@ -27,11 +27,33 @@ internal data class ManagementMachine(
     val id: String,
     val name: String,
     val stableId: String?,
+    val groupId: String,
     val capacity: Int,
     val operational: Boolean,
+    val stopReason: String?,
+    val stopReasonDetail: String?,
+    val configuration: MachineConfiguration,
     val registrationCount: Int,
     val playing: List<ManagementRegistration>,
     val waiting: List<ManagementRegistration>
+)
+
+internal data class ManagementLogEntry(
+    val cursor: Long,
+    val eventId: String,
+    val occurredAtMillis: Long,
+    val machineId: String?,
+    val machineName: String?,
+    val type: String,
+    val title: String,
+    val detail: String,
+    val operationSource: String,
+    val registrationIds: List<String>
+)
+
+internal data class ManagementLogsPage(
+    val logs: List<ManagementLogEntry>,
+    val nextCursor: Long?
 )
 
 internal data class ManagementProfile(
@@ -53,6 +75,11 @@ internal data class ManagementCapabilities(
     val queueReadAll: Boolean,
     val queueEditAll: Boolean,
     val queueReorder: Boolean,
+    val registrationControl: Boolean,
+    val machineStatusEdit: Boolean,
+    val machineConfigurationEdit: Boolean,
+    val businessHoursEdit: Boolean,
+    val commonPlayPreviewEdit: Boolean,
     val profileReadPrivate: Boolean,
     val profileEditAll: Boolean,
     val profileResetPassword: Boolean,
@@ -70,6 +97,16 @@ internal data class ManagementTerminalPolicy(
     val oneBotSyncEnabled: Boolean
 )
 
+internal data class ManagementTerminalSettings(
+    val supported: Boolean,
+    val revision: Long,
+    val showCommonPlayPreview: Boolean,
+    val registrationControlOpen: Boolean,
+    val businessHours: BusinessHoursSettings,
+    val machineGroups: List<MachineGroupConfiguration>,
+    val defaultMachineGroupId: String
+)
+
 internal data class ManagementOverview(
     val venueName: String,
     val venueCode: String?,
@@ -83,6 +120,7 @@ internal data class ManagementOverview(
     val registrationOpen: Boolean,
     val queueRules: Map<String, Boolean>,
     val terminalPolicy: ManagementTerminalPolicy,
+    val terminalSettings: ManagementTerminalSettings,
     val machines: List<ManagementMachine>,
     val profiles: List<ManagementProfile>,
     val capabilities: ManagementCapabilities
@@ -107,6 +145,34 @@ internal class ManagementApi(
         try {
             val body = readResponse(connection)
             parseOverview(body)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    suspend fun fetchLogs(
+        queueId: String,
+        before: Long? = null,
+        limit: Int = 50,
+        operationSource: String? = null
+    ): ManagementLogsPage = withContext(Dispatchers.IO) {
+        val query = buildString {
+            append("?queue_id=")
+            append(java.net.URLEncoder.encode(queueId, "UTF-8"))
+            append("&limit=")
+            append(limit.coerceIn(1, 100))
+            operationSource?.takeIf { it.isNotBlank() && it != "ALL" }?.let {
+                append("&source=")
+                append(java.net.URLEncoder.encode(it, "UTF-8"))
+            }
+            before?.let {
+                append("&before=")
+                append(it)
+            }
+        }
+        val connection = openConnection(managementPath("/api/queue-management/logs$query"), "GET")
+        try {
+            parseLogs(readResponse(connection))
         } finally {
             connection.disconnect()
         }
@@ -374,6 +440,117 @@ internal class ManagementApi(
         }
     }
 
+    suspend fun updateRegistrationAvailability(
+        expectedQueueId: String,
+        expectedQueueRevision: Long,
+        expectedMachineConfigurationRevision: Long,
+        expectedRegistrationOpen: Boolean,
+        registrationOpen: Boolean,
+        expectedRegistrationIds: List<String>,
+        confirmClearQueue: Boolean,
+        reason: String
+    ): ManagementCommandResult = submitManagementCommand(
+        path = "/api/queue-management/registration-availability",
+        body = JSONObject().apply {
+            put("request_id", java.util.UUID.randomUUID().toString())
+            put("expected_queue_id", expectedQueueId)
+            put("expected_queue_revision", expectedQueueRevision)
+            put("expected_machine_configuration_revision", expectedMachineConfigurationRevision)
+            put("expected_registration_open", expectedRegistrationOpen)
+            put("registration_open", registrationOpen)
+            put("expected_registration_ids", JSONArray(expectedRegistrationIds.sorted()))
+            put("confirm_clear_queue", confirmClearQueue)
+            put("reason", reason.trim().ifEmpty {
+                if (registrationOpen) "管理后台开启登记排队" else "管理后台关闭登记排队"
+            })
+        }
+    )
+
+    suspend fun updateTerminalSettings(
+        expectedQueueId: String,
+        expectedSettingsRevision: Long,
+        expectedPolicyRevision: Long,
+        expectedMachineConfigurationRevision: Long,
+        expectedRegistrationOpen: Boolean,
+        showCommonPlayPreview: Boolean,
+        businessHours: BusinessHoursSettings,
+        machineGroups: List<MachineGroupConfiguration>,
+        defaultMachineGroupId: String,
+        machines: List<ManagementMachine>,
+        reason: String
+    ): ManagementCommandResult = submitManagementCommand(
+        path = "/api/queue-management/terminal-settings",
+        body = JSONObject().apply {
+            put("request_id", java.util.UUID.randomUUID().toString())
+            put("expected_queue_id", expectedQueueId)
+            put("expected_settings_revision", expectedSettingsRevision)
+            put("expected_policy_revision", expectedPolicyRevision)
+            put("expected_machine_configuration_revision", expectedMachineConfigurationRevision)
+            put("expected_registration_open", expectedRegistrationOpen)
+            put("show_common_play_preview", showCommonPlayPreview)
+            put("business_hours", businessHours.toVenueSettingsJson())
+            put("machine_groups", JSONArray().apply {
+                machineGroups.forEach { group ->
+                    put(JSONObject().apply {
+                        put("id", group.id)
+                        put("name", group.name)
+                    })
+                }
+            })
+            put("default_machine_group_id", defaultMachineGroupId)
+            put("machines", JSONObject().apply {
+                machines.forEach { machine ->
+                    put(machine.id, machine.toTerminalSettingsJson())
+                }
+            })
+            put("reason", reason.trim().ifEmpty { "管理后台更新终端设置" })
+        }
+    )
+
+    suspend fun updateMachineStatus(
+        expectedQueueId: String,
+        expectedMachineConfigurationRevision: Long,
+        machine: ManagementMachine,
+        operational: Boolean,
+        stopReason: String?,
+        stopReasonDetail: String?,
+        reason: String
+    ): ManagementCommandResult = submitManagementCommand(
+        path = "/api/queue-management/machine-status",
+        body = JSONObject().apply {
+            put("request_id", java.util.UUID.randomUUID().toString())
+            put("expected_queue_id", expectedQueueId)
+            put("expected_machine_configuration_revision", expectedMachineConfigurationRevision)
+            put("machine_id", machine.id)
+            put("expected_machine_stable_id", machine.stableId)
+            put("expected_operational", machine.operational)
+            put("operational", operational)
+            put("stop_reason", stopReason ?: JSONObject.NULL)
+            put("stop_reason_detail", stopReasonDetail ?: JSONObject.NULL)
+            put("reason", reason.trim().ifEmpty {
+                if (operational) "管理后台恢复机台" else "管理后台停止机台"
+            })
+        }
+    )
+
+    private suspend fun submitManagementCommand(
+        path: String,
+        body: JSONObject
+    ): ManagementCommandResult = withContext(Dispatchers.IO) {
+        val serialized = body.toString()
+        val connection = openConnection(managementPath(path), "PATCH").apply {
+            doOutput = true
+            val bytes = serialized.toByteArray(Charsets.UTF_8)
+            setFixedLengthStreamingMode(bytes.size)
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+        try {
+            parseCommandResult(readResponse(connection, serialized))
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     private fun overviewEndpoint(): String = managementPath("/api/queue-management/overview")
 
     private fun commandEndpoint(): String = managementPath("/api/queue-management/commands")
@@ -435,6 +612,19 @@ private fun parseOverview(response: String): ManagementOverview {
         }
     }.orEmpty()
     val policy = queue.optJSONObject("terminal_policy") ?: JSONObject()
+    val terminalSettingsSource = queue.optJSONObject("terminal_settings") ?: JSONObject()
+    val parsedGroups = terminalSettingsSource.optJSONArray("machine_groups")?.let { groups ->
+        buildList {
+            repeat(groups.length()) { index ->
+                val group = groups.optJSONObject(index) ?: return@repeat
+                val id = group.optionalString("id") ?: return@repeat
+                add(MachineGroupConfiguration(id, group.optString("name", "分组 ${index + 1}")))
+            }
+        }
+    }.orEmpty()
+    val businessHours = terminalSettingsSource.optJSONObject("business_hours")
+        ?.toBusinessHoursSettingsOrNull()
+        ?: BusinessHoursSettings()
     return ManagementOverview(
         venueName = venue.optString("name", "未命名机厅"),
         venueCode = venue.optionalString("code"),
@@ -465,12 +655,31 @@ private fun parseOverview(response: String): ManagementOverview {
             ),
             oneBotSyncEnabled = policy.optBoolean("onebot_sync_enabled", false)
         ),
+        terminalSettings = ManagementTerminalSettings(
+            supported = terminalSettingsSource.optBoolean("supported", false),
+            revision = terminalSettingsSource.optLong("revision", 0L).coerceAtLeast(0L),
+            showCommonPlayPreview = terminalSettingsSource.optBoolean("show_common_play_preview", true),
+            registrationControlOpen = queue.optBoolean("registration_open", true),
+            businessHours = businessHours,
+            machineGroups = parsedGroups.ifEmpty {
+                listOf(MachineGroupConfiguration(DEFAULT_MACHINE_GROUP_ID, DEFAULT_MACHINE_GROUP_NAME))
+            },
+            defaultMachineGroupId = terminalSettingsSource.optString(
+                "default_machine_group_id",
+                DEFAULT_MACHINE_GROUP_ID
+            )
+        ),
         machines = machines,
         profiles = profiles,
         capabilities = ManagementCapabilities(
             queueReadAll = capabilities.optBoolean("QUEUE_READ_ALL", true),
             queueEditAll = capabilities.optBoolean("QUEUE_EDIT_ALL", true),
             queueReorder = capabilities.optBoolean("QUEUE_REORDER", true),
+            registrationControl = capabilities.optBoolean("REGISTRATION_CONTROL", false),
+            machineStatusEdit = capabilities.optBoolean("MACHINE_STATUS_EDIT", false),
+            machineConfigurationEdit = capabilities.optBoolean("MACHINE_CONFIGURATION_EDIT", false),
+            businessHoursEdit = capabilities.optBoolean("BUSINESS_HOURS_EDIT", false),
+            commonPlayPreviewEdit = capabilities.optBoolean("COMMON_PLAY_PREVIEW_EDIT", false),
             profileReadPrivate = capabilities.optBoolean("PROFILE_READ_PRIVATE", true),
             profileEditAll = capabilities.optBoolean("PROFILE_EDIT_ALL", true),
             profileResetPassword = capabilities.optBoolean("PROFILE_RESET_PASSWORD", true),
@@ -502,11 +711,18 @@ private fun parseMachines(source: JSONArray): List<ManagementMachine> = buildLis
                 id = machineId,
                 name = machine.optString("name", "机台 $machineId"),
                 stableId = machine.optionalString("stable_id"),
+                groupId = machine.optString("group_id", DEFAULT_MACHINE_GROUP_ID),
                 capacity = machine.optJSONObject("configuration")
                     ?.optInt("capacity", 2)
                     ?.coerceIn(1, 2)
                     ?: 2,
                 operational = machine.optBoolean("operational", false),
+                stopReason = machine.optionalString("stop_reason"),
+                stopReasonDetail = machine.optionalString("stop_reason_detail"),
+                configuration = machine.optJSONObject("configuration")?.let(::parseMachineConfiguration)
+                    ?: MachineConfiguration(
+                        remark = machine.optString("remark", machine.optString("name", "机台 $machineId"))
+                    ),
                 registrationCount = machine.optInt("registration_count", playing.size + waiting.size),
                 playing = playing,
                 waiting = waiting
@@ -514,6 +730,21 @@ private fun parseMachines(source: JSONArray): List<ManagementMachine> = buildLis
         )
     }
 }
+
+private fun parseMachineConfiguration(source: JSONObject): MachineConfiguration = MachineConfiguration(
+    remark = source.optString("remark", ""),
+    gameType = runCatching { MachineGameType.valueOf(source.optString("game_type", MachineGameType.MAIMAI_DX.name)) }
+        .getOrDefault(MachineGameType.MAIMAI_DX),
+    customGameType = source.optionalString("custom_game_type").orEmpty(),
+    server = runCatching { MachineServer.valueOf(source.optString("server", MachineServer.HIDDEN.name)) }
+        .getOrDefault(MachineServer.HIDDEN),
+    customServer = source.optionalString("custom_server").orEmpty(),
+    gameVersion = source.optionalString("game_version").orEmpty(),
+    showGameVersion = source.optBoolean("game_version_visible", false),
+    capacity = source.optInt("capacity", DEFAULT_MACHINE_CAPACITY).coerceIn(1, 2),
+    soloRoundMinutes = source.optInt("solo_round_minutes", DEFAULT_SOLO_ROUND_MINUTES),
+    sharedRoundMinutes = source.optInt("shared_round_minutes", DEFAULT_SHARED_ROUND_MINUTES)
+)
 
 private fun parseRegistrations(
     source: JSONArray,
@@ -573,6 +804,60 @@ private fun parseCommandResult(response: String): ManagementCommandResult {
         status = source.optString("status", "PENDING"),
         detail = source.optionalString("result_detail") ?: source.optionalString("error")
     )
+}
+
+private fun parseLogs(response: String): ManagementLogsPage {
+    val source = JSONObject(response)
+    val logs = source.optJSONArray("logs") ?: JSONArray()
+    val parsed = buildList {
+        repeat(logs.length()) { index ->
+            val log = logs.optJSONObject(index) ?: return@repeat
+            val registrationIds = log.optJSONArray("registration_ids")?.let { ids ->
+                buildList {
+                    repeat(ids.length()) { idIndex ->
+                        ids.optString(idIndex).takeIf { it.isNotBlank() }?.let(::add)
+                    }
+                }
+            }.orEmpty()
+            add(
+                ManagementLogEntry(
+                    cursor = log.optLong("cursor", 0L),
+                    eventId = log.optString("event_id"),
+                    occurredAtMillis = log.optLong("occurred_at", 0L) * 1000L,
+                    machineId = log.optionalString("machine_id"),
+                    machineName = log.optionalString("machine_name"),
+                    type = log.optString("type"),
+                    title = log.optString("title", "队列事件"),
+                    detail = log.optString("detail"),
+                    operationSource = log.optString("operation_source", "UNKNOWN"),
+                    registrationIds = registrationIds
+                )
+            )
+        }
+    }
+    return ManagementLogsPage(
+        logs = parsed,
+        nextCursor = source.optLong("next_cursor", 0L).takeIf { it > 0L }
+    )
+}
+
+private fun MachineConfiguration.toTerminalSettingsJson(): JSONObject = JSONObject().apply {
+    put("game_type", gameType.name)
+    put("custom_game_type", customGameType.trim().ifBlank { JSONObject.NULL })
+    put("server", server.name)
+    put("custom_server", customServer.trim().ifBlank { JSONObject.NULL })
+    put("game_version", gameVersion.trim().ifBlank { JSONObject.NULL })
+    put("game_version_visible", showGameVersion)
+    put("capacity", capacity.coerceIn(1, 2))
+    put("solo_round_minutes", soloRoundMinutes)
+    put("shared_round_minutes", sharedRoundMinutes)
+}
+
+private fun ManagementMachine.toTerminalSettingsJson(): JSONObject = JSONObject().apply {
+    put("stable_id", stableId ?: JSONObject.NULL)
+    put("group_id", groupId)
+    put("remark", configuration.remark.trim())
+    put("configuration", configuration.toTerminalSettingsJson())
 }
 
 private fun JSONObject.optionalString(name: String): String? =

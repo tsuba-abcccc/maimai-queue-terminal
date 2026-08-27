@@ -124,6 +124,52 @@ internal data class TerminalPolicyUpdateCommand(
     val reason: String?
 ) : RemoteTerminalCommand
 
+internal data class RegistrationAvailabilityCommand(
+    override val commandId: String,
+    val createdAtMillis: Long,
+    val queueId: String,
+    val expectedQueueRevision: Long,
+    val expectedMachineConfigurationRevision: Long,
+    val expectedRegistrationOpen: Boolean,
+    val registrationOpen: Boolean,
+    val expectedRegistrationIds: Set<String>,
+    val reason: String?
+) : RemoteTerminalCommand
+
+internal data class TerminalSettingsUpdateCommand(
+    override val commandId: String,
+    val createdAtMillis: Long,
+    val queueId: String,
+    val expectedSettingsRevision: Long,
+    val nextSettingsRevision: Long,
+    val expectedPolicyRevision: Long,
+    val expectedMachineConfigurationRevision: Long,
+    val expectedRegistrationOpen: Boolean,
+    val showCommonPlayPreview: Boolean,
+    val businessHours: BusinessHoursSettings,
+    val configuredMachineCount: Int,
+    val machineConfigurations: Map<MachineId, MachineConfiguration>,
+    val machineStableIds: Map<MachineId, String>,
+    val machineGroupAssignments: Map<MachineId, String>,
+    val machineGroups: List<MachineGroupConfiguration>,
+    val defaultMachineGroupId: String,
+    val reason: String?
+) : RemoteTerminalCommand
+
+internal data class MachineStatusUpdateCommand(
+    override val commandId: String,
+    val createdAtMillis: Long,
+    val queueId: String,
+    val expectedMachineConfigurationRevision: Long,
+    val machineId: MachineId,
+    val machineStableId: String,
+    val expectedOperational: Boolean,
+    val operational: Boolean,
+    val stopReason: MachineStopReason?,
+    val stopReasonDetail: String?,
+    val reason: String?
+) : RemoteTerminalCommand
+
 internal sealed interface PlayerProfileCommandDecision {
     data class Apply(val profile: PlayerProfile) : PlayerProfileCommandDecision
     data object AlreadyApplied : PlayerProfileCommandDecision
@@ -264,6 +310,9 @@ internal data class QueuePublicDisplaySettings(
     val managementPolicySupported: Boolean = false,
     val managementAppBound: Boolean = false,
     val managementPolicyRevision: Long = 0L,
+    val managementSettingsSupported: Boolean = false,
+    val managementSettingsRevision: Long = 0L,
+    val businessHoursSettings: BusinessHoursSettings = BusinessHoursSettings(),
     val businessHours: QueuePublicBusinessHours = QueuePublicBusinessHours()
 ) {
     fun machineConfiguration(machineId: MachineId): MachineConfiguration =
@@ -965,6 +1014,9 @@ private fun parseSyncedPlayerProfile(source: JSONObject?): PlayerProfile? {
                 source.getString("default_preference")
             ),
             qqNumber = qqNumber,
+            avatarReference = normalizePlayerAvatarReference(
+                source.optionalNonBlankString("avatar_url")
+            ),
             usageCount = source.getInt("usage_count"),
             lastUsedAtMillis = if (source.isNull("last_used_at")) {
                 null
@@ -1045,6 +1097,9 @@ private const val PROFILE_UPDATE_COMMAND = "UPDATE_PLAYER_PROFILE"
 private const val QUEUE_OPERATION_COMMAND = "QUEUE_OPERATION"
 private const val MOBILE_REGISTRATION_COMMAND = "MOBILE_DEVICE_REGISTRATION"
 private const val TERMINAL_POLICY_COMMAND = "UPDATE_TERMINAL_POLICY"
+private const val REGISTRATION_AVAILABILITY_COMMAND = "SET_REGISTRATION_AVAILABILITY"
+private const val TERMINAL_SETTINGS_COMMAND = "UPDATE_TERMINAL_SETTINGS"
+private const val MACHINE_STATUS_COMMAND = "UPDATE_MACHINE_STATUS"
 
 internal fun parseRemoteTerminalCommands(response: String): List<RemoteTerminalCommand> {
     val commands = JSONObject(response).getJSONArray("commands")
@@ -1056,6 +1111,9 @@ internal fun parseRemoteTerminalCommands(response: String): List<RemoteTerminalC
                 QUEUE_OPERATION_COMMAND -> parseQueueOperation(source)
                 MOBILE_REGISTRATION_COMMAND -> parseMobileDeviceRegistration(source)
                 TERMINAL_POLICY_COMMAND -> parseTerminalPolicyUpdate(source)
+                REGISTRATION_AVAILABILITY_COMMAND -> parseRegistrationAvailability(source)
+                TERMINAL_SETTINGS_COMMAND -> parseTerminalSettingsUpdate(source)
+                MACHINE_STATUS_COMMAND -> parseMachineStatusUpdate(source)
                 else -> null
             }?.let(::add)
         }
@@ -1152,6 +1210,216 @@ private fun parseTerminalPolicyUpdate(command: JSONObject?): TerminalPolicyUpdat
             parsed.expectedPolicyRevision >= 0L &&
             parsed.nextPolicyRevision == parsed.expectedPolicyRevision + 1L &&
             (parsed.reason == null || parsed.reason.codePointCount(0, parsed.reason.length) <= 200)
+    }
+}
+
+private fun parseRegistrationAvailability(
+    command: JSONObject?
+): RegistrationAvailabilityCommand? {
+    if (command == null ||
+        command.optString("type") != REGISTRATION_AVAILABILITY_COMMAND
+    ) return null
+    val payload = command.optJSONObject("payload") ?: return null
+    return runCatching {
+        check(
+            RemoteQueueOperationSource.valueOf(payload.getString("operation_source")) ==
+                RemoteQueueOperationSource.MANAGEMENT_APP
+        )
+        val expectedRegistrationIds = payload.getJSONArray("expected_registration_ids")
+            .let { registrations ->
+                buildList {
+                    repeat(registrations.length()) { index ->
+                        add(registrations.getString(index))
+                    }
+                }
+            }
+        check(expectedRegistrationIds.size == expectedRegistrationIds.distinct().size)
+        val registrationOpen = payload.getBoolean("registration_open")
+        check(payload.getBoolean("confirm_clear_queue") == !registrationOpen)
+        check(!registrationOpen || expectedRegistrationIds.isEmpty())
+        RegistrationAvailabilityCommand(
+            commandId = command.getString("command_id"),
+            createdAtMillis = command.getLong("created_at"),
+            queueId = payload.getString("queue_id"),
+            expectedQueueRevision = payload.getLong("expected_queue_revision"),
+            expectedMachineConfigurationRevision = payload.getLong(
+                "expected_machine_configuration_revision"
+            ),
+            expectedRegistrationOpen = payload.getBoolean("expected_registration_open"),
+            registrationOpen = registrationOpen,
+            expectedRegistrationIds = expectedRegistrationIds.toSet(),
+            reason = payload.optionalNonBlankString("reason")
+        )
+    }.getOrNull()?.takeIf { parsed ->
+        isUuid(parsed.commandId) &&
+            isUuid(parsed.queueId) &&
+            parsed.createdAtMillis > 0L &&
+            parsed.expectedQueueRevision > 0L &&
+            parsed.expectedMachineConfigurationRevision > 0L &&
+            parsed.expectedRegistrationOpen != parsed.registrationOpen &&
+            parsed.expectedRegistrationIds.size <= 200 &&
+            parsed.expectedRegistrationIds.all { it.matches(Regex("[0-9a-f]{24}")) } &&
+            (parsed.reason == null ||
+                parsed.reason.codePointCount(0, parsed.reason.length) <= 200)
+    }
+}
+
+private fun parseTerminalSettingsUpdate(command: JSONObject?): TerminalSettingsUpdateCommand? {
+    if (command == null || command.optString("type") != TERMINAL_SETTINGS_COMMAND) return null
+    val payload = command.optJSONObject("payload") ?: return null
+    return runCatching {
+        check(
+            RemoteQueueOperationSource.valueOf(payload.getString("operation_source")) ==
+                RemoteQueueOperationSource.MANAGEMENT_APP
+        )
+        val machines = payload.getJSONObject("machines")
+        val machineNames = buildSet {
+            val keys = machines.keys()
+            while (keys.hasNext()) add(keys.next())
+        }
+        val configuredMachineIds = MachineId.entries.take(machineNames.size)
+        check(machineNames == configuredMachineIds.mapTo(mutableSetOf(), MachineId::name))
+        val groups = payload.getJSONArray("machine_groups").let { source ->
+            buildList {
+                repeat(source.length()) { index ->
+                    val group = source.getJSONObject(index)
+                    add(
+                        MachineGroupConfiguration(
+                            id = group.getString("id"),
+                            name = group.getString("name")
+                        )
+                    )
+                }
+            }
+        }
+        TerminalSettingsUpdateCommand(
+            commandId = command.getString("command_id"),
+            createdAtMillis = command.getLong("created_at"),
+            queueId = payload.getString("queue_id"),
+            expectedSettingsRevision = payload.getLong("expected_settings_revision"),
+            nextSettingsRevision = payload.getLong("next_settings_revision"),
+            expectedPolicyRevision = payload.getLong("expected_policy_revision"),
+            expectedMachineConfigurationRevision = payload.getLong(
+                "expected_machine_configuration_revision"
+            ),
+            expectedRegistrationOpen = payload.getBoolean("expected_registration_open"),
+            showCommonPlayPreview = payload.getBoolean("show_common_play_preview"),
+            businessHours = payload.getJSONObject("business_hours")
+                .toBusinessHoursSettingsOrNull() ?: error("Invalid business hours"),
+            configuredMachineCount = configuredMachineIds.size,
+            machineConfigurations = configuredMachineIds.associateWith { machineId ->
+                machines.getJSONObject(machineId.name).toManagedMachineConfiguration(machineId)
+            },
+            machineStableIds = configuredMachineIds.associateWith { machineId ->
+                machines.getJSONObject(machineId.name).getString("stable_id")
+            },
+            machineGroupAssignments = configuredMachineIds.associateWith { machineId ->
+                machines.getJSONObject(machineId.name).getString("group_id")
+            },
+            machineGroups = groups,
+            defaultMachineGroupId = payload.getString("default_machine_group_id"),
+            reason = payload.optionalNonBlankString("reason")
+        )
+    }.getOrNull()?.takeIf { parsed ->
+        if (!isUuid(parsed.commandId) ||
+            !isUuid(parsed.queueId) ||
+            parsed.createdAtMillis <= 0L ||
+            parsed.expectedSettingsRevision < 0L ||
+            parsed.nextSettingsRevision != parsed.expectedSettingsRevision + 1L ||
+            parsed.expectedPolicyRevision < 0L ||
+            parsed.expectedMachineConfigurationRevision <= 0L ||
+            parsed.configuredMachineCount !in 1..MachineId.entries.size ||
+            parsed.machineGroups.isEmpty() ||
+            parsed.machineGroups.size > parsed.configuredMachineCount ||
+            parsed.reason?.let { it.codePointCount(0, it.length) > 200 } == true
+        ) {
+            false
+        } else {
+            val draft = normalizeMachineLayoutSettings(
+                QueueRuleSettings(
+                    configuredMachineCount = parsed.configuredMachineCount,
+                    machineConfigurations = parsed.machineConfigurations,
+                    machineStableIds = parsed.machineStableIds,
+                    machineGroupAssignments = parsed.machineGroupAssignments,
+                    machineGroups = parsed.machineGroups,
+                    defaultMachineGroupId = parsed.defaultMachineGroupId,
+                    businessHours = parsed.businessHours,
+                    showCommonPlayPreview = parsed.showCommonPlayPreview
+                )
+            )
+            draft.configuredMachineCount == parsed.configuredMachineCount &&
+                draft.configuredMachineIds.all { machineId ->
+                    draft.machineConfiguration(machineId) ==
+                        parsed.machineConfigurations[machineId] &&
+                        draft.machineStableId(machineId) == parsed.machineStableIds[machineId] &&
+                        draft.machineGroupId(machineId) ==
+                        parsed.machineGroupAssignments[machineId]
+                } &&
+                draft.machineGroups == parsed.machineGroups &&
+                draft.defaultMachineGroupId == parsed.defaultMachineGroupId
+        }
+    }
+}
+
+private fun JSONObject.toManagedMachineConfiguration(machineId: MachineId): MachineConfiguration {
+    val configuration = getJSONObject("configuration")
+    return normalizeMachineConfiguration(
+        machineId,
+        MachineConfiguration(
+            remark = getString("remark"),
+            gameType = MachineGameType.valueOf(configuration.getString("game_type")),
+            customGameType = configuration.optionalNonBlankString("custom_game_type").orEmpty(),
+            server = MachineServer.valueOf(configuration.getString("server")),
+            customServer = configuration.optionalNonBlankString("custom_server").orEmpty(),
+            gameVersion = configuration.optionalNonBlankString("game_version").orEmpty(),
+            showGameVersion = configuration.getBoolean("game_version_visible"),
+            capacity = configuration.getInt("capacity"),
+            soloRoundMinutes = configuration.getInt("solo_round_minutes"),
+            sharedRoundMinutes = configuration.getInt("shared_round_minutes")
+        )
+    )
+}
+
+private fun parseMachineStatusUpdate(command: JSONObject?): MachineStatusUpdateCommand? {
+    if (command == null || command.optString("type") != MACHINE_STATUS_COMMAND) return null
+    val payload = command.optJSONObject("payload") ?: return null
+    return runCatching {
+        check(
+            RemoteQueueOperationSource.valueOf(payload.getString("operation_source")) ==
+                RemoteQueueOperationSource.MANAGEMENT_APP
+        )
+        val operational = payload.getBoolean("operational")
+        MachineStatusUpdateCommand(
+            commandId = command.getString("command_id"),
+            createdAtMillis = command.getLong("created_at"),
+            queueId = payload.getString("queue_id"),
+            expectedMachineConfigurationRevision = payload.getLong(
+                "expected_machine_configuration_revision"
+            ),
+            machineId = MachineId.valueOf(payload.getString("machine_id")),
+            machineStableId = payload.getString("machine_stable_id"),
+            expectedOperational = payload.getBoolean("expected_operational"),
+            operational = operational,
+            stopReason = payload.optionalNonBlankString("stop_reason")
+                ?.let(MachineStopReason::valueOf),
+            stopReasonDetail = payload.optionalNonBlankString("stop_reason_detail"),
+            reason = payload.optionalNonBlankString("reason")
+        )
+    }.getOrNull()?.takeIf { parsed ->
+        isUuid(parsed.commandId) &&
+            isUuid(parsed.queueId) &&
+            parsed.createdAtMillis > 0L &&
+            parsed.expectedMachineConfigurationRevision > 0L &&
+            parsed.machineStableId.matches(Regex("[0-9a-f]{32}")) &&
+            parsed.expectedOperational != parsed.operational &&
+            (parsed.operational == (parsed.stopReason == null)) &&
+            (parsed.stopReason == MachineStopReason.OTHER || parsed.stopReasonDetail == null) &&
+            (parsed.stopReason != MachineStopReason.OTHER || parsed.stopReasonDetail != null) &&
+            (parsed.stopReasonDetail == null ||
+                parsed.stopReasonDetail.codePointCount(0, parsed.stopReasonDetail.length) <=
+                MAX_MACHINE_STOP_REASON_DETAIL_CHARACTERS) &&
+            (parsed.reason == null ||
+                parsed.reason.codePointCount(0, parsed.reason.length) <= 200)
     }
 }
 
@@ -1702,6 +1970,11 @@ internal fun buildQueueSyncSnapshot(
                         put("profile_id", profile.id)
                         if (schemaVersion >= 8) {
                             put("public_player_id", profile.publicPlayerId ?: JSONObject.NULL)
+                            put(
+                                "avatar_url",
+                                normalizePlayerAvatarReference(profile.avatarReference)
+                                    ?: JSONObject.NULL
+                            )
                         }
                         put("nickname", profile.nickname)
                         put("gender", profile.gender.name)
@@ -1808,6 +2081,7 @@ internal fun playerProfilesForCloudSync(profiles: List<PlayerProfile>): List<Pla
         if (!isValidUuidForSync(profile.id) || nickname.isBlank()) return@mapNotNull null
         profile.copy(
             nickname = nickname,
+            avatarReference = normalizePlayerAvatarReference(profile.avatarReference),
             qqNumber = profile.normalizedQqNumber()?.takeIf(::isValidQqNumber),
             usageCount = profile.usageCount.coerceAtLeast(0),
             lastUsedAtMillis = profile.lastUsedAtMillis?.takeIf { it > 0L },
@@ -1884,6 +2158,14 @@ internal fun buildPublicQueueSnapshot(
         "management_policy_revision",
         displaySettings.managementPolicyRevision.coerceAtLeast(0L)
     )
+    put("management_settings_supported", displaySettings.managementSettingsSupported)
+    put(
+        "management_settings_revision",
+        displaySettings.managementSettingsRevision.coerceAtLeast(0L)
+    )
+    put("show_common_play_preview", displaySettings.showCommonPlayPreview)
+    put("registration_control_open", state.registrationOpen)
+    put("business_hours_settings", displaySettings.businessHoursSettings.toVenueSettingsJson())
     put(
         "management_policy",
         JSONObject().apply {

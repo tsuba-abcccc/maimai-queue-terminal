@@ -1,6 +1,6 @@
 # maimai Q
 
-[![Version](https://img.shields.io/badge/version-0.13.1-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
+[![Version](https://img.shields.io/badge/version-0.13.2-007AFF)](https://github.com/tsuba-abcccc/maimai-queue-terminal/tags)
 [![Android](https://img.shields.io/badge/Android-10%2B-34C759?logo=android&logoColor=white)](https://developer.android.com/about/versions/10)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.2.10-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-007AFF)](https://developer.android.com/compose)
@@ -17,7 +17,8 @@
 - [独立公开队列页说明](public-site/README.md)
 - [玩家使用手册](docs/user-manual.md)
 - [玩家使用手册 PDF](output/pdf/maimai-Q-玩家使用手册.pdf)
-- [0.1.0 至 0.13.1 更新日志](docs/update.md)
+- [0.1.0 至 0.13.2 更新日志](docs/update.md)
+- [0.13.2 自定义头像与管理后台收尾说明](docs/releases/0.13.2-avatar-management.md)
 - [0.13.1 现场终端补丁发布说明](docs/releases/0.13.1-terminal-profile-edit.md)
 - [0.13.0 管理后台发布说明](docs/releases/0.13.0-management-app.md)
 - [后续版本路线](docs/roadmap.md)
@@ -80,6 +81,7 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将现�
 - 临时登记、玩家资料库和“使用移动设备登记”三种现场入口。
 - 玩家资料支持昵称或 QQ 搜索、推荐排序、首字母排序和四列紧凑布局；推荐顺序会参考使用次数和最近使用时间。
 - 玩家资料包含昵称、性别、默认游玩偏好、QQ 号、QQ 显示范围和排队通知设置。
+- 已绑定网页账户的玩家可在网页个人资料顶部点击头像，从系统图库上传自定义头像；服务端统一裁切为 WebP，终端只在资料库现有头像组件中显示，失败时仍显示昵称首字。
 - 通知可以分别控制队列状态、游玩位置、线上登记与签到、暂缓一次与暂时离开及未到场、机台及营业状态；修改结果会在 App、云端和 QQ Bot 间同步。
 - 默认偏好可设为“每次询问”，也可把本次选择保存为以后默认。
 - 使用玩家资料认领临时登记，保留原机台和位置，并将昵称更新为资料昵称。
@@ -115,14 +117,15 @@ maimai Q 处理的是机厅现场排队，不是线上预约系统。它将现�
 - 机台数量和游玩容量只允许在关闭登记后修改。关闭登记会清空当前批次，再次开启时重新载入最新配置和机台状态，并生成新的排队批次。
 - 重要操作使用确认弹窗、状态动画和克制的操作音效。
 
-### 管理后台（0.13.0）
+### 管理后台（独立版本 0.13.1）
 
 - 提供独立的 Android 手机竖屏管理 App，显示全部机台、当前游玩、等待位置、线上待签到、固定组合、暂缓一次和暂时离开状态。
 - 管理员可以立即签到线上登记、新建正式登记、编辑任意登记、退出排队、暂缓一次、暂时离开、修改本次游玩偏好、转移机台和调整等待顺序。
 - 管理后台可以查看和编辑玩家资料，并为已绑定网页账户的玩家修改密码；密码修改会撤销旧网页会话。
-- 管理后台可以接管已支持的终端敏感策略。绑定后，终端不能再编辑这些策略；正常拖动全队列排序属于日常队列操作，始终保持可用。
+- 管理后台可以接管终端敏感策略，并管理登记开放状态、营业时间、机台分组、机台完整配置与停用状态；需要先关闭登记的风险设置仍执行原有保护。
+- 管理后台提供完整操作日志和来源筛选。绑定后，终端不能再编辑后台已覆盖的敏感设置；正常拖动全队列排序属于日常队列操作，始终保持可用。
 - 管理命令由服务端生成并由现场终端和 `queue-core` 最终校验执行；管理 App 不直接写入队列快照。
-- 机台完整配置、营业时间、同步故障恢复、日志浏览和其他尚未接入的终端设置保留在后续管理版本，不在本版本伪装为已开放能力。
+- 同步总开关、同步模式、服务器地址和终端令牌暂时仍由现场终端维护，用于断线和换服恢复；管理 App 未开放这些连接项前，绑定后台不会把它们锁死。
 
 ### 与服务端同步
 
@@ -216,7 +219,7 @@ app/build/outputs/apk/local/debug/app-local-debug.apk
 .\gradlew.bat :app:packageLocalDebugApk
 ```
 
-文件会复制到 `output/apk/maimai-Q-0.13.1-local.apk`。
+文件会复制到 `output/apk/maimai-Q-0.13.2-local.apk`。
 
 macOS 或 Linux 使用：
 
@@ -265,7 +268,7 @@ $signedApk = 'app\build\outputs\apk\local\release\app-local-release-signed.apk'
 & '<Android SDK>\build-tools\<已安装版本>\apksigner.bat' verify --verbose --print-certs $signedApk
 ```
 
-公开渠道只能上传已经验证签名的 Release APK。`localRelease` 是完全离线版；自建服务端的测试者还需要下文所述、不含预置地址和令牌的公开 `terminalRelease`。禁止上传 Debug、未签名 APK，或任何预置了机厅私有连接信息的终端包。0.13.1 的公开 APK 使用既有长期证书签名，证书 SHA-256 指纹为 `daa2e919d2f8d956c0a93417aae601e6ec658edc5ae7c9673830c53f649ec925`。
+公开渠道只能上传已经验证签名的 Release APK。`localRelease` 是完全离线版；自建服务端的测试者还需要下文所述、不含预置地址和令牌的公开 `terminalRelease`。禁止上传 Debug、未签名 APK，或任何预置了机厅私有连接信息的终端包。0.13.2 的公开 APK 使用既有长期证书签名，证书 SHA-256 指纹为 `daa2e919d2f8d956c0a93417aae601e6ec658edc5ae7c9673830c53f649ec925`。
 
 ### 配置与服务端同步
 
@@ -304,7 +307,7 @@ QUEUE_SYNC_TOKEN=<与服务器一致的高强度随机令牌>
 
 签名后还应检查其应用 ID 为 `com.abcccc.maimaiqueue`、包含联网权限、不是 Debug 构建，并确认 APK 中没有任何实际域名或令牌。
 
-现场终端文件会复制到 `output/apk/maimai-Q-0.13.1-terminal.apk`。只有不含预置连接信息且经过正式签名和校验的构建，才可以作为 GitHub 公开 Release 附件。
+现场终端文件会复制到 `output/apk/maimai-Q-0.13.2-terminal.apk`。只有不含预置连接信息且经过正式签名和校验的构建，才可以作为 GitHub 公开 Release 附件。
 
 ### 管理后台构建
 
