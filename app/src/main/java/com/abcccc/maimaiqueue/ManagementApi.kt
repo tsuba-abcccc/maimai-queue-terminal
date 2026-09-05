@@ -23,6 +23,13 @@ internal data class ManagementRegistration(
     val temporaryAwaySkippedTurns: Int
 )
 
+internal data class ManagementWaitingPosition(
+    val index: Int,
+    val registrations: List<ManagementRegistration>,
+    val estimatedWaitMinutes: Int?,
+    val commonPlayPreview: String?
+)
+
 internal data class ManagementMachine(
     val id: String,
     val name: String,
@@ -34,9 +41,13 @@ internal data class ManagementMachine(
     val stopReasonDetail: String?,
     val configuration: MachineConfiguration,
     val registrationCount: Int,
+    val playingStartedAtMillis: Long?,
     val playing: List<ManagementRegistration>,
+    val waitingPositions: List<ManagementWaitingPosition>
+) {
     val waiting: List<ManagementRegistration>
-)
+        get() = waitingPositions.flatMap(ManagementWaitingPosition::registrations)
+}
 
 internal data class ManagementLogEntry(
     val cursor: Long,
@@ -130,6 +141,25 @@ internal data class ManagementCommandResult(
     val commandId: String,
     val status: String,
     val detail: String?
+)
+
+internal data class ManagementTerminalActionRequest(
+    val action: ManagementQueueAction,
+    val machine: ManagementMachine,
+    val registrationIds: List<String> = emptyList(),
+    val profileId: String? = null,
+    val friendProfileId: String? = null,
+    val displayId: String? = null,
+    val preference: String? = null,
+    val targetMachine: ManagementMachine? = null,
+    val sourcePositionIndex: Int? = null,
+    val destinationPositionIndex: Int? = null,
+    val desiredWaitingPositions: List<List<String>>? = null,
+    val desiredRegistrationOrder: List<String>? = null,
+    val noShowResolution: String? = null,
+    val startNextWhenPlayingBecomesEmpty: Boolean = true,
+    val advanceWhenPlayingEmpty: Boolean = false,
+    val reason: String
 )
 
 internal class ManagementApiException(val statusCode: Int, message: String) : Exception(message)
@@ -233,6 +263,85 @@ internal class ManagementApi(
         }.toString()
         val connection = openConnection(
             managementPath("/api/queue-management/registrations"),
+            "POST"
+        ).apply {
+            doOutput = true
+            val bytes = body.toByteArray(Charsets.UTF_8)
+            setFixedLengthStreamingMode(bytes.size)
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+        try {
+            parseCommandResult(readResponse(connection, body))
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    suspend fun terminalQueueAction(
+        overview: ManagementOverview,
+        request: ManagementTerminalActionRequest
+    ): ManagementCommandResult = withContext(Dispatchers.IO) {
+        val machineStableId = request.machine.stableId
+            ?: throw ManagementApiException(409, "目标机台缺少稳定身份，请刷新后重试")
+        val body = JSONObject().apply {
+            put("request_id", java.util.UUID.randomUUID().toString())
+            put("expected_queue_id", overview.queueId)
+            put("expected_queue_revision", overview.queueRevision)
+            put(
+                "expected_machine_configuration_revision",
+                overview.machineConfigurationRevision
+            )
+            put("action", request.action.name)
+            put("machine_id", request.machine.id)
+            put("expected_machine_stable_id", machineStableId)
+            put(
+                "expected_playing_registration_ids",
+                JSONArray(request.machine.playing.map(ManagementRegistration::registrationId))
+            )
+            put(
+                "expected_waiting_positions",
+                registrationIdGroupsJson(
+                    request.machine.waitingPositions.map { position ->
+                        position.registrations.map(ManagementRegistration::registrationId)
+                    }
+                )
+            )
+            put("registration_ids", JSONArray(request.registrationIds))
+            request.profileId?.let { put("profile_id", it) }
+            request.friendProfileId?.let { put("friend_profile_id", it) }
+            request.displayId?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                put("display_id", it)
+            }
+            request.preference?.let { put("preference", it) }
+            request.targetMachine?.let { target ->
+                put("target_machine_id", target.id)
+                put(
+                    "expected_target_machine_stable_id",
+                    target.stableId
+                        ?: throw ManagementApiException(
+                            409,
+                            "要转入的机台缺少稳定身份，请刷新后重试"
+                        )
+                )
+            }
+            request.sourcePositionIndex?.let { put("source_position_index", it) }
+            request.destinationPositionIndex?.let { put("destination_position_index", it) }
+            request.desiredWaitingPositions?.let {
+                put("desired_waiting_positions", registrationIdGroupsJson(it))
+            }
+            request.desiredRegistrationOrder?.let {
+                put("desired_registration_order", JSONArray(it))
+            }
+            request.noShowResolution?.let { put("no_show_resolution", it) }
+            put(
+                "start_next_when_playing_becomes_empty",
+                request.startNextWhenPlayingBecomesEmpty
+            )
+            put("advance_when_playing_empty", request.advanceWhenPlayingEmpty)
+            put("reason", request.reason.trim().ifEmpty { "管理后台执行现场终端队列操作" })
+        }.toString()
+        val connection = openConnection(
+            managementPath("/api/queue-management/terminal-actions"),
             "POST"
         ).apply {
             doOutput = true
@@ -696,13 +805,26 @@ private fun parseMachines(source: JSONArray): List<ManagementMachine> = buildLis
         val playing = machine.optJSONArray("playing")?.let { registrations ->
             parseRegistrations(registrations, "PLAYING", null)
         }.orEmpty()
-        val waiting = buildList {
+        val waitingPositions = buildList {
             val positions = machine.optJSONArray("waiting_positions") ?: JSONArray()
             repeat(positions.length()) { positionIndex ->
                 val position = positions.optJSONObject(positionIndex) ?: return@repeat
                 val queuePosition = position.optInt("index", positionIndex + 1)
-                position.optJSONArray("registrations")?.let { registrations ->
-                    addAll(parseRegistrations(registrations, "WAITING", queuePosition))
+                val registrations = position.optJSONArray("registrations")?.let {
+                    parseRegistrations(it, "WAITING", queuePosition)
+                }.orEmpty()
+                if (registrations.isNotEmpty()) {
+                    add(
+                        ManagementWaitingPosition(
+                            index = queuePosition,
+                            registrations = registrations,
+                            estimatedWaitMinutes = position.optInt(
+                                "estimated_wait_minutes",
+                                -1
+                            ).takeIf { it >= 0 },
+                            commonPlayPreview = position.optionalString("common_play_preview")
+                        )
+                    )
                 }
             }
         }
@@ -723,9 +845,13 @@ private fun parseMachines(source: JSONArray): List<ManagementMachine> = buildLis
                     ?: MachineConfiguration(
                         remark = machine.optString("remark", machine.optString("name", "机台 $machineId"))
                     ),
-                registrationCount = machine.optInt("registration_count", playing.size + waiting.size),
+                registrationCount = machine.optInt(
+                    "registration_count",
+                    playing.size + waitingPositions.sumOf { it.registrations.size }
+                ),
+                playingStartedAtMillis = machine.optionalLong("playing_started_at"),
                 playing = playing,
-                waiting = waiting
+                waitingPositions = waitingPositions
             )
         )
     }
@@ -865,3 +991,8 @@ private fun JSONObject.optionalString(name: String): String? =
 
 private fun JSONObject.optionalLong(name: String): Long? =
     if (!has(name) || isNull(name)) null else optLong(name).takeIf { it > 0L }
+
+private fun registrationIdGroupsJson(groups: List<List<String>>): JSONArray =
+    JSONArray().apply {
+        groups.forEach { group -> put(JSONArray(group)) }
+    }

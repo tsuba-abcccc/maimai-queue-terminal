@@ -112,6 +112,19 @@ location ^~ /api/player-account/ {
     client_max_body_size 1m;
 }
 
+# Mobile web player-profile creation is opened from the terminal QR code.
+# It is public by one-time session token, while the terminal-only session
+# creation endpoint remains protected by the /api/queue-terminal/ location.
+location ^~ /api/player-profile-creation/ {
+    proxy_pass http://127.0.0.1:8081;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    client_max_body_size 1m;
+}
+
 location ^~ /api/player-avatars/ {
     proxy_pass http://127.0.0.1:8081;
     proxy_http_version 1.1;

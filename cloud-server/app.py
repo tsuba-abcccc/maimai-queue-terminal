@@ -50,6 +50,8 @@ PLAYER_ACCOUNT_PASSWORD_MIN_LENGTH = 8
 PLAYER_ACCOUNT_PASSWORD_MAX_LENGTH = 128
 PLAYER_ACCOUNT_SESSION_TOKEN_BYTES = 32
 PLAYER_ACCOUNT_BINDING_TOKEN_BYTES = 32
+PLAYER_PROFILE_CREATION_TOKEN_BYTES = 32
+PLAYER_ACCOUNT_LOOKUP_ACTION = "login_lookup_request"
 PLAYER_ACCOUNT_SCRYPT_N = 2**14
 PLAYER_ACCOUNT_SCRYPT_R = 8
 PLAYER_ACCOUNT_SCRYPT_P = 1
@@ -82,6 +84,7 @@ BOT_PROFILE_UPDATE_FIELDS = (
 )
 PROFILE_UPDATE_COMMAND = "UPDATE_PLAYER_PROFILE"
 QUEUE_OPERATION_COMMAND = "QUEUE_OPERATION"
+MANAGEMENT_QUEUE_ACTION_COMMAND = "MANAGEMENT_QUEUE_ACTION"
 MOBILE_REGISTRATION_COMMAND = "MOBILE_DEVICE_REGISTRATION"
 TERMINAL_POLICY_COMMAND = "UPDATE_TERMINAL_POLICY"
 REGISTRATION_AVAILABILITY_COMMAND = "SET_REGISTRATION_AVAILABILITY"
@@ -97,6 +100,43 @@ QUEUE_OPERATIONS = {
     "CHANGE_PLAY_PREFERENCE",
     "LEAVE_QUEUE",
     "CHECK_IN",
+}
+MANAGEMENT_QUEUE_ACTIONS = {
+    "ADD_TEMPORARY_REGISTRATION",
+    "ADD_PROFILE_REGISTRATION",
+    "FINISH_ROUND",
+    "END_ROUND_ONLY",
+    "REMOVE_CURRENT_ROUND_AND_START_NEXT",
+    "ENTER_PLAYING_POSITION",
+    "RESTART_PLAYING_TIMER",
+    "RESTART_PENDING_CHECK_IN_TIMERS",
+    "RESTART_MACHINE_TIMERS",
+    "RETURN_PLAYING_TO_WAITING_FRONT",
+    "MOVE_WAITING_REGISTRATION_INTO_CURRENT_ROUND",
+    "ADVANCE_TO_WAITING_POSITION",
+    "DEFER_ONE_ROUND",
+    "CANCEL_DEFER_ONE_ROUND",
+    "TEMPORARILY_LEAVE",
+    "CANCEL_TEMPORARY_LEAVE",
+    "CHANGE_PREFERENCE",
+    "CREATE_FIXED_PAIR",
+    "CREATE_FIXED_PAIR_WITH_REGISTRATION",
+    "RELEASE_FIXED_PAIR",
+    "RENAME_REGISTRATION",
+    "CLAIM_WITH_PLAYER_PROFILE",
+    "MARK_NO_SHOW",
+    "CHECK_IN",
+    "REMOVE_REGISTRATIONS",
+    "MOVE_WAITING_POSITION",
+    "REPLACE_WAITING_POSITIONS",
+    "REPLACE_REGISTRATION_ORDER",
+    "TRANSFER_REGISTRATIONS",
+}
+NO_SHOW_RESOLUTIONS = {
+    "DEFER_ONE_ROUND",
+    "DEFER_GROUP_ONE_ROUND",
+    "MOVE_TO_TAIL",
+    "REMOVE",
 }
 RESULT_SOURCE_TERMINAL = "TERMINAL"
 RESULT_SOURCE_SERVER_TIMEOUT = "SERVER_TIMEOUT"
@@ -257,6 +297,25 @@ REQUIRED_DATABASE_COLUMNS = {
         "expires_at",
         "consumed_at",
         "invalidated_at",
+    },
+    "player_profile_creation_session": {
+        "session_id",
+        "session_token",
+        "profile_scope_id",
+        "created_by_terminal",
+        "created_instance_id",
+        "created_instance_generation",
+        "created_at",
+        "expires_at",
+        "status",
+        "consumed_at",
+        "profile_id",
+        "account_id",
+    },
+    "pending_player_profile_sync": {
+        "profile_scope_id",
+        "profile_id",
+        "created_at",
     },
     "player_auth_limit": {
         "action",
@@ -539,6 +598,15 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         PLAYER_BINDING_SESSION_TTL_SECONDS=int(
             os.getenv("QUEUE_PLAYER_BINDING_TTL_SECONDS", "600")
         ),
+        PLAYER_PROFILE_CREATION_SESSION_TTL_SECONDS=int(
+            os.getenv("QUEUE_PLAYER_PROFILE_CREATION_TTL_SECONDS", "600")
+        ),
+        PLAYER_PROFILE_CREATION_SESSION_RETENTION_SECONDS=int(
+            os.getenv(
+                "QUEUE_PLAYER_PROFILE_CREATION_SESSION_RETENTION_SECONDS",
+                os.getenv("QUEUE_PLAYER_PROFILE_CREATION_RETENTION_SECONDS", "86400"),
+            )
+        ),
         PLAYER_AUTH_LIMIT_WINDOW_SECONDS=int(
             os.getenv("QUEUE_PLAYER_AUTH_LIMIT_WINDOW_SECONDS", "900")
         ),
@@ -547,6 +615,9 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         ),
         PLAYER_AUTH_LIMIT_FAILURES=int(
             os.getenv("QUEUE_PLAYER_AUTH_LIMIT_FAILURES", "5")
+        ),
+        PLAYER_AUTH_LOOKUP_LIMIT_REQUESTS=int(
+            os.getenv("QUEUE_PLAYER_AUTH_LOOKUP_LIMIT_REQUESTS", "30")
         ),
         PLAYER_ACCOUNT_COOKIE_SECURE=os.getenv(
             "QUEUE_PLAYER_COOKIE_SECURE", "true"
@@ -560,10 +631,10 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         CORS_ORIGIN=configured_cors_origin,
         PUBLIC_SITE_URL=configured_public_site_url.rstrip("/"),
         LATEST_TERMINAL_VERSION=os.getenv(
-            "QUEUE_LATEST_TERMINAL_VERSION", "0.13.2"
+            "QUEUE_LATEST_TERMINAL_VERSION", "0.13.3"
         ),
         LATEST_WEBSITE_VERSION=os.getenv(
-            "QUEUE_LATEST_WEBSITE_VERSION", "0.13.2"
+            "QUEUE_LATEST_WEBSITE_VERSION", "0.13.3"
         ),
         LATEST_BOT_VERSION=os.getenv("QUEUE_LATEST_BOT_VERSION", "0.3.13"),
         MAX_CONTENT_LENGTH=MAX_AVATAR_REQUEST_BYTES,
@@ -964,6 +1035,66 @@ def initialize_database(database_path: str, *, profile_scope_id: str = "default"
         )
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS pending_player_profile_sync (
+                profile_scope_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(profile_scope_id, profile_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS player_profile_creation_session (
+                session_id TEXT PRIMARY KEY,
+                session_token TEXT NOT NULL UNIQUE,
+                profile_scope_id TEXT NOT NULL,
+                created_by_terminal TEXT NOT NULL,
+                created_instance_id TEXT NOT NULL DEFAULT '',
+                created_instance_generation INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                consumed_at INTEGER,
+                profile_id TEXT,
+                account_id TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS player_profile_creation_session_expiry
+            ON player_profile_creation_session(expires_at, consumed_at)
+            """
+        )
+        player_profile_creation_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(player_profile_creation_session)"
+            )
+        }
+        for column_name, declaration in (
+            ("created_instance_id", "TEXT NOT NULL DEFAULT ''"),
+            ("created_instance_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column_name not in player_profile_creation_columns:
+                connection.execute(
+                    "ALTER TABLE player_profile_creation_session "
+                    f"ADD COLUMN {column_name} {declaration}"
+                )
+        # Sessions created before runtime-instance binding was introduced used
+        # the stable terminal ID as their effective instance identity. Backfill
+        # that compatibility value so an in-flight QR is not invalidated merely
+        # because the server schema was upgraded.
+        connection.execute(
+            """
+            UPDATE player_profile_creation_session
+            SET created_instance_id = created_by_terminal
+            WHERE created_instance_id = ''
+            """
+        )
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS player_auth_limit (
                 action TEXT NOT NULL,
                 subject_hash TEXT NOT NULL,
@@ -1304,6 +1435,13 @@ def register_routes(app: Flask) -> None:
             return authorization_error
         return create_management_queue_operation_command()
 
+    @app.post("/api/queue-management/terminal-actions")
+    def queue_management_create_terminal_action():
+        authorization_error = authorize_management()
+        if authorization_error is not None:
+            return authorization_error
+        return create_management_terminal_queue_action()
+
     @app.post("/api/queue-management/queue-reorders")
     def queue_management_create_queue_reorder():
         authorization_error = authorize_management()
@@ -1381,6 +1519,16 @@ def register_routes(app: Flask) -> None:
             return venue_error
         return create_player_binding_session()
 
+    @app.post("/api/queue-terminal/player-profile-sessions")
+    def queue_terminal_create_player_profile_session():
+        authorization_error = authorize_terminal()
+        if authorization_error is not None:
+            return authorization_error
+        venue_error = authorize_terminal_venue()
+        if venue_error is not None:
+            return venue_error
+        return create_player_profile_creation_session()
+
     @app.get("/api/player-account/bindings/<binding_token>")
     def player_account_binding(binding_token: str):
         return read_player_binding_session(binding_token)
@@ -1389,9 +1537,21 @@ def register_routes(app: Flask) -> None:
     def player_account_complete_binding(binding_token: str):
         return complete_player_binding_session(binding_token)
 
+    @app.get("/api/player-profile-creation/sessions/<session_token>")
+    def player_profile_creation_session(session_token: str):
+        return read_player_profile_creation_session(session_token)
+
+    @app.post("/api/player-profile-creation/sessions/<session_token>/complete")
+    def player_profile_creation_complete(session_token: str):
+        return complete_player_profile_creation_session(session_token)
+
     @app.post("/api/player-account/login")
     def player_account_login():
         return login_player_account()
+
+    @app.post("/api/player-account/login-lookup")
+    def player_account_login_lookup():
+        return lookup_player_account_login()
 
     @app.get("/api/player-account")
     def player_account_current():
@@ -1754,16 +1914,22 @@ def player_auth_limit_error(
     ), 429
 
 
-def record_player_auth_failure(
+def record_player_auth_attempt(
     connection: sqlite3.Connection,
     *,
     action: str,
     subject_hash: str,
     now: int,
+    limit: int | None = None,
 ) -> None:
     window_seconds = max(60, current_app.config["PLAYER_AUTH_LIMIT_WINDOW_SECONDS"])
     block_seconds = max(60, current_app.config["PLAYER_AUTH_LIMIT_BLOCK_SECONDS"])
-    failure_limit = max(2, current_app.config["PLAYER_AUTH_LIMIT_FAILURES"])
+    failure_limit = max(
+        2,
+        limit
+        if limit is not None
+        else current_app.config["PLAYER_AUTH_LIMIT_FAILURES"],
+    )
     row = connection.execute(
         """
         SELECT window_started_at, failure_count, blocked_until
@@ -1789,6 +1955,22 @@ def record_player_auth_failure(
             blocked_until = excluded.blocked_until
         """,
         (action, subject_hash, window_started_at, failure_count, blocked_until),
+    )
+
+
+def record_player_auth_failure(
+    connection: sqlite3.Connection,
+    *,
+    action: str,
+    subject_hash: str,
+    now: int,
+) -> None:
+    """Record a failed password or binding verification attempt."""
+    record_player_auth_attempt(
+        connection,
+        action=action,
+        subject_hash=subject_hash,
+        now=now,
     )
 
 
@@ -2344,6 +2526,492 @@ def complete_player_binding_session(binding_token: str):
     return response, 201
 
 
+def cleanup_player_profile_creation_sessions(
+    connection: sqlite3.Connection, now: int
+) -> None:
+    retention = max(
+        1, current_app.config["PLAYER_PROFILE_CREATION_SESSION_RETENTION_SECONDS"]
+    )
+    connection.execute(
+        """
+        DELETE FROM player_profile_creation_session
+        WHERE COALESCE(consumed_at, expires_at) <= ?
+        """,
+        (now - retention,),
+    )
+    connection.execute(
+        """
+        DELETE FROM pending_player_profile_sync
+        WHERE created_at <= ?
+          AND profile_id NOT IN (
+              SELECT profile_id
+              FROM player_account
+              WHERE profile_scope_id = pending_player_profile_sync.profile_scope_id
+          )
+        """,
+        (now - retention,),
+    )
+
+
+def find_player_profile_creation_session(
+    connection: sqlite3.Connection, session_token: str
+) -> sqlite3.Row | None:
+    if MOBILE_SESSION_TOKEN_PATTERN.fullmatch(session_token) is None:
+        return None
+    return connection.execute(
+        """
+        SELECT session.*,
+               venue.venue_id, venue.venue_code,
+               venue.display_name AS venue_name
+        FROM player_profile_creation_session AS session
+        JOIN venue ON venue.profile_scope_id = session.profile_scope_id
+        WHERE session.session_token = ?
+        """,
+        (session_token,),
+    ).fetchone()
+
+
+def serialize_player_profile_creation_session(
+    row: sqlite3.Row,
+) -> dict[str, Any]:
+    site_url = current_app.config["PLAYER_ACCOUNT_SITE_URL"] or current_app.config[
+        "PUBLIC_SITE_URL"
+    ]
+    separator = "&" if "?" in site_url else "?"
+    return {
+        "session_id": row["session_id"],
+        "status": row["status"],
+        "created_at": row["created_at"] * 1000,
+        "expires_at": row["expires_at"] * 1000,
+        "profile_id": row["profile_id"],
+        "profile_creation_url": (
+            f"{site_url}{separator}"
+            f"{urlencode({'player_profile_creation': row['session_token']})}"
+            if site_url
+            else None
+        ),
+        "venue": {
+            "id": row["venue_id"],
+            "code": row["venue_code"],
+            "name": row["venue_name"],
+        },
+    }
+
+
+def create_player_profile_creation_session():
+    source = request.get_json(silent=True)
+    if not isinstance(source, dict) or set(source) != {"request_id"}:
+        return jsonify({"ok": False, "error": "网页玩家资料会话参数不完整"}), 400
+    try:
+        session_id = read_uuid(source, "request_id")
+    except ValidationError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+
+    site_url = current_app.config["PLAYER_ACCOUNT_SITE_URL"] or current_app.config[
+        "PUBLIC_SITE_URL"
+    ]
+    if not site_url:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "PLAYER_ACCOUNT_SITE_NOT_CONFIGURED",
+                "error": "服务端尚未配置公开网页地址，暂不能生成玩家资料二维码。",
+            }
+        ), 503
+
+    device_id = request.headers.get("X-Device-ID", "").strip()
+    try:
+        instance_id, instance_generation = read_terminal_instance_identity(device_id)
+    except ValidationError as error:
+        return jsonify(validation_error_payload(error)), 400
+    now = int(time.time())
+    expires_at = now + max(
+        60, current_app.config["PLAYER_PROFILE_CREATION_SESSION_TTL_SECONDS"]
+    )
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cleanup_player_profile_creation_sessions(connection, now)
+        existing = connection.execute(
+            "SELECT * FROM player_profile_creation_session WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["created_by_terminal"] != device_id
+                or existing["created_instance_id"] != instance_id
+                or existing["created_instance_generation"] != instance_generation
+            ):
+                connection.rollback()
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "PLAYER_PROFILE_CREATION_INSTANCE_CONFLICT",
+                        "error": "这个请求编号已属于另一份终端运行实例，请重新打开玩家资料创建页面。",
+                    }
+                ), 409
+            connection.commit()
+            existing = find_player_profile_creation_session(
+                connection, existing["session_token"]
+            )
+            return jsonify(serialize_player_profile_creation_session(existing)), 200
+
+        snapshot_row = connection.execute(
+            """
+            SELECT queue_id, device_id, instance_id, instance_generation,
+                   payload, received_at
+            FROM queue_snapshot WHERE id = 1
+            """
+        ).fetchone()
+        if snapshot_row is None:
+            connection.rollback()
+            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+        if not snapshot_is_online(snapshot_row):
+            connection.rollback()
+            return jsonify(
+                {"ok": False, "error": "现场终端暂时离线，暂不能创建网页玩家资料。"}
+            ), 503
+        if snapshot_row["device_id"] != device_id:
+            connection.rollback()
+            return jsonify({"ok": False, "error": "当前终端不是正在同步的终端"}), 409
+        if not terminal_instance_matches(
+            snapshot_row, device_id, instance_id, instance_generation
+        ):
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "STALE_TERMINAL_INSTANCE",
+                    "error": TERMINAL_INSTANCE_CONFLICT_DETAIL,
+                }
+            ), 409
+        snapshot = json.loads(snapshot_row["payload"])
+        if snapshot.get("test_data", False):
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "TEST_DATA_PROFILE_CREATION_UNAVAILABLE",
+                    "error": "当前数据是测试数据，不能创建长期网页玩家资料。",
+                }
+            ), 409
+        if not snapshot.get("website_remote_enabled", False):
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "WEBSITE_SYNC_DISABLED",
+                    "error": "与服务端同步已关闭，暂不能创建网页玩家资料。",
+                }
+            ), 409
+        _, profile_scope_id = snapshot_storage_context(snapshot_row, snapshot)
+        session_token = secrets.token_urlsafe(PLAYER_PROFILE_CREATION_TOKEN_BYTES)
+        connection.execute(
+            """
+            INSERT INTO player_profile_creation_session
+                (session_id, session_token, profile_scope_id,
+                 created_by_terminal, created_instance_id,
+                 created_instance_generation, created_at, expires_at, status,
+                 consumed_at, profile_id, account_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', NULL, NULL, NULL)
+            """,
+            (
+                session_id,
+                session_token,
+                profile_scope_id,
+                device_id,
+                instance_id,
+                instance_generation,
+                now,
+                expires_at,
+            ),
+        )
+        connection.commit()
+        created = find_player_profile_creation_session(connection, session_token)
+    return jsonify(serialize_player_profile_creation_session(created)), 201
+
+
+def player_profile_creation_state_error(
+    session: sqlite3.Row | None, now: int
+):
+    if session is None:
+        return jsonify({"ok": False, "error": "玩家资料创建页面无效，请在终端重新打开。"}), 404
+    if session["status"] == "COMPLETED" or session["consumed_at"] is not None:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "PLAYER_PROFILE_CREATION_USED",
+                "error": "这次玩家资料创建已经完成，请直接使用网页账户登录。",
+            }
+        ), 409
+    if session["expires_at"] <= now:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "PLAYER_PROFILE_CREATION_EXPIRED",
+                "error": "玩家资料创建页面已经失效，请在现场终端重新生成。",
+            }
+        ), 410
+    return None
+
+
+def read_player_profile_creation_session(session_token: str):
+    now = int(time.time())
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cleanup_player_profile_creation_sessions(connection, now)
+        session = find_player_profile_creation_session(connection, session_token)
+        connection.commit()
+    state_error = player_profile_creation_state_error(session, now)
+    if state_error is not None:
+        return state_error
+    return jsonify(serialize_player_profile_creation_session(session))
+
+
+def complete_player_profile_creation_session(session_token: str):
+    source = request.get_json(silent=True)
+    required_fields = {
+        "nickname",
+        "gender",
+        "default_preference",
+        "qq_number",
+        "password",
+        "password_confirmation",
+        *NOTIFICATION_FIELDS,
+    }
+    if not isinstance(source, dict) or set(source) != required_fields:
+        return jsonify(
+            {"ok": False, "error": "请填写完整的网页玩家资料和账户密码。"}
+        ), 400
+    try:
+        nickname = read_string(source, "nickname", maximum_length=18)
+        gender = read_choice(source, "gender", PLAYER_GENDERS)
+        default_preference = read_choice(
+            source, "default_preference", PROFILE_PREFERENCES
+        )
+        qq_number = read_qq_number(source, "qq_number")
+        password = validate_player_account_password(source.get("password"))
+        password_confirmation = validate_player_account_password(
+            source.get("password_confirmation")
+        )
+        if password != password_confirmation:
+            raise ValidationError("两次输入的密码不一致。", code="PASSWORD_MISMATCH")
+        notifications = {
+            key: read_boolean(source, key) for key in NOTIFICATION_FIELDS
+        }
+    except ValidationError as error:
+        return jsonify(validation_error_payload(error)), 400
+
+    now = int(time.time())
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        cleanup_player_profile_creation_sessions(connection, now)
+        session = find_player_profile_creation_session(connection, session_token)
+        state_error = player_profile_creation_state_error(session, now)
+        if state_error is not None:
+            connection.rollback()
+            return state_error
+
+        snapshot_row = connection.execute(
+            """
+            SELECT queue_id, device_id, instance_id, instance_generation,
+                   payload, received_at
+            FROM queue_snapshot WHERE id = 1
+            """
+        ).fetchone()
+        if snapshot_row is None or snapshot_row["device_id"] != session[
+            "created_by_terminal"
+        ]:
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "PLAYER_PROFILE_CREATION_STALE",
+                    "error": "现场终端连接已经变化，请回到终端重新生成二维码。",
+                }
+            ), 409
+        if not terminal_instance_matches(
+            snapshot_row,
+            session["created_by_terminal"],
+            session["created_instance_id"],
+            session["created_instance_generation"],
+        ):
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "PLAYER_PROFILE_CREATION_STALE",
+                    "error": "现场终端已经重新启动，请回到终端重新生成二维码。",
+                }
+            ), 409
+        if not snapshot_is_online(snapshot_row):
+            connection.rollback()
+            return jsonify(
+                {"ok": False, "error": "现场终端暂时离线，请稍后重试。"}
+            ), 503
+        snapshot = json.loads(snapshot_row["payload"])
+        if snapshot.get("test_data", False) or not snapshot.get(
+            "website_remote_enabled", False
+        ):
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "PLAYER_PROFILE_CREATION_UNAVAILABLE",
+                    "error": "现场终端已停止长期网页资料创建，请重新打开二维码。",
+                }
+            ), 409
+        _, profile_scope_id = snapshot_storage_context(snapshot_row, snapshot)
+        if profile_scope_id != session["profile_scope_id"]:
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "PLAYER_PROFILE_CREATION_STALE",
+                    "error": "现场机厅已经变化，请回到终端重新生成二维码。",
+                }
+            ), 409
+
+        duplicate = connection.execute(
+            """
+            SELECT profile_id, nickname, qq_number
+            FROM player_profile
+            WHERE device_id = ?
+              AND (lower(nickname) = lower(?) OR qq_number = ?)
+            LIMIT 1
+            """,
+            (profile_scope_id, nickname, qq_number),
+        ).fetchone()
+        if duplicate is not None:
+            if duplicate["qq_number"] == qq_number:
+                connection.rollback()
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "QQ_ALREADY_USED",
+                        "error": "这个 QQ 已经关联其他玩家资料，请返回终端选择已有资料或更换 QQ。",
+                    }
+                ), 409
+            connection.rollback()
+            return jsonify(
+                {
+                    "ok": False,
+                    "code": "NICKNAME_ALREADY_USED",
+                    "error": "这个昵称已经用于其他玩家资料，请更换一个昵称。",
+                }
+            ), 409
+
+        profile_id = str(uuid4())
+        account_id = str(uuid4())
+        public_player_id = allocate_player_public_id(
+            connection,
+            profile_scope_id=profile_scope_id,
+            profile_id=profile_id,
+        )
+        created_at_millis = now * 1000
+        connection.execute(
+            """
+            INSERT INTO player_profile
+                (device_id, profile_id, nickname, gender, default_preference,
+                 qq_number, usage_count, last_used_at, qq_visibility,
+                 notification_enabled, notify_queue_changes,
+                 notify_playing_position, notify_online_check_in,
+                 notify_absence, notify_machine_status, setup_version,
+                 profile_revision, created_at, profile_updated_at,
+                 public_player_id, avatar_reference, web_account_bound,
+                 terminal_editing_allowed, visited_venues_public,
+                 web_profile_revision, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, 0, NULL, 'PUBLIC_WEBSITE', ?, ?, ?, ?, ?, ?,
+                    1, 1, ?, ?, ?, NULL, 1, 0, 1, 1, ?)
+            """,
+            (
+                profile_scope_id,
+                profile_id,
+                nickname,
+                gender,
+                default_preference,
+                qq_number,
+                int(notifications["notification_enabled"]),
+                int(notifications["notify_queue_changes"]),
+                int(notifications["notify_playing_position"]),
+                int(notifications["notify_online_check_in"]),
+                int(notifications["notify_absence"]),
+                int(notifications["notify_machine_status"]),
+                created_at_millis,
+                created_at_millis,
+                public_player_id,
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO current_player_profile(profile_scope_id, profile_id)
+            VALUES (?, ?)
+            """,
+            (profile_scope_id, profile_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO pending_player_profile_sync(profile_scope_id, profile_id, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(profile_scope_id, profile_id) DO UPDATE SET
+                created_at = excluded.created_at
+            """,
+            (profile_scope_id, profile_id, now),
+        )
+        salt = secrets.token_bytes(16)
+        password_hash = hash_player_account_password(password, salt)
+        connection.execute(
+            """
+            INSERT INTO player_account
+                (account_id, profile_scope_id, profile_id, password_salt,
+                 password_hash, created_at, updated_at, password_changed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_id,
+                profile_scope_id,
+                profile_id,
+                salt,
+                password_hash,
+                now,
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE player_profile_creation_session
+            SET status = 'COMPLETED', consumed_at = ?, profile_id = ?, account_id = ?
+            WHERE session_id = ? AND status = 'OPEN'
+            """,
+            (now, profile_id, account_id, session["session_id"]),
+        )
+        session_token_value, csrf_token, ttl_seconds = create_player_web_session(
+            connection, account_id=account_id, now=now
+        )
+        full_account = current_player_account_session_for_id(connection, account_id)
+        connection.commit()
+
+    response = make_response(
+        jsonify(
+            {
+                "ok": True,
+                "session_id": session["session_id"],
+                "profile_id": profile_id,
+                "account": serialize_player_account(full_account),
+                "csrf_token": csrf_token,
+            }
+        )
+    )
+    set_player_account_cookies(
+        response,
+        session_token=session_token_value,
+        csrf_token=csrf_token,
+        max_age=ttl_seconds,
+    )
+    return response, 201
+
+
 def current_player_account_session_for_id(
     connection: sqlite3.Connection, account_id: str
 ) -> sqlite3.Row:
@@ -2371,6 +3039,70 @@ def current_player_account_session_for_id(
         """,
         (account_id,),
     ).fetchone()
+
+
+def lookup_player_account_login():
+    """Return only whether a QQ number has a current web account binding.
+
+    The staged login UI needs to decide whether to render a password field.
+    No profile, account, or venue data is returned here; authentication still
+    happens exclusively through ``/login``.
+    """
+    source = request.get_json(silent=True)
+    if not isinstance(source, dict) or set(source) != {"qq"}:
+        return jsonify({"ok": False, "error": "请求内容必须包含 QQ 号"}), 400
+    qq_number = source.get("qq")
+    if not isinstance(qq_number, str) or QQ_NUMBER_PATTERN.fullmatch(qq_number.strip()) is None:
+        return jsonify(
+            {
+                "ok": False,
+                "code": "QQ_INVALID",
+                "error": "QQ 号必须是 5 至 12 位数字。",
+            }
+        ), 400
+    qq_number = qq_number.strip()
+    now = int(time.time())
+    subject_hash = player_auth_subject(PLAYER_ACCOUNT_LOOKUP_ACTION, qq_number)
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        limit_error = player_auth_limit_error(
+            connection,
+            action=PLAYER_ACCOUNT_LOOKUP_ACTION,
+            subject_hash=subject_hash,
+            now=now,
+        )
+        if limit_error is not None:
+            connection.commit()
+            return limit_error
+        account = connection.execute(
+            """
+            SELECT 1
+            FROM player_account AS account
+            JOIN player_profile AS profile
+              ON profile.device_id = account.profile_scope_id
+             AND profile.profile_id = account.profile_id
+             AND profile.web_account_bound = 1
+            JOIN current_player_profile AS current_profile
+              ON current_profile.profile_scope_id = account.profile_scope_id
+             AND current_profile.profile_id = account.profile_id
+            WHERE profile.qq_number = ?
+            LIMIT 1
+            """,
+            (qq_number,),
+        ).fetchone()
+        # Keep account-existence probing bounded without treating a successful
+        # lookup as a failed password attempt. The lookup action has its own,
+        # more generous request budget so normal staged-login retries do not
+        # lock a player out after a handful of page refreshes.
+        record_player_auth_attempt(
+            connection,
+            action=PLAYER_ACCOUNT_LOOKUP_ACTION,
+            subject_hash=subject_hash,
+            now=now,
+            limit=current_app.config["PLAYER_AUTH_LOOKUP_LIMIT_REQUESTS"],
+        )
+        connection.commit()
+    return jsonify({"ok": True, "bound": account is not None})
 
 
 def login_player_account():
@@ -3526,7 +4258,7 @@ def publish_snapshot():
                     SET status = 'REJECTED', completed_at = ?, result_detail = ?,
                         result_source = ?
                     WHERE status = 'PENDING' AND device_id = ?
-                      AND command_type IN (?, ?, ?, ?, ?, ?)
+                      AND command_type IN (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         now,
@@ -3534,6 +4266,7 @@ def publish_snapshot():
                         RESULT_SOURCE_SERVER_MIGRATION,
                         device_id,
                         QUEUE_OPERATION_COMMAND,
+                        MANAGEMENT_QUEUE_ACTION_COMMAND,
                         MOBILE_REGISTRATION_COMMAND,
                         TERMINAL_POLICY_COMMAND,
                         REGISTRATION_AVAILABILITY_COMMAND,
@@ -3653,7 +4386,7 @@ def publish_snapshot():
                 SET status = 'REJECTED', completed_at = ?,
                     result_detail = ?, result_source = ?
                 WHERE status = 'PENDING' AND claimed_at IS NULL AND device_id = ? AND (
-                    command_type IN (?, ?, ?, ?, ?)
+                    command_type IN (?, ?, ?, ?, ?, ?)
                     OR json_extract(payload, '$.operation_source') = 'WEBSITE_REMOTE'
                 )
                 """,
@@ -3663,6 +4396,7 @@ def publish_snapshot():
                     RESULT_SOURCE_SYNC_DISABLED,
                     device_id,
                     MOBILE_REGISTRATION_COMMAND,
+                    MANAGEMENT_QUEUE_ACTION_COMMAND,
                     TERMINAL_POLICY_COMMAND,
                     REGISTRATION_AVAILABILITY_COMMAND,
                     TERMINAL_SETTINGS_COMMAND,
@@ -3847,13 +4581,14 @@ def publish_snapshot():
                         SET status = 'REJECTED', completed_at = ?, result_detail = ?,
                             result_source = ?
                         WHERE status = 'PENDING'
-                          AND command_type IN (?, ?, ?, ?, ?, ?)
+                          AND command_type IN (?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             now,
                             TAKEOVER_QUEUE_CONTEXT_CHANGED_DETAIL,
                             RESULT_SOURCE_SERVER_MIGRATION,
                             QUEUE_OPERATION_COMMAND,
+                            MANAGEMENT_QUEUE_ACTION_COMMAND,
                             MOBILE_REGISTRATION_COMMAND,
                             TERMINAL_POLICY_COMMAND,
                             REGISTRATION_AVAILABILITY_COMMAND,
@@ -3916,6 +4651,17 @@ def upsert_player_profiles(
     received_at: int,
 ) -> None:
     for profile in profiles:
+        # A web-created profile may not be present in the terminal's next
+        # snapshot yet. Once the terminal sends this profile back, it has
+        # observed the row and the temporary current-index protection can be
+        # removed.
+        connection.execute(
+            """
+            DELETE FROM pending_player_profile_sync
+            WHERE profile_scope_id = ? AND profile_id = ?
+            """,
+            (profile_scope_id, profile["profile_id"]),
+        )
         current = connection.execute(
             """
             SELECT profile_revision, profile_updated_at, public_player_id,
@@ -4279,6 +5025,22 @@ def replace_current_player_profile_ids(
     profile_scope_id: str,
     profile_ids: set[str],
 ) -> None:
+    pending_ids = {
+        row["profile_id"]
+        for row in connection.execute(
+            """
+            SELECT pending.profile_id
+            FROM pending_player_profile_sync AS pending
+            JOIN player_profile AS profile
+              ON profile.device_id = pending.profile_scope_id
+             AND profile.profile_id = pending.profile_id
+            WHERE pending.profile_scope_id = ?
+              AND profile.web_account_bound = 1
+            """,
+            (profile_scope_id,),
+        ).fetchall()
+    }
+    effective_profile_ids = set(profile_ids) | pending_ids
     connection.execute(
         "DELETE FROM current_player_profile WHERE profile_scope_id = ?",
         (profile_scope_id,),
@@ -4288,7 +5050,10 @@ def replace_current_player_profile_ids(
         INSERT INTO current_player_profile(profile_scope_id, profile_id)
         VALUES (?, ?)
         """,
-        [(profile_scope_id, profile_id) for profile_id in sorted(profile_ids)],
+        [
+            (profile_scope_id, profile_id)
+            for profile_id in sorted(effective_profile_ids)
+        ],
     )
 
 
@@ -5506,6 +6271,432 @@ def create_bot_queue_operation_command():
     if set(source) - allowed_fields:
         return jsonify({"ok": False, "error": "请求包含不支持的排队操作字段"}), 400
     return create_queue_operation_command(source, "QQ_BOT")
+
+
+def create_management_terminal_queue_action():
+    """Queue an action from the management app using the on-site terminal model.
+
+    The complete machine position snapshot is checked here and checked again by the
+    terminal before the shared queue engine applies the action.
+    """
+    source = request.get_json(silent=True)
+    allowed_fields = {
+        "request_id",
+        "expected_queue_id",
+        "expected_queue_revision",
+        "expected_machine_configuration_revision",
+        "action",
+        "machine_id",
+        "expected_machine_stable_id",
+        "expected_playing_registration_ids",
+        "expected_waiting_positions",
+        "registration_ids",
+        "profile_id",
+        "friend_profile_id",
+        "display_id",
+        "preference",
+        "target_machine_id",
+        "expected_target_machine_stable_id",
+        "source_position_index",
+        "destination_position_index",
+        "desired_waiting_positions",
+        "desired_registration_order",
+        "no_show_resolution",
+        "start_next_when_playing_becomes_empty",
+        "advance_when_playing_empty",
+        "reason",
+    }
+    if not isinstance(source, dict):
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+    if set(source) - allowed_fields:
+        return jsonify({"ok": False, "error": "请求包含不支持的终端队列操作字段"}), 400
+
+    def read_registration_ids(key: str, *, required: bool = False) -> list[str]:
+        value = source.get(key)
+        if value is None and not required:
+            return []
+        if not isinstance(value, list) or len(value) > MAX_REGISTRATIONS_PER_MACHINE:
+            raise ValidationError(f"{key} 必须是登记编号数组")
+        result: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or PUBLIC_ID_PATTERN.fullmatch(item) is None:
+                raise ValidationError(f"{key} 中包含无效登记编号")
+            if item in result:
+                raise ValidationError(f"{key} 中不能有重复登记编号")
+            result.append(item)
+        return result
+
+    def read_position_groups(key: str, *, required: bool = False) -> list[list[str]] | None:
+        value = source.get(key)
+        if value is None and not required:
+            return None
+        if not isinstance(value, list) or len(value) > MAX_REGISTRATIONS_PER_MACHINE:
+            raise ValidationError(f"{key} 必须是等待位置数组")
+        groups: list[list[str]] = []
+        seen: set[str] = set()
+        for group in value:
+            if not isinstance(group, list) or not 1 <= len(group) <= 2:
+                raise ValidationError(f"{key} 中的每个等待位置必须包含一至两份登记")
+            normalized: list[str] = []
+            for item in group:
+                if not isinstance(item, str) or PUBLIC_ID_PATTERN.fullmatch(item) is None:
+                    raise ValidationError(f"{key} 中包含无效登记编号")
+                if item in seen:
+                    raise ValidationError(f"{key} 中不能有重复登记编号")
+                seen.add(item)
+                normalized.append(item)
+            groups.append(normalized)
+        return groups
+
+    def optional_uuid(key: str) -> str | None:
+        if key not in source or source.get(key) in (None, ""):
+            return None
+        try:
+            return str(UUID(read_string(source, key, maximum_length=36)))
+        except ValueError as error:
+            raise ValidationError(f"{key} 无效") from error
+
+    try:
+        command_id = read_uuid(source, "request_id")
+        expected_queue_id = read_uuid(source, "expected_queue_id")
+        expected_queue_revision = read_integer(
+            source, "expected_queue_revision", minimum=1, maximum=2**63 - 1
+        )
+        expected_machine_revision = read_integer(
+            source,
+            "expected_machine_configuration_revision",
+            minimum=1,
+            maximum=2**63 - 1,
+        )
+        action = read_choice(source, "action", MANAGEMENT_QUEUE_ACTIONS)
+        machine_id = read_optional_machine_id(source, "machine_id")
+        if machine_id is None:
+            raise ValidationError("machine_id 不能为空")
+        machine_stable_id = read_machine_internal_id(
+            source, "expected_machine_stable_id"
+        )
+        expected_playing = read_registration_ids(
+            "expected_playing_registration_ids", required=True
+        )
+        if len(expected_playing) > 2:
+            raise ValidationError("游玩位置最多只能包含两份登记")
+        expected_waiting = read_position_groups("expected_waiting_positions", required=True)
+        assert expected_waiting is not None
+        registration_ids = read_registration_ids("registration_ids")
+        profile_id = optional_uuid("profile_id")
+        friend_profile_id = optional_uuid("friend_profile_id")
+        display_id = read_optional_string(source, "display_id", maximum_length=18)
+        preference = read_optional_choice(source, "preference", PREFERENCES)
+        target_machine_id = read_optional_machine_id(source, "target_machine_id")
+        target_machine_stable_id = (
+            read_machine_internal_id(source, "expected_target_machine_stable_id")
+            if "expected_target_machine_stable_id" in source
+            else None
+        )
+        source_position_index = (
+            read_integer(source, "source_position_index", minimum=0, maximum=19)
+            if "source_position_index" in source
+            else None
+        )
+        destination_position_index = (
+            read_integer(source, "destination_position_index", minimum=0, maximum=19)
+            if "destination_position_index" in source
+            else None
+        )
+        desired_waiting = read_position_groups("desired_waiting_positions")
+        desired_registration_order = (
+            read_registration_ids("desired_registration_order", required=True)
+            if "desired_registration_order" in source
+            else None
+        )
+        no_show_resolution = read_optional_choice(
+            source, "no_show_resolution", NO_SHOW_RESOLUTIONS
+        )
+        start_next = (
+            read_boolean(source, "start_next_when_playing_becomes_empty")
+            if "start_next_when_playing_becomes_empty" in source
+            else True
+        )
+        advance_when_empty = (
+            read_boolean(source, "advance_when_playing_empty")
+            if "advance_when_playing_empty" in source
+            else False
+        )
+        reason = read_optional_string(source, "reason", maximum_length=200) or (
+            "管理后台执行现场终端队列操作"
+        )
+
+        machine_only_actions = {
+            "FINISH_ROUND",
+            "END_ROUND_ONLY",
+            "REMOVE_CURRENT_ROUND_AND_START_NEXT",
+            "ENTER_PLAYING_POSITION",
+            "RESTART_PLAYING_TIMER",
+            "RESTART_PENDING_CHECK_IN_TIMERS",
+            "RESTART_MACHINE_TIMERS",
+        }
+        single_registration_actions = {
+            "MOVE_WAITING_REGISTRATION_INTO_CURRENT_ROUND",
+            "DEFER_ONE_ROUND",
+            "CANCEL_DEFER_ONE_ROUND",
+            "TEMPORARILY_LEAVE",
+            "CANCEL_TEMPORARY_LEAVE",
+            "CHANGE_PREFERENCE",
+            "RENAME_REGISTRATION",
+            "CLAIM_WITH_PLAYER_PROFILE",
+            "CHECK_IN",
+        }
+        if action in machine_only_actions and registration_ids:
+            raise ValidationError("这项机台操作不接受登记编号")
+        if action in single_registration_actions and len(registration_ids) != 1:
+            raise ValidationError("这项操作必须指定一份登记")
+        if action in {
+            "RETURN_PLAYING_TO_WAITING_FRONT",
+            "ADVANCE_TO_WAITING_POSITION",
+            "MARK_NO_SHOW",
+            "REMOVE_REGISTRATIONS",
+            "TRANSFER_REGISTRATIONS",
+        } and not registration_ids:
+            raise ValidationError("这项操作必须指定至少一份登记")
+        if action in {"CREATE_FIXED_PAIR", "RELEASE_FIXED_PAIR"} and len(registration_ids) != 2:
+            raise ValidationError("这项操作必须指定两份登记")
+        if action == "CREATE_FIXED_PAIR_WITH_REGISTRATION" and (
+            len(registration_ids) != 1 or (friend_profile_id is None and not display_id)
+        ):
+            raise ValidationError("请指定原登记以及朋友的玩家资料或临时名称")
+        if action == "ADD_TEMPORARY_REGISTRATION" and (
+            registration_ids or not display_id or profile_id is not None
+        ):
+            raise ValidationError("新建临时登记需要填写名称且不能指定现有登记")
+        if action == "ADD_PROFILE_REGISTRATION" and (
+            registration_ids or profile_id is None
+        ):
+            raise ValidationError("新建玩家登记必须选择玩家资料")
+        if action == "CHANGE_PREFERENCE" and preference is None:
+            raise ValidationError("请选择本次游玩偏好")
+        if action == "RENAME_REGISTRATION" and not display_id:
+            raise ValidationError("请输入新的登记名称")
+        if action == "CLAIM_WITH_PLAYER_PROFILE" and profile_id is None:
+            raise ValidationError("请选择要关联的玩家资料")
+        if action == "MARK_NO_SHOW" and no_show_resolution is None:
+            raise ValidationError("请选择未到场处理方式")
+        if action == "MOVE_WAITING_POSITION" and (
+            source_position_index is None
+            or destination_position_index is None
+            or source_position_index == destination_position_index
+        ):
+            raise ValidationError("请选择不同的原等待位置和目标等待位置")
+        if action == "REPLACE_WAITING_POSITIONS" and desired_waiting is None:
+            raise ValidationError("请提交新的等待位置顺序")
+        if action == "REPLACE_REGISTRATION_ORDER" and desired_registration_order is None:
+            raise ValidationError("请提交新的登记顺序")
+        if action == "TRANSFER_REGISTRATIONS" and (
+            target_machine_id is None
+            or target_machine_id == machine_id
+            or target_machine_stable_id is None
+        ):
+            raise ValidationError("请选择不同的目标机台并提交稳定身份")
+        if action != "TRANSFER_REGISTRATIONS" and (
+            target_machine_id is not None or target_machine_stable_id is not None
+        ):
+            raise ValidationError("只有转移登记可以指定目标机台")
+    except ValidationError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+
+    request_identity = {
+        "operation_source": "MANAGEMENT_APP",
+        "action": action,
+        "queue_id": expected_queue_id,
+        "queue_revision": expected_queue_revision,
+        "machine_configuration_revision": expected_machine_revision,
+        "machine_id": machine_id,
+        "machine_stable_id": machine_stable_id,
+        "expected_playing_registration_ids": expected_playing,
+        "expected_waiting_positions": expected_waiting,
+        "registration_ids": registration_ids,
+        "profile_id": profile_id,
+        "friend_profile_id": friend_profile_id,
+        "display_id": display_id,
+        "preference": preference,
+        "target_machine_id": target_machine_id,
+        "target_machine_stable_id": target_machine_stable_id,
+        "source_position_index": source_position_index,
+        "destination_position_index": destination_position_index,
+        "desired_waiting_positions": desired_waiting,
+        "desired_registration_order": desired_registration_order,
+        "no_show_resolution": no_show_resolution,
+        "start_next_when_playing_becomes_empty": start_next,
+        "advance_when_playing_empty": advance_when_empty,
+        "reason": reason,
+    }
+
+    with open_database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        now = int(time.time())
+        expire_pending_commands(connection, now)
+        existing_command = connection.execute(
+            "SELECT * FROM terminal_command WHERE command_id = ?", (command_id,)
+        ).fetchone()
+        if existing_command is not None:
+            existing_payload = json.loads(existing_command["payload"])
+            if (
+                existing_command["command_type"] != MANAGEMENT_QUEUE_ACTION_COMMAND
+                or existing_payload.get("_request") != request_identity
+            ):
+                connection.rollback()
+                return jsonify({"ok": False, "error": "request_id 已用于其他命令"}), 409
+            connection.commit()
+            return jsonify(serialize_command(existing_command)), 200
+
+        snapshot_row = connection.execute(
+            """
+            SELECT queue_id, device_id, revision, payload, received_at
+            FROM queue_snapshot WHERE id = 1
+            """
+        ).fetchone()
+        if snapshot_row is None:
+            connection.rollback()
+            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+        if not snapshot_is_online(snapshot_row):
+            connection.rollback()
+            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能操作队列"}), 503
+        snapshot = json.loads(snapshot_row["payload"])
+        if (
+            snapshot_row["queue_id"] != expected_queue_id
+            or snapshot_row["revision"] != expected_queue_revision
+            or snapshot.get("machine_configuration_revision", 1) != expected_machine_revision
+        ):
+            connection.rollback()
+            return jsonify(
+                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列或机台配置已经更新，请刷新后重试"}
+            ), 409
+        machine = snapshot.get("machines", {}).get(machine_id)
+        if not isinstance(machine, dict):
+            connection.rollback()
+            return jsonify({"ok": False, "error": "目标机台不存在"}), 409
+        current_stable_id = machine.get("stable_id") or default_machine_stable_id(machine_id)
+        if current_stable_id != machine_stable_id:
+            connection.rollback()
+            return jsonify(
+                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "目标机台已经变化，请刷新后重试"}
+            ), 409
+        current_playing = [
+            registration["registration_id"] for registration in machine.get("playing", [])
+        ]
+        current_waiting = [
+            [
+                registration["registration_id"]
+                for registration in position.get("registrations", [])
+            ]
+            for position in machine.get("waiting_positions", [])
+        ]
+        if current_playing != expected_playing or current_waiting != expected_waiting:
+            connection.rollback()
+            return jsonify(
+                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列位置已经变化，请刷新后重试"}
+            ), 409
+        current_registration_ids = set(current_playing)
+        current_registration_ids.update(
+            registration_id for position in current_waiting for registration_id in position
+        )
+        if any(registration_id not in current_registration_ids for registration_id in registration_ids):
+            connection.rollback()
+            return jsonify({"ok": False, "error": "所选登记已经不在目标机台"}), 409
+        if desired_waiting is not None:
+            current_groups = sorted(tuple(sorted(position)) for position in current_waiting)
+            desired_groups = sorted(tuple(sorted(position)) for position in desired_waiting)
+            if current_groups != desired_groups:
+                connection.rollback()
+                return jsonify({"ok": False, "error": "新的顺序必须完整保留每个等待位置"}), 409
+        if desired_registration_order is not None:
+            current_order = current_playing + [item for position in current_waiting for item in position]
+            if (
+                desired_registration_order[: len(current_playing)] != current_playing
+                or len(desired_registration_order) != len(current_order)
+                or set(desired_registration_order) != set(current_order)
+            ):
+                connection.rollback()
+                return jsonify({"ok": False, "error": "新的登记顺序与当前队列不一致"}), 409
+        if target_machine_id is not None:
+            target_machine = snapshot.get("machines", {}).get(target_machine_id)
+            if not isinstance(target_machine, dict):
+                connection.rollback()
+                return jsonify({"ok": False, "error": "目标机台不存在"}), 409
+            current_target_stable_id = target_machine.get("stable_id") or default_machine_stable_id(
+                target_machine_id
+            )
+            if current_target_stable_id != target_machine_stable_id:
+                connection.rollback()
+                return jsonify(
+                    {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "要转入的机台已经变化，请刷新后重试"}
+                ), 409
+
+        pending = connection.execute(
+            """
+            SELECT 1 FROM terminal_command
+            WHERE status = 'PENDING' AND device_id = ?
+              AND command_type = ?
+              AND json_extract(payload, '$.machine_id') = ?
+            LIMIT 1
+            """,
+            (snapshot_row["device_id"], MANAGEMENT_QUEUE_ACTION_COMMAND, machine_id),
+        ).fetchone()
+        if pending is not None:
+            connection.rollback()
+            return jsonify({"ok": False, "error": "这台机台已有管理操作正在等待终端处理"}), 409
+
+        queue_storage_id, _ = snapshot_storage_context(snapshot_row, snapshot)
+        payload = {
+            "_queue_storage_id": queue_storage_id,
+            "operation_source": "MANAGEMENT_APP",
+            "queue_id": expected_queue_id,
+            "queue_revision": expected_queue_revision,
+            "machine_configuration_revision": expected_machine_revision,
+            "action": action,
+            "machine_id": machine_id,
+            "machine_stable_id": current_stable_id,
+            "expected_playing_registration_ids": expected_playing,
+            "expected_waiting_positions": expected_waiting,
+            "registration_ids": registration_ids,
+            "start_next_when_playing_becomes_empty": start_next,
+            "advance_when_playing_empty": advance_when_empty,
+            "management_reason": reason,
+            "management_actor_id": "management-app",
+            "_request": request_identity,
+        }
+        optional_payload = {
+            "profile_id": profile_id,
+            "friend_profile_id": friend_profile_id,
+            "display_id": display_id,
+            "preference": preference,
+            "target_machine_id": target_machine_id,
+            "target_machine_stable_id": target_machine_stable_id,
+            "source_position_index": source_position_index,
+            "destination_position_index": destination_position_index,
+            "desired_waiting_positions": desired_waiting,
+            "desired_registration_order": desired_registration_order,
+            "no_show_resolution": no_show_resolution,
+        }
+        payload.update({key: value for key, value in optional_payload.items() if value is not None})
+        connection.execute(
+            """
+            INSERT INTO terminal_command
+                (command_id, device_id, command_type, payload, status, created_at)
+            VALUES (?, ?, ?, ?, 'PENDING', ?)
+            """,
+            (
+                command_id,
+                snapshot_row["device_id"],
+                MANAGEMENT_QUEUE_ACTION_COMMAND,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                now,
+            ),
+        )
+        connection.commit()
+        created = connection.execute(
+            "SELECT * FROM terminal_command WHERE command_id = ?", (command_id,)
+        ).fetchone()
+    return jsonify(serialize_command(created)), 202
 
 
 def create_management_queue_operation_command():

@@ -34,6 +34,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
@@ -78,6 +79,21 @@ import java.util.Locale
 private const val MANAGEMENT_PREFERENCES = "management_app_preferences"
 private const val MANAGEMENT_ENDPOINT_KEY = "management_endpoint"
 private const val MANAGEMENT_TOKEN_KEY = "management_token"
+
+private data class ManagementActionPrompt(
+    val title: String,
+    val detail: String,
+    val confirmLabel: String,
+    val request: ManagementTerminalActionRequest,
+    val destructive: Boolean = false
+)
+
+private data class ManagementPositionTarget(
+    val machine: ManagementMachine,
+    val registrations: List<ManagementRegistration>,
+    val playing: Boolean,
+    val waitingPositionIndex: Int? = null
+)
 
 @Composable
 internal fun ManagementApp() {
@@ -139,6 +155,31 @@ internal fun ManagementApp() {
                     }
                 }
             loading = false
+        }
+    }
+
+    fun submitTerminalAction(
+        request: ManagementTerminalActionRequest,
+        onSubmitted: (() -> Unit)? = null
+    ) {
+        val currentOverview = overview ?: return
+        val pendingKeys = request.registrationIds.toSet() + request.machine.id
+        pendingCommandIds = pendingCommandIds + pendingKeys
+        scope.launch {
+            runCatching {
+                ManagementApi(endpoint, token).terminalQueueAction(currentOverview, request)
+            }.onSuccess { result ->
+                if (result.status.equals("REJECTED", true)) {
+                    error = result.detail ?: "现场终端未执行这项队列操作"
+                } else {
+                    error = "队列操作已发送，等待现场终端处理。"
+                    onSubmitted?.invoke()
+                }
+                refresh()
+            }.onFailure { throwable ->
+                error = throwable.message ?: "管理队列操作请求失败"
+            }
+            pendingCommandIds = pendingCommandIds - pendingKeys
         }
     }
 
@@ -216,66 +257,10 @@ internal fun ManagementApp() {
                     pendingCommandIds = pendingCommandIds,
                     onCreateRegistration = { createRegistrationVisible = true },
                     onReorder = { reorderMachine = it },
-                    onQueueAction = { registration, machine, operation, preference, targetMachine ->
-                        val profileId = registration.profileId
-                        if (registration.registrationId.isNotBlank()) {
-                            pendingCommandIds = pendingCommandIds + registration.registrationId
-                            scope.launch {
-                                runCatching {
-                                    ManagementApi(endpoint, token).queueAction(
-                                        profileId = profileId,
-                                        operation = operation,
-                                        queueId = overview?.queueId.orEmpty(),
-                                        registration = registration,
-                                        machine = machine,
-                                        preference = preference,
-                                        targetMachine = targetMachine,
-                                        machineConfigurationRevision =
-                                            overview?.machineConfigurationRevision ?: 1L
-                                    )
-                                }.onSuccess { result ->
-                                    error = if (result.status.equals("REJECTED", true)) {
-                                        result.detail ?: "管理队列操作未执行"
-                                    } else {
-                                        "管理队列命令已发送，等待现场终端处理。"
-                                    }
-                                    refresh()
-                                }.onFailure { throwable ->
-                                    error = throwable.message ?: "管理队列操作请求失败"
-                                }
-                                pendingCommandIds = pendingCommandIds - registration.registrationId
-                            }
-                        }
-                    },
-                    onCheckIn = { registration, machine ->
-                        if (registration.registrationId.isNotBlank()) {
-                            pendingCommandIds = pendingCommandIds + registration.registrationId
-                            scope.launch {
-                                runCatching {
-                                    ManagementApi(endpoint, token).checkIn(
-                                        registrationId = registration.registrationId,
-                                        expectedQueueId = overview?.queueId.orEmpty(),
-                                        expectedMachineId = machine.id,
-                                        expectedPosition = registration.position,
-                                        expectedPendingCheckIn = registration.pendingCheckIn,
-                                        expectedMachineConfigurationRevision =
-                                            overview?.machineConfigurationRevision ?: 1L,
-                                        reason = "管理后台立即签到"
-                                    )
-                                }.onSuccess { result ->
-                                    error = if (result.status.equals("REJECTED", true)) {
-                                        result.detail ?: "立即签到未执行"
-                                    } else {
-                                        null
-                                    }
-                                    refresh()
-                                }.onFailure { throwable ->
-                                    error = throwable.message ?: "立即签到请求失败"
-                                }
-                                pendingCommandIds = pendingCommandIds - registration.registrationId
-                            }
-                        }
-                    }
+                    profiles = overview?.profiles.orEmpty(),
+                    queueRules = overview?.queueRules.orEmpty(),
+                    registrationOpen = overview?.registrationOpen == true,
+                    onTerminalAction = { request -> submitTerminalAction(request) }
                 )
                 1 -> ManagementProfilesPage(
                     profiles = overview?.profiles.orEmpty(),
@@ -475,33 +460,26 @@ internal fun ManagementApp() {
             machines = overview?.machines.orEmpty(),
             busy = creatingRegistration,
             onDismiss = { if (!creatingRegistration) createRegistrationVisible = false },
-            onSubmit = { profileId, machine, preference ->
+            onSubmit = { profileId, temporaryDisplayId, machine, preference ->
                 creatingRegistration = true
-                scope.launch {
-                    runCatching {
-                        ManagementApi(endpoint, token).createRegistration(
-                            profileId = profileId,
-                            expectedQueueId = overview?.queueId.orEmpty(),
-                            machineId = machine.id,
-                            machineStableId = machine.stableId,
-                            preference = preference,
-                            expectedMachineConfigurationRevision =
-                                overview?.machineConfigurationRevision ?: 1L,
-                            reason = "管理后台新建登记"
-                        )
-                    }.onSuccess { result ->
-                        createRegistrationVisible = false
-                        error = if (result.status.equals("REJECTED", true)) {
-                            result.detail ?: "新建登记未执行"
+                submitTerminalAction(
+                    ManagementTerminalActionRequest(
+                        action = if (profileId == null) {
+                            ManagementQueueAction.ADD_TEMPORARY_REGISTRATION
                         } else {
-                            "新建登记命令已发送，等待现场终端处理。"
-                        }
-                        refresh()
-                    }.onFailure { throwable ->
-                        error = throwable.message ?: "新建登记请求失败"
-                    }
+                            ManagementQueueAction.ADD_PROFILE_REGISTRATION
+                        },
+                        machine = machine,
+                        profileId = profileId,
+                        displayId = temporaryDisplayId,
+                        preference = preference,
+                        reason = "管理后台新建登记"
+                    )
+                ) {
+                    createRegistrationVisible = false
                     creatingRegistration = false
                 }
+                creatingRegistration = false
             }
         )
     }
@@ -511,34 +489,15 @@ internal fun ManagementApp() {
             machine = machine,
             busy = machine.id in pendingCommandIds,
             onDismiss = { if (machine.id !in pendingCommandIds) reorderMachine = null },
-            onSubmit = { desiredOrder ->
-                val current = overview
-                if (current != null) {
-                    pendingCommandIds = pendingCommandIds + machine.id
-                    scope.launch {
-                        runCatching {
-                            ManagementApi(endpoint, token).reorderQueue(
-                                queueId = current.queueId,
-                                machine = machine,
-                                expectedOrder = machine.playing.map { it.registrationId } +
-                                    machine.waiting.map { it.registrationId },
-                                desiredOrder = machine.playing.map { it.registrationId } + desiredOrder,
-                                machineConfigurationRevision = current.machineConfigurationRevision
-                            )
-                        }.onSuccess { result ->
-                            reorderMachine = null
-                            error = if (result.status.equals("REJECTED", true)) {
-                                result.detail ?: "队列顺序调整未执行"
-                            } else {
-                                "队列顺序调整命令已发送，等待现场终端处理。"
-                            }
-                            refresh()
-                        }.onFailure { throwable ->
-                            error = throwable.message ?: "队列顺序调整请求失败"
-                        }
-                        pendingCommandIds = pendingCommandIds - machine.id
-                    }
-                }
+            onSubmit = { desiredPositions ->
+                submitTerminalAction(
+                    ManagementTerminalActionRequest(
+                        action = ManagementQueueAction.REPLACE_WAITING_POSITIONS,
+                        machine = machine,
+                        desiredWaitingPositions = desiredPositions,
+                        reason = "管理后台调整等待位置顺序"
+                    )
+                ) { reorderMachine = null }
             }
         )
     }
@@ -703,14 +662,10 @@ private fun ManagementQueuePage(
     pendingCommandIds: Set<String>,
     onCreateRegistration: () -> Unit,
     onReorder: (ManagementMachine) -> Unit,
-    onQueueAction: (
-        ManagementRegistration,
-        ManagementMachine,
-        String,
-        String?,
-        ManagementMachine?
-    ) -> Unit,
-    onCheckIn: (ManagementRegistration, ManagementMachine) -> Unit
+    profiles: List<ManagementProfile>,
+    queueRules: Map<String, Boolean>,
+    registrationOpen: Boolean,
+    onTerminalAction: (ManagementTerminalActionRequest) -> Unit
 ) {
     val machines = overview?.machines.orEmpty()
     if (loading && overview == null) {
@@ -738,7 +693,7 @@ private fun ManagementQueuePage(
                 }
                 OutlinedButton(
                     onClick = onCreateRegistration,
-                    enabled = overview.registrationOpen && overview.profiles.isNotEmpty(),
+                    enabled = overview.registrationOpen && machines.any(ManagementMachine::operational),
                     modifier = Modifier.fillMaxWidth(),
                     contentPadding = PaddingValues(vertical = 9.dp)
                 ) {
@@ -754,8 +709,10 @@ private fun ManagementQueuePage(
                 machines = machines,
                 pendingCommandIds = pendingCommandIds,
                 onReorder = onReorder,
-                onQueueAction = onQueueAction,
-                onCheckIn = onCheckIn
+                profiles = profiles,
+                queueRules = queueRules,
+                registrationOpen = registrationOpen,
+                onTerminalAction = onTerminalAction
             )
         }
     }
@@ -778,10 +735,17 @@ private fun ManagementCreateRegistrationDialog(
     machines: List<ManagementMachine>,
     busy: Boolean,
     onDismiss: () -> Unit,
-    onSubmit: (profileId: String, machine: ManagementMachine, preference: String?) -> Unit
+    onSubmit: (
+        profileId: String?,
+        temporaryDisplayId: String?,
+        machine: ManagementMachine,
+        preference: String?
+    ) -> Unit
 ) {
     val firstProfile = profiles.firstOrNull()
     val firstMachine = machines.firstOrNull { it.operational } ?: machines.firstOrNull()
+    var temporaryMode by rememberSaveable { mutableStateOf(false) }
+    var temporaryDisplayId by rememberSaveable { mutableStateOf("") }
     var selectedProfileId by remember(profiles) {
         mutableStateOf(firstProfile?.id.orEmpty())
     }
@@ -801,9 +765,9 @@ private fun ManagementCreateRegistrationDialog(
         "OPEN_TO_JOIN" to "允许他人加入"
     )
     val resolvedPreference = when {
-        selectedMachine?.let { it.operational } != true -> preference
-        selectedMachine?.let { it.id } != null &&
-            selectedProfile?.defaultPreference == "SOLO" -> "SOLO"
+        selectedMachine?.capacity == 1 -> "SOLO"
+        temporaryMode -> preference
+        selectedProfile?.defaultPreference == "SOLO" -> "SOLO"
         selectedProfile?.defaultPreference == "OPEN_TO_JOIN" -> "OPEN_TO_JOIN"
         else -> preference
     }
@@ -812,39 +776,71 @@ private fun ManagementCreateRegistrationDialog(
         title = { Text("新建登记") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Box {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(
-                        onClick = { profileMenuOpen = true },
-                        modifier = Modifier.fillMaxWidth(),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 9.dp)
+                        onClick = { temporaryMode = false },
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(vertical = 8.dp)
                     ) {
                         Text(
-                            "玩家：${selectedProfile?.nickname ?: "请选择玩家"}",
-                            modifier = Modifier.fillMaxWidth()
+                            "玩家资料",
+                            color = if (!temporaryMode) SystemBlue else PrimaryText
                         )
                     }
-                    DropdownMenu(
-                        expanded = profileMenuOpen,
-                        onDismissRequest = { profileMenuOpen = false }
+                    OutlinedButton(
+                        onClick = { temporaryMode = true },
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(vertical = 8.dp)
                     ) {
-                        profiles.forEach { profile ->
-                            DropdownMenuItem(
-                                text = {
-                                    Text(
-                                        listOfNotNull(
-                                            profile.nickname,
-                                            profile.qqNumber?.let { "QQ $it" }
-                                        ).joinToString(" · ")
-                                    )
-                                },
-                                onClick = {
-                                    selectedProfileId = profile.id
-                                    preference = profile.defaultPreference.takeIf {
-                                        it != "ASK_EVERY_TIME"
-                                    }
-                                    profileMenuOpen = false
-                                }
+                        Text(
+                            "临时登记",
+                            color = if (temporaryMode) SystemBlue else PrimaryText
+                        )
+                    }
+                }
+                if (temporaryMode) {
+                    OutlinedTextField(
+                        value = temporaryDisplayId,
+                        onValueChange = { temporaryDisplayId = it.take(18) },
+                        label = { Text("登记名称") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    Box {
+                        OutlinedButton(
+                            onClick = { profileMenuOpen = true },
+                            modifier = Modifier.fillMaxWidth(),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 9.dp)
+                        ) {
+                            Text(
+                                "玩家：${selectedProfile?.nickname ?: "请选择玩家"}",
+                                modifier = Modifier.fillMaxWidth()
                             )
+                        }
+                        DropdownMenu(
+                            expanded = profileMenuOpen,
+                            onDismissRequest = { profileMenuOpen = false }
+                        ) {
+                            profiles.forEach { profile ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            listOfNotNull(
+                                                profile.nickname,
+                                                profile.qqNumber?.let { "QQ $it" }
+                                            ).joinToString(" · ")
+                                        )
+                                    },
+                                    onClick = {
+                                        selectedProfileId = profile.id
+                                        preference = profile.defaultPreference.takeIf {
+                                            it != "ASK_EVERY_TIME"
+                                        }
+                                        profileMenuOpen = false
+                                    }
+                                )
+                            }
                         }
                     }
                 }
@@ -880,7 +876,10 @@ private fun ManagementCreateRegistrationDialog(
                         }
                     }
                 }
-                if (selectedProfile?.defaultPreference == "ASK_EVERY_TIME") {
+                if (
+                    selectedMachine?.capacity != 1 &&
+                    (temporaryMode || selectedProfile?.defaultPreference == "ASK_EVERY_TIME")
+                ) {
                     Box {
                         OutlinedButton(
                             onClick = { preferenceMenuOpen = true },
@@ -914,29 +913,31 @@ private fun ManagementCreateRegistrationDialog(
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
-                Text(
-                    "新建登记由现场终端执行，成功后直接进入正式队列；不使用移动设备登记入口。",
-                    color = TertiaryText,
-                    style = MaterialTheme.typography.labelSmall
-                )
             }
         },
         confirmButton = {
             Button(
                 onClick = {
-                    val profile = selectedProfile
                     val machine = selectedMachine
-                    if (profile != null && machine != null) {
-                        onSubmit(profile.id, machine, resolvedPreference)
+                    if (machine != null) {
+                        onSubmit(
+                            selectedProfile?.id.takeUnless { temporaryMode },
+                            temporaryDisplayId.trim().takeIf { temporaryMode },
+                            machine,
+                            resolvedPreference
+                        )
                     }
                 },
-                enabled = !busy && selectedProfile != null && selectedMachine?.operational == true &&
-                    (selectedProfile?.defaultPreference != "ASK_EVERY_TIME" || preference != null)
+                enabled = !busy && selectedMachine?.operational == true &&
+                    (if (temporaryMode) temporaryDisplayId.isNotBlank() else selectedProfile != null) &&
+                    (selectedMachine.capacity == 1 ||
+                        (!temporaryMode && selectedProfile?.defaultPreference != "ASK_EVERY_TIME") ||
+                        preference != null)
             ) {
                 if (busy) {
                     CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                 } else {
-                    Text("发送命令")
+                    Text("新建登记")
                 }
             }
         },
@@ -950,15 +951,33 @@ private fun ManagementMachineCard(
     machines: List<ManagementMachine>,
     pendingCommandIds: Set<String>,
     onReorder: (ManagementMachine) -> Unit,
-    onQueueAction: (
-        ManagementRegistration,
-        ManagementMachine,
-        String,
-        String?,
-        ManagementMachine?
-    ) -> Unit,
-    onCheckIn: (ManagementRegistration, ManagementMachine) -> Unit
+    profiles: List<ManagementProfile>,
+    queueRules: Map<String, Boolean>,
+    registrationOpen: Boolean,
+    onTerminalAction: (ManagementTerminalActionRequest) -> Unit
 ) {
+    var machineMenuOpen by remember(machine.id) { mutableStateOf(false) }
+    var roundMenuOpen by remember(machine.id) { mutableStateOf(false) }
+    var prompt by remember(machine.id) { mutableStateOf<ManagementActionPrompt?>(null) }
+    var noShowTarget by remember(machine.id) { mutableStateOf<ManagementPositionTarget?>(null) }
+    var transferTarget by remember(machine.id) { mutableStateOf<ManagementPositionTarget?>(null) }
+    val busy = machine.id in pendingCommandIds
+    fun request(
+        action: ManagementQueueAction,
+        registrations: List<ManagementRegistration> = emptyList(),
+        reason: String,
+        targetMachine: ManagementMachine? = null,
+        noShowResolution: String? = null,
+        startNext: Boolean = true
+    ) = ManagementTerminalActionRequest(
+        action = action,
+        machine = machine,
+        registrationIds = registrations.map(ManagementRegistration::registrationId),
+        targetMachine = targetMachine,
+        noShowResolution = noShowResolution,
+        startNextWhenPlayingBecomesEmpty = startNext,
+        reason = reason
+    )
     Surface(
         modifier = Modifier.fillMaxWidth(),
         color = CardBackground,
@@ -976,8 +995,95 @@ private fun ManagementMachineCard(
                     )
                 }
                 Text(machine.id, color = TertiaryText, style = MaterialTheme.typography.labelMedium)
+                Box {
+                    IconButton(
+                        onClick = { machineMenuOpen = true },
+                        enabled = !busy && machine.operational
+                    ) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "机台队列操作")
+                    }
+                    DropdownMenu(
+                        expanded = machineMenuOpen,
+                        onDismissRequest = { machineMenuOpen = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("重新开始游玩计时") },
+                            enabled = machine.playing.isNotEmpty(),
+                            onClick = {
+                                machineMenuOpen = false
+                                prompt = ManagementActionPrompt(
+                                    "重新开始游玩计时？",
+                                    "${machine.name} 当前一轮的计时会从现在重新开始。",
+                                    "确认重新计时",
+                                    request(
+                                        ManagementQueueAction.RESTART_PLAYING_TIMER,
+                                        reason = "管理后台重新开始游玩计时"
+                                    )
+                                )
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("重新开始待签到计时") },
+                            enabled = machine.playing.any { it.pendingCheckIn } ||
+                                machine.waiting.any { it.pendingCheckIn },
+                            onClick = {
+                                machineMenuOpen = false
+                                prompt = ManagementActionPrompt(
+                                    "重新开始待签到计时？",
+                                    "${machine.name} 所有待签到登记的现场签到时限会从现在重新计算。",
+                                    "确认重新计时",
+                                    request(
+                                        ManagementQueueAction.RESTART_PENDING_CHECK_IN_TIMERS,
+                                        reason = "管理后台重新开始待签到计时"
+                                    )
+                                )
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("重新开始全部计时") },
+                            enabled = machine.registrationCount > 0,
+                            onClick = {
+                                machineMenuOpen = false
+                                prompt = ManagementActionPrompt(
+                                    "重新开始全部计时？",
+                                    "${machine.name} 的游玩计时和待签到计时都会从现在重新开始。",
+                                    "确认重新计时",
+                                    request(
+                                        ManagementQueueAction.RESTART_MACHINE_TIMERS,
+                                        reason = "管理后台重新开始机台全部计时"
+                                    )
+                                )
+                            }
+                        )
+                    }
+                }
             }
-            if (machine.waiting.size > 1) {
+            if (machine.playing.isNotEmpty()) {
+                Button(
+                    onClick = { roundMenuOpen = true },
+                    enabled = !busy && machine.operational,
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(vertical = 8.dp)
+                ) { Text("结束本轮") }
+            } else if (machine.waiting.isNotEmpty()) {
+                Button(
+                    onClick = {
+                        prompt = ManagementActionPrompt(
+                            "开始下一轮？",
+                            "${machine.name} 当前可用的首个等待位置将进入游玩位置。",
+                            "确认开始下一轮",
+                            request(
+                                ManagementQueueAction.ENTER_PLAYING_POSITION,
+                                reason = "管理后台开始下一轮"
+                            )
+                        )
+                    },
+                    enabled = !busy && machine.operational,
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(vertical = 8.dp)
+                ) { Text("开始下一轮") }
+            }
+            if (machine.waitingPositions.size > 1) {
                 OutlinedButton(
                     onClick = { onReorder(machine) },
                     enabled = machine.id !in pendingCommandIds,
@@ -1000,30 +1106,66 @@ private fun ManagementMachineCard(
                         machines,
                         registration,
                         pendingCommandIds,
-                        onQueueAction,
-                        onCheckIn
+                        profiles,
+                        registrationOpen,
+                        onTerminalAction
                     )
                 }
+                ManagementPositionMenu(
+                    target = ManagementPositionTarget(machine, machine.playing, playing = true),
+                    machines = machines,
+                    allowDeferOneRound = queueRules["allow_defer_one_round"] ?: true,
+                    enabled = !busy,
+                    onPrompt = { prompt = it },
+                    onNoShow = { noShowTarget = it },
+                    onTransfer = { transferTarget = it }
+                )
             }
             Spacer(Modifier.height(6.dp))
             ManagementPositionLabel("等待顺序")
             if (machine.waiting.isEmpty()) {
                 ManagementEmptyRow("暂无等待登记")
             } else {
-                machine.waiting
-                    .groupBy { it.waitingPosition ?: 0 }
-                    .toSortedMap()
-                    .forEach { (position, registrations) ->
+                machine.waitingPositions.forEach { waitingPosition ->
+                    val registrations = waitingPosition.registrations
+                    val position = waitingPosition.index
                         Column(modifier = Modifier.fillMaxWidth()) {
-                            Text("第 $position 位", color = TertiaryText, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 5.dp, bottom = 2.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    buildString {
+                                        append("第 $position 位")
+                                        waitingPosition.estimatedWaitMinutes?.let {
+                                            append(" · 预计 $it 分钟")
+                                        }
+                                    },
+                                    color = TertiaryText,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    modifier = Modifier.weight(1f).padding(top = 5.dp, bottom = 2.dp)
+                                )
+                                ManagementPositionMenu(
+                                    target = ManagementPositionTarget(
+                                        machine,
+                                        registrations,
+                                        playing = false,
+                                        waitingPositionIndex = position - 1
+                                    ),
+                                    machines = machines,
+                                    allowDeferOneRound = queueRules["allow_defer_one_round"] ?: true,
+                                    enabled = !busy,
+                                    onPrompt = { prompt = it },
+                                    onNoShow = { noShowTarget = it },
+                                    onTransfer = { transferTarget = it }
+                                )
+                            }
                             registrations.forEach { registration ->
                                 ManagementRegistrationRow(
                                     machine,
                                     machines,
                                     registration,
                                     pendingCommandIds,
-                                    onQueueAction,
-                                    onCheckIn
+                                    profiles,
+                                    registrationOpen,
+                                    onTerminalAction
                                 )
                             }
                         }
@@ -1031,6 +1173,362 @@ private fun ManagementMachineCard(
             }
         }
     }
+    if (roundMenuOpen) {
+        AlertDialog(
+            onDismissRequest = { roundMenuOpen = false },
+            title = { Text("结束${machine.name}本轮游玩") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            roundMenuOpen = false
+                            prompt = ManagementActionPrompt(
+                                "结束本轮并开始下一轮？",
+                                "当前游玩登记会回到队尾，首个可用等待位置随后进入游玩位置。",
+                                "确认结束并开始下一轮",
+                                request(
+                                    ManagementQueueAction.FINISH_ROUND,
+                                    reason = "管理后台结束本轮并开始下一轮"
+                                )
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("结束本轮并开始下一轮") }
+                    OutlinedButton(
+                        onClick = {
+                            roundMenuOpen = false
+                            prompt = ManagementActionPrompt(
+                                "仅结束本轮？",
+                                "当前游玩登记会回到队尾，游玩位置保持空缺。",
+                                "确认仅结束本轮",
+                                request(
+                                    ManagementQueueAction.END_ROUND_ONLY,
+                                    reason = "管理后台仅结束本轮"
+                                )
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("仅结束本轮") }
+                    Button(
+                        onClick = {
+                            roundMenuOpen = false
+                            prompt = ManagementActionPrompt(
+                                "移除本轮登记并开始下一轮？",
+                                "当前游玩位置中的登记会永久退出队列，随后开始下一轮。",
+                                "确认移除并开始下一轮",
+                                request(
+                                    ManagementQueueAction.REMOVE_CURRENT_ROUND_AND_START_NEXT,
+                                    reason = "管理后台移除本轮登记并开始下一轮"
+                                ),
+                                destructive = true
+                            )
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Destructive),
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("移除本轮登记并开始下一轮") }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { roundMenuOpen = false }) { Text("取消") }
+            }
+        )
+    }
+    prompt?.let { currentPrompt ->
+        ManagementActionPromptDialog(
+            prompt = currentPrompt,
+            onDismiss = { prompt = null },
+            onConfirm = {
+                prompt = null
+                onTerminalAction(currentPrompt.request)
+            }
+        )
+    }
+    noShowTarget?.let { target ->
+        ManagementNoShowDialog(
+            target = target,
+            allowDeferOneRound = queueRules["allow_defer_one_round"] ?: true,
+            onDismiss = { noShowTarget = null },
+            onSelect = { resolution ->
+                noShowTarget = null
+                prompt = ManagementActionPrompt(
+                    "确认未到场处理？",
+                    "所选${if (target.registrations.size > 1) "位置" else "登记"}将按所选方式处理。",
+                    "确认处理",
+                    request(
+                        ManagementQueueAction.MARK_NO_SHOW,
+                        registrations = target.registrations,
+                        reason = "管理后台处理未到场",
+                        noShowResolution = resolution,
+                        startNext = !target.playing
+                    ),
+                    destructive = resolution == "REMOVE"
+                )
+            }
+        )
+    }
+    transferTarget?.let { target ->
+        ManagementTransferChooser(
+            sourceMachine = machine,
+            machines = machines,
+            registrations = target.registrations,
+            onDismiss = { transferTarget = null },
+            onSelect = { destination ->
+                transferTarget = null
+                prompt = ManagementActionPrompt(
+                    "转移到${destination.name}？",
+                    "所选${target.registrations.size}份登记会作为完整位置转入目标机台等待末端。",
+                    "确认转移",
+                    request(
+                        ManagementQueueAction.TRANSFER_REGISTRATIONS,
+                        registrations = target.registrations,
+                        reason = "管理后台转移等待位置",
+                        targetMachine = destination
+                    )
+                )
+            }
+        )
+    }
+}
+
+@Composable
+private fun ManagementPositionMenu(
+    target: ManagementPositionTarget,
+    machines: List<ManagementMachine>,
+    allowDeferOneRound: Boolean,
+    enabled: Boolean,
+    onPrompt: (ManagementActionPrompt) -> Unit,
+    onNoShow: (ManagementPositionTarget) -> Unit,
+    onTransfer: (ManagementPositionTarget) -> Unit
+) {
+    var expanded by remember(
+        target.machine.id,
+        target.playing,
+        target.waitingPositionIndex,
+        target.registrations.map(ManagementRegistration::registrationId)
+    ) { mutableStateOf(false) }
+    val machine = target.machine
+    fun request(action: ManagementQueueAction, reason: String) =
+        ManagementTerminalActionRequest(
+            action = action,
+            machine = machine,
+            registrationIds = target.registrations.map(ManagementRegistration::registrationId),
+            reason = reason
+        )
+    Box {
+        IconButton(onClick = { expanded = true }, enabled = enabled) {
+            Icon(Icons.Default.MoreVert, contentDescription = "位置操作")
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            if (target.playing) {
+                DropdownMenuItem(
+                    text = { Text("退回等待顺序前端") },
+                    onClick = {
+                        expanded = false
+                        onPrompt(
+                            ManagementActionPrompt(
+                                "退回等待顺序前端？",
+                                "所选游玩登记会离开当前游玩位置并回到等待首位。",
+                                "确认退回",
+                                request(
+                                    ManagementQueueAction.RETURN_PLAYING_TO_WAITING_FRONT,
+                                    "管理后台将游玩登记退回等待前端"
+                                )
+                            )
+                        )
+                    }
+                )
+            } else {
+                DropdownMenuItem(
+                    text = { Text("让此位置上场") },
+                    enabled = machine.playing.isNotEmpty() &&
+                        (target.waitingPositionIndex ?: 0) > 0,
+                    onClick = {
+                        expanded = false
+                        onPrompt(
+                            ManagementActionPrompt(
+                                "让此等待位置上场？",
+                                "当前游玩登记会回到队尾，前方位置会被跳过，本位置进入游玩位置。",
+                                "确认上场",
+                                request(
+                                    ManagementQueueAction.ADVANCE_TO_WAITING_POSITION,
+                                    "管理后台指定等待位置上场"
+                                )
+                            )
+                        )
+                    }
+                )
+                DropdownMenuItem(
+                    text = { Text("补入当前游玩位置") },
+                    enabled = machine.capacity > 1 && machine.playing.size == 1 &&
+                        target.waitingPositionIndex == 0 && target.registrations.size == 1,
+                    onClick = {
+                        expanded = false
+                        onPrompt(
+                            ManagementActionPrompt(
+                                "补入当前游玩位置？",
+                                "这份等待登记会与当前玩家共同游玩。",
+                                "确认补入",
+                                request(
+                                    ManagementQueueAction.MOVE_WAITING_REGISTRATION_INTO_CURRENT_ROUND,
+                                    "管理后台补入当前游玩位置"
+                                )
+                            )
+                        )
+                    }
+                )
+                if (
+                    target.registrations.size == 2 &&
+                    target.registrations.all(ManagementRegistration::fixedPair)
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("解除固定组合") },
+                        onClick = {
+                            expanded = false
+                            onPrompt(
+                                ManagementActionPrompt(
+                                    "解除固定组合？",
+                                    "两份登记会恢复为允许他人加入，等待位置将重新划分。",
+                                    "确认解除",
+                                    request(
+                                        ManagementQueueAction.RELEASE_FIXED_PAIR,
+                                        "管理后台解除固定组合"
+                                    )
+                                )
+                            )
+                        }
+                    )
+                }
+                DropdownMenuItem(
+                    text = { Text("转移整个位置") },
+                    enabled = machines.any { it.operational && it.id != machine.id },
+                    onClick = {
+                        expanded = false
+                        onTransfer(target)
+                    }
+                )
+            }
+            DropdownMenuItem(
+                text = { Text("未到场处理") },
+                enabled = target.registrations.none { it.pendingCheckIn } &&
+                    (allowDeferOneRound || target.registrations.isNotEmpty()),
+                onClick = {
+                    expanded = false
+                    onNoShow(target)
+                }
+            )
+            DropdownMenuItem(
+                text = { Text("移除整个位置", color = Destructive) },
+                onClick = {
+                    expanded = false
+                    onPrompt(
+                        ManagementActionPrompt(
+                            "移除整个位置？",
+                            "所选${target.registrations.size}份登记会永久退出当前队列。",
+                            "确认移除",
+                            request(
+                                ManagementQueueAction.REMOVE_REGISTRATIONS,
+                                "管理后台移除队列位置"
+                            ),
+                            destructive = true
+                        )
+                    )
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun ManagementActionPromptDialog(
+    prompt: ManagementActionPrompt,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(prompt.title) },
+        text = { Text(prompt.detail, color = SecondaryText) },
+        confirmButton = {
+            Button(
+                onClick = onConfirm,
+                colors = if (prompt.destructive) {
+                    ButtonDefaults.buttonColors(containerColor = Destructive)
+                } else {
+                    ButtonDefaults.buttonColors()
+                }
+            ) { Text(prompt.confirmLabel) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
+}
+
+@Composable
+private fun ManagementNoShowDialog(
+    target: ManagementPositionTarget,
+    allowDeferOneRound: Boolean,
+    onDismiss: () -> Unit,
+    onSelect: (String) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("未到场处理") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = {
+                        onSelect(
+                            if (target.registrations.size > 1) {
+                                "DEFER_GROUP_ONE_ROUND"
+                            } else {
+                                "DEFER_ONE_ROUND"
+                            }
+                        )
+                    },
+                    enabled = allowDeferOneRound,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("暂缓一轮") }
+                OutlinedButton(
+                    onClick = { onSelect("MOVE_TO_TAIL") },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("移至队尾") }
+                Button(
+                    onClick = { onSelect("REMOVE") },
+                    colors = ButtonDefaults.buttonColors(containerColor = Destructive),
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("删除登记") }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
+}
+
+@Composable
+private fun ManagementTransferChooser(
+    sourceMachine: ManagementMachine,
+    machines: List<ManagementMachine>,
+    registrations: List<ManagementRegistration>,
+    onDismiss: () -> Unit,
+    onSelect: (ManagementMachine) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("选择目标机台") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                machines.filter { it.operational && it.id != sourceMachine.id }.forEach { machine ->
+                    OutlinedButton(
+                        onClick = { onSelect(machine) },
+                        enabled = machine.registrationCount + registrations.size <= 20,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("${machine.name} · ${machine.registrationCount} 份登记") }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
 }
 
 @Composable
@@ -1048,10 +1546,10 @@ private fun ManagementReorderDialog(
     machine: ManagementMachine,
     busy: Boolean,
     onDismiss: () -> Unit,
-    onSubmit: (List<String>) -> Unit
+    onSubmit: (List<List<String>>) -> Unit
 ) {
-    val initialWaiting = machine.waiting
-    var waitingOrder by remember(machine.id, machine.waiting) {
+    val initialWaiting = machine.waitingPositions
+    var waitingOrder by remember(machine.id, machine.waitingPositions) {
         mutableStateOf(initialWaiting)
     }
     AlertDialog(
@@ -1062,7 +1560,7 @@ private fun ManagementReorderDialog(
                 if (waitingOrder.isEmpty()) {
                     Text("暂无等待登记", color = SecondaryText)
                 } else {
-                    waitingOrder.forEachIndexed { index, registration ->
+                    waitingOrder.forEachIndexed { index, position ->
                         Surface(
                             color = PageBackground,
                             shape = RoundedCornerShape(6.dp)
@@ -1081,15 +1579,19 @@ private fun ManagementReorderDialog(
                                 )
                                 Column(Modifier.weight(1f)) {
                                     Text(
-                                        registration.displayId,
+                                        position.registrations.joinToString(" + ") {
+                                            it.displayId
+                                        },
                                         color = PrimaryText,
                                         style = MaterialTheme.typography.bodyMedium,
-                                        maxLines = 1,
+                                        maxLines = 2,
                                         overflow = TextOverflow.Ellipsis
                                     )
-                                    registration.profileId?.let {
-                                        Text("已关联玩家资料", color = SecondaryText, style = MaterialTheme.typography.labelSmall)
-                                    }
+                                    Text(
+                                        "完整等待位置 · ${position.registrations.size} 份登记",
+                                        color = SecondaryText,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
                                 }
                                 IconButton(
                                     onClick = {
@@ -1125,9 +1627,15 @@ private fun ManagementReorderDialog(
         },
         confirmButton = {
             Button(
-                onClick = { onSubmit(waitingOrder.map { it.registrationId }) },
-                enabled = !busy && waitingOrder.map { it.registrationId } !=
-                    initialWaiting.map { it.registrationId }
+                onClick = {
+                    onSubmit(
+                        waitingOrder.map { position ->
+                            position.registrations.map(ManagementRegistration::registrationId)
+                        }
+                    )
+                },
+                enabled = !busy && waitingOrder.map(ManagementWaitingPosition::index) !=
+                    initialWaiting.map(ManagementWaitingPosition::index)
             ) {
                 if (busy) {
                     CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
@@ -1146,24 +1654,48 @@ private fun ManagementRegistrationRow(
     machines: List<ManagementMachine>,
     registration: ManagementRegistration,
     pendingCommandIds: Set<String>,
-    onQueueAction: (
-        ManagementRegistration,
-        ManagementMachine,
-        String,
-        String?,
-        ManagementMachine?
-    ) -> Unit,
-    onCheckIn: (ManagementRegistration, ManagementMachine) -> Unit
+    profiles: List<ManagementProfile>,
+    registrationOpen: Boolean,
+    onTerminalAction: (ManagementTerminalActionRequest) -> Unit
 ) {
     var actionMenuOpen by remember(registration.registrationId) { mutableStateOf(false) }
     var transferDialogOpen by remember(registration.registrationId) { mutableStateOf(false) }
     var preferenceDialogOpen by remember(registration.registrationId) { mutableStateOf(false) }
+    var renameDialogOpen by remember(registration.registrationId) { mutableStateOf(false) }
+    var claimDialogOpen by remember(registration.registrationId) { mutableStateOf(false) }
+    var fixedPairDialogOpen by remember(registration.registrationId) { mutableStateOf(false) }
+    var renameDraft by remember(registration.registrationId) {
+        mutableStateOf(registration.displayId)
+    }
+    var prompt by remember(registration.registrationId) {
+        mutableStateOf<ManagementActionPrompt?>(null)
+    }
     var selectedTargetMachineId by remember(registration.registrationId) {
         mutableStateOf<String?>(null)
     }
     var selectedPreference by remember(registration.registrationId) {
         mutableStateOf(registration.preference)
     }
+    fun request(
+        action: ManagementQueueAction,
+        registrationIds: List<String> = listOf(registration.registrationId),
+        preference: String? = null,
+        targetMachine: ManagementMachine? = null,
+        profileId: String? = null,
+        friendProfileId: String? = null,
+        displayId: String? = null,
+        reason: String
+    ) = ManagementTerminalActionRequest(
+        action = action,
+        machine = machine,
+        registrationIds = registrationIds,
+        preference = preference,
+        targetMachine = targetMachine,
+        profileId = profileId,
+        friendProfileId = friendProfileId,
+        displayId = displayId,
+        reason = reason
+    )
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1186,7 +1718,14 @@ private fun ManagementRegistrationRow(
             if (registration.pendingCheckIn) {
                 val pending = registration.registrationId in pendingCommandIds
                 Button(
-                    onClick = { onCheckIn(registration, machine) },
+                    onClick = {
+                        onTerminalAction(
+                            request(
+                                ManagementQueueAction.CHECK_IN,
+                                reason = "管理后台立即签到"
+                            )
+                        )
+                    },
                     enabled = !pending,
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
                     modifier = Modifier.height(38.dp)
@@ -1220,12 +1759,11 @@ private fun ManagementRegistrationRow(
                                 text = { Text("暂缓一次") },
                                 onClick = {
                                     actionMenuOpen = false
-                                    onQueueAction(
-                                        registration,
-                                        machine,
-                                        "DEFER_ONE_ROUND",
-                                        null,
-                                        null
+                                    onTerminalAction(
+                                        request(
+                                            ManagementQueueAction.DEFER_ONE_ROUND,
+                                            reason = "管理后台暂缓一轮"
+                                        )
                                     )
                                 }
                             )
@@ -1233,12 +1771,11 @@ private fun ManagementRegistrationRow(
                                 text = { Text("暂时离开") },
                                 onClick = {
                                     actionMenuOpen = false
-                                    onQueueAction(
-                                        registration,
-                                        machine,
-                                        "TEMPORARILY_LEAVE",
-                                        null,
-                                        null
+                                    onTerminalAction(
+                                        request(
+                                            ManagementQueueAction.TEMPORARILY_LEAVE,
+                                            reason = "管理后台设置暂时离开"
+                                        )
                                     )
                                 }
                             )
@@ -1248,12 +1785,11 @@ private fun ManagementRegistrationRow(
                                 text = { Text("取消暂缓一次") },
                                 onClick = {
                                     actionMenuOpen = false
-                                    onQueueAction(
-                                        registration,
-                                        machine,
-                                        "CANCEL_DEFER_ONE_ROUND",
-                                        null,
-                                        null
+                                    onTerminalAction(
+                                        request(
+                                            ManagementQueueAction.CANCEL_DEFER_ONE_ROUND,
+                                            reason = "管理后台取消暂缓一轮"
+                                        )
                                     )
                                 }
                             )
@@ -1263,16 +1799,43 @@ private fun ManagementRegistrationRow(
                                 text = { Text("取消暂时离开") },
                                 onClick = {
                                     actionMenuOpen = false
-                                    onQueueAction(
-                                        registration,
-                                        machine,
-                                        "CANCEL_TEMPORARY_LEAVE",
-                                        null,
-                                        null
+                                    onTerminalAction(
+                                        request(
+                                            ManagementQueueAction.CANCEL_TEMPORARY_LEAVE,
+                                            reason = "管理后台取消暂时离开"
+                                        )
                                     )
                                 }
                             )
                         }
+                        DropdownMenuItem(
+                            text = { Text("修改登记名称") },
+                            enabled = !registration.pendingCheckIn,
+                            onClick = {
+                                actionMenuOpen = false
+                                renameDraft = registration.displayId
+                                renameDialogOpen = true
+                            }
+                        )
+                        if (registration.profileId == null) {
+                            DropdownMenuItem(
+                                text = { Text("关联玩家资料") },
+                                enabled = !registration.pendingCheckIn && profiles.isNotEmpty(),
+                                onClick = {
+                                    actionMenuOpen = false
+                                    claimDialogOpen = true
+                                }
+                            )
+                        }
+                        DropdownMenuItem(
+                            text = { Text("与朋友组成固定组合") },
+                            enabled = registrationOpen && machine.capacity > 1 &&
+                                registration.position == "WAITING" && !registration.pendingCheckIn,
+                            onClick = {
+                                actionMenuOpen = false
+                                fixedPairDialogOpen = true
+                            }
+                        )
                         DropdownMenuItem(
                             text = { Text("转移机台") },
                             enabled = registration.position == "WAITING" &&
@@ -1295,15 +1858,18 @@ private fun ManagementRegistrationRow(
                             }
                         )
                         DropdownMenuItem(
-                            text = { Text("退出排队") },
+                            text = { Text("退出排队", color = Destructive) },
                             onClick = {
                                 actionMenuOpen = false
-                                onQueueAction(
-                                    registration,
-                                    machine,
-                                    "LEAVE_QUEUE",
-                                    null,
-                                    null
+                                prompt = ManagementActionPrompt(
+                                    "移除这份登记？",
+                                    "“${registration.displayId}”会永久退出当前队列。",
+                                    "确认退出排队",
+                                    request(
+                                        ManagementQueueAction.REMOVE_REGISTRATIONS,
+                                        reason = "管理后台移除登记"
+                                    ),
+                                    destructive = true
                                 )
                             }
                         )
@@ -1343,7 +1909,16 @@ private fun ManagementRegistrationRow(
                         val target = machines.firstOrNull { it.id == selectedTargetMachineId }
                         if (target != null) {
                             transferDialogOpen = false
-                            onQueueAction(registration, machine, "TRANSFER_MACHINE", null, target)
+                            prompt = ManagementActionPrompt(
+                                "转移到${target.name}？",
+                                "“${registration.displayId}”会转入目标机台等待末端。",
+                                "确认转移",
+                                request(
+                                    ManagementQueueAction.TRANSFER_REGISTRATIONS,
+                                    targetMachine = target,
+                                    reason = "管理后台转移登记"
+                                )
+                            )
                         }
                     },
                     enabled = selectedTargetMachineId != null
@@ -1382,12 +1957,12 @@ private fun ManagementRegistrationRow(
                 Button(
                     onClick = {
                         preferenceDialogOpen = false
-                        onQueueAction(
-                            registration,
-                            machine,
-                            "CHANGE_PLAY_PREFERENCE",
-                            selectedPreference,
-                            null
+                        onTerminalAction(
+                            request(
+                                ManagementQueueAction.CHANGE_PREFERENCE,
+                                preference = selectedPreference,
+                                reason = "管理后台修改本次游玩偏好"
+                            )
                         )
                     },
                     enabled = selectedPreference.isNotBlank()
@@ -1397,6 +1972,321 @@ private fun ManagementRegistrationRow(
                 TextButton(onClick = { preferenceDialogOpen = false }) { Text("取消") }
             }
         )
+    }
+    if (renameDialogOpen) {
+        AlertDialog(
+            onDismissRequest = { renameDialogOpen = false },
+            title = { Text("修改登记名称") },
+            text = {
+                OutlinedTextField(
+                    value = renameDraft,
+                    onValueChange = { renameDraft = it.take(18) },
+                    label = { Text("登记名称") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        renameDialogOpen = false
+                        onTerminalAction(
+                            request(
+                                ManagementQueueAction.RENAME_REGISTRATION,
+                                displayId = renameDraft.trim(),
+                                reason = "管理后台修改登记名称"
+                            )
+                        )
+                    },
+                    enabled = renameDraft.isNotBlank() && renameDraft.trim() != registration.displayId
+                ) { Text("确认修改") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameDialogOpen = false }) { Text("取消") }
+            }
+        )
+    }
+    if (claimDialogOpen) {
+        ManagementProfileChooserDialog(
+            title = "关联玩家资料",
+            profiles = profiles.filter { profile ->
+                machines.none { currentMachine ->
+                    (currentMachine.playing + currentMachine.waiting).any {
+                        it.profileId == profile.id
+                    }
+                }
+            },
+            onDismiss = { claimDialogOpen = false },
+            onSelect = { profile ->
+                claimDialogOpen = false
+                prompt = ManagementActionPrompt(
+                    "关联到“${profile.nickname}”？",
+                    "临时登记“${registration.displayId}”会改用这份玩家资料的昵称和资料信息。",
+                    "确认关联",
+                    request(
+                        ManagementQueueAction.CLAIM_WITH_PLAYER_PROFILE,
+                        profileId = profile.id,
+                        preference = profile.defaultPreference.takeIf {
+                            it != "ASK_EVERY_TIME"
+                        },
+                        reason = "管理后台关联临时登记与玩家资料"
+                    )
+                )
+            }
+        )
+    }
+    if (fixedPairDialogOpen) {
+        ManagementFixedPairDialog(
+            registration = registration,
+            machine = machine,
+            profiles = profiles,
+            registeredProfileIds = machines.flatMap { currentMachine ->
+                currentMachine.playing + currentMachine.waiting
+            }.mapNotNull(ManagementRegistration::profileId).toSet(),
+            onDismiss = { fixedPairDialogOpen = false },
+            onPairExisting = { friend ->
+                fixedPairDialogOpen = false
+                prompt = ManagementActionPrompt(
+                    "组成固定组合？",
+                    "“${registration.displayId}”与“${friend.displayId}”会作为完整双人位置共同游玩。",
+                    "确认组成固定组合",
+                    request(
+                        ManagementQueueAction.CREATE_FIXED_PAIR,
+                        registrationIds = listOf(
+                            registration.registrationId,
+                            friend.registrationId
+                        ),
+                        reason = "管理后台组成固定组合"
+                    )
+                )
+            },
+            onCreateProfileFriend = { profile, preference ->
+                fixedPairDialogOpen = false
+                prompt = ManagementActionPrompt(
+                    "为“${profile.nickname}”新建朋友登记？",
+                    "新登记会与“${registration.displayId}”组成固定组合。",
+                    "确认新建并组合",
+                    request(
+                        ManagementQueueAction.CREATE_FIXED_PAIR_WITH_REGISTRATION,
+                        friendProfileId = profile.id,
+                        preference = preference,
+                        reason = "管理后台新建玩家登记并组成固定组合"
+                    )
+                )
+            },
+            onCreateTemporaryFriend = { displayId, preference ->
+                fixedPairDialogOpen = false
+                prompt = ManagementActionPrompt(
+                    "新建朋友临时登记？",
+                    "“$displayId”会作为新登记与“${registration.displayId}”组成固定组合。",
+                    "确认新建并组合",
+                    request(
+                        ManagementQueueAction.CREATE_FIXED_PAIR_WITH_REGISTRATION,
+                        displayId = displayId,
+                        preference = preference,
+                        reason = "管理后台新建临时登记并组成固定组合"
+                    )
+                )
+            }
+        )
+    }
+    prompt?.let { currentPrompt ->
+        ManagementActionPromptDialog(
+            prompt = currentPrompt,
+            onDismiss = { prompt = null },
+            onConfirm = {
+                prompt = null
+                onTerminalAction(currentPrompt.request)
+            }
+        )
+    }
+}
+
+@Composable
+private fun ManagementProfileChooserDialog(
+    title: String,
+    profiles: List<ManagementProfile>,
+    onDismiss: () -> Unit,
+    onSelect: (ManagementProfile) -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            if (profiles.isEmpty()) {
+                Text("当前没有可用的玩家资料。", color = SecondaryText)
+            } else {
+                LazyColumn(
+                    modifier = Modifier.height(360.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    items(profiles, key = { it.id }) { profile ->
+                        OutlinedButton(
+                            onClick = { onSelect(profile) },
+                            modifier = Modifier.fillMaxWidth(),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                        ) {
+                            Column(Modifier.fillMaxWidth()) {
+                                Text(profile.nickname, color = PrimaryText)
+                                Text(
+                                    listOfNotNull(
+                                        profile.publicPlayerId?.let { "玩家 $it" },
+                                        profile.qqNumber?.let { "QQ $it" }
+                                    ).joinToString(" · "),
+                                    color = SecondaryText,
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
+}
+
+@Composable
+private fun ManagementFixedPairDialog(
+    registration: ManagementRegistration,
+    machine: ManagementMachine,
+    profiles: List<ManagementProfile>,
+    registeredProfileIds: Set<String>,
+    onDismiss: () -> Unit,
+    onPairExisting: (ManagementRegistration) -> Unit,
+    onCreateProfileFriend: (ManagementProfile, String?) -> Unit,
+    onCreateTemporaryFriend: (String, String) -> Unit
+) {
+    var mode by remember { mutableStateOf("EXISTING") }
+    var selectedProfileId by remember { mutableStateOf<String?>(null) }
+    var temporaryName by remember { mutableStateOf("") }
+    var preference by remember { mutableStateOf("SOLO") }
+    val candidates = machine.waiting.filter {
+        it.registrationId != registration.registrationId && !it.pendingCheckIn
+    }
+    val availableProfiles = profiles.filter { it.id !in registeredProfileIds }
+    val selectedProfile = availableProfiles.firstOrNull { it.id == selectedProfileId }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("与朋友组成固定组合") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf(
+                        "EXISTING" to "现有登记",
+                        "PROFILE" to "玩家资料",
+                        "TEMPORARY" to "临时登记"
+                    ).forEach { (value, label) ->
+                        OutlinedButton(
+                            onClick = { mode = value },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 3.dp, vertical = 7.dp)
+                        ) {
+                            Text(
+                                label,
+                                color = if (mode == value) SystemBlue else PrimaryText,
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    }
+                }
+                when (mode) {
+                    "EXISTING" -> LazyColumn(
+                        modifier = Modifier.height(280.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        items(candidates, key = { it.registrationId }) { candidate ->
+                            OutlinedButton(
+                                onClick = { onPairExisting(candidate) },
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text(candidate.displayId) }
+                        }
+                    }
+                    "PROFILE" -> {
+                        LazyColumn(
+                            modifier = Modifier.height(220.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            items(availableProfiles, key = { it.id }) { profile ->
+                                OutlinedButton(
+                                    onClick = {
+                                        selectedProfileId = profile.id
+                                        preference = profile.defaultPreference.takeIf {
+                                            it != "ASK_EVERY_TIME"
+                                        } ?: "SOLO"
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(
+                                        profile.nickname,
+                                        color = if (selectedProfileId == profile.id) {
+                                            SystemBlue
+                                        } else {
+                                            PrimaryText
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                        if (selectedProfile?.defaultPreference == "ASK_EVERY_TIME") {
+                            ManagementPreferenceSelector(preference) { preference = it }
+                        }
+                    }
+                    else -> {
+                        OutlinedTextField(
+                            value = temporaryName,
+                            onValueChange = { temporaryName = it.take(18) },
+                            label = { Text("朋友的登记名称") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        ManagementPreferenceSelector(preference) { preference = it }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            when (mode) {
+                "PROFILE" -> Button(
+                    onClick = {
+                        selectedProfile?.let {
+                            onCreateProfileFriend(it, preference)
+                        }
+                    },
+                    enabled = selectedProfile != null
+                ) { Text("新建并组合") }
+                "TEMPORARY" -> Button(
+                    onClick = {
+                        onCreateTemporaryFriend(temporaryName.trim(), preference)
+                    },
+                    enabled = temporaryName.isNotBlank()
+                ) { Text("新建并组合") }
+                else -> Unit
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
+}
+
+@Composable
+private fun ManagementPreferenceSelector(
+    selected: String,
+    onSelect: (String) -> Unit
+) {
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        listOf("SOLO" to "单人游玩", "OPEN_TO_JOIN" to "允许加入").forEach { option ->
+            OutlinedButton(
+                onClick = { onSelect(option.first) },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(
+                    option.second,
+                    color = if (selected == option.first) SystemBlue else PrimaryText,
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+        }
     }
 }
 

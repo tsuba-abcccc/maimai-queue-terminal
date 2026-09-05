@@ -1,7 +1,8 @@
 <script setup>
 defineProps({
   settings: { type: Object, required: true },
-  botQq: { type: String, default: null }
+  botQq: { type: String, default: null },
+  showVisibility: { type: Boolean, default: true }
 })
 
 const emit = defineEmits(['change'])
@@ -20,7 +21,7 @@ function update(key, value) {
 </script>
 
 <template>
-  <fieldset>
+  <fieldset v-if="showVisibility">
     <legend>QQ 显示范围</legend>
     <div class="mobile-choice-row">
       <button type="button" :class="{ active: settings.qq_visibility === 'TERMINAL_ONLY' }"

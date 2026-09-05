@@ -256,6 +256,10 @@ internal interface QueueCommandClient {
         machineId: String,
         machineStableId: String
     ): MobileRegistrationSession?
+    suspend fun createPlayerProfileCreationSession(
+        expectedVenueId: String?,
+        requestId: String
+    ): PlayerProfileCreationSession?
     suspend fun createPlayerAccountBindingSession(
         expectedVenueId: String?,
         profileId: String
@@ -278,6 +282,12 @@ internal data class PlayerProfileSyncPayload(
 internal data class MobileRegistrationSession(
     val sessionId: String,
     val registrationUrl: String,
+    val expiresAtMillis: Long
+)
+
+internal data class PlayerProfileCreationSession(
+    val sessionId: String,
+    val profileCreationUrl: String,
     val expiresAtMillis: Long
 )
 
@@ -740,6 +750,57 @@ internal class HttpQueueCommandClient(
         )
     }
 
+    override suspend fun createPlayerProfileCreationSession(
+        expectedVenueId: String?,
+        requestId: String
+    ): PlayerProfileCreationSession? = withContext(Dispatchers.IO) {
+        runCatching {
+            val requestConfiguration = configuration
+            withSchemaFallback(requestConfiguration, expectedVenueId) { schemaVersion ->
+                val body = JSONObject().apply {
+                    put("request_id", requestId)
+                }.toString().toByteArray(Charsets.UTF_8)
+                val connection = openConnection(
+                    terminalEndpoint(requestConfiguration, "/queue-terminal/player-profile-sessions"),
+                    "POST",
+                    requestConfiguration.token,
+                    schemaVersion,
+                    expectedVenueId
+                ).apply {
+                    doOutput = true
+                    setFixedLengthStreamingMode(body.size)
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                }
+                try {
+                    connection.outputStream.use { it.write(body) }
+                    requireSuccessfulResponse(connection)
+                    val payload = JSONObject(
+                        connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                    )
+                    PlayerProfileCreationSession(
+                        sessionId = payload.getString("session_id"),
+                        profileCreationUrl = payload.getString("profile_creation_url"),
+                        expiresAtMillis = payload.getLong("expires_at")
+                    )
+                } finally {
+                    connection.disconnect()
+                }
+            }
+        }.fold(
+            onSuccess = { session ->
+                commandSyncFailureDetail = null
+                session
+            },
+            onFailure = { error ->
+                if (error is CancellationException) throw error
+                Log.w(LOG_TAG, "Player profile creation session failed", error)
+                commandSyncFailureDetail = queuePublishFailureDetail(error)
+                commandSyncLastErrorAtMillis = System.currentTimeMillis()
+                null
+            }
+        )
+    }
+
     private fun requestMobileRegistrationSession(
         requestConfiguration: QueueConnectionConfiguration,
         schemaVersion: Int,
@@ -1095,6 +1156,7 @@ private const val MAX_PROFILE_ALIASES = 500
 
 private const val PROFILE_UPDATE_COMMAND = "UPDATE_PLAYER_PROFILE"
 private const val QUEUE_OPERATION_COMMAND = "QUEUE_OPERATION"
+private const val MANAGEMENT_QUEUE_ACTION_COMMAND = "MANAGEMENT_QUEUE_ACTION"
 private const val MOBILE_REGISTRATION_COMMAND = "MOBILE_DEVICE_REGISTRATION"
 private const val TERMINAL_POLICY_COMMAND = "UPDATE_TERMINAL_POLICY"
 private const val REGISTRATION_AVAILABILITY_COMMAND = "SET_REGISTRATION_AVAILABILITY"
@@ -1109,6 +1171,7 @@ internal fun parseRemoteTerminalCommands(response: String): List<RemoteTerminalC
             when (source?.optString("type")) {
                 PROFILE_UPDATE_COMMAND -> parsePlayerProfileUpdate(source)
                 QUEUE_OPERATION_COMMAND -> parseQueueOperation(source)
+                MANAGEMENT_QUEUE_ACTION_COMMAND -> parseManagementQueueAction(source)
                 MOBILE_REGISTRATION_COMMAND -> parseMobileDeviceRegistration(source)
                 TERMINAL_POLICY_COMMAND -> parseTerminalPolicyUpdate(source)
                 REGISTRATION_AVAILABILITY_COMMAND -> parseRegistrationAvailability(source)
@@ -1476,6 +1539,171 @@ private fun parseQueueOperation(command: JSONObject?): RemoteQueueOperationComma
             registrationOrder = payload.optionalRegistrationOrder("registration_order")
         )
     }.getOrNull()?.takeIf(::isValidQueueOperationCommand)
+}
+
+private fun parseManagementQueueAction(
+    command: JSONObject?
+): ManagementQueueActionCommand? {
+    if (
+        command == null ||
+        command.optString("type") != MANAGEMENT_QUEUE_ACTION_COMMAND
+    ) return null
+    val payload = command.optJSONObject("payload") ?: return null
+    return runCatching {
+        check(
+            RemoteQueueOperationSource.valueOf(payload.getString("operation_source")) ==
+                RemoteQueueOperationSource.MANAGEMENT_APP
+        )
+        ManagementQueueActionCommand(
+            commandId = command.getString("command_id"),
+            createdAtMillis = command.getLong("created_at"),
+            queueId = payload.getString("queue_id"),
+            queueRevision = payload.getLong("queue_revision"),
+            machineConfigurationRevision = payload.getLong(
+                "machine_configuration_revision"
+            ),
+            action = ManagementQueueAction.valueOf(payload.getString("action")),
+            machineId = payload.getString("machine_id"),
+            machineStableId = payload.getString("machine_stable_id"),
+            expectedPlayingRegistrationIds = payload.getJSONArray(
+                "expected_playing_registration_ids"
+            ).registrationIds(),
+            expectedWaitingPositionRegistrationIds = payload.getJSONArray(
+                "expected_waiting_positions"
+            ).registrationIdGroups(),
+            registrationIds = payload.optJSONArray("registration_ids")
+                ?.registrationIds().orEmpty(),
+            profileId = payload.optionalNonBlankString("profile_id"),
+            friendProfileId = payload.optionalNonBlankString("friend_profile_id"),
+            displayId = payload.optionalNonBlankString("display_id"),
+            preference = payload.optionalNonBlankString("preference")
+                ?.let(PlayPreference::valueOf),
+            targetMachineId = payload.optionalNonBlankString("target_machine_id"),
+            targetMachineStableId = payload.optionalNonBlankString(
+                "target_machine_stable_id"
+            ),
+            sourcePositionIndex = payload.optionalNonNegativeInt("source_position_index"),
+            destinationPositionIndex = payload.optionalNonNegativeInt(
+                "destination_position_index"
+            ),
+            desiredWaitingPositionRegistrationIds = payload.optJSONArray(
+                "desired_waiting_positions"
+            )?.registrationIdGroups(),
+            desiredRegistrationOrder = payload.optJSONArray("desired_registration_order")
+                ?.registrationIds(),
+            noShowResolution = payload.optionalNonBlankString("no_show_resolution")
+                ?.let(NoShowResolution::valueOf),
+            startNextWhenPlayingBecomesEmpty = payload.optBoolean(
+                "start_next_when_playing_becomes_empty",
+                true
+            ),
+            advanceWhenPlayingEmpty = payload.optBoolean("advance_when_playing_empty", false),
+            reason = payload.optionalNonBlankString("reason")
+        )
+    }.getOrNull()?.takeIf(::isValidManagementQueueActionCommand)
+}
+
+private fun JSONArray.registrationIds(): List<String> = buildList {
+    repeat(length()) { index -> add(getString(index).trim()) }
+}
+
+private fun JSONArray.registrationIdGroups(): List<List<String>> = buildList {
+    repeat(length()) { index -> add(getJSONArray(index).registrationIds()) }
+}
+
+private fun JSONObject.optionalNonNegativeInt(name: String): Int? =
+    if (!has(name) || isNull(name)) null else getInt(name).also { require(it >= 0) }
+
+private fun isValidManagementQueueActionCommand(
+    command: ManagementQueueActionCommand
+): Boolean {
+    val publicIdPattern = Regex("[0-9a-f]{24}")
+    val validMachineId = { value: String? ->
+        value != null && value.matches(Regex("[A-Z][A-Z0-9_-]{0,7}"))
+    }
+    val validStableId = { value: String? ->
+        value != null && value.matches(Regex("[0-9a-f]{32}"))
+    }
+    val validIds = { values: List<String> ->
+        values.size <= 20 && values.distinct().size == values.size &&
+            values.all(publicIdPattern::matches)
+    }
+    val validGroups = { groups: List<List<String>> ->
+        groups.size <= 20 && groups.all { it.isNotEmpty() && it.size <= 2 && validIds(it) } &&
+            validIds(groups.flatten())
+    }
+    if (
+        !isUuid(command.commandId) ||
+        !isUuid(command.queueId) ||
+        command.createdAtMillis <= 0L ||
+        command.queueRevision <= 0L ||
+        command.machineConfigurationRevision <= 0L ||
+        !validMachineId(command.machineId) ||
+        !validStableId(command.machineStableId) ||
+        !validIds(command.expectedPlayingRegistrationIds) ||
+        command.expectedPlayingRegistrationIds.size > 2 ||
+        !validGroups(command.expectedWaitingPositionRegistrationIds) ||
+        !validIds(command.registrationIds) ||
+        (command.profileId != null && !isUuid(command.profileId)) ||
+        (command.friendProfileId != null && !isUuid(command.friendProfileId)) ||
+        (command.displayId != null &&
+            command.displayId.codePointCount(0, command.displayId.length) > 18) ||
+        (command.reason != null && command.reason.codePointCount(0, command.reason.length) > 200) ||
+        (command.targetMachineId == null) != (command.targetMachineStableId == null) ||
+        (command.targetMachineId != null && !validMachineId(command.targetMachineId)) ||
+        (command.targetMachineStableId != null && !validStableId(command.targetMachineStableId)) ||
+        (command.sourcePositionIndex == null) != (command.destinationPositionIndex == null) ||
+        command.desiredWaitingPositionRegistrationIds?.let { !validGroups(it) } == true ||
+        command.desiredRegistrationOrder?.let { !validIds(it) } == true
+    ) return false
+
+    return when (command.action) {
+        ManagementQueueAction.ADD_TEMPORARY_REGISTRATION ->
+            command.registrationIds.isEmpty() && command.displayId != null &&
+                command.profileId == null && command.friendProfileId == null
+        ManagementQueueAction.ADD_PROFILE_REGISTRATION ->
+            command.registrationIds.isEmpty() && command.profileId != null &&
+                command.displayId == null && command.friendProfileId == null
+        ManagementQueueAction.FINISH_ROUND,
+        ManagementQueueAction.END_ROUND_ONLY,
+        ManagementQueueAction.REMOVE_CURRENT_ROUND_AND_START_NEXT,
+        ManagementQueueAction.ENTER_PLAYING_POSITION,
+        ManagementQueueAction.RESTART_PLAYING_TIMER,
+        ManagementQueueAction.RESTART_PENDING_CHECK_IN_TIMERS,
+        ManagementQueueAction.RESTART_MACHINE_TIMERS -> command.registrationIds.isEmpty()
+        ManagementQueueAction.CREATE_FIXED_PAIR -> command.registrationIds.size == 2
+        ManagementQueueAction.CREATE_FIXED_PAIR_WITH_REGISTRATION ->
+            command.registrationIds.size == 1 &&
+                (command.friendProfileId != null || command.displayId != null)
+        ManagementQueueAction.RELEASE_FIXED_PAIR -> command.registrationIds.size == 2
+        ManagementQueueAction.RENAME_REGISTRATION ->
+            command.registrationIds.size == 1 && command.displayId != null
+        ManagementQueueAction.CLAIM_WITH_PLAYER_PROFILE ->
+            command.registrationIds.size == 1 && command.profileId != null
+        ManagementQueueAction.MARK_NO_SHOW ->
+            command.registrationIds.isNotEmpty() && command.noShowResolution != null
+        ManagementQueueAction.MOVE_WAITING_POSITION ->
+            command.registrationIds.isEmpty() && command.sourcePositionIndex != null &&
+                command.sourcePositionIndex != command.destinationPositionIndex
+        ManagementQueueAction.REPLACE_WAITING_POSITIONS ->
+            command.registrationIds.isEmpty() && command.desiredWaitingPositionRegistrationIds != null
+        ManagementQueueAction.REPLACE_REGISTRATION_ORDER ->
+            command.registrationIds.isEmpty() && command.desiredRegistrationOrder != null
+        ManagementQueueAction.TRANSFER_REGISTRATIONS ->
+            command.registrationIds.isNotEmpty() && command.targetMachineId != null &&
+                command.targetMachineId != command.machineId
+        ManagementQueueAction.CHANGE_PREFERENCE ->
+            command.registrationIds.size == 1 && command.preference != null
+        ManagementQueueAction.RETURN_PLAYING_TO_WAITING_FRONT,
+        ManagementQueueAction.ADVANCE_TO_WAITING_POSITION,
+        ManagementQueueAction.REMOVE_REGISTRATIONS -> command.registrationIds.isNotEmpty()
+        ManagementQueueAction.MOVE_WAITING_REGISTRATION_INTO_CURRENT_ROUND,
+        ManagementQueueAction.DEFER_ONE_ROUND,
+        ManagementQueueAction.CANCEL_DEFER_ONE_ROUND,
+        ManagementQueueAction.TEMPORARILY_LEAVE,
+        ManagementQueueAction.CANCEL_TEMPORARY_LEAVE,
+        ManagementQueueAction.CHECK_IN -> command.registrationIds.size == 1
+    }
 }
 
 private fun parseMobileDeviceRegistration(

@@ -16,6 +16,7 @@ import {
 } from '@lucide/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import MobileRegistrationFlow from './MobileRegistrationFlow.vue'
+import MobileProfileCreationFlow from './MobileProfileCreationFlow.vue'
 import PlayerAccountDialog from './PlayerAccountDialog.vue'
 import { compactMiddleDots, formatMiddleDots, normalizeMachineConfiguration } from './machineConfiguration.js'
 
@@ -135,6 +136,7 @@ const onlineJoinResultDetail = ref('')
 const onlineJoinResultRegistrationId = ref(null)
 const onlineJoinTerminalApplied = ref(false)
 const mobileRegistrationToken = ref('')
+const mobileProfileCreationToken = ref('')
 const playerAccountBindingToken = ref('')
 const playerAccountDialogVisible = ref(false)
 const playerAccountFocusRegistrationId = ref('')
@@ -2647,6 +2649,7 @@ function handleKeydown(event) {
 onMounted(async () => {
   const query = new URLSearchParams(window.location.search)
   mobileRegistrationToken.value = query.get('mobile_registration') || ''
+  mobileProfileCreationToken.value = query.get('player_profile_creation') || ''
   playerAccountBindingToken.value = query.get('account_binding') || ''
   playerAccountDialogVisible.value = Boolean(playerAccountBindingToken.value)
   if (playerAccountBindingToken.value) {
@@ -2654,7 +2657,7 @@ onMounted(async () => {
     url.searchParams.delete('account_binding')
     window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
   }
-  if (mobileRegistrationToken.value) {
+  if (mobileRegistrationToken.value || mobileProfileCreationToken.value) {
     await nextTick()
     return
   }
@@ -2679,6 +2682,7 @@ onBeforeUnmount(() => {
 
 <template>
   <MobileRegistrationFlow v-if="mobileRegistrationToken" :token="mobileRegistrationToken" />
+  <MobileProfileCreationFlow v-else-if="mobileProfileCreationToken" :token="mobileProfileCreationToken" />
   <main v-else class="queue-panel">
     <header class="queue-header">
       <div class="queue-heading">

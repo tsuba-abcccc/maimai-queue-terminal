@@ -384,6 +384,11 @@ internal fun RegistrationApp() {
     }
     var mobileRegistrationLoading by remember { mutableStateOf(false) }
     var mobileRegistrationFailureDetail by remember { mutableStateOf<String?>(null) }
+    var playerProfileCreationSession by remember {
+        mutableStateOf<PlayerProfileCreationSession?>(null)
+    }
+    var playerProfileCreationLoading by remember { mutableStateOf(false) }
+    var playerProfileCreationFailureDetail by remember { mutableStateOf<String?>(null) }
     var playerAccountBindingSession by remember {
         mutableStateOf<PlayerAccountBindingSession?>(null)
     }
@@ -2525,7 +2530,7 @@ internal fun RegistrationApp() {
         notificationPreferences = profileNotificationDraft
     )
 
-    fun openNewPlayerProfile() {
+    fun openLocalPlayerProfileEditor() {
         playerProfileEditorReturnScreen = Screen.PLAYER_LIBRARY
         editingPlayerProfileId = null
         profileNicknameDraft = ""
@@ -2537,6 +2542,46 @@ internal fun RegistrationApp() {
         initialPlayerProfileDraft = currentPlayerProfileDraft()
         discardPlayerProfileDraftConfirmationVisible = false
         screen = Screen.PLAYER_PROFILE_EDITOR
+    }
+
+    fun requestPlayerProfileCreationSession() {
+        if (
+            playerProfileCreationLoading ||
+            !cloudSyncAvailable ||
+            !queueRuleSettings.websiteSyncEnabled ||
+            !queueCommandClient.isConfigured ||
+            !terminalInstallation.allowsOnlineAccess(queueRuleSettings.queueSyncEndpoint)
+        ) {
+            openLocalPlayerProfileEditor()
+            return
+        }
+        playerProfileCreationLoading = true
+        playerProfileCreationFailureDetail = null
+        val requestId = java.util.UUID.randomUUID().toString()
+        coroutineScope.launch {
+            try {
+                val session = queueCommandClient.createPlayerProfileCreationSession(
+                    expectedVenueId = terminalInstallation.expectedServerVenueId,
+                    requestId = requestId
+                )
+                if (screen != Screen.PLAYER_LIBRARY) return@launch
+                if (session == null) {
+                    playerProfileCreationFailureDetail =
+                        queueCommandClient.commandSyncFailureDetail
+                            ?: "暂时无法创建网页玩家资料页面，请稍后重试。"
+                } else {
+                    playerProfileCreationSession = session
+                }
+            } finally {
+                playerProfileCreationLoading = false
+            }
+        }
+    }
+
+    fun openNewPlayerProfile() {
+        playerProfileCreationSession = null
+        playerProfileCreationFailureDetail = null
+        requestPlayerProfileCreationSession()
     }
 
     fun openEditPlayerProfile(
@@ -3878,6 +3923,174 @@ internal fun RegistrationApp() {
                                 }
                             }
 
+                            is ManagementQueueActionCommand -> {
+                                val commandAppliedAtMillis = System.currentTimeMillis()
+                                val decision = decideManagementQueueAction(
+                                    command = command,
+                                    state = currentRemoteQueueExecutionState(),
+                                    appliedAtMillis = commandAppliedAtMillis,
+                                    appliedCommandIds = appliedTerminalCommandIds()
+                                )
+                                when (val result = decision) {
+                                    is ManagementQueueActionDecision.Apply -> {
+                                        val beforeQueues = configuredMachineIds.associate { machineId ->
+                                            machineId.name to queueFor(machineId)
+                                        }
+                                        configuredMachineIds.forEach { machineId ->
+                                            result.state.queues[machineId.name]?.let { queue ->
+                                                setQueue(machineId, queue)
+                                            }
+                                        }
+                                        nextKey = maxOf(nextKey, result.state.nextRegistrationKey)
+                                        homeSidePanelFeedback = null
+                                        newRegistrationHighlight = null
+                                        result.changedMachineIds.forEach { machineName ->
+                                            val machineId = MachineId.entries.firstOrNull {
+                                                it.name == machineName
+                                            } ?: return@forEach
+                                            val beforeQueue = beforeQueues.getValue(machineName)
+                                            val afterQueue = result.state.queues.getValue(machineName)
+                                            appendQueueAuditLog(
+                                                machineId = machineId,
+                                                beforeQueue = beforeQueue,
+                                                afterQueue = afterQueue,
+                                                titleOverride = "管理后台：${result.detail}",
+                                                source = AuditLogSource.MANAGEMENT_APP,
+                                                classifyAvailabilityOutcomes = true,
+                                                semanticAction = result.action
+                                            )
+                                        }
+                                        queueUndoAction = result.changedMachineIds.singleOrNull()
+                                            ?.let { machineName ->
+                                                val machineId = MachineId.entries.firstOrNull {
+                                                    it.name == machineName
+                                                } ?: return@let null
+                                                val beforeQueue = beforeQueues.getValue(machineName)
+                                                val afterQueue = result.state.queues.getValue(machineName)
+                                                val feedback = queueUndoFeedbackOutcome(
+                                                    beforeQueue,
+                                                    afterQueue
+                                                )
+                                                QueueUndoAction(
+                                                    id = nextQueueUndoId++,
+                                                    machineId = machineId,
+                                                    beforeQueue = beforeQueue,
+                                                    afterQueue = afterQueue,
+                                                    message = result.detail.removeSuffix("。"),
+                                                    feedbackTitle = result.detail.removeSuffix("。"),
+                                                    feedbackDetail = result.detail,
+                                                    contextLabel = configuredMachineName(machineId),
+                                                    feedbackTone = feedback.tone,
+                                                    nonRestorableRegistrationKeys =
+                                                        feedback.nonRestorableRegistrationKeys
+                                                )
+                                            }
+                                        if (result.changedMachineIds.isNotEmpty()) {
+                                            queueSoundPlayer.play(QueueSoundCue.QUEUE_CHANGE)
+                                            showHomeOperationFeedback(
+                                                title = "管理后台操作已执行",
+                                                detail = result.detail,
+                                                contextLabel = result.changedMachineIds.mapNotNull { name ->
+                                                    MachineId.entries.firstOrNull { it.name == name }
+                                                        ?.let(::configuredMachineName)
+                                                }.joinToString("、"),
+                                                tone = HomeSidePanelFeedbackTone.INFO
+                                            )
+                                        }
+                                        persistQueueStateBeforeRemoteAcknowledgement()
+                                        if (result.updatedProfile != null) {
+                                            val persisted = playerProfilePersistence.persistAndApply(
+                                                result.updatedProfile
+                                            ) { profile ->
+                                                applyPlayerProfileToState(
+                                                    profile,
+                                                    recordAudit = false,
+                                                    source = AuditLogSource.MANAGEMENT_APP
+                                                )
+                                            }
+                                            if (!persisted) {
+                                                localWriteFailureDetail =
+                                                    "管理队列操作关联的玩家资料暂时无法写入本机，应用将继续重试。"
+                                                localWriteFailureAtMillis = System.currentTimeMillis()
+                                                continue
+                                            }
+                                        }
+                                        val resultRegistrationId = result.state.queues.values.asSequence()
+                                            .flatMap { it.allRegistrations.asSequence() }
+                                            .firstOrNull {
+                                                it.originatingCommandId == command.commandId
+                                            }
+                                            ?.key
+                                            ?.let { publicRegistrationId(queueId, it) }
+                                        if (!persistTerminalCommandReceipt(
+                                                TerminalCommandReceipt(
+                                                    commandId = command.commandId,
+                                                    applied = true,
+                                                    detail = result.detail,
+                                                    resultRegistrationId = resultRegistrationId
+                                                )
+                                            )
+                                        ) {
+                                            localWriteFailureDetail =
+                                                "管理队列操作的执行结果暂时无法写入本机，应用将继续重试。"
+                                            localWriteFailureAtMillis = System.currentTimeMillis()
+                                            continue
+                                        }
+                                        localWriteFailureDetail = null
+                                        completeRemoteCommand(
+                                            command.commandId,
+                                            applied = true,
+                                            detail = result.detail,
+                                            resultRegistrationId = resultRegistrationId
+                                        )
+                                    }
+
+                                    is ManagementQueueActionDecision.AlreadyApplied -> {
+                                        if (!persistTerminalCommandReceipt(
+                                                TerminalCommandReceipt(
+                                                    commandId = command.commandId,
+                                                    applied = true,
+                                                    detail = result.detail
+                                                )
+                                            )
+                                        ) {
+                                            localWriteFailureDetail =
+                                                "管理队列操作的执行结果暂时无法写入本机，应用将继续重试。"
+                                            localWriteFailureAtMillis = System.currentTimeMillis()
+                                            continue
+                                        }
+                                        localWriteFailureDetail = null
+                                        completeRemoteCommand(
+                                            command.commandId,
+                                            applied = true,
+                                            detail = result.detail
+                                        )
+                                    }
+
+                                    is ManagementQueueActionDecision.Reject -> {
+                                        if (!persistTerminalCommandReceipt(
+                                                TerminalCommandReceipt(
+                                                    commandId = command.commandId,
+                                                    applied = false,
+                                                    detail = result.detail
+                                                )
+                                            )
+                                        ) {
+                                            localWriteFailureDetail =
+                                                "管理队列操作的处理结果暂时无法写入本机，应用将继续重试。"
+                                            localWriteFailureAtMillis = System.currentTimeMillis()
+                                            continue
+                                        }
+                                        localWriteFailureDetail = null
+                                        completeRemoteCommand(
+                                            command.commandId,
+                                            applied = false,
+                                            detail = result.detail
+                                        )
+                                    }
+                                }
+                            }
+
                             is RemoteQueueOperationCommand -> {
                                 val commandAppliedAtMillis = System.currentTimeMillis()
                                 var decision = decideRemoteQueueOperation(
@@ -4514,6 +4727,9 @@ internal fun RegistrationApp() {
         closeQueueConfirmation ||
         mobileRegistrationSession != null ||
         mobileRegistrationFailureDetail != null ||
+        playerProfileCreationSession != null ||
+        playerProfileCreationFailureDetail != null ||
+        playerProfileCreationLoading ||
         botFriendPromptQq != null ||
         incompleteCheckInProfileId != null ||
         playerProfileWriteInProgress ||
@@ -6952,6 +7168,42 @@ internal fun RegistrationApp() {
                         onRetry = {
                             mobileRegistrationFailureDetail = null
                             requestMobileRegistrationSession()
+                        }
+                    )
+                }
+
+                if (playerProfileCreationLoading) {
+                    PlayerProfileCreationLoadingDialog()
+                }
+
+                playerProfileCreationSession?.let { session ->
+                    PlayerProfileCreationDialog(
+                        session = session,
+                        nowMillis = nowMillis,
+                        onDismiss = { playerProfileCreationSession = null },
+                        onRefresh = {
+                            playerProfileCreationSession = null
+                            requestPlayerProfileCreationSession()
+                        },
+                        onCreateLocal = {
+                            playerProfileCreationSession = null
+                            openLocalPlayerProfileEditor()
+                        }
+                    )
+                }
+
+                playerProfileCreationFailureDetail?.let { detail ->
+                    PlayerProfileCreationFailureDialog(
+                        detail = detail,
+                        retryEnabled = !playerProfileCreationLoading,
+                        onDismiss = { playerProfileCreationFailureDetail = null },
+                        onRetry = {
+                            playerProfileCreationFailureDetail = null
+                            requestPlayerProfileCreationSession()
+                        },
+                        onCreateLocal = {
+                            playerProfileCreationFailureDetail = null
+                            openLocalPlayerProfileEditor()
                         }
                     )
                 }
@@ -16385,6 +16637,131 @@ private fun PlayerProfileSavingOverlay() {
 }
 
 @Composable
+private fun PlayerProfileCreationLoadingDialog() {
+    ModalSurface(onDismiss = {}, width = 430.dp) {
+        Text(
+            "正在准备网页资料二维码",
+            color = PrimaryText,
+            fontSize = 20.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "正在向服务端创建一次性页面，请稍候。",
+            color = SecondaryText,
+            fontSize = 13.sp,
+            lineHeight = 20.sp
+        )
+        Spacer(Modifier.height(18.dp))
+        CircularProgressIndicator(
+            modifier = Modifier.size(28.dp),
+            color = SystemBlue,
+            strokeWidth = 3.dp
+        )
+    }
+}
+
+@Composable
+private fun PlayerProfileCreationDialog(
+    session: PlayerProfileCreationSession,
+    nowMillis: Long,
+    onDismiss: () -> Unit,
+    onRefresh: () -> Unit,
+    onCreateLocal: () -> Unit
+) {
+    val expired = nowMillis >= session.expiresAtMillis
+    ModalSurface(onDismiss, width = 500.dp) {
+        Text(
+            "创建网页玩家资料",
+            color = PrimaryText,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(7.dp))
+        Text(
+            if (expired) {
+                "这张二维码已经失效，请重新生成后再扫码。"
+            } else {
+                "请使用手机扫描二维码，在网页中填写玩家资料并设置密码。完成后会立即绑定网页账户。"
+            },
+            color = if (expired) Destructive else SecondaryText,
+            fontSize = 13.sp,
+            lineHeight = 20.sp
+        )
+        Spacer(Modifier.height(16.dp))
+        if (!expired) {
+            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                QrCodeImage(
+                    content = session.profileCreationUrl,
+                    contentDescription = "创建网页玩家资料二维码",
+                    size = 224.dp
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "二维码将在 ${formatClockTime(session.expiresAtMillis)} 失效",
+                color = TertiaryText,
+                fontSize = 11.sp,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(14.dp))
+            Text(
+                "手机页面创建的是云端同步的网页玩家资料，并会同时设置登录密码。绑定后，现场终端默认只读；玩家可以在网页设置中重新开放终端编辑权限。",
+                color = SecondaryText,
+                fontSize = 12.sp,
+                lineHeight = 19.sp,
+                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                    .background(PageBackground)
+                    .padding(horizontal = 13.dp, vertical = 11.dp)
+            )
+            Spacer(Modifier.height(16.dp))
+            PrimaryButton("仅创建本地玩家资料", onCreateLocal, Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
+            CancelAction(onDismiss)
+        } else {
+            PrimaryButton("重新生成二维码", onRefresh, Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
+            SecondaryButton("仅创建本地玩家资料", onCreateLocal, Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
+            CancelAction(onDismiss)
+        }
+    }
+}
+
+@Composable
+private fun PlayerProfileCreationFailureDialog(
+    detail: String,
+    retryEnabled: Boolean,
+    onDismiss: () -> Unit,
+    onRetry: () -> Unit,
+    onCreateLocal: () -> Unit
+) {
+    ModalSurface(onDismiss, width = 470.dp) {
+        Text(
+            "无法创建网页资料二维码",
+            color = PrimaryText,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(detail, color = SecondaryText, fontSize = 13.sp, lineHeight = 20.sp)
+        Spacer(Modifier.height(18.dp))
+        PrimaryButton(
+            "重试",
+            onRetry,
+            Modifier.fillMaxWidth(),
+            enabled = retryEnabled,
+            disabledReason = "正在向服务端创建网页资料页面。"
+        )
+        Spacer(Modifier.height(8.dp))
+        SecondaryButton("仅创建本地玩家资料", onCreateLocal, Modifier.fillMaxWidth())
+        Spacer(Modifier.height(8.dp))
+        CancelAction(onDismiss)
+    }
+}
+
+@Composable
 private fun MobileRegistrationDialog(
     session: MobileRegistrationSession,
     machineName: String,
@@ -17070,6 +17447,11 @@ private fun TerminalInstallationDetailsDialog(
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "0.13.3",
+            "网页登录与二维码建档",
+            "网页登录先查询 QQ 是否已绑定，再显示密码；未绑定时提示先绑定网页账户。终端新建玩家资料默认生成一次性二维码，手机网页创建并绑定账户；仍可选择仅创建本地玩家资料。二维码绑定终端运行实例，重启或过期后自动失效。"
+        ),
         Triple(
             "0.13.2",
             "自定义头像与管理后台收尾",

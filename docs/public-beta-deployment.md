@@ -1,6 +1,6 @@
 # maimai Q 公开测试版自建部署方案
 
-本文面向不使用项目维护者服务器、希望自行部署 maimai Q 的机厅或测试者。当前方案对应 Android 现场终端 `0.13.2`、管理 App `0.13.1`、队列网站 `0.13.2`、Koishi 插件 `0.3.13`；队列 API 使用 `v0.13.2` 配套源码。它是公开测试方案，不代表已经完成正式多租户和多终端联动。
+本文面向不使用项目维护者服务器、希望自行部署 maimai Q 的机厅或测试者。当前方案对应 Android 现场终端 `0.13.3`、管理 App `0.13.1`、队列网站 `0.13.3`、Koishi 插件 `0.3.13`；队列 API 使用 `v0.13.3` 配套源码。它是公开测试方案，不代表已经完成正式多租户和多终端联动。
 
 ## 先确认当前边界
 
@@ -49,7 +49,7 @@ https://example.com/api/queue-status
 ```bash
 git clone https://github.com/tsuba-abcccc/maimai-queue-terminal.git
 cd maimai-queue-terminal
-git checkout v0.13.2
+git checkout v0.13.3
 ```
 
 如果公开 Release 尚未发布，使用经过验收的提交哈希，并把它记录在部署记录中；不要把未提交的工作区直接复制到生产主机。
@@ -75,13 +75,18 @@ QUEUE_PLAYER_AVATAR_DIRECTORY=/app/data/player-avatars
 QUEUE_CORS_ORIGIN=https://example.com
 QUEUE_PUBLIC_SITE_URL=https://example.com
 QUEUE_PLAYER_ACCOUNT_SITE_URL=https://example.com
+QUEUE_PLAYER_PROFILE_CREATION_TTL_SECONDS=600
+QUEUE_PLAYER_PROFILE_CREATION_SESSION_RETENTION_SECONDS=86400
+QUEUE_PLAYER_AUTH_LOOKUP_LIMIT_REQUESTS=30
 QUEUE_PLAYER_COOKIE_SECURE=true
-QUEUE_LATEST_TERMINAL_VERSION=0.13.2
-QUEUE_LATEST_WEBSITE_VERSION=0.13.2
+QUEUE_LATEST_TERMINAL_VERSION=0.13.3
+QUEUE_LATEST_WEBSITE_VERSION=0.13.3
 QUEUE_LATEST_BOT_VERSION=0.3.13
 ```
 
 `QUEUE_PROFILE_SCOPE_ID` 是同一机厅共享玩家资料的作用域；以后重建容器或升级版本时必须保持不变。`QUEUE_PUBLIC_SITE_URL` 必须填写完整的 HTTPS 排队页面地址，因为它会被编码进终端生成的移动设备登记二维码。`QUEUE_PLAYER_ACCOUNT_SITE_URL` 是玩家网页账户绑定二维码打开的地址，通常填写同一页面；公开部署必须使用 HTTPS 并保持 `QUEUE_PLAYER_COOKIE_SECURE=true`。不要把 `.env` 提交 Git。
+
+`QUEUE_PLAYER_PROFILE_CREATION_TTL_SECONDS` 控制终端创建网页玩家资料二维码的有效时间，默认 10 分钟；`QUEUE_PLAYER_PROFILE_CREATION_SESSION_RETENTION_SECONDS` 控制已完成或过期会话的保留时间，默认 24 小时。会话绑定终端运行实例，终端重启后旧二维码不能继续提交。
 
 启动并检查 Compose 配置：
 
@@ -96,7 +101,7 @@ Compose 将 SQLite 和 `/app/data/player-avatars` 保存在名为 `queue-status-
 
 ### 3. 配置反向代理和 HTTPS
 
-将 [`cloud-server/nginx-location.conf.example`](../cloud-server/nginx-location.conf.example) 中的 location 合并到自己的 HTTPS 站点，不要覆盖站点已有的证书和其他路径。它包含公开队列、日志、版本、线上登记、移动登记、玩家账户与头像、终端私有接口、Bot/管理私有接口和健康检查路由。头像上传精确路径使用 `9m` 请求体上限，其他玩家账户路径仍为 `1m`。
+将 [`cloud-server/nginx-location.conf.example`](../cloud-server/nginx-location.conf.example) 中的 location 合并到自己的 HTTPS 站点，不要覆盖站点已有的证书和其他路径。它包含公开队列、日志、版本、线上登记、移动登记、二维码创建网页玩家资料、玩家账户与头像、终端私有接口、Bot/管理私有接口和健康检查路由。头像上传精确路径使用 `9m` 请求体上限，其他玩家账户和网页资料创建路径仍为 `1m`。二维码提交页面必须能访问 `/api/player-profile-creation/`，否则扫码后会出现网页 404。
 
 ```bash
 sudo nginx -t
@@ -131,7 +136,7 @@ export VITE_QUEUE_MOBILE_API_BASE=https://example.com/api/queue-mobile/sessions
 pnpm run build
 ```
 
-部署前确认 `dist/index.html`、`dist/queue-status/index.html` 和 `dist/queue-client-version.json` 存在，且 manifest 中的版本为 `0.13.2`。使用临时目录原子切换静态目录：
+部署前确认 `dist/index.html`、`dist/queue-status/index.html` 和 `dist/queue-client-version.json` 存在，且 manifest 中的版本为 `0.13.3`。使用临时目录原子切换静态目录：
 
 ```bash
 rsync -a --delete dist/ /var/www/queue-site/dist-next/
@@ -204,13 +209,13 @@ keytool -genkeypair -v -keystore maimai-q-release.jks \
 构建出的 `*-release-unsigned.apk` 需要先对齐、再签名；下面的路径以 Android SDK Build Tools 为准：
 
 ```bash
-zipalign -p -f 4 maimai-Q-0.13.2-terminal-release-unsigned.apk maimai-Q-0.13.2-terminal-aligned.apk
+zipalign -p -f 4 maimai-Q-0.13.3-terminal-release-unsigned.apk maimai-Q-0.13.3-terminal-aligned.apk
 apksigner sign --ks maimai-q-release.jks --ks-key-alias maimai-q \
-  --out maimai-Q-0.13.2-terminal.apk maimai-Q-0.13.2-terminal-aligned.apk
-apksigner verify --verbose maimai-Q-0.13.2-terminal.apk
+  --out maimai-Q-0.13.3-terminal.apk maimai-Q-0.13.3-terminal-aligned.apk
+apksigner verify --verbose maimai-Q-0.13.3-terminal.apk
 ```
 
-不要把 keystore、密码或带令牌的私有 APK 上传 GitHub。工作区中不带 `-beta` 的 `maimai-Q-0.13.2-terminal.apk` 如由调试任务生成，可能使用 Debug 证书；`*-release-unsigned.apk` 是未签名候选。公开 Release 只上传已经核验长期签名的 `maimai-Q-0.13.2-local-beta.apk`、`maimai-Q-0.13.2-terminal-beta.apk` 和独立版本 `maimai-Q-0.13.1-management.apk`。
+不要把 keystore、密码或带令牌的私有 APK 上传 GitHub。工作区中不带 `-beta` 的 `maimai-Q-0.13.3-terminal.apk` 如由调试任务生成，可能使用 Debug 证书；`*-release-unsigned.apk` 是未签名候选。公开 Release 只上传已经核验长期签名的 `maimai-Q-0.13.3-local-beta.apk`、`maimai-Q-0.13.3-terminal-beta.apk` 和独立版本 `maimai-Q-0.13.1-management.apk`。
 
 ## 首次联调清单
 
@@ -235,7 +240,7 @@ apksigner verify --verbose maimai-Q-0.13.2-terminal.apk
 
 每次发布都应固定为一个不可变版本，至少包含：
 
-- 主仓库 Git tag（例如 `v0.13.2`）和 GitHub Release；
+- 主仓库 Git tag（例如 `v0.13.3`）和 GitHub Release；
 - API 源码或 Docker 构建上下文、数据库迁移说明；
 - Android APK（公开本地版、必要时另附受控终端版）；
 - `public-site` 对应源码、静态站点压缩包和 `queue-client-version.json`；其他独立站点如同步发布，再另外保留其对应提交或 tag；
@@ -281,7 +286,7 @@ API 升级完成后，管理员还必须把 `.env` 中三个 `QUEUE_LATEST_*_VER
 
 ## 维护者现有部署与公开测试包的关系
 
-- 两者使用同一套 0.13.2 队列规则和跨端协议；差异主要是签名、默认配置、网站外壳和数据实例，不是另做一套功能逻辑。
+- 两者使用同一套 0.13.3 队列规则和跨端协议；差异主要是签名、默认配置、网站外壳和数据实例，不是另做一套功能逻辑。
 - 公开 `terminal-beta.apk` 使用长期 Release 证书签名，不预置服务器地址或令牌。维护者目前现场安装的联调终端使用 Android Debug 证书，已经保存自己的服务器配置和现场数据；两个签名不同，不能直接互相覆盖安装。
 - 维护者可以继续使用现有联调终端，不会因 GitHub 公开发布而自动改变、清空或连接到其他实例。若以后迁移到公开 Release 签名，必须先导出并核对可恢复的数据与配置，再卸载 Debug 版并安装 Release 版；不要在正在排队时迁移。
 - 公开网站来自 `public-site/`；其他站点可以保留自己的站点外壳。两者共享队列组件，但分别构建、分别部署，公开包不会包含其他站点的文章或导航。

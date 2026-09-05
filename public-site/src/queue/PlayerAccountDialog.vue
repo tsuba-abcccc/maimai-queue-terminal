@@ -26,6 +26,8 @@ const binding = ref(null)
 const qq = ref('')
 const password = ref('')
 const passwordConfirmation = ref('')
+const loginStep = ref('QQ')
+const forgotPasswordVisible = ref(false)
 const bindingCompleted = ref(false)
 const activeSection = ref('overview')
 const profileDraft = ref(null)
@@ -106,6 +108,9 @@ function clearAccountSession() {
     queueCommandTimer = undefined
   }
   setAccount(null)
+  loginStep.value = 'QQ'
+  password.value = ''
+  forgotPasswordVisible.value = false
   csrfToken.value = ''
   queueState.value = null
   emit('queue-state', null)
@@ -164,7 +169,7 @@ async function load() {
 }
 
 async function login() {
-  if (submitting.value) return
+  if (submitting.value || loginStep.value !== 'PASSWORD') return
   submitting.value = true
   error.value = ''
   try {
@@ -181,6 +186,47 @@ async function login() {
   } finally {
     submitting.value = false
   }
+}
+
+async function lookupLoginAccount() {
+  if (submitting.value) return
+  const normalizedQq = qq.value.trim()
+  if (!/^\d{5,12}$/.test(normalizedQq)) {
+    error.value = '请输入 5 至 12 位数字的 QQ 号。'
+    return
+  }
+  submitting.value = true
+  error.value = ''
+  forgotPasswordVisible.value = false
+  try {
+    const response = await accountRequest('/login-lookup', {
+      method: 'POST',
+      body: JSON.stringify({ qq: normalizedQq })
+    })
+    if (response.bound === true) {
+      loginStep.value = 'PASSWORD'
+      password.value = ''
+    } else {
+      loginStep.value = 'UNBOUND'
+    }
+  } catch (lookupError) {
+    error.value = lookupError.message
+  } finally {
+    submitting.value = false
+  }
+}
+
+function resetLoginStep() {
+  if (submitting.value) return
+  loginStep.value = 'QQ'
+  password.value = ''
+  error.value = ''
+  forgotPasswordVisible.value = false
+}
+
+function handleLoginQqInput() {
+  if (loginStep.value !== 'QQ') resetLoginStep()
+  qq.value = qq.value.replace(/\D/g, '').slice(0, 12)
 }
 
 async function completeBinding() {
@@ -220,10 +266,12 @@ async function logout() {
       headers: csrfHeaders()
     })
     setAccount(null)
+    loginStep.value = 'QQ'
     csrfToken.value = ''
     queueState.value = null
     emit('queue-state', null)
     password.value = ''
+    forgotPasswordVisible.value = false
   } catch (logoutError) {
     error.value = logoutError.message
   } finally {
@@ -1013,23 +1061,49 @@ onBeforeUnmount(() => {
         </button>
       </template>
 
-      <form v-else @submit.prevent="login">
-        <p class="account-explanation">使用已在现场绑定的 QQ 和账户密码登录。</p>
-        <label>
-          <span>QQ</span>
-          <input v-model="qq" type="text" inputmode="numeric" autocomplete="username" maxlength="12"
-            placeholder="输入 QQ 号" required />
-        </label>
-        <label>
-          <span>密码</span>
-          <input v-model="password" type="password" autocomplete="current-password" maxlength="128"
-            placeholder="输入账户密码" required />
-        </label>
-        <p v-if="error" class="account-error" role="alert">{{ error }}</p>
-        <button class="account-primary" type="submit" :disabled="submitting">
-          <LogIn :size="17" />{{ submitting ? '正在登录' : '登录' }}
-        </button>
-        <p class="account-footnote">尚未绑定时，请先在现场终端打开自己的玩家资料并生成绑定二维码。</p>
+      <form v-else @submit.prevent="loginStep === 'QQ' ? lookupLoginAccount() : login()">
+        <template v-if="loginStep === 'QQ'">
+          <p class="account-explanation">先输入 QQ 号，确认是否已经绑定网页玩家资料。</p>
+          <label>
+            <span>QQ</span>
+            <input v-model="qq" type="text" inputmode="numeric" autocomplete="username" maxlength="12"
+              placeholder="输入 QQ 号" required @input="handleLoginQqInput" />
+          </label>
+          <p v-if="error" class="account-error" role="alert">{{ error }}</p>
+          <button class="account-primary" type="submit" :disabled="submitting">
+            <LogIn :size="17" />{{ submitting ? '正在查询' : '继续' }}
+          </button>
+        </template>
+
+        <template v-else-if="loginStep === 'PASSWORD'">
+          <div class="account-login-identity">
+            <div><span>登录 QQ</span><strong>{{ qq }}</strong></div>
+            <button type="button" class="account-text-action" :disabled="submitting" @click="resetLoginStep">更换 QQ</button>
+          </div>
+          <label>
+            <span>账户密码</span>
+            <input v-model="password" type="password" autocomplete="current-password" maxlength="128"
+              placeholder="输入账户密码" required autofocus />
+          </label>
+          <button type="button" class="account-text-action account-forgot-action" @click="forgotPasswordVisible = !forgotPasswordVisible">
+            忘记密码？
+          </button>
+          <p v-if="forgotPasswordVisible" class="account-help-note">
+            忘记密码时，请联系现场管理员进行身份核验和密码处理。网页端暂不支持仅凭 QQ 自行重置密码。
+          </p>
+          <p v-if="error" class="account-error" role="alert">{{ error }}</p>
+          <button class="account-primary" type="submit" :disabled="submitting">
+            <LogIn :size="17" />{{ submitting ? '正在登录' : '登录' }}
+          </button>
+        </template>
+
+        <template v-else>
+          <div class="account-unbound-note">
+            <strong>这个 QQ 尚未绑定网页玩家资料</strong>
+            <p>请先在现场终端打开对应的玩家资料，选择“绑定网页账户”并扫码设置密码。完成绑定后，再使用 QQ 和密码登录。</p>
+          </div>
+          <button class="account-secondary account-change-qq" type="button" @click="resetLoginStep">更换 QQ</button>
+        </template>
       </form>
     </section>
   </div>
@@ -1083,6 +1157,17 @@ onBeforeUnmount(() => {
 .account-explanation, .account-footnote { color: var(--queue-secondary, #6e6e73); font-size: 12px; line-height: 1.65; }
 .account-explanation { margin: 16px 0; }
 .account-footnote { margin: 12px 0 0; text-align: center; }
+.account-login-identity { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 2px 0 1px; padding: 11px 12px; border-radius: 7px; background: var(--queue-soft, #f5f5f7); }
+.account-login-identity span { display: block; color: var(--queue-secondary, #6e6e73); font-size: 10px; }
+.account-login-identity strong { display: block; margin-top: 3px; font-size: 15px; letter-spacing: .02em; }
+.account-text-action { min-height: 30px; border: 0; padding: 0; color: var(--queue-blue); background: transparent; cursor: pointer; font-size: 11px; font-weight: 650; }
+.account-text-action:disabled { color: var(--queue-tertiary, #8e8e93); cursor: default; }
+.account-forgot-action { justify-self: start; margin-top: -5px; }
+.account-help-note { margin: -2px 0 0; padding: 10px 11px; border-left: 3px solid var(--queue-blue); color: var(--queue-secondary, #6e6e73); background: var(--queue-soft-blue); font-size: 10px; line-height: 1.6; }
+.account-unbound-note { margin-top: 14px; padding: 13px 14px; border-radius: 7px; background: var(--queue-soft-blue); }
+.account-unbound-note strong { display: block; font-size: 13px; }
+.account-unbound-note p { margin: 7px 0 0; color: var(--queue-secondary, #6e6e73); font-size: 11px; line-height: 1.65; }
+.account-change-qq { margin-top: 14px; }
 .account-dialog form { display: grid; gap: 13px; }
 .account-dialog label > span:not(.account-select-wrap) { display: block; margin-bottom: 6px; color: var(--queue-secondary); font-size: 12px; font-weight: 650; }
 .account-dialog input { width: 100%; height: 48px; border: 1px solid var(--queue-separator, #d2d2d7); border-radius: 7px; background: var(--queue-card, #fff); color: inherit; padding: 0 13px; font-size: 15px; }

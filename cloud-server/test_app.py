@@ -351,6 +351,399 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("PENDING", command_status.get_json()["status"])
         self.assertEqual(404, anonymous_status.status_code)
 
+    def test_player_account_login_lookup_returns_only_binding_state(self):
+        snapshot = self.remote_ready_snapshot()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+
+        unbound = self.client.post(
+            "/api/player-account/login-lookup",
+            json={"qq": "12345678"},
+        )
+        self.assertEqual(200, unbound.status_code)
+        self.assertEqual({"ok": True, "bound": False}, unbound.get_json())
+
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        ).get_json()
+        self.assertEqual(
+            201,
+            self.client.post(
+                f"/api/player-account/bindings/{binding['binding_token']}/complete",
+                json={"password": "lookup-password"},
+            ).status_code,
+        )
+        bound = self.client.post(
+            "/api/player-account/login-lookup",
+            json={"qq": "12345678"},
+        )
+        self.assertEqual(200, bound.status_code)
+        self.assertEqual({"ok": True, "bound": True}, bound.get_json())
+        self.assertEqual(
+            400,
+            self.client.post(
+                "/api/player-account/login-lookup",
+                json={"qq": "1234", "extra": "ignored"},
+            ).status_code,
+        )
+
+    def test_player_account_login_lookup_has_a_separate_request_budget(self):
+        self.app.config["PLAYER_AUTH_LOOKUP_LIMIT_REQUESTS"] = 3
+        snapshot = self.remote_ready_snapshot()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        for _ in range(3):
+            response = self.client.post(
+                "/api/player-account/login-lookup",
+                json={"qq": "12345678"},
+            )
+            self.assertEqual(200, response.status_code)
+
+        limited = self.client.post(
+            "/api/player-account/login-lookup",
+            json={"qq": "12345678"},
+        )
+        self.assertEqual(429, limited.status_code)
+        self.assertEqual("AUTH_RATE_LIMITED", limited.get_json()["code"])
+
+        # Lookup throttling must not consume the password-login failure budget
+        # or make a later valid login impossible.
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        ).get_json()
+        self.assertEqual(
+            201,
+            self.client.post(
+                f"/api/player-account/bindings/{binding['binding_token']}/complete",
+                json={"password": "lookup-budget-password"},
+            ).status_code,
+        )
+        login = self.app.test_client().post(
+            "/api/player-account/login",
+            json={"qq": "12345678", "password": "lookup-budget-password"},
+        )
+        self.assertEqual(200, login.status_code, login.get_json())
+
+    def test_mobile_player_profile_creation_creates_bound_account_and_syncs_profile(self):
+        snapshot = self.remote_ready_snapshot()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+
+        session_response = self.client.post(
+            "/api/queue-terminal/player-profile-sessions",
+            json={"request_id": "00000000-0000-0000-0000-000000000951"},
+            headers=self.headers,
+        )
+        self.assertEqual(201, session_response.status_code, session_response.get_json())
+        session = session_response.get_json()
+        self.assertIn("player_profile_creation=", session["profile_creation_url"])
+        token = session["profile_creation_url"].split("player_profile_creation=", 1)[1]
+
+        opened = self.client.get(
+            f"/api/player-profile-creation/sessions/{token}"
+        )
+        self.assertEqual(200, opened.status_code)
+        self.assertEqual("OPEN", opened.get_json()["status"])
+
+        payload = {
+            "nickname": "移动建档玩家",
+            "gender": "UNDISCLOSED",
+            "default_preference": "ASK_EVERY_TIME",
+            "qq_number": "23456789",
+            "password": "mobile-password",
+            "password_confirmation": "mobile-password",
+            "notification_enabled": True,
+            "notify_queue_changes": True,
+            "notify_playing_position": False,
+            "notify_online_check_in": True,
+            "notify_absence": True,
+            "notify_machine_status": False,
+        }
+        completed = self.client.post(
+            f"/api/player-profile-creation/sessions/{token}/complete",
+            json=payload,
+        )
+        self.assertEqual(201, completed.status_code, completed.get_json())
+        account_profile = completed.get_json()["account"]["profile"]
+        self.assertEqual("移动建档玩家", account_profile["nickname"])
+        self.assertTrue(account_profile["web_account_bound"])
+        self.assertFalse(account_profile["terminal_editing_allowed"])
+        self.assertEqual("PUBLIC_WEBSITE", account_profile["qq_visibility"])
+        self.assertEqual(6, len(account_profile["public_player_id"]))
+
+        login = self.app.test_client().post(
+            "/api/player-account/login",
+            json={"qq": "23456789", "password": "mobile-password"},
+        )
+        self.assertEqual(200, login.status_code, login.get_json())
+        terminal_profiles = self.client.get(
+            "/api/queue-terminal/profiles", headers=self.headers
+        )
+        self.assertEqual(200, terminal_profiles.status_code)
+        self.assertTrue(
+            any(
+                profile["profile_id"] == account_profile["profile_id"]
+                for profile in terminal_profiles.get_json()["profiles"]
+            )
+        )
+        used = self.client.get(
+            f"/api/player-profile-creation/sessions/{token}"
+        )
+        self.assertEqual(409, used.status_code)
+        self.assertEqual("PLAYER_PROFILE_CREATION_USED", used.get_json()["code"])
+
+    def test_mobile_player_profile_creation_survives_a_snapshot_before_terminal_echo(self):
+        snapshot = self.remote_ready_snapshot()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            ).status_code,
+        )
+        session_response = self.client.post(
+            "/api/queue-terminal/player-profile-sessions",
+            json={"request_id": "00000000-0000-0000-0000-000000000952"},
+            headers=self.headers,
+        )
+        self.assertEqual(201, session_response.status_code, session_response.get_json())
+        token = session_response.get_json()["profile_creation_url"].split(
+            "player_profile_creation=", 1
+        )[1]
+        payload = {
+            "nickname": "尚未回显玩家",
+            "gender": "UNDISCLOSED",
+            "default_preference": "ASK_EVERY_TIME",
+            "qq_number": "34567890",
+            "password": "echo-delay-password",
+            "password_confirmation": "echo-delay-password",
+            "notification_enabled": True,
+            "notify_queue_changes": True,
+            "notify_playing_position": False,
+            "notify_online_check_in": True,
+            "notify_absence": True,
+            "notify_machine_status": False,
+        }
+        completed = self.client.post(
+            f"/api/player-profile-creation/sessions/{token}/complete",
+            json=payload,
+        )
+        self.assertEqual(201, completed.status_code, completed.get_json())
+        created_profile_id = completed.get_json()["profile_id"]
+
+        # Simulate the terminal's next upload arriving before it has received
+        # the newly-created profile from its own local store.
+        next_snapshot = copy.deepcopy(snapshot)
+        next_snapshot["revision"] += 1
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=next_snapshot, headers=self.headers
+            ).status_code,
+        )
+        profiles = self.client.get(
+            "/api/queue-terminal/profiles", headers=self.headers
+        ).get_json()["profiles"]
+        self.assertIn(created_profile_id, {profile["profile_id"] for profile in profiles})
+        lookup = self.client.post(
+            "/api/player-account/login-lookup", json={"qq": "34567890"}
+        )
+        self.assertEqual({"ok": True, "bound": True}, lookup.get_json())
+
+    def test_mobile_player_profile_creation_request_id_is_idempotent_for_same_instance(self):
+        snapshot = self.remote_ready_snapshot(revision=60)
+        instance_headers = {
+            **self.headers,
+            "X-Terminal-Instance-ID": "00000000-0000-0000-0000-000000000061",
+            "X-Terminal-Instance-Generation": "7",
+        }
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=instance_headers
+            ).status_code,
+        )
+        request = {"request_id": "00000000-0000-0000-0000-000000000961"}
+        first = self.client.post(
+            "/api/queue-terminal/player-profile-sessions",
+            json=request,
+            headers=instance_headers,
+        )
+        repeated = self.client.post(
+            "/api/queue-terminal/player-profile-sessions",
+            json=request,
+            headers=instance_headers,
+        )
+        self.assertEqual(201, first.status_code, first.get_json())
+        self.assertEqual(200, repeated.status_code, repeated.get_json())
+        self.assertEqual(
+            first.get_json()["session_id"], repeated.get_json()["session_id"]
+        )
+        self.assertEqual(
+            first.get_json()["profile_creation_url"],
+            repeated.get_json()["profile_creation_url"],
+        )
+
+        # A restarted instance on the same physical terminal must not reuse
+        # the old idempotency key or its QR session.
+        restarted_headers = {
+            **instance_headers,
+            "X-Terminal-Instance-ID": "00000000-0000-0000-0000-000000000062",
+            "X-Terminal-Instance-Generation": "8",
+        }
+        conflict = self.client.post(
+            "/api/queue-terminal/player-profile-sessions",
+            json=request,
+            headers=restarted_headers,
+        )
+        self.assertEqual(409, conflict.status_code, conflict.get_json())
+        self.assertEqual(
+            "PLAYER_PROFILE_CREATION_INSTANCE_CONFLICT",
+            conflict.get_json()["code"],
+        )
+
+    def test_mobile_player_profile_creation_qr_is_invalidated_after_terminal_restart(self):
+        initial_headers = {
+            **self.headers,
+            "X-Terminal-Instance-ID": "00000000-0000-0000-0000-000000000071",
+            "X-Terminal-Instance-Generation": "11",
+        }
+        snapshot = self.remote_ready_snapshot(revision=61)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=initial_headers
+            ).status_code,
+        )
+        created = self.client.post(
+            "/api/queue-terminal/player-profile-sessions",
+            json={"request_id": "00000000-0000-0000-0000-000000000962"},
+            headers=initial_headers,
+        )
+        self.assertEqual(201, created.status_code, created.get_json())
+        token = created.get_json()["profile_creation_url"].split(
+            "player_profile_creation=", 1
+        )[1]
+
+        restarted_snapshot = copy.deepcopy(snapshot)
+        restarted_snapshot["revision"] += 1
+        restarted_headers = {
+            **self.headers,
+            "X-Terminal-Instance-ID": "00000000-0000-0000-0000-000000000072",
+            "X-Terminal-Instance-Generation": "12",
+        }
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status",
+                json=restarted_snapshot,
+                headers=restarted_headers,
+            ).status_code,
+        )
+        payload = {
+            "nickname": "重启后旧二维码",
+            "gender": "UNDISCLOSED",
+            "default_preference": "ASK_EVERY_TIME",
+            "qq_number": "45678901",
+            "password": "restart-stale-password",
+            "password_confirmation": "restart-stale-password",
+            "notification_enabled": True,
+            "notify_queue_changes": True,
+            "notify_playing_position": False,
+            "notify_online_check_in": True,
+            "notify_absence": True,
+            "notify_machine_status": False,
+        }
+        rejected = self.client.post(
+            f"/api/player-profile-creation/sessions/{token}/complete",
+            json=payload,
+        )
+        self.assertEqual(409, rejected.status_code, rejected.get_json())
+        self.assertEqual("PLAYER_PROFILE_CREATION_STALE", rejected.get_json()["code"])
+        connection = sqlite3.connect(self.database_path)
+        try:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM player_account WHERE profile_id IN "
+                    "(SELECT profile_id FROM player_profile WHERE nickname = ?)",
+                    ("重启后旧二维码",),
+                ).fetchone()[0],
+            )
+        finally:
+            connection.close()
+
+    def test_mobile_player_profile_creation_rejects_expired_session_without_creating_rows(self):
+        self.app.config["PLAYER_PROFILE_CREATION_SESSION_TTL_SECONDS"] = 60
+        snapshot = self.remote_ready_snapshot(revision=62)
+        with patch("app.time.time", return_value=2_000_000):
+            self.assertEqual(
+                204,
+                self.client.post(
+                    "/api/queue-status", json=snapshot, headers=self.headers
+                ).status_code,
+            )
+            created = self.client.post(
+                "/api/queue-terminal/player-profile-sessions",
+                json={"request_id": "00000000-0000-0000-0000-000000000963"},
+                headers=self.headers,
+            )
+        self.assertEqual(201, created.status_code, created.get_json())
+        token = created.get_json()["profile_creation_url"].split(
+            "player_profile_creation=", 1
+        )[1]
+        with patch("app.time.time", return_value=2_000_061):
+            expired = self.client.get(
+                f"/api/player-profile-creation/sessions/{token}"
+            )
+            completed = self.client.post(
+                f"/api/player-profile-creation/sessions/{token}/complete",
+                json={
+                    "nickname": "不应创建",
+                    "gender": "UNDISCLOSED",
+                    "default_preference": "ASK_EVERY_TIME",
+                    "qq_number": "56789012",
+                    "password": "expired-password",
+                    "password_confirmation": "expired-password",
+                    "notification_enabled": True,
+                    "notify_queue_changes": True,
+                    "notify_playing_position": False,
+                    "notify_online_check_in": True,
+                    "notify_absence": True,
+                    "notify_machine_status": False,
+                },
+            )
+        self.assertEqual(410, expired.status_code, expired.get_json())
+        self.assertEqual("PLAYER_PROFILE_CREATION_EXPIRED", expired.get_json()["code"])
+        self.assertEqual(410, completed.status_code, completed.get_json())
+        self.assertEqual("PLAYER_PROFILE_CREATION_EXPIRED", completed.get_json()["code"])
+        connection = sqlite3.connect(self.database_path)
+        try:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM player_profile WHERE nickname = ?",
+                    ("不应创建",),
+                ).fetchone()[0],
+            )
+        finally:
+            connection.close()
+
     def test_player_account_avatar_upload_is_processed_and_synced_to_terminal(self):
         try:
             from PIL import Image
@@ -6775,16 +7168,18 @@ class QueueStatusApiTest(unittest.TestCase):
             {
                 "name": "现场终端",
                 "current_version": "0.10.0",
-                "latest_version": "0.13.2",
+                "latest_version": "0.13.3",
                 "status": "UPDATE_AVAILABLE",
                 "updated_at": 1_234_000,
             },
             payload["components"]["terminal"],
         )
         self.assertEqual(
-            "0.13.2", payload["components"]["website"]["latest_version"]
+            "0.13.3", payload["components"]["website"]["latest_version"]
         )
-        self.assertEqual("LATEST", payload["components"]["website"]["status"])
+        self.assertEqual(
+            "UPDATE_AVAILABLE", payload["components"]["website"]["status"]
+        )
         self.assertEqual("LATEST", payload["components"]["bot"]["status"])
 
     def test_version_status_is_unknown_without_reports_or_valid_release_config(self):

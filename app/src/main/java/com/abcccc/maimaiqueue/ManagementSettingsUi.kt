@@ -306,8 +306,9 @@ internal fun ManagementSettingsPage(
                                 stopReasonDetail = null,
                                 configuration = configuration,
                                 registrationCount = 0,
+                                playingStartedAtMillis = null,
                                 playing = emptyList(),
-                                waiting = emptyList()
+                                waitingPositions = emptyList()
                             )
                             editingMachine = newMachine
                         },

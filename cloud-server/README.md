@@ -33,14 +33,17 @@ QUEUE_PUBLIC_SITE_URL=https://example.com
 QUEUE_MOBILE_SESSION_TTL_SECONDS=600
 QUEUE_MOBILE_SESSION_RETENTION_SECONDS=86400
 QUEUE_PLAYER_ACCOUNT_SITE_URL=https://example.com
+QUEUE_PLAYER_PROFILE_CREATION_TTL_SECONDS=600
+QUEUE_PLAYER_PROFILE_CREATION_SESSION_RETENTION_SECONDS=86400
 QUEUE_PLAYER_SESSION_TTL_SECONDS=2592000
 QUEUE_PLAYER_BINDING_TTL_SECONDS=600
 QUEUE_PLAYER_AUTH_LIMIT_WINDOW_SECONDS=900
 QUEUE_PLAYER_AUTH_LIMIT_BLOCK_SECONDS=900
 QUEUE_PLAYER_AUTH_LIMIT_FAILURES=5
+QUEUE_PLAYER_AUTH_LOOKUP_LIMIT_REQUESTS=30
 QUEUE_PLAYER_COOKIE_SECURE=true
-QUEUE_LATEST_TERMINAL_VERSION=0.13.2
-QUEUE_LATEST_WEBSITE_VERSION=0.13.2
+QUEUE_LATEST_TERMINAL_VERSION=0.13.3
+QUEUE_LATEST_WEBSITE_VERSION=0.13.3
 QUEUE_LATEST_BOT_VERSION=0.3.13
 ```
 
@@ -59,6 +62,8 @@ QUEUE_LATEST_BOT_VERSION=0.3.13
 `QUEUE_EVENT_RECIPIENT_RETENTION_SECONDS` 控制日志通知与 QQ 收件人的私有关联保留时间，默认 30 天。到期后只删除 QQ 收件人关联，公开日志仍会保留。清理由终端同步或 Bot 读取通知时执行。
 
 `QUEUE_PUBLIC_SITE_URL` 是终端“使用移动设备登记”二维码打开的排队页面。`QUEUE_MOBILE_SESSION_TTL_SECONDS` 控制二维码有效时间，默认 10 分钟；`QUEUE_MOBILE_SESSION_RETENTION_SECONDS` 控制已结束会话和结果的保留时间，默认 24 小时。
+
+`QUEUE_PLAYER_PROFILE_CREATION_TTL_SECONDS` 控制终端“创建网页玩家资料”二维码的有效时间，默认 10 分钟；`QUEUE_PLAYER_PROFILE_CREATION_SESSION_RETENTION_SECONDS` 控制已完成或过期创建会话的保留时间，默认 24 小时。创建会话会绑定终端运行实例，终端重启后旧二维码不能继续提交。
 
 `QUEUE_PLAYER_ACCOUNT_SITE_URL` 是终端“绑定网页账户”二维码打开的页面；留空时使用 `QUEUE_PUBLIC_SITE_URL`。公开 HTTPS 部署必须保持 `QUEUE_PLAYER_COOKIE_SECURE=true`。账户会话默认保留 30 天，绑定二维码默认 10 分钟有效；登录、绑定、修改 QQ 或修改密码连续验证失败 5 次后默认限制 15 分钟。
 
@@ -111,6 +116,16 @@ GET  /api/queue-mobile/sessions/<session_token>/result
 ```
 
 如果未配置 `QUEUE_PUBLIC_SITE_URL`，创建移动登记会话会安全返回 `503`，不会生成指向未知站点或无效相对路径的二维码。
+
+终端“新建玩家资料”使用独立的一次性手机页面。终端创建会话需要 `QUEUE_SYNC_TOKEN`，手机页面只凭短时会话令牌读取和提交资料：
+
+```text
+POST /api/queue-terminal/player-profile-sessions
+GET  /api/player-profile-creation/sessions/<session_token>
+POST /api/player-profile-creation/sessions/<session_token>/complete
+```
+
+反向代理必须把 `/api/player-profile-creation/` 转发到 API；二维码页面本身不需要把终端或管理令牌暴露给浏览器。该会话绑定终端运行实例，过期、重复使用或终端重启后均会失效。
 
 终端接口使用 `QUEUE_SYNC_TOKEN`、稳定的 `X-Device-ID`，以及每次进程启动生成的 `X-Terminal-Instance-ID` 和单调递增的 `X-Terminal-Instance-Generation`。服务器只允许当前权威运行实例上传快照、领取命令和提交回执；旧版终端缺少实例请求头时仍按稳定设备编号兼容：
 

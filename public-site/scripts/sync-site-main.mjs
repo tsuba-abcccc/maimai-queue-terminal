@@ -7,6 +7,7 @@ const sharedFiles = [
   'QueueStatusPanel.vue',
   'PlayerAccountDialog.vue',
   'MobileRegistrationFlow.vue',
+  'MobileProfileCreationFlow.vue',
   'MobileProfileSettings.vue',
   'machineConfiguration.js'
 ]
