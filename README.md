@@ -182,7 +182,7 @@ flowchart LR
 
 ### 终端
 
-- Android 10（API 29）或更高版本。
+- Android 9（API 28）或更高版本。
 - 横屏设备，建议使用固定摆放并持续供电的平板或排队终端。
 - 需要与服务端同步时，终端必须获得系统联网权限。
 
@@ -197,11 +197,12 @@ flowchart LR
 
 | 组件 | 版本 |
 | --- | --- |
-| Android Gradle Plugin | 9.3.0 |
-| Kotlin | 2.2.10 |
-| Jetpack Compose BOM | 2026.02.01 |
-| minSdk | 29 |
-| targetSdk | 36 |
+| Android Gradle Plugin | 9.4.1 |
+| Kotlin | 2.4.20 |
+| Jetpack Compose BOM | 2026.09.00 |
+| compileSdk | 37.2 |
+| minSdk | 28 |
+| targetSdk | 37 |
 
 ## 构建 Android 应用
 

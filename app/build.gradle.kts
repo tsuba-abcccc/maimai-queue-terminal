@@ -54,15 +54,15 @@ val managementVersionCode = 68
 android {
     namespace = "com.abcccc.maimaiqueue"
     compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
+        version = release(37) {
+            minorApiLevel = 2
         }
     }
 
     defaultConfig {
         applicationId = "com.abcccc.maimaiqueue"
-        minSdk = 29
-        targetSdk = 36
+        minSdk = 28
+        targetSdk = 37
         versionCode = localVersionCode
         versionName = localAppVersionName
 
@@ -170,7 +170,7 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
-    implementation("com.google.zxing:core:3.5.3")
+    implementation("com.google.zxing:core:3.5.4")
     testImplementation(libs.junit)
     testImplementation(libs.json)
     androidTestImplementation(platform(libs.androidx.compose.bom))
