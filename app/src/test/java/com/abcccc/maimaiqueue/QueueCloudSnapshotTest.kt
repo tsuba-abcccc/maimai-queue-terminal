@@ -981,6 +981,345 @@ class QueueCloudSnapshotTest {
         assertEquals(listOf(secondId), profiles.map(PlayerProfile::id))
     }
 
+    @Test
+    fun recordOfHavingSeenTheExplanationIsUploadedOnlyOnceItIsSet() {
+        fun uploaded(seen: Boolean) = buildQueueSyncSnapshot(
+            state = state(),
+            terminalId = "terminal-1",
+            capturedAtMillis = 1_000L,
+            playerProfiles = listOf(
+                PlayerProfile(
+                    id = "00000000-0000-0000-0000-000000000111",
+                    nickname = "测试玩家",
+                    gender = PlayerGender.UNDISCLOSED,
+                    defaultPreference = ProfilePlayPreference.SOLO,
+                    createdAtMillis = 100L,
+                    updatedAtMillis = 100L,
+                    pairedMachineQueueingIntroduced = seen
+                )
+            ),
+            schemaVersion = 7,
+            venueId = "00000000-0000-0000-0000-000000000222",
+            terminalName = "入口终端"
+        ).getJSONArray("private_player_profiles").getJSONObject(0)
+
+        assertTrue(uploaded(seen = true).getBoolean("paired_machine_queueing_introduced"))
+        // Left out while it is not set, so that an upload can never clear it on the server.
+        assertFalse(uploaded(seen = false).has("paired_machine_queueing_introduced"))
+    }
+
+    @Test
+    fun registrationThatGaveUpItsPlaceForThisRoundIsPublishedWithoutAPreview() {
+        val nowMillis = 1_000_000L
+        val pairedState = pairedState(
+            machineA = MachineQueue(
+                playing = listOf(registration(1, "机台甲玩家")),
+                waiting = listOf(
+                    registration(3, "被调整的玩家").copy(
+                        isTemporary = false,
+                        alsoQueuesAtPairedMachine = true,
+                        skipsPairedMachineThisRound = true
+                    ),
+                    registration(4, "只排一台玩家")
+                ),
+                playingStartedAtMillis = nowMillis
+            ),
+            machineB = MachineQueue(
+                playing = listOf(registration(2, "机台乙玩家")),
+                playingStartedAtMillis = nowMillis - 6 * 60_000L
+            ),
+            nowMillis = nowMillis
+        )
+        // It holds no place at machine B, although the player's choice is still on.
+        assertTrue(pairedState.machine(MachineId.B).pairedOrder.isEmpty())
+
+        val machines = buildPublicQueueSnapshot(
+            state = pairedState,
+            terminalId = "terminal-1",
+            capturedAtMillis = nowMillis,
+            displaySettings = pairedDisplaySettings
+        ).getJSONObject("machines")
+        val waitingA = machines.getJSONObject("A").getJSONArray("waiting_positions")
+        val moved = waitingA.getJSONObject(0).getJSONArray("registrations").getJSONObject(0)
+        assertTrue(moved.getBoolean("also_queues_at_paired_machine"))
+        assertTrue(moved.getBoolean("skips_paired_machine_this_round"))
+        // The key is only sent when it is set.
+        assertFalse(
+            waitingA.getJSONObject(1).getJSONArray("registrations").getJSONObject(0)
+                .has("skips_paired_machine_this_round")
+        )
+        // The server refuses a preview of such a registration, so none may be sent.
+        assertTrue(machines.getJSONObject("B").isNull("paired_waiting_positions"))
+        // It waits for its own machine only: 12 minutes until machine A ends its round.
+        assertEquals(12L, waitingA.getJSONObject(0).getLong("estimated_wait_minutes"))
+    }
+
+    @Test
+    fun pairedMachinesPublishPreviewPositionsAndJointEstimates() {
+        val nowMillis = 1_000_000L
+        val pairedState = pairedState(
+            machineA = MachineQueue(
+                playing = listOf(registration(1, "机台甲玩家")),
+                waiting = listOf(
+                    registration(3, "同时排队玩家").copy(isTemporary = false, alsoQueuesAtPairedMachine = true),
+                    registration(4, "只排一台玩家")
+                ),
+                playingStartedAtMillis = nowMillis
+            ),
+            machineB = MachineQueue(
+                playing = listOf(registration(2, "机台乙玩家")),
+                playingStartedAtMillis = nowMillis - 6 * 60_000L
+            ),
+            nowMillis = nowMillis,
+            // A preview has announced the arrangement for seven minutes: five more to go.
+            pairedArrangements = mapOf(
+                3 to PairedArrangementRecord(previewSinceMillis = nowMillis - 7 * 60_000L)
+            )
+        )
+        assertEquals(listOf(3), pairedState.machine(MachineId.B).pairedOrder)
+
+        val machines = buildPublicQueueSnapshot(
+            state = pairedState,
+            terminalId = "terminal-1",
+            capturedAtMillis = nowMillis,
+            displaySettings = pairedDisplaySettings
+        ).getJSONObject("machines")
+        val machineA = machines.getJSONObject("A")
+        val machineB = machines.getJSONObject("B")
+        val waitingA = machineA.getJSONArray("waiting_positions")
+        val pairedRegistrationId = publicRegistrationId(queueId, 3)
+
+        assertEquals("B", machineA.getString("paired_machine_id"))
+        assertEquals("A", machineB.getString("paired_machine_id"))
+        // The registration stays listed once, under the machine it is registered at.
+        assertEquals(3, machineA.getInt("registration_count"))
+        assertEquals(1, machineB.getInt("registration_count"))
+        assertEquals(0, machineB.getJSONArray("waiting_positions").length())
+        val pairedRegistration = waitingA.getJSONObject(0).getJSONArray("registrations")
+            .getJSONObject(0)
+        assertEquals(pairedRegistrationId, pairedRegistration.getString("registration_id"))
+        assertTrue(pairedRegistration.getBoolean("also_queues_at_paired_machine"))
+        assertTrue(pairedRegistration.getBoolean("paired_arrangement_announced"))
+        assertEquals(
+            nowMillis + 5 * 60_000L,
+            pairedRegistration.getLong("paired_arrangement_not_before")
+        )
+        val plainRegistration = waitingA.getJSONObject(1).getJSONArray("registrations")
+            .getJSONObject(0)
+        assertFalse(plainRegistration.getBoolean("also_queues_at_paired_machine"))
+        assertFalse(plainRegistration.has("paired_arrangement_announced"))
+        assertFalse(plainRegistration.has("paired_arrangement_not_before"))
+        // Machine B ends its round in 6 minutes, by which time the announcement has run long
+        // enough; machine A ends in 12. The registration is expected on B, and the one behind
+        // it moves up on A.
+        assertEquals(6L, waitingA.getJSONObject(0).getLong("estimated_wait_minutes"))
+        assertEquals(12L, waitingA.getJSONObject(1).getLong("estimated_wait_minutes"))
+        assertTrue(machineA.isNull("paired_waiting_positions"))
+
+        val previewPositions = machineB.getJSONArray("paired_waiting_positions")
+        assertEquals(1, previewPositions.length())
+        val previewPosition = previewPositions.getJSONObject(0)
+        assertEquals(1, previewPosition.getInt("index"))
+        assertEquals(publicPositionId(queueId, setOf(3)), previewPosition.getString("position_id"))
+        assertEquals(6L, previewPosition.getLong("estimated_wait_minutes"))
+        assertTrue(previewPosition.isNull("common_play_preview"))
+        val previewRegistrations = previewPosition.getJSONArray("registrations")
+        assertEquals(1, previewRegistrations.length())
+        assertEquals(
+            pairedRegistrationId,
+            previewRegistrations.getJSONObject(0).getString("registration_id")
+        )
+        assertTrue(previewRegistrations.getJSONObject(0).getBoolean("paired_place_preview"))
+        // A reference only: the registration's details are not repeated.
+        assertEquals(2, previewRegistrations.getJSONObject(0).length())
+
+        // A new registration waits behind the place held on B, and behind both on A. It is told
+        // the middle value: a round lasts 10 to 15 minutes, 12 most often, about 12.3 in the
+        // middle, so B's remaining 6.3 and one more round give about 18.5 minutes.
+        assertEquals(19L, machineB.getLong("new_registration_estimated_wait_minutes"))
+        // On A: the round now playing and registration 4's, about 12.3 each in the middle.
+        assertEquals(25L, machineA.getLong("new_registration_estimated_wait_minutes"))
+    }
+
+    @Test
+    fun registrationWithoutAnAnnouncementIsNotPreviewedAtTheOtherMachine() {
+        val nowMillis = 1_000_000L
+        fun machines(pairedArrangements: Map<Int, PairedArrangementRecord>) = buildPublicQueueSnapshot(
+            state = pairedState(
+                machineA = MachineQueue(
+                    playing = listOf(registration(1, "机台甲玩家")),
+                    waiting = listOf(
+                        registration(3, "资料玩家")
+                            .copy(isTemporary = false, alsoQueuesAtPairedMachine = true)
+                    ),
+                    playingStartedAtMillis = nowMillis
+                ),
+                machineB = MachineQueue(
+                    playing = listOf(registration(2, "机台乙玩家")),
+                    playingStartedAtMillis = nowMillis - 6 * 60_000L
+                ),
+                nowMillis = nowMillis,
+                pairedArrangements = pairedArrangements
+            ),
+            terminalId = "terminal-1",
+            capturedAtMillis = nowMillis,
+            displaySettings = pairedDisplaySettings
+        ).getJSONObject("machines")
+
+        // Nothing has been announced: the registration is expected at its own machine only.
+        val unannounced = machines(emptyMap())
+        assertTrue(unannounced.getJSONObject("B").isNull("paired_waiting_positions"))
+        val waiting = unannounced.getJSONObject("A").getJSONArray("waiting_positions")
+            .getJSONObject(0)
+        assertEquals(12L, waiting.getLong("estimated_wait_minutes"))
+        val registration = waiting.getJSONArray("registrations").getJSONObject(0)
+        assertTrue(registration.getBoolean("also_queues_at_paired_machine"))
+        assertFalse(registration.has("paired_arrangement_announced"))
+
+        // The count is held: the preview is published, but no time is promised.
+        val held = machines(
+            mapOf(
+                3 to PairedArrangementRecord(
+                    previewSinceMillis = nowMillis - 7 * 60_000L,
+                    previewPausedAtMillis = nowMillis - 60_000L
+                )
+            )
+        ).getJSONObject("A").getJSONArray("waiting_positions").getJSONObject(0)
+            .getJSONArray("registrations").getJSONObject(0)
+        assertTrue(held.getBoolean("paired_arrangement_announced"))
+        assertFalse(held.has("paired_arrangement_not_before"))
+    }
+
+    @Test
+    fun snapshotReportsThePairSettingOnlyWhenTheTerminalProvidesIt() {
+        val stableA = "1".repeat(32)
+        val stableB = "3".repeat(32)
+        val reported = buildPublicQueueSnapshot(
+            state = state(),
+            terminalId = "terminal-1",
+            capturedAtMillis = 1_000L,
+            displaySettings = QueuePublicDisplaySettings(
+                pairedMachineQueueSettings = PairedMachineQueueConfiguration(
+                    enabled = false,
+                    pairs = listOf(stableA to stableB)
+                )
+            )
+        ).getJSONObject("paired_machine_queue_settings")
+
+        assertFalse(reported.getBoolean("enabled"))
+        assertEquals(1, reported.getJSONArray("pairs").length())
+        assertEquals(stableA, reported.getJSONArray("pairs").getJSONArray(0).getString(0))
+        assertEquals(stableB, reported.getJSONArray("pairs").getJSONArray(0).getString(1))
+        assertFalse(
+            buildPublicQueueSnapshot(state(), "terminal-1", 1_000L)
+                .has("paired_machine_queue_settings")
+        )
+    }
+
+    @Test
+    fun machinesWithoutPairPublishNoPairedFields() {
+        val nowMillis = 1_000_000L
+        val unpaired = state(
+            machineA = MachineQueue(
+                playing = listOf(registration(1, "机台甲玩家")),
+                waiting = listOf(registration(3, "等待玩家")),
+                playingStartedAtMillis = nowMillis - 5 * 60_000L
+            )
+        )
+        val machineA = buildPublicQueueSnapshot(unpaired, "terminal-1", nowMillis)
+            .getJSONObject("machines").getJSONObject("A")
+
+        assertTrue(machineA.isNull("paired_machine_id"))
+        assertTrue(machineA.isNull("paired_waiting_positions"))
+        val waiting = machineA.getJSONArray("waiting_positions").getJSONObject(0)
+        assertEquals(7L, waiting.getLong("estimated_wait_minutes"))
+        assertFalse(
+            waiting.getJSONArray("registrations").getJSONObject(0)
+                .getBoolean("also_queues_at_paired_machine")
+        )
+    }
+
+    @Test
+    fun stoppedMachineOfPairShowsNoPreviewAndNoEstimate() {
+        val nowMillis = 1_000_000L
+        val pairedState = pairedState(
+            machineA = MachineQueue(
+                playing = listOf(registration(1, "机台甲玩家")),
+                waiting = listOf(
+                    registration(3, "同时排队玩家").copy(isTemporary = false, alsoQueuesAtPairedMachine = true)
+                ),
+                playingStartedAtMillis = nowMillis
+            ),
+            machineB = MachineQueue(waiting = listOf(registration(2, "机台乙玩家"))),
+            machineBStatus = MachineStatus().stop(MachineStopReason.MAINTENANCE, nowMillis),
+            nowMillis = nowMillis
+        )
+        val machines = buildPublicQueueSnapshot(
+            state = pairedState,
+            terminalId = "terminal-1",
+            capturedAtMillis = nowMillis,
+            displaySettings = pairedDisplaySettings
+        ).getJSONObject("machines")
+        val machineA = machines.getJSONObject("A")
+        val machineB = machines.getJSONObject("B")
+
+        assertEquals("A", machineB.getString("paired_machine_id"))
+        assertTrue(machineB.isNull("paired_waiting_positions"))
+        assertTrue(machineB.isNull("new_registration_estimated_wait_minutes"))
+        assertTrue(
+            machineB.getJSONArray("waiting_positions").getJSONObject(0)
+                .isNull("estimated_wait_minutes")
+        )
+        // The stopped machine does not take the registration; it waits for its own machine.
+        assertEquals(
+            12L,
+            machineA.getJSONArray("waiting_positions").getJSONObject(0)
+                .getLong("estimated_wait_minutes")
+        )
+    }
+
+    private val pairedDisplaySettings = QueuePublicDisplaySettings(
+        machinePartners = mapOf(MachineId.A to MachineId.B, MachineId.B to MachineId.A)
+    )
+
+    /** A two-machine state in which A and B form a pair, settled as the engine leaves it. */
+    private fun pairedState(
+        machineA: MachineQueue,
+        machineB: MachineQueue,
+        machineBStatus: MachineStatus = MachineStatus(),
+        nowMillis: Long,
+        pairedArrangements: Map<Int, PairedArrangementRecord> = emptyMap()
+    ): PersistedQueueState {
+        val settled = QueueEngine.settlePairedMachines(
+            state = QueueEngineState(linkedMapOf("A" to machineA, "B" to machineB)),
+            policy = QueueEnginePolicy(
+                machineStatuses = mapOf("A" to MachineStatus(), "B" to machineBStatus),
+                machinePartners = mapOf("A" to "B", "B" to "A")
+            ),
+            atMillis = nowMillis
+        )
+        return PersistedQueueState(
+            queueId = queueId,
+            revision = 9L,
+            machines = linkedMapOf(
+                MachineId.A to PersistedMachineState(
+                    queue = settled.queue("A")!!,
+                    status = MachineStatus(),
+                    pairedOrder = settled.pairedMachineOrders["A"].orEmpty()
+                ),
+                MachineId.B to PersistedMachineState(
+                    queue = settled.queue("B")!!,
+                    status = machineBStatus,
+                    pairedOrder = settled.pairedMachineOrders["B"].orEmpty()
+                )
+            ),
+            registrationOpen = true,
+            nextRegistrationKey = 20,
+            savedAtMillis = 900L,
+            pairedArrangements = pairedArrangements
+        )
+    }
+
     private fun state(
         machineA: MachineQueue = MachineQueue(),
         machineB: MachineQueue = MachineQueue()

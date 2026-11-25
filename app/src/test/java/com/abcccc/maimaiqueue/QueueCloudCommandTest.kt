@@ -316,7 +316,7 @@ class QueueCloudCommandTest {
         )
 
         assertTrue(decision is PlayerProfileCommandDecision.Reject)
-        assertTrue((decision as PlayerProfileCommandDecision.Reject).detail.contains("终端发生更新"))
+        assertTrue((decision as PlayerProfileCommandDecision.Reject).detail.contains("玩家资料已经更新"))
     }
 
     @Test
@@ -449,6 +449,130 @@ class QueueCloudCommandTest {
         assertEquals(2L, machine.expectedPolicyRevision)
         assertEquals(MachineStopReason.OTHER, machine.stopReason)
         assertEquals("临时检修", machine.stopReasonDetail)
+    }
+
+    /** The settings fixture with a second machine, so that A and B can form a pair. */
+    private fun twoMachineSettingsCommand(pairedSettings: JSONObject?): JSONObject =
+        managementTerminalSettingsCommand().apply {
+            val payload = getJSONObject("payload")
+            val machines = payload.getJSONObject("machines")
+            machines.put(
+                "B",
+                JSONObject(machines.getJSONObject("A").toString())
+                    .put("stable_id", "3".repeat(32))
+                    .put("remark", "右侧")
+            )
+            pairedSettings?.let { payload.put("paired_machine_queue_settings", it) }
+        }
+
+    private fun pairedSettingsJson(enabled: Boolean, vararg pairs: Pair<String, String>) =
+        JSONObject().put("enabled", enabled).put(
+            "pairs",
+            JSONArray().apply {
+                pairs.forEach { (first, second) -> put(JSONArray().put(first).put(second)) }
+            }
+        )
+
+    @Test
+    fun managementSettingsCommandCarriesThePairSettingOnlyWhenPresent() {
+        val stableA = "1".repeat(32)
+        val stableB = "3".repeat(32)
+        fun parse(command: JSONObject) = parseRemoteTerminalCommands(
+            JSONObject().put("commands", JSONArray().put(command)).toString()
+        ).filterIsInstance<TerminalSettingsUpdateCommand>()
+
+        assertEquals(null, parse(twoMachineSettingsCommand(null)).single().pairedMachineQueue)
+
+        // The management app may name the machines of a pair in either order.
+        val paired = parse(
+            twoMachineSettingsCommand(pairedSettingsJson(true, stableB to stableA))
+        ).single().pairedMachineQueue
+        assertEquals(true, paired?.enabled)
+        assertEquals(setOf(setOf(stableA, stableB)), paired?.unorderedPairs)
+
+        val switchedOff = parse(
+            twoMachineSettingsCommand(pairedSettingsJson(false))
+        ).single().pairedMachineQueue
+        assertEquals(PairedMachineQueueConfiguration(enabled = false, pairs = emptyList()), switchedOff)
+
+        // A pair that would not survive on the terminal makes the whole command invalid.
+        listOf(
+            pairedSettingsJson(true, stableA to "9".repeat(32)),
+            pairedSettingsJson(true, stableA to stableA),
+            pairedSettingsJson(true, stableA to stableB, stableB to stableA),
+            JSONObject().put("enabled", true)
+        ).forEach { invalid ->
+            assertTrue(parse(twoMachineSettingsCommand(invalid)).isEmpty())
+        }
+        val differentCapacity = twoMachineSettingsCommand(pairedSettingsJson(true, stableA to stableB))
+        differentCapacity.getJSONObject("payload").getJSONObject("machines").getJSONObject("B")
+            .getJSONObject("configuration").put("capacity", 1)
+        assertTrue(parse(differentCapacity).isEmpty())
+    }
+
+    @Test
+    fun settingsCommandAppliesThePairSettingOrKeepsTheTerminalsOwn() {
+        val stableA = "1".repeat(32)
+        val stableB = "3".repeat(32)
+        fun parse(command: JSONObject) = parseRemoteTerminalCommands(
+            JSONObject().put("commands", JSONArray().put(command)).toString()
+        ).filterIsInstance<TerminalSettingsUpdateCommand>().single()
+        val current = QueueRuleSettings(
+            configuredMachineCount = 2,
+            machineStableIds = DEFAULT_MACHINE_STABLE_IDS + mapOf(
+                MachineId.A to stableA,
+                MachineId.B to stableB
+            ),
+            pairedMachineQueueEnabled = true,
+            pairedMachineStableIds = listOf(stableA to stableB),
+            managementAppBound = true,
+            managementPolicyRevision = 2L,
+            managementSettingsRevision = 3L
+        )
+
+        val untouched = parse(twoMachineSettingsCommand(null)).requestedSettings(current)
+        assertTrue(untouched.pairedMachineQueueEnabled)
+        assertEquals(listOf(stableA to stableB), untouched.pairedMachineStableIds)
+        assertEquals(4L, untouched.managementSettingsRevision)
+
+        val switchedOff = parse(twoMachineSettingsCommand(pairedSettingsJson(false)))
+            .requestedSettings(current)
+        assertTrue(!switchedOff.pairedMachineQueueEnabled)
+        assertTrue(switchedOff.pairedMachineStableIds.isEmpty())
+
+        val command = parse(twoMachineSettingsCommand(null))
+        assertEquals(
+            null,
+            command.rejectionDetail(
+                currentQueueId = "00000000-0000-0000-0000-000000000001",
+                settings = current,
+                registrationOpen = false
+            )
+        )
+        assertEquals(
+            "现场终端已经解除管理后台接管，请重新绑定后再提交。",
+            command.rejectionDetail(
+                currentQueueId = "00000000-0000-0000-0000-000000000001",
+                settings = current.copy(managementAppBound = false),
+                registrationOpen = false
+            )
+        )
+        assertEquals(
+            "终端设置已经更新，请刷新后重试。",
+            command.rejectionDetail(
+                currentQueueId = "00000000-0000-0000-0000-000000000001",
+                settings = current.copy(managementSettingsRevision = 5L),
+                registrationOpen = false
+            )
+        )
+        assertEquals(
+            "登记排队状态已经更新，请管理后台刷新后重试。",
+            command.rejectionDetail(
+                currentQueueId = "00000000-0000-0000-0000-000000000001",
+                settings = current,
+                registrationOpen = true
+            )
+        )
     }
 
     @Test

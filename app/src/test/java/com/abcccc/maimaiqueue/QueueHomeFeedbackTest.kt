@@ -49,7 +49,7 @@ class QueueHomeFeedbackTest {
         )
 
         assertEquals(HomeSidePanelFeedbackTone.SUCCESS, outcome.tone)
-        assertTrue(outcome.detailLines.single().contains("已跳过本次机会，随后自动恢复"))
+        assertTrue(outcome.detailLines.single().contains("已跳过本次机会，暂缓状态随后自动解除"))
         assertTrue(outcome.detailLines.single().contains("真实等待顺序未改变"))
     }
 
@@ -99,7 +99,7 @@ class QueueHomeFeedbackTest {
 
         assertEquals(HomeSidePanelFeedbackTone.WARNING, outcome.tone)
         assertTrue(outcome.nonRestorableRegistrationKeys.isEmpty())
-        assertTrue(outcome.detailLines.single().contains("第四次轮到"))
+        assertTrue(outcome.detailLines.single().contains("第 4 次轮到"))
         assertTrue(outcome.detailLines.single().contains("撤销时会恢复"))
     }
 

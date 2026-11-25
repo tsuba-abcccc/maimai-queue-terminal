@@ -83,7 +83,7 @@ internal data class MachineDisplayState(
 }
 
 internal enum class RegistrationActionMode { ACTIONS, PREFERENCE, RENAME }
-internal enum class QueueAbsenceChoice { DEFER_ONE_ROUND, TEMPORARILY_AWAY }
+internal enum class QueueAbsenceChoice { DEFER_ONE_ROUND, SKIP_ONE_TURN, TEMPORARILY_AWAY }
 internal enum class PlayerProfileContext { JOIN_QUEUE, CLAIM_REGISTRATION, FRIEND_PAIR }
 internal enum class FriendPairStep { METHOD, SELECT_EXISTING, CONFIRM_EXISTING, CREATE_FRIEND }
 
@@ -131,7 +131,9 @@ internal data class SelectedRegistration(
     val machineId: MachineId,
     val registrationKey: Int,
     val fromPlayingPosition: Boolean = false,
-    val confirmationSnapshots: List<RegistrationConfirmationSnapshot> = emptyList()
+    val confirmationSnapshots: List<RegistrationConfirmationSnapshot> = emptyList(),
+    /** Opens the 暂缓一次 or 暂时离开 confirmation directly, without the choice between them. */
+    val initialAbsenceChoice: QueueAbsenceChoice? = null
 )
 
 internal data class RegistrationConfirmationSnapshot(
@@ -218,7 +220,12 @@ internal data class QueueUndoAction(
     val feedbackDetail: String,
     val contextLabel: String,
     val feedbackTone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS,
-    val nonRestorableRegistrationKeys: Set<Int> = emptySet()
+    val nonRestorableRegistrationKeys: Set<Int> = emptySet(),
+    /** Other machines the action also changed: their queues before and after it. */
+    val otherMachineQueues: Map<MachineId, Pair<MachineQueue, MachineQueue>> = emptyMap(),
+    /** The orders shared across paired machines before the action, by machine name. */
+    val beforePairedOrders: Map<String, List<Int>>? = null,
+    val beforePairedArrangements: Map<Int, PairedArrangementRecord>? = null
 )
 
 internal data class PositionSelection(
@@ -305,6 +312,31 @@ internal data class JoinClosingWarningRequest(
     val continueFromMachineSelection: Boolean = false
 )
 
+/**
+ * The tick box that lets the system arrange a registration between the two machines of a pair.
+ * It is offered with the play preference of one registration: while the registration is
+ * created, and later where that preference is changed.
+ */
+internal data class PairedMachineQueueJoinOption(
+    val machineLabel: String,
+    val pairedMachineLabel: String,
+    val checked: Boolean,
+    val onToggle: () -> Unit,
+    /** Opens the explanation; the question mark beside the tick box. */
+    val onShowDetails: () -> Unit,
+    /**
+     * True when the box is being ticked for a registration that is already waiting: it then
+     * only takes effect after that registration has played a round.
+     */
+    val startsAfterNextRound: Boolean = false,
+    /** Why the box cannot be changed, for example for a fixed pair; null when it can. */
+    val disabledReason: String? = null,
+    /** For a waiting registration whose box is on: the preview that announces a move, if any. */
+    val announcement: PairedMachineArrangementAnnouncement? = null,
+    /** Where the other machine shows that preview, such as B1; null when it shows none. */
+    val previewPosition: String? = null
+)
+
 internal data class MenuAction(
     val title: String,
     val description: String,
@@ -313,7 +345,13 @@ internal data class MenuAction(
     val enabled: Boolean = true,
     val accented: Boolean? = null,
     val accentColor: Color? = null,
-    val accentBackgroundColor: Color? = null
+    val accentBackgroundColor: Color? = null,
+    /**
+     * Shown as a menu entry with its line of explanation, for the few entries whose explanation
+     * must be read before choosing (docs/ui-guide.md). Otherwise the title says enough, and the
+     * entry is an ordinary button; [description] then only explains why it is unavailable.
+     */
+    val explained: Boolean = false
 )
 
 internal data class PositionReorderProposal(

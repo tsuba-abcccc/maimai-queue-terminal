@@ -19,6 +19,8 @@ internal enum class ManagementQueueAction {
     ADVANCE_TO_WAITING_POSITION,
     DEFER_ONE_ROUND,
     CANCEL_DEFER_ONE_ROUND,
+    SKIP_ONE_TURN,
+    CANCEL_SKIP_ONE_TURN,
     TEMPORARILY_LEAVE,
     CANCEL_TEMPORARY_LEAVE,
     CHANGE_PREFERENCE,
@@ -33,7 +35,8 @@ internal enum class ManagementQueueAction {
     MOVE_WAITING_POSITION,
     REPLACE_WAITING_POSITIONS,
     REPLACE_REGISTRATION_ORDER,
-    TRANSFER_REGISTRATIONS
+    TRANSFER_REGISTRATIONS,
+    SET_PAIRED_MACHINE_QUEUEING
 }
 
 internal data class ManagementQueueActionCommand(
@@ -62,7 +65,12 @@ internal data class ManagementQueueActionCommand(
     val noShowResolution: NoShowResolution? = null,
     val startNextWhenPlayingBecomesEmpty: Boolean = true,
     val advanceWhenPlayingEmpty: Boolean = false,
-    val reason: String? = null
+    val reason: String? = null,
+    /**
+     * For [ManagementQueueAction.SET_PAIRED_MACHINE_QUEUEING] the state asked for; for a new
+     * profile registration the answer of a profile that asks every time. Null when absent.
+     */
+    val alsoQueuesAtPairedMachine: Boolean? = null
 ) : RemoteTerminalCommand
 
 internal sealed interface ManagementQueueActionDecision {
@@ -91,7 +99,7 @@ internal fun decideManagementQueueAction(
         )
     }
     if (command.queueId != state.queueId) {
-        return reject("排队批次已经变化，请刷新管理后台后再操作。")
+        return reject("现场已开始新的队列，请刷新管理后台后再操作。")
     }
     if (command.machineConfigurationRevision != state.machineConfigurationRevision) {
         return reject("机台配置已经更新，请刷新管理后台后再操作。")
@@ -100,7 +108,7 @@ internal fun decideManagementQueueAction(
         command.expectedPolicyRevision != null &&
         command.expectedPolicyRevision != state.managementPolicyRevision
     ) {
-        return reject("终端接管策略已经更新，请刷新管理后台后再操作。")
+        return reject("终端敏感策略已经更新，请刷新管理后台后再操作。")
     }
     if (state.machineStableIds[command.machineId] != command.machineStableId) {
         return reject("目标机台已经变化，请刷新管理后台后再操作。")
@@ -148,7 +156,7 @@ internal fun decideManagementQueueAction(
     var profileUsed: PlayerProfile? = null
     val queueAction: QueueAction = when (command.action) {
         ManagementQueueAction.ADD_TEMPORARY_REGISTRATION -> {
-            if (!state.acceptingNewRegistrations) return reject("现场当前没有使用登记排队。")
+            if (!state.acceptingNewRegistrations) return reject("现场当前未使用登记排队。")
             val displayId = command.displayId?.trim()?.takeIf { it.isNotEmpty() }
                 ?: return reject("请输入临时登记名称。")
             val preference = if (state.machineCapacity(command.machineId) == 1) {
@@ -173,12 +181,16 @@ internal fun decideManagementQueueAction(
         }
 
         ManagementQueueAction.ADD_PROFILE_REGISTRATION -> {
-            if (!state.acceptingNewRegistrations) return reject("现场当前没有使用登记排队。")
+            if (!state.acceptingNewRegistrations) return reject("现场当前未使用登记排队。")
             val profile = command.profileId?.let { profileId ->
                 state.playerProfiles.firstOrNull { it.id == profileId }
             } ?: return reject("玩家资料已不存在。")
             val preference = resolveProfilePreference(profile)
                 ?: return reject("请选择本次游玩偏好。")
+            val queuesAtPairedMachine = state.resolvePairedMachineQueueing(
+                machineId = command.machineId,
+                requested = command.alsoQueuesAtPairedMachine
+            ) ?: return reject("一对机台的设置已经变化，请重新确认后再创建。")
             profileUsed = profile
             addedRegistrationCount = 1
             QueueAction.AddRegistrations(
@@ -192,6 +204,7 @@ internal fun decideManagementQueueAction(
                         createdAtMillis = appliedAtMillis,
                         gender = profile.gender,
                         playerProfileId = profile.id,
+                        alsoQueuesAtPairedMachine = queuesAtPairedMachine,
                         originatingCommandId = command.commandId
                     )
                 ),
@@ -213,7 +226,7 @@ internal fun decideManagementQueueAction(
             QueueAction.RestartMachineTimers(command.machineId)
 
         ManagementQueueAction.RETURN_PLAYING_TO_WAITING_FRONT -> {
-            val selected = selectedRegistrations() ?: return reject("游玩位置已经变化。")
+            val selected = selectedRegistrations() ?: return reject("游玩位置已经变化，请刷新管理后台后再操作。")
             QueueAction.ReturnPlayingToWaitingFront(
                 command.machineId,
                 selected.mapTo(mutableSetOf(), Registration::key)
@@ -237,6 +250,9 @@ internal fun decideManagementQueueAction(
         ManagementQueueAction.DEFER_ONE_ROUND -> {
             val registration = selectedRegistrations()?.singleOrNull()
                 ?: return reject("请选择一份登记。")
+            if (queue.playing.any { it.key == registration.key }) {
+                return reject("处于游玩位置的登记不能暂缓一次，请先撤回至等待顺序。")
+            }
             QueueAction.DeferOneRound(command.machineId, registration.key)
         }
 
@@ -246,9 +262,27 @@ internal fun decideManagementQueueAction(
             QueueAction.CancelDeferOneRound(command.machineId, registration.key)
         }
 
+        ManagementQueueAction.SKIP_ONE_TURN -> {
+            val registration = selectedRegistrations()?.singleOrNull()
+                ?: return reject("请选择一份登记。")
+            if (queue.playing.any { it.key == registration.key }) {
+                return reject("处于游玩位置的登记不能轮空一次，请先撤回至等待顺序。")
+            }
+            QueueAction.SkipOneTurn(command.machineId, registration.key)
+        }
+
+        ManagementQueueAction.CANCEL_SKIP_ONE_TURN -> {
+            val registration = selectedRegistrations()?.singleOrNull()
+                ?: return reject("请选择一份登记。")
+            QueueAction.CancelSkipOneTurn(command.machineId, registration.key)
+        }
+
         ManagementQueueAction.TEMPORARILY_LEAVE -> {
             val registration = selectedRegistrations()?.singleOrNull()
                 ?: return reject("请选择一份登记。")
+            if (queue.playing.any { it.key == registration.key }) {
+                return reject("处于游玩位置的登记不能暂时离开，请先撤回至等待顺序。")
+            }
             QueueAction.TemporarilyLeave(command.machineId, registration.key)
         }
 
@@ -280,7 +314,7 @@ internal fun decideManagementQueueAction(
         }
 
         ManagementQueueAction.CREATE_FIXED_PAIR_WITH_REGISTRATION -> {
-            if (!state.acceptingNewRegistrations) return reject("现场当前没有使用登记排队。")
+            if (!state.acceptingNewRegistrations) return reject("现场当前未使用登记排队。")
             val target = selectedRegistrations()?.singleOrNull()
                 ?: return reject("请选择要组成固定组合的登记。")
             val friendProfile = command.friendProfileId?.let { profileId ->
@@ -372,6 +406,30 @@ internal fun decideManagementQueueAction(
             QueueAction.CheckIn(command.machineId, registration.key)
         }
 
+        ManagementQueueAction.SET_PAIRED_MACHINE_QUEUEING -> {
+            val registration = selectedRegistrations()?.singleOrNull()
+                ?: return reject("请选择一份登记。")
+            val enabled = command.alsoQueuesAtPairedMachine
+                ?: return reject("未能确定是否允许系统在两台机台之间安排登记，请重新操作。")
+            if (registration.alsoQueuesAtPairedMachine == enabled) {
+                return ManagementQueueActionDecision.AlreadyApplied(
+                    if (enabled) "这份登记已经允许系统在两台机台之间安排。" else "这份登记当前未允许系统在两台机台之间安排。"
+                )
+            }
+            if (enabled) {
+                if (state.machinePartners[command.machineId] == null) {
+                    return reject("系统规则不允许自动在两台机台之间安排登记。")
+                }
+                if (registration.fixedPartnerKey != null) {
+                    return reject("固定组合只能在当前机台游玩。")
+                }
+                if (registration.isTemporary) {
+                    return reject("临时登记只能在当前机台游玩。")
+                }
+            }
+            QueueAction.SetPairedMachineQueueing(command.machineId, registration.key, enabled)
+        }
+
         ManagementQueueAction.REMOVE_REGISTRATIONS -> {
             val selected = selectedRegistrations() ?: return reject("所选登记已经变化。")
             QueueAction.RemoveRegistrations(
@@ -433,11 +491,18 @@ internal fun decideManagementQueueAction(
         }
     }
 
-    val execution = state.executeQueueAction(
+    val executed = state.executeQueueAction(
         action = queueAction,
         origin = QueueActionOrigin.MANAGEMENT_APP,
         atMillis = appliedAtMillis
-    ) as? QueueActionExecution.Applied ?: return reject("现场终端拒绝了这项队列操作。")
+    )
+    val execution = executed as? QueueActionExecution.Applied ?: return reject(
+        when ((executed as? QueueActionExecution.Rejected)?.failure?.code) {
+            QueueActionFailureCode.NO_SHOW_REMOVAL_ONLY -> ONLINE_REGISTRATION_NO_SHOW_REMOVAL_ONLY
+            QueueActionFailureCode.DEFER_ONE_ROUND_ALREADY_USED -> DEFER_ONE_ROUND_USED_REASON
+            else -> "现场终端未执行这项队列操作，请按当前队列重新确认。"
+        }
+    )
     if (execution.state.queues == state.queues) {
         return reject("队列状态已经变化，这项操作没有执行。")
     }
@@ -450,6 +515,8 @@ internal fun decideManagementQueueAction(
     return ManagementQueueActionDecision.Apply(
         state = state.copy(
             queues = execution.state.queues,
+            pairedMachineOrders = execution.state.pairedMachineOrders,
+            pairedArrangements = execution.state.pairedArrangements,
             nextRegistrationKey = state.nextRegistrationKey + addedRegistrationCount
         ),
         detail = managementQueueActionDetail(command.action, command.machineId),
@@ -459,10 +526,17 @@ internal fun decideManagementQueueAction(
     )
 }
 
+/** Why a no-show of a checked-in online registration that has not played yet offers one outcome. */
+internal const val ONLINE_REGISTRATION_NO_SHOW_REMOVAL_ONLY =
+    "线上登记第一次轮到时未到场，只能移除登记。"
+
+/** Under the two outcomes that are not offered in that case. */
+internal const val ONLINE_REGISTRATION_NO_SHOW_CHOICE_UNAVAILABLE = "线上登记第一次轮到时不提供。"
+
 internal fun managementQueueActionDetail(action: ManagementQueueAction, machineId: String): String =
     when (action) {
-        ManagementQueueAction.ADD_TEMPORARY_REGISTRATION -> "已在机台 $machineId 新建临时登记。"
-        ManagementQueueAction.ADD_PROFILE_REGISTRATION -> "已在机台 $machineId 新建玩家登记。"
+        ManagementQueueAction.ADD_TEMPORARY_REGISTRATION -> "已在 机台 $machineId 创建临时登记。"
+        ManagementQueueAction.ADD_PROFILE_REGISTRATION -> "已在 机台 $machineId 创建玩家登记。"
         ManagementQueueAction.FINISH_ROUND -> "已结束本轮并开始下一轮。"
         ManagementQueueAction.END_ROUND_ONLY -> "已仅结束本轮，游玩位置保持空缺。"
         ManagementQueueAction.REMOVE_CURRENT_ROUND_AND_START_NEXT -> "已移除本轮登记并开始下一轮。"
@@ -470,24 +544,27 @@ internal fun managementQueueActionDetail(action: ManagementQueueAction, machineI
         ManagementQueueAction.RESTART_PLAYING_TIMER -> "已重新开始本轮游玩计时。"
         ManagementQueueAction.RESTART_PENDING_CHECK_IN_TIMERS -> "已重新开始待签到计时。"
         ManagementQueueAction.RESTART_MACHINE_TIMERS -> "已重新开始机台全部计时。"
-        ManagementQueueAction.RETURN_PLAYING_TO_WAITING_FRONT -> "游玩登记已退回等待顺序前端。"
+        ManagementQueueAction.RETURN_PLAYING_TO_WAITING_FRONT -> "游玩登记已撤回至等待顺序。"
         ManagementQueueAction.MOVE_WAITING_REGISTRATION_INTO_CURRENT_ROUND -> "等待登记已补入当前游玩位置。"
         ManagementQueueAction.ADVANCE_TO_WAITING_POSITION -> "指定等待位置已进入游玩位置。"
-        ManagementQueueAction.DEFER_ONE_ROUND -> "已暂缓一轮。"
-        ManagementQueueAction.CANCEL_DEFER_ONE_ROUND -> "已取消暂缓一轮。"
+        ManagementQueueAction.DEFER_ONE_ROUND -> "登记将暂缓一次。"
+        ManagementQueueAction.CANCEL_DEFER_ONE_ROUND -> "已取消暂缓一次。"
+        ManagementQueueAction.SKIP_ONE_TURN -> "登记将轮空一次。"
+        ManagementQueueAction.CANCEL_SKIP_ONE_TURN -> "已取消轮空一次。"
         ManagementQueueAction.TEMPORARILY_LEAVE -> "已设为暂时离开。"
         ManagementQueueAction.CANCEL_TEMPORARY_LEAVE -> "已取消暂时离开。"
-        ManagementQueueAction.CHANGE_PREFERENCE -> "已修改本次游玩偏好。"
+        ManagementQueueAction.CHANGE_PREFERENCE -> "已更改本次游玩偏好。"
         ManagementQueueAction.CREATE_FIXED_PAIR -> "已将两份登记组成固定组合。"
-        ManagementQueueAction.CREATE_FIXED_PAIR_WITH_REGISTRATION -> "已新建朋友登记并组成固定组合。"
+        ManagementQueueAction.CREATE_FIXED_PAIR_WITH_REGISTRATION -> "已创建朋友登记并组成固定组合。"
         ManagementQueueAction.RELEASE_FIXED_PAIR -> "已解除固定组合。"
         ManagementQueueAction.RENAME_REGISTRATION -> "已修改登记名称。"
-        ManagementQueueAction.CLAIM_WITH_PLAYER_PROFILE -> "已将临时登记关联到玩家资料。"
+        ManagementQueueAction.CLAIM_WITH_PLAYER_PROFILE -> "已将临时登记与玩家资料关联。"
         ManagementQueueAction.MARK_NO_SHOW -> "已完成未到场处理。"
         ManagementQueueAction.CHECK_IN -> "已立即完成现场签到。"
         ManagementQueueAction.REMOVE_REGISTRATIONS -> "已移除所选登记。"
         ManagementQueueAction.MOVE_WAITING_POSITION,
-        ManagementQueueAction.REPLACE_WAITING_POSITIONS -> "已调整等待位置顺序。"
-        ManagementQueueAction.REPLACE_REGISTRATION_ORDER -> "已调整登记顺序。"
-        ManagementQueueAction.TRANSFER_REGISTRATIONS -> "已将所选登记转移到其他机台。"
+        ManagementQueueAction.REPLACE_WAITING_POSITIONS -> "已调整等待顺序。"
+        ManagementQueueAction.REPLACE_REGISTRATION_ORDER -> "已调整等待顺序。"
+        ManagementQueueAction.TRANSFER_REGISTRATIONS -> "已将所选登记转至其他机台。"
+        ManagementQueueAction.SET_PAIRED_MACHINE_QUEUEING -> "已更改是否允许系统在两台机台之间安排。"
     }

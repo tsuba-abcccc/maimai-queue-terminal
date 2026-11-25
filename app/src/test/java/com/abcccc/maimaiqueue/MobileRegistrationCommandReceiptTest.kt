@@ -24,7 +24,7 @@ class MobileRegistrationCommandReceiptTest {
         val first = TerminalCommandReceipt(
             commandId = "00000000-0000-0000-0000-000000000001",
             applied = true,
-            detail = "登记已切换机台。"
+            detail = "登记已转至其他机台。"
         )
         val rejected = TerminalCommandReceipt(
             commandId = "00000000-0000-0000-0000-000000000002",

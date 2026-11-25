@@ -138,6 +138,8 @@ async function submit() {
     } else {
       step.value = error?.status >= 500 ? 'SUBMIT_ERROR' : 'REJECTED'
       resultDetail.value = error?.message || '玩家资料创建未能完成。'
+      // The page shows errorDetail for a rejection; without this the reason stayed empty.
+      errorDetail.value = resultDetail.value
     }
   } finally {
     submitting.value = false
@@ -153,7 +155,7 @@ function leaveFlow() {
 function genderLabel(value) {
   if (value === 'MALE') return '男'
   if (value === 'FEMALE') return '女'
-  return '不显示'
+  return '不愿透露'
 }
 
 function preferenceLabel(value) {
@@ -194,7 +196,7 @@ onBeforeUnmount(() => {})
           <section class="profile-creation-intro">
             <span>来自现场终端</span>
             <h2>填写玩家资料并设置密码</h2>
-            <p>完成后会上传到当前机厅的玩家资料库，并立即绑定网页账户。以后可以用 QQ 和密码登录网页管理资料。</p>
+            <p>创建后，这份玩家资料会保存到当前机厅的玩家资料库，并立即绑定网页账户；之后可以使用 QQ 和密码登录网页修改资料。</p>
           </section>
           <form class="profile-creation-form" @submit.prevent="submit">
             <label><span>玩家昵称</span><input v-model="draft.nickname" maxlength="18" autocomplete="nickname" placeholder="输入现场容易辨认的昵称" /></label>
@@ -207,9 +209,9 @@ onBeforeUnmount(() => {})
               <button v-for="value in ['OPEN_TO_JOIN', 'SOLO', 'ASK_EVERY_TIME']" :key="value" type="button"
                 :class="{ active: draft.default_preference === value }" @click="draft.default_preference = value">{{ preferenceLabel(value) }}</button>
             </div></fieldset>
-            <label><span>账户密码</span><input v-model="draft.password" type="password" minlength="8" maxlength="128" autocomplete="new-password" placeholder="至少 8 个字符" /><small>请使用本人能够记住的密码；网页端暂不提供仅凭 QQ 的自助找回。</small></label>
+            <label><span>账户密码</span><input v-model="draft.password" type="password" minlength="8" maxlength="128" autocomplete="new-password" placeholder="至少 8 个字符" /><small>请设置本人能够记住的密码；忘记密码时，需要联系管理员重置。</small></label>
             <label><span>再次输入密码</span><input v-model="draft.password_confirmation" type="password" minlength="8" maxlength="128" autocomplete="new-password" placeholder="再次输入账户密码" /></label>
-            <p class="profile-creation-fixed-note">网页账户绑定后，QQ 将允许在网站玩家资料中显示；现场终端默认不能编辑这份资料，之后可由玩家在网页设置中重新开放。</p>
+            <p class="profile-creation-fixed-note">绑定网页账户后，QQ 号会显示在网站的登记详情中，现场终端默认不能编辑这份玩家资料；之后可以登录网页账户更改这两项设置。</p>
             <MobileProfileSettings :settings="draft" :show-visibility="false" @change="updateSetting" />
             <p v-if="errorDetail" class="profile-form-error" role="alert">{{ errorDetail }}</p>
             <button class="profile-primary" type="submit" :disabled="!formValid || submitting"><Check :size="17" />确认创建并绑定</button>

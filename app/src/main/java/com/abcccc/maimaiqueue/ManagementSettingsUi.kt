@@ -59,8 +59,36 @@ internal data class ManagementSettingsDraft(
     val businessHours: BusinessHoursSettings,
     val machineGroups: List<MachineGroupConfiguration>,
     val defaultMachineGroupId: String,
-    val machines: List<ManagementMachine>
+    val machines: List<ManagementMachine>,
+    /** Null when the terminal does not offer the setting; the command then leaves it out. */
+    val pairedMachineQueue: PairedMachineQueueConfiguration? = null
 )
+
+/**
+ * The pairs that are still possible with [machines]: both machines present, the same play
+ * capacity, each machine in one pair at most. Editing machines can make a pair impossible.
+ */
+internal fun validMachinePairs(
+    pairs: List<Pair<String, String>>,
+    machines: List<ManagementMachine>
+): List<Pair<String, String>> {
+    val machineByStableId = machines.mapNotNull { machine ->
+        machine.stableId?.let { it to machine }
+    }.toMap()
+    val used = mutableSetOf<String>()
+    return pairs.filter { (first, second) ->
+        val firstMachine = machineByStableId[first]
+        val secondMachine = machineByStableId[second]
+        val valid = firstMachine != null && secondMachine != null && first != second &&
+            first !in used && second !in used &&
+            firstMachine.configuration.capacity == secondMachine.configuration.capacity
+        if (valid) {
+            used += first
+            used += second
+        }
+        valid
+    }
+}
 
 private data class ManagementMachineDraftSource(
     val id: String,
@@ -106,6 +134,11 @@ internal fun ManagementSettingsPage(
     var showPreview by remember(terminalSettings) {
         mutableStateOf(terminalSettings.showCommonPlayPreview)
     }
+    val pairedQueueEditAllowed = overview.capabilities.pairedMachineQueueEdit
+    var pairedQueue by remember(terminalSettings) {
+        mutableStateOf(terminalSettings.pairedMachineQueue)
+    }
+    var addingMachinePair by remember { mutableStateOf(false) }
     var businessHours by remember(terminalSettings) {
         mutableStateOf(terminalSettings.businessHours)
     }
@@ -159,7 +192,10 @@ internal fun ManagementSettingsPage(
             businessHours = businessHours.normalized(),
             machineGroups = validGroups,
             defaultMachineGroupId = selectedDefault,
-            machines = normalizedMachines
+            machines = normalizedMachines,
+            pairedMachineQueue = pairedQueue?.let { settings ->
+                settings.copy(pairs = validMachinePairs(settings.pairs, normalizedMachines))
+            }
         )
     }
 
@@ -178,9 +214,9 @@ internal fun ManagementSettingsPage(
                         Spacer(Modifier.height(3.dp))
                         Text(
                             when {
-                                !terminalSettings.supported -> "当前终端版本不支持管理后台设置接管"
-                                !overview.terminalPolicy.managementAppBound -> "请先在权限页绑定并接管终端设置"
-                                else -> "设置修订 ${terminalSettings.revision}·修改后由现场终端执行"
+                                !terminalSettings.supported -> "当前终端版本不支持管理后台接管。"
+                                !overview.terminalPolicy.managementAppBound -> "请先绑定并接管终端敏感策略。"
+                                else -> "修改后由现场终端执行。"
                             },
                             color = SecondaryText,
                             style = MaterialTheme.typography.bodySmall
@@ -200,7 +236,7 @@ internal fun ManagementSettingsPage(
         item {
             SurfaceLikeSettingsCard {
                 ManagementSettingsSwitchRow(
-                    title = "开放登记排队",
+                    title = "开启登记排队",
                     checked = overview.registrationOpen,
                     enabled = canEdit && registrationControlAllowed && !registrationBusy,
                     onCheckedChange = { open ->
@@ -208,7 +244,7 @@ internal fun ManagementSettingsPage(
                     }
                 )
                 Text(
-                    if (overview.registrationOpen) "关闭登记会清空当前全部登记，必须再次确认。" else "登记已关闭；开启后现场终端会创建新的空队列。",
+                    if (overview.registrationOpen) "关闭登记会清空当前全部登记，必须再次确认。" else "登记排队已关闭；重新开启后，现场终端会开始新的空队列。",
                     color = TertiaryText,
                     style = MaterialTheme.typography.labelSmall
                 )
@@ -230,6 +266,17 @@ internal fun ManagementSettingsPage(
                 )
             }
         }
+        pairedQueue?.let { settings ->
+            item {
+                ManagementPairedMachineQueueCard(
+                    settings = settings.copy(pairs = validMachinePairs(settings.pairs, machines)),
+                    machines = machines,
+                    enabled = canEdit && pairedQueueEditAllowed && !settingsBusy,
+                    onChange = { pairedQueue = it },
+                    onAddPair = { addingMachinePair = true }
+                )
+            }
+        }
         item {
             SurfaceLikeSettingsCard {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -243,7 +290,7 @@ internal fun ManagementSettingsPage(
                         },
                         enabled = canEdit && machineConfigurationEditAllowed && !settingsBusy && groups.size < machines.size.coerceAtLeast(1)
                     ) {
-                        Icon(Icons.Default.Add, contentDescription = "新增分组", tint = SystemBlue)
+                        Icon(Icons.Default.Add, contentDescription = "创建分组", tint = SystemBlue)
                     }
                 }
                 Spacer(Modifier.height(6.dp))
@@ -325,13 +372,13 @@ internal fun ManagementSettingsPage(
                     ) {
                         Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(4.dp))
-                        Text("增加机台", style = MaterialTheme.typography.labelMedium)
+                        Text("添加机台", style = MaterialTheme.typography.labelMedium)
                     }
                 }
                 Spacer(Modifier.height(8.dp))
                 if (overview.registrationOpen) {
                     Text(
-                        "机台数量、游玩容量和计划时间需要先关闭登记排队；备注、分组和展示信息仍可修改。",
+                        "关闭登记排队后才能添加、删除机台、修改游玩容量或计划游玩时间。分组、备注与机台详情仍可直接更新。",
                         color = TertiaryText,
                         style = MaterialTheme.typography.labelSmall
                     )
@@ -362,7 +409,8 @@ internal fun ManagementSettingsPage(
                 Button(
                     onClick = { onSave(normalizedDraft()) },
                     enabled = canEdit && !settingsBusy && machines.isNotEmpty() &&
-                        (commonPlayPreviewEditAllowed || businessHoursEditAllowed || machineConfigurationEditAllowed),
+                        (commonPlayPreviewEditAllowed || businessHoursEditAllowed ||
+                            machineConfigurationEditAllowed || pairedQueueEditAllowed),
                     modifier = Modifier.fillMaxWidth(),
                     contentPadding = PaddingValues(vertical = 9.dp)
                 ) {
@@ -383,7 +431,7 @@ internal fun ManagementSettingsPage(
             onDismissRequest = { if (!registrationBusy) closeRegistrationConfirm = false },
             icon = { Icon(Icons.Default.Warning, contentDescription = null, tint = Destructive) },
             title = { Text("关闭登记排队？") },
-            text = { Text("关闭后现场终端会清空当前全部登记并创建新的空队列。此操作需要现场终端在线。") },
+            text = { Text("确认后，现场终端会清空所有机台的全部登记；重新开启登记排队时会开始新的空队列。此操作需要现场终端在线。") },
             confirmButton = {
                 Button(
                     onClick = {
@@ -395,6 +443,21 @@ internal fun ManagementSettingsPage(
             },
             dismissButton = { TextButton(onClick = { closeRegistrationConfirm = false }, enabled = !registrationBusy) { Text("取消") } }
         )
+    }
+    if (addingMachinePair) {
+        pairedQueue?.let { settings ->
+            val validPairs = validMachinePairs(settings.pairs, machines)
+            val pairedStableIds = validPairs.flatMapTo(mutableSetOf()) { listOf(it.first, it.second) }
+            ManagementAddMachinePairDialog(
+                machines = machines.filter { it.stableId != null && it.stableId !in pairedStableIds },
+                onDismiss = { addingMachinePair = false },
+                onAdd = { first, second ->
+                    addingMachinePair = false
+                    // Adding a pair is the reason to have the setting on.
+                    pairedQueue = settings.copy(enabled = true, pairs = validPairs + (first to second))
+                }
+            )
+        }
     }
     editingMachine?.let { machine ->
         ManagementMachineEditDialog(
@@ -467,7 +530,7 @@ private fun ManagementTerminalPolicyCard(
         ManagementSettingsSwitchRow("允许暂时离开", draft.allowTemporaryLeave, canEdit && !busy) { draft = draft.copy(allowTemporaryLeave = it) }
         ManagementSettingsSwitchRow("QQ Bot 联动", draft.oneBotSyncEnabled, canEdit && !busy) { draft = draft.copy(oneBotSyncEnabled = it) }
         Spacer(Modifier.height(4.dp))
-        Text("绑定后现场终端不能修改以上敏感设置；正常拖动队列排序仍由终端负责。", color = TertiaryText, style = MaterialTheme.typography.labelSmall)
+        Text("绑定后，现场终端不能修改以上设置；在现场终端调整等待顺序不受影响。", color = TertiaryText, style = MaterialTheme.typography.labelSmall)
         Spacer(Modifier.height(8.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
@@ -489,6 +552,167 @@ private fun ManagementTerminalPolicyCard(
             }
         }
     }
+}
+
+@Composable
+private fun ManagementPairedMachineQueueCard(
+    settings: PairedMachineQueueConfiguration,
+    machines: List<ManagementMachine>,
+    enabled: Boolean,
+    onChange: (PairedMachineQueueConfiguration) -> Unit,
+    onAddPair: () -> Unit
+) {
+    val machineByStableId = machines.mapNotNull { machine ->
+        machine.stableId?.let { it to machine }
+    }.toMap()
+    val pairedStableIds = settings.pairs.flatMapTo(mutableSetOf()) { listOf(it.first, it.second) }
+    SurfaceLikeSettingsCard {
+        ManagementSettingsSwitchRow(
+            title = "允许系统在一对机台之间安排登记",
+            checked = settings.enabled,
+            enabled = enabled,
+            onCheckedChange = { onChange(settings.copy(enabled = it)) }
+        )
+        Text(
+            "开启后，玩家可以允许系统在一对机台之间安排自己的登记。",
+            color = TertiaryText,
+            style = MaterialTheme.typography.labelSmall
+        )
+        Spacer(Modifier.height(10.dp))
+        Text(
+            "一对机台",
+            color = PrimaryText,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium
+        )
+        if (settings.pairs.isEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            Text("尚未添加一对机台。", color = SecondaryText, style = MaterialTheme.typography.bodySmall)
+        }
+        settings.pairs.forEach { pair ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "${machineByStableId[pair.first]?.name.orEmpty()} 与 " +
+                        machineByStableId[pair.second]?.name.orEmpty(),
+                    modifier = Modifier.weight(1f),
+                    color = PrimaryText,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                IconButton(
+                    onClick = { onChange(settings.copy(pairs = settings.pairs - pair)) },
+                    enabled = enabled
+                ) {
+                    Icon(Icons.Default.Delete, contentDescription = "移除这一对机台", tint = Destructive)
+                }
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        OutlinedButton(
+            onClick = onAddPair,
+            enabled = enabled &&
+                machines.count { it.stableId != null && it.stableId !in pairedStableIds } >= 2,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(4.dp))
+            Text("添加一对机台")
+        }
+    }
+}
+
+@Composable
+private fun ManagementAddMachinePairDialog(
+    machines: List<ManagementMachine>,
+    onDismiss: () -> Unit,
+    onAdd: (String, String) -> Unit
+) {
+    var selected by remember { mutableStateOf(emptyList<ManagementMachine>()) }
+    // Different game type or server needs a second, explicit confirmation.
+    var confirmingDifference by remember { mutableStateOf(false) }
+    val capacitiesDiffer = selected.size == 2 &&
+        selected[0].configuration.capacity != selected[1].configuration.capacity
+    val kindsDiffer = selected.size == 2 &&
+        pairedMachineKindLabel(selected[0].configuration) !=
+        pairedMachineKindLabel(selected[1].configuration)
+    fun add() {
+        val first = selected[0].stableId
+        val second = selected[1].stableId
+        if (first != null && second != null) onAdd(first, second)
+    }
+    if (confirmingDifference && selected.size == 2) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            icon = { Icon(Icons.Default.Warning, contentDescription = null, tint = Destructive) },
+            title = { Text("将 ${selected[0].name} 与 ${selected[1].name} 设为一对机台？") },
+            text = {
+                Text(
+                    "两台机台的游戏类型或服务器不同：${selected[0].name} 为 " +
+                        "${pairedMachineKindLabel(selected[0].configuration)}，${selected[1].name} 为 " +
+                        "${pairedMachineKindLabel(selected[1].configuration)}。确认后，登记可能自动转至另一机台。" +
+                        "请仅在玩家可以在两台机台游玩时继续。"
+                )
+            },
+            confirmButton = { Button(onClick = ::add) { Text("仍然添加") } },
+            dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+        )
+        return
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("添加一对机台") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text(
+                    "选择两台游玩容量相同的机台。一台机台只能属于一对。",
+                    color = SecondaryText,
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.height(8.dp))
+                machines.forEach { machine ->
+                    val isSelected = machine in selected
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = isSelected,
+                            onCheckedChange = {
+                                selected = when {
+                                    isSelected -> selected - machine
+                                    selected.size < 2 -> selected + machine
+                                    else -> listOf(selected[1], machine)
+                                }
+                            }
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(machine.name, color = PrimaryText, style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "${pairedMachineKindLabel(machine.configuration)}·" +
+                                    "${machine.configuration.capacity} 人",
+                                color = SecondaryText,
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    }
+                }
+                if (capacitiesDiffer) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "两台机台的游玩容量不同，不能设为一对机台。",
+                        color = Destructive,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { if (kindsDiffer) confirmingDifference = true else add() },
+                enabled = selected.size == 2 && !capacitiesDiffer
+            ) { Text("添加") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
 }
 
 @Composable
@@ -586,7 +810,7 @@ private fun ManagementDailyHoursRow(
                 opening = text.filter { it.isDigit() || it == ':' }.take(5)
                 parseClock(opening)?.let { value -> onChange(hours.copy(openingMinutes = value)) }
             },
-            label = { Text("开") },
+            label = { Text("开店") },
             singleLine = true,
             enabled = enabled,
             modifier = Modifier.weight(1f)
@@ -598,7 +822,7 @@ private fun ManagementDailyHoursRow(
                 closing = text.filter { it.isDigit() || it == ':' }.take(5)
                 parseClock(closing)?.let { value -> onChange(hours.copy(closingMinutes = value)) }
             },
-            label = { Text("关") },
+            label = { Text("闭店") },
             singleLine = true,
             enabled = enabled,
             modifier = Modifier.weight(1f)
@@ -662,7 +886,7 @@ private fun ManagementSettingsMachineRow(
             Column(Modifier.weight(1f)) {
                 Text(machine.name, color = PrimaryText, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
                 Text(
-                    "${groups.firstOrNull { it.id == machine.groupId }?.name ?: "未分组"}·容量 ${machine.configuration.capacity}·${if (machine.operational) "运行中" else "已停止"}",
+                    "${groups.firstOrNull { it.id == machine.groupId }?.name ?: "未分组"}·游玩容量 ${machine.configuration.capacity} 人·${if (machine.operational) "运行中" else "已停止"}",
                     color = if (machine.operational) SecondaryText else Destructive,
                     style = MaterialTheme.typography.labelSmall
                 )
@@ -681,7 +905,7 @@ private fun ManagementSettingsMachineRow(
             ) {
                 Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(4.dp))
-                Text(if (machine.operational) "停止机台" else "恢复机台", style = MaterialTheme.typography.labelMedium)
+                Text(if (machine.operational) "停止使用" else "恢复使用", style = MaterialTheme.typography.labelMedium)
             }
             Text(
                 machine.stopReasonDetail?.takeIf { it.isNotBlank() } ?: machine.stopReason.orEmpty(),
@@ -710,7 +934,7 @@ private fun ManagementMachineEditDialog(
     var serverExpanded by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
-        title = { Text("编辑${machine.id}机台") },
+        title = { Text("编辑 机台 ${machine.id}") },
         text = {
             Column(
                 modifier = Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
@@ -719,11 +943,11 @@ private fun ManagementMachineEditDialog(
                 OutlinedTextField(value = remark, onValueChange = { remark = limitMachineRemarkLength(it) }, label = { Text("机台备注") }, singleLine = true, enabled = !busy, modifier = Modifier.fillMaxWidth())
                 ManagementGroupSelector("分组", selectedGroupId, groups, !busy) { selectedGroupId = it }
                 if (!allowRiskSensitiveChanges) {
-                    Text("关闭登记排队后才能修改容量和计划游玩时间。", color = TertiaryText, style = MaterialTheme.typography.labelSmall)
+                    Text("关闭登记排队后才能修改游玩容量和计划游玩时间。", color = TertiaryText, style = MaterialTheme.typography.labelSmall)
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    OutlinedButton(onClick = { configuration = configuration.copy(capacity = 1) }, enabled = !busy && allowRiskSensitiveChanges, modifier = Modifier.weight(1f)) { Text(if (configuration.capacity == 1) "单人容量" else "单人") }
-                    OutlinedButton(onClick = { configuration = configuration.copy(capacity = 2) }, enabled = !busy && allowRiskSensitiveChanges, modifier = Modifier.weight(1f)) { Text(if (configuration.capacity == 2) "共同容量" else "共同") }
+                    OutlinedButton(onClick = { configuration = configuration.copy(capacity = 1) }, enabled = !busy && allowRiskSensitiveChanges, modifier = Modifier.weight(1f)) { Text(if (configuration.capacity == 1) "1 人" else "1 人") }
+                    OutlinedButton(onClick = { configuration = configuration.copy(capacity = 2) }, enabled = !busy && allowRiskSensitiveChanges, modifier = Modifier.weight(1f)) { Text(if (configuration.capacity == 2) "2 人" else "2 人") }
                 }
                 Box {
                     OutlinedButton(onClick = { gameTypeExpanded = true }, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("游戏类型：${machineGameTypeLabel(configuration.gameType)}", modifier = Modifier.fillMaxWidth()) }
@@ -753,8 +977,8 @@ private fun ManagementMachineEditDialog(
                     Text("显示游戏版本", color = PrimaryText, style = MaterialTheme.typography.bodySmall)
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    OutlinedTextField(value = configuration.soloRoundMinutes.toString(), onValueChange = { configuration = configuration.copy(soloRoundMinutes = it.toIntOrNull()?.coerceIn(MIN_PLANNED_ROUND_MINUTES, MAX_PLANNED_ROUND_MINUTES) ?: configuration.soloRoundMinutes) }, label = { Text("单人分钟") }, singleLine = true, enabled = !busy && allowRiskSensitiveChanges, modifier = Modifier.weight(1f))
-                    OutlinedTextField(value = configuration.sharedRoundMinutes.toString(), onValueChange = { configuration = configuration.copy(sharedRoundMinutes = it.toIntOrNull()?.coerceIn(MIN_PLANNED_ROUND_MINUTES, MAX_PLANNED_ROUND_MINUTES) ?: configuration.sharedRoundMinutes) }, label = { Text("共同分钟") }, singleLine = true, enabled = !busy && allowRiskSensitiveChanges, modifier = Modifier.weight(1f))
+                    OutlinedTextField(value = configuration.soloRoundMinutes.toString(), onValueChange = { configuration = configuration.copy(soloRoundMinutes = it.toIntOrNull()?.coerceIn(MIN_PLANNED_ROUND_MINUTES, MAX_PLANNED_ROUND_MINUTES) ?: configuration.soloRoundMinutes) }, label = { Text("单人游玩（分钟）") }, singleLine = true, enabled = !busy && allowRiskSensitiveChanges, modifier = Modifier.weight(1f))
+                    OutlinedTextField(value = configuration.sharedRoundMinutes.toString(), onValueChange = { configuration = configuration.copy(sharedRoundMinutes = it.toIntOrNull()?.coerceIn(MIN_PLANNED_ROUND_MINUTES, MAX_PLANNED_ROUND_MINUTES) ?: configuration.sharedRoundMinutes) }, label = { Text("两人共同游玩（分钟）") }, singleLine = true, enabled = !busy && allowRiskSensitiveChanges, modifier = Modifier.weight(1f))
                 }
             }
         },
@@ -790,7 +1014,7 @@ private fun ManagementMachineStatusDialog(
     val selectedLabel = reasons.firstOrNull { it.first == reason }?.second ?: reason
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
-        title = { Text(if (machine.operational) "停止${machine.name}" else "恢复${machine.name}") },
+        title = { Text(if (machine.operational) "停止使用 ${machine.name}" else "恢复使用 ${machine.name}") },
         text = {
             if (machine.operational) {
                 Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
@@ -816,14 +1040,14 @@ private fun ManagementMachineStatusDialog(
                     }
                 }
             } else {
-                Text("恢复后现场终端会继续保留当前队列，并恢复该机台的计时。", color = SecondaryText)
+                Text("恢复后，现场终端会保留当前队列；该机台的本轮游玩计时和线上登记的签到计时会从头开始。", color = SecondaryText)
             }
         },
         confirmButton = {
             Button(
                 onClick = { onSubmit(!machine.operational, if (machine.operational) reason else null, if (machine.operational && reason == "OTHER") detail.trim() else null) },
                 enabled = !busy && (!machine.operational || (reason != "OTHER" || detail.trim().isNotBlank()))
-            ) { Text(if (machine.operational) "确认停止" else "确认恢复") }
+            ) { Text(if (machine.operational) "确认停止使用" else "确认恢复使用") }
         },
         dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("取消") } }
     )

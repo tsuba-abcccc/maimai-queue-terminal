@@ -193,7 +193,9 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                 revision = item.optLong("revision", 1L).coerceAtLeast(1L),
                 createdAtMillis = createdAtMillis,
                 updatedAtMillis = item.optLong("updatedAtMillis", 0L)
-                    .takeIf { it > 0L } ?: createdAtMillis
+                    .takeIf { it > 0L } ?: createdAtMillis,
+                pairedMachineQueueingIntroduced =
+                    item.optBoolean("pairedMachineQueueingIntroduced", false)
             ).withCanonicalContact()
         }
         profiles
@@ -242,6 +244,9 @@ class LocalPlayerProfileRepository(context: Context) : PlayerProfileRepository {
                     put("revision", profile.revision)
                     put("createdAtMillis", profile.createdAtMillis)
                     put("updatedAtMillis", profile.updatedAtMillis)
+                    if (profile.pairedMachineQueueingIntroduced) {
+                        put("pairedMachineQueueingIntroduced", true)
+                    }
                 }
             )
         }

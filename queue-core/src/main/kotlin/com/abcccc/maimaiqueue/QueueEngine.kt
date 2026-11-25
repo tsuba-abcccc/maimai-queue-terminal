@@ -42,6 +42,18 @@ enum class QueueActionFailureCode {
     INVALID_FIXED_PAIR,
     SINGLE_PLAYER_MACHINE_ONLY,
     WOULD_DELAY_OTHER_REGISTRATIONS,
+    PAIRED_MACHINE_QUEUE_UNAVAILABLE,
+    /** Only a registration of a player profile can be arranged between two machines. */
+    PAIRED_MACHINE_QUEUE_NEEDS_PLAYER_PROFILE,
+    /** See [Registration.mustBeRemovedWhenAbsent]. */
+    NO_SHOW_REMOVAL_ONLY,
+    /** 暂缓一次 was used and the registration has not played since; see [Registration.deferOneRoundUsed]. */
+    DEFER_ONE_ROUND_ALREADY_USED,
+    /**
+     * A checked-in online registration that has not played cannot be postponed in any way,
+     * except from the management app (maintainer, 2026-11-25).
+     */
+    ONLINE_REGISTRATION_NOT_PLAYED,
     STALE_STATE,
     NO_STATE_CHANGE,
     INVARIANT_VIOLATION
@@ -52,6 +64,52 @@ data class QueueActionFailure(
     val detail: String? = null
 )
 
+/**
+ * The waits that make arranging a registration to the other machine of its pair predictable:
+ * it is announced by a preview first, and only happens once that preview has been shown for a
+ * while without a break.
+ */
+data class PairedArrangementRules(
+    /** How long the preview must have been shown without a break before the registration moves. */
+    val leadMillis: Long = 12L * 60_000L,
+    /** A preview appears once the other machine is expected earlier by more than this... */
+    val appearMarginMillis: Long = 3L * 60_000L,
+    /** ...and breaks when it is no longer earlier by more than this. */
+    val breakMarginMillis: Long = 60_000L,
+    /** After this much uninterrupted preview the player is told. */
+    val noticeAfterMillis: Long = 5L * 60_000L,
+    /** A round that has run longer than this makes its machine's estimates unreliable. */
+    val overdueRoundMillis: Long = 20L * 60_000L
+)
+
+/**
+ * What the engine remembers about one registration that may be, or has just been, arranged to
+ * the other machine of its pair. It is kept beside the queues rather than inside the
+ * registration: the timing changes as time passes, and must not make an open confirmation of
+ * some unrelated action look out of date.
+ */
+/** See [QueueEngine.pairedArrangementOutlook]. */
+data class PairedArrangementOutlook(
+    /**
+     * The earliest moment at which the registration may be arranged to the other machine; null
+     * while the count is held because the queues are not being kept up normally.
+     */
+    val notBeforeMillis: Long?
+)
+
+data class PairedArrangementRecord(
+    /** Since when the preview at the other machine has been shown without a break. */
+    val previewSinceMillis: Long? = null,
+    /** Set while the count is paused because a machine's round is overdue. */
+    val previewPausedAtMillis: Long? = null,
+    /** When the player was told in this wait; they are told once per wait. */
+    val noticedAtMillis: Long? = null,
+    /** While it plays the round it was arranged for: the machine it came from... */
+    val arrangedFromMachineId: String? = null,
+    /** ...and the registrations that were ahead of it there, for the way back. */
+    val aheadKeysAtOrigin: List<Int> = emptyList()
+)
+
 data class QueueEnginePolicy(
     val registrationOpen: Boolean = true,
     val allowOnlineRegistration: Boolean = true,
@@ -60,7 +118,17 @@ data class QueueEnginePolicy(
     val machineStatuses: Map<String, MachineStatus> = emptyMap(),
     val machineCapacities: Map<String, Int> = emptyMap(),
     val maxRegistrationsPerMachine: Int = 20,
-    val requireOperationalForPlayerActions: Boolean = false
+    val requireOperationalForPlayerActions: Boolean = false,
+    /**
+     * Machines configured as a pair for queueing at both at once, in both directions:
+     * `A to B` and `B to A`. A machine belongs to at most one pair.
+     */
+    val machinePartners: Map<String, String> = emptyMap(),
+    /**
+     * When set, a registration is only arranged to the other machine of its pair after that has
+     * been announced, see [PairedArrangementRules]. Null arranges as soon as it is reached.
+     */
+    val pairedArrangementRules: PairedArrangementRules? = null
 ) {
     fun isOperational(machineId: String): Boolean =
         machineStatuses[machineId]?.isOperational != false
@@ -76,7 +144,14 @@ data class QueueActionContext(
 )
 
 data class QueueEngineState(
-    val queues: Map<String, MachineQueue>
+    val queues: Map<String, MachineQueue>,
+    /**
+     * For each machine of an active pair: its waiting registrations interleaved with the places
+     * that registrations of the other machine hold here, as registration keys in order.
+     */
+    val pairedMachineOrders: Map<String, List<Int>> = emptyMap(),
+    /** By registration key; see [PairedArrangementRecord]. */
+    val pairedArrangements: Map<Int, PairedArrangementRecord> = emptyMap()
 ) {
     val allRegistrations: List<Registration>
         get() = queues.values.flatMap(MachineQueue::allRegistrations)
@@ -96,6 +171,7 @@ data class QueueEngineState(
         if (duplicateKeys.isNotEmpty()) {
             add("不同机台不能出现重复登记编号：${duplicateKeys.sorted().joinToString()}")
         }
+        addAll(PairedMachineQueues.invariantViolations(this@QueueEngineState))
     }.distinct()
 
     companion object {
@@ -148,6 +224,17 @@ sealed interface QueueAction {
     ) : QueueAction
 
     data class TemporarilyLeave(
+        override val machineId: String,
+        val registrationKey: Int
+    ) : QueueAction
+
+    /** 将轮空一次; see [QueueAbsenceStatus.SKIP_ONE_TURN]. */
+    data class SkipOneTurn(
+        override val machineId: String,
+        val registrationKey: Int
+    ) : QueueAction
+
+    data class CancelSkipOneTurn(
         override val machineId: String,
         val registrationKey: Int
     ) : QueueAction
@@ -217,9 +304,25 @@ sealed interface QueueAction {
         val registrationKey: Int
     ) : QueueAction
 
+    /** Turns queueing at both machines of the pair on or off for one registration. */
+    data class SetPairedMachineQueueing(
+        override val machineId: String,
+        val registrationKey: Int,
+        val enabled: Boolean
+    ) : QueueAction
+
     data class RemoveRegistrations(
         override val machineId: String,
         val registrationKeys: Set<Int>
+    ) : QueueAction
+
+    /**
+     * The player takes their own registration out of the queue. The effect is that of
+     * [RemoveRegistrations]; it is kept apart so that records can say who decided.
+     */
+    data class LeaveQueue(
+        override val machineId: String,
+        val registrationKey: Int
     ) : QueueAction
 
     data class RemoveExpiredOnlineRegistrations(override val machineId: String) : QueueAction
@@ -232,7 +335,12 @@ sealed interface QueueAction {
 
     data class ReplaceOrder(
         override val machineId: String,
-        val registrations: List<Registration>
+        val registrations: List<Registration>,
+        /**
+         * The registrations the operator dragged, when the caller knows them. Without it the
+         * moved registrations are worked out from the old and the new order.
+         */
+        val movedRegistrationKeys: Set<Int>? = null
     ) : QueueAction
 
     data class TransferRegistrations(
@@ -255,14 +363,29 @@ sealed interface QueueAction {
         override val machineId: String,
         val expectedCurrentQueue: MachineQueue,
         val restoredQueue: MachineQueue,
-        val excludedRegistrationKeys: Set<Int> = emptySet()
+        val excludedRegistrationKeys: Set<Int> = emptySet(),
+        /**
+         * Other machines the undone action also changed, for example the paired machine a
+         * registration was moved from: machine id to its queue before and after that action.
+         */
+        val alsoRestoredQueues: Map<String, RestoredMachineQueue> = emptyMap(),
+        /** The orders shared across paired machines as they were before the undone action. */
+        val restoredPairedMachineOrders: Map<String, List<Int>>? = null,
+        /** What was remembered about arrangements before the undone action. */
+        val restoredPairedArrangements: Map<Int, PairedArrangementRecord>? = null
     ) : QueueAction
+
+    data class RestoredMachineQueue(
+        val expectedCurrentQueue: MachineQueue,
+        val restoredQueue: MachineQueue
+    )
 }
 
 private val QueueAction.requiredUnchangedMachineIds: Set<String>
     get() = when (this) {
         is QueueAction.TransferRegistrations -> setOf(sourceMachineId, destinationMachineId)
         is QueueAction.ClearRegistrations -> machineIds
+        is QueueAction.RestoreSnapshot -> alsoRestoredQueues.keys + machineId
         else -> setOf(machineId)
     }
 
@@ -295,8 +418,18 @@ class QueueActionPlan internal constructor(
         currentPolicy: QueueEnginePolicy = context.policy,
         atMillis: Long = context.atMillis
     ): QueueActionExecution {
-        if (action.requiredUnchangedMachineIds.any { machineId ->
-                currentState.queue(machineId) != sourceState.queue(machineId)
+        // On a paired machine the outcome also depends on the other machine and on the places
+        // held across the pair, so a change there invalidates the confirmation as well.
+        val pairedMachineIds = action.requiredUnchangedMachineIds.flatMapTo(mutableSetOf()) { machineId ->
+            listOfNotNull(
+                machineId,
+                PairedMachineQueues.activePartner(sourceState, context.policy, machineId)
+            )
+        }
+        if (pairedMachineIds.any { machineId ->
+                currentState.queue(machineId) != sourceState.queue(machineId) ||
+                    currentState.pairedMachineOrders[machineId] !=
+                    sourceState.pairedMachineOrders[machineId]
             }) {
             return QueueActionExecution.Rejected(
                 QueueActionFailure(QueueActionFailureCode.STALE_STATE)
@@ -354,7 +487,19 @@ object QueueEngine {
             return rejectedPlan(state, action, context, prerequisiteFailure)
         }
 
-        val applied = applyLegacyBehavior(state, action, context)
+        val legacyApplied = applyLegacyBehavior(state, action, context)
+        if (legacyApplied.state == state) {
+            return rejectedPlan(
+                state,
+                action,
+                context,
+                QueueActionFailure(QueueActionFailureCode.NO_STATE_CHANGE),
+                legacyApplied
+            )
+        }
+        val applied = legacyApplied.copy(
+            state = settlePairedMachines(legacyApplied.state, action, state, context)
+        )
         val resultState = applied.state
         if (resultState == state) {
             return rejectedPlan(
@@ -438,6 +583,7 @@ object QueueEngine {
         if (
             policy.requireOperationalForPlayerActions &&
             action.isPlayerAction &&
+            !action.remainsPossibleOnStoppedMachine &&
             context.origin != QueueActionOrigin.SYSTEM &&
             !policy.isOperational(action.machineId)
         ) {
@@ -501,11 +647,40 @@ object QueueEngine {
                     return QueueActionFailure(QueueActionFailureCode.DEFER_ONE_ROUND_DISABLED)
                 }
                 registrationFailure(queue, action.registrationKey)?.let { return it }
+                playingPositionFailure(queue, action.registrationKey)?.let { return it }
                 val registration = queue.allRegistrations.first { it.key == action.registrationKey }
                 if (registration.requiresOnSiteCheckIn) {
                     return QueueActionFailure(QueueActionFailureCode.PENDING_CHECK_IN)
                 }
                 if (registration.absenceStatus != QueueAbsenceStatus.NONE) {
+                    return QueueActionFailure(QueueActionFailureCode.WRONG_ABSENCE_STATE)
+                }
+                postponeFailure(queue, action.registrationKey, context)?.let { return it }
+                if (queue.fixedGroupKeys(action.registrationKey).any { key ->
+                        queue.allRegistrations.any { it.key == key && it.deferOneRoundUsed }
+                    }) {
+                    return QueueActionFailure(QueueActionFailureCode.DEFER_ONE_ROUND_ALREADY_USED)
+                }
+            }
+
+            is QueueAction.SkipOneTurn -> {
+                registrationFailure(queue, action.registrationKey)?.let { return it }
+                playingPositionFailure(queue, action.registrationKey)?.let { return it }
+                val registration = queue.allRegistrations.first { it.key == action.registrationKey }
+                if (registration.requiresOnSiteCheckIn) {
+                    return QueueActionFailure(QueueActionFailureCode.PENDING_CHECK_IN)
+                }
+                if (registration.absenceStatus != QueueAbsenceStatus.NONE) {
+                    return QueueActionFailure(QueueActionFailureCode.WRONG_ABSENCE_STATE)
+                }
+                postponeFailure(queue, action.registrationKey, context)?.let { return it }
+            }
+
+            is QueueAction.CancelSkipOneTurn -> {
+                registrationFailure(queue, action.registrationKey)?.let { return it }
+                if (queue.allRegistrations.first { it.key == action.registrationKey }.absenceStatus !=
+                    QueueAbsenceStatus.SKIP_ONE_TURN
+                ) {
                     return QueueActionFailure(QueueActionFailureCode.WRONG_ABSENCE_STATE)
                 }
             }
@@ -524,6 +699,7 @@ object QueueEngine {
                     return QueueActionFailure(QueueActionFailureCode.TEMPORARY_LEAVE_DISABLED)
                 }
                 registrationFailure(queue, action.registrationKey)?.let { return it }
+                playingPositionFailure(queue, action.registrationKey)?.let { return it }
                 val registration = queue.allRegistrations.first { it.key == action.registrationKey }
                 if (registration.requiresOnSiteCheckIn) {
                     return QueueActionFailure(QueueActionFailureCode.PENDING_CHECK_IN)
@@ -531,6 +707,7 @@ object QueueEngine {
                 if (registration.absenceStatus != QueueAbsenceStatus.NONE) {
                     return QueueActionFailure(QueueActionFailureCode.WRONG_ABSENCE_STATE)
                 }
+                postponeFailure(queue, action.registrationKey, context)?.let { return it }
             }
 
             is QueueAction.CancelTemporaryLeave -> {
@@ -583,10 +760,8 @@ object QueueEngine {
                 if (action.sourceMachineId == action.destinationMachineId) {
                     return QueueActionFailure(QueueActionFailureCode.INVALID_POSITION)
                 }
-                if (
-                    !policy.isOperational(action.sourceMachineId) ||
-                    !policy.isOperational(action.destinationMachineId)
-                ) {
+                // A registration may leave a machine that has stopped, but not join one.
+                if (!policy.isOperational(action.destinationMachineId)) {
                     return QueueActionFailure(QueueActionFailureCode.MACHINE_STOPPED)
                 }
                 if (action.registrationKeys.isEmpty() || action.registrationKeys.any { key ->
@@ -615,6 +790,30 @@ object QueueEngine {
                     }
                 ) {
                     return QueueActionFailure(QueueActionFailureCode.SINGLE_PLAYER_MACHINE_ONLY)
+                }
+            }
+
+            is QueueAction.SetPairedMachineQueueing -> {
+                registrationFailure(queue, action.registrationKey)?.let { return it }
+                if (action.enabled) {
+                    if (PairedMachineQueues.activePartner(state, policy, action.machineId) == null) {
+                        return QueueActionFailure(
+                            QueueActionFailureCode.PAIRED_MACHINE_QUEUE_UNAVAILABLE
+                        )
+                    }
+                    val registration = queue.allRegistrations.first {
+                        it.key == action.registrationKey
+                    }
+                    if (registration.fixedPartnerKey != null) {
+                        return QueueActionFailure(QueueActionFailureCode.INVALID_FIXED_PAIR)
+                    }
+                    // A temporary registration has no profile and no way to be told that it
+                    // is about to be arranged to the other machine.
+                    if (registration.isTemporary) {
+                        return QueueActionFailure(
+                            QueueActionFailureCode.PAIRED_MACHINE_QUEUE_NEEDS_PLAYER_PROFILE
+                        )
+                    }
                 }
             }
 
@@ -665,6 +864,8 @@ object QueueEngine {
                 }
             }
 
+            is QueueAction.LeaveQueue -> registrationFailure(queue, action.registrationKey)?.let { return it }
+
             is QueueAction.MarkNoShow -> {
                 if (
                     action.resolution in setOf(
@@ -680,6 +881,34 @@ object QueueEngine {
                     action.registrationKeys.any { !queue.canMarkNoShow(it) }
                 ) {
                     return QueueActionFailure(QueueActionFailureCode.INVALID_POSITION)
+                }
+                if (action.resolution != NoShowResolution.REMOVE) {
+                    // A registration the system arranged here goes back to its own machine and
+                    // is not settled by the chosen resolution at all.
+                    val settledKeys = action.registrationKeys - PairedMachineQueues.returnAbsentArrivals(
+                        state = state,
+                        policy = policy,
+                        machineId = action.machineId,
+                        registrationKeys = action.registrationKeys
+                    ).returnedKeys
+                    // Deferring one of a fixed pair defers both.
+                    val concernedKeys = if (action.resolution == NoShowResolution.MOVE_TO_TAIL) {
+                        settledKeys
+                    } else {
+                        settledKeys.flatMapTo(mutableSetOf(), queue::fixedGroupKeys)
+                    }
+                    if (queue.allRegistrations.any {
+                            it.key in concernedKeys && it.mustBeRemovedWhenAbsent
+                        }) {
+                        return QueueActionFailure(QueueActionFailureCode.NO_SHOW_REMOVAL_ONLY)
+                    }
+                    // Settling a no-show by deferring is 暂缓一次 too: not twice before playing.
+                    if (
+                        action.resolution != NoShowResolution.MOVE_TO_TAIL &&
+                        queue.allRegistrations.any { it.key in concernedKeys && it.deferOneRoundUsed }
+                    ) {
+                        return QueueActionFailure(QueueActionFailureCode.DEFER_ONE_ROUND_ALREADY_USED)
+                    }
                 }
             }
 
@@ -817,11 +1046,29 @@ object QueueEngine {
                 if (queue != action.expectedCurrentQueue) {
                     return QueueActionFailure(QueueActionFailureCode.STALE_STATE)
                 }
+                if (action.machineId in action.alsoRestoredQueues) {
+                    return QueueActionFailure(QueueActionFailureCode.INVALID_POSITION)
+                }
+                action.alsoRestoredQueues.forEach { (machineId, restored) ->
+                    val current = state.queue(machineId)
+                        ?: return QueueActionFailure(QueueActionFailureCode.MACHINE_NOT_FOUND)
+                    if (current != restored.expectedCurrentQueue) {
+                        return QueueActionFailure(QueueActionFailureCode.STALE_STATE)
+                    }
+                }
                 val restoredRegistrations = action.restoredQueue
                     .removeAll(action.excludedRegistrationKeys)
-                    .allRegistrations
+                    .allRegistrations +
+                    action.alsoRestoredQueues.values.flatMap { it.restoredQueue.allRegistrations }
+                if (restoredRegistrations.map(Registration::key).distinct().size !=
+                    restoredRegistrations.size
+                ) {
+                    return QueueActionFailure(QueueActionFailureCode.DUPLICATE_REGISTRATION)
+                }
                 val otherRegistrations = state.queues.asSequence()
-                    .filter { (machineId, _) -> machineId != action.machineId }
+                    .filter { (machineId, _) ->
+                        machineId != action.machineId && machineId !in action.alsoRestoredQueues
+                    }
                     .flatMap { (_, otherQueue) -> otherQueue.allRegistrations.asSequence() }
                     .toList()
                 if (restoredRegistrations.any { restored ->
@@ -854,6 +1101,43 @@ object QueueEngine {
         null
     }
 
+    /**
+     * Deferring and leaving temporarily are for registrations that wait. One that is in the
+     * playing position has to be taken back to the front of the waiting order first; otherwise
+     * a player could step out late in a round and be first in line for the next one.
+     */
+    private fun playingPositionFailure(
+        queue: MachineQueue,
+        registrationKey: Int
+    ): QueueActionFailure? = if (
+        queue.fixedGroupKeys(registrationKey).any { key -> queue.playing.any { it.key == key } }
+    ) {
+        QueueActionFailure(QueueActionFailureCode.PLAYING_POSITION_NOT_ALLOWED)
+    } else {
+        null
+    }
+
+    /**
+     * A checked-in online registration that has not played yet can only be removed when it is
+     * absent (see [Registration.mustBeRemovedWhenAbsent]); postponing it in any way would sidestep
+     * that, so only the management app may (maintainer, 2026-11-25).
+     */
+    private fun postponeFailure(
+        queue: MachineQueue,
+        registrationKey: Int,
+        context: QueueActionContext
+    ): QueueActionFailure? =
+        if (
+            context.origin != QueueActionOrigin.MANAGEMENT_APP &&
+            queue.fixedGroupKeys(registrationKey).any { key ->
+                queue.allRegistrations.any { it.key == key && it.mustBeRemovedWhenAbsent }
+            }
+        ) {
+            QueueActionFailure(QueueActionFailureCode.ONLINE_REGISTRATION_NOT_PLAYED)
+        } else {
+            null
+        }
+
     private val QueueAction.isPlayerAction: Boolean
         get() = this !is QueueAction.RestartPlayingTimer &&
             this !is QueueAction.RestartPendingCheckInTimers &&
@@ -862,6 +1146,15 @@ object QueueEngine {
             this !is QueueAction.SyncPlayerProfileDetails &&
             this !is QueueAction.ClearRegistrations &&
             this !is QueueAction.RestoreSnapshot
+
+    /**
+     * A stopped machine keeps its registrations, and nobody is to be held at a machine that
+     * cannot be played on: leaving the queue and moving to another machine stay possible.
+     */
+    private val QueueAction.remainsPossibleOnStoppedMachine: Boolean
+        get() = this is QueueAction.RemoveRegistrations ||
+            this is QueueAction.LeaveQueue ||
+            this is QueueAction.TransferRegistrations
 
     private fun invariantViolationKind(violation: String): String {
         val withoutMachinePrefix = if (violation.startsWith("机台 ")) {
@@ -892,18 +1185,47 @@ object QueueEngine {
         var friendPairPlan: FriendPairPlan? = null
         var availabilityConfirmation = false
         var confirmation = false
+        var stagedRound: PairedMachineQueues.StagedRound? = null
+        // The state the outcome is written into; an action may first change another machine.
+        var workingState = state
+
+        // Whenever a waiting group may enter the playing position, the places held here by
+        // registrations of the paired machine take part in the choice.
+        fun forRound(
+            base: MachineQueue,
+            frontReturnedKeys: Set<Int> = emptySet()
+        ): MachineQueue {
+            val staged = PairedMachineQueues.stageRound(
+                state = workingState,
+                policy = context.policy,
+                machineId = action.machineId,
+                baseQueue = base,
+                frontReturnedKeys = frontReturnedKeys,
+                atMillis = context.atMillis
+            )
+            stagedRound = staged
+            return staged?.queue ?: base
+        }
 
         val updatedQueue = when (action) {
             is QueueAction.AddRegistrations -> when (action.placement) {
-                RegistrationPlacement.AUTO_ADVANCE ->
-                    queue.joinAll(action.registrations, context.atMillis)
+                RegistrationPlacement.AUTO_ADVANCE -> {
+                    val joined = action.registrations.fold(queue) { current, registration ->
+                        current.stageWaiting(registration)
+                    }
+                    if (joined == queue) {
+                        queue
+                    } else {
+                        RoundPlanner.advance(forRound(joined), emptySet()).execute(context.atMillis)
+                    }
+                }
                 RegistrationPlacement.WAITING_TAIL -> queue.receiveAtWaitingTail(action.registrations)
                 RegistrationPlacement.STAGED_WAITING -> action.registrations.fold(queue) { current, registration ->
                     current.stageWaiting(registration)
                 }
                 RegistrationPlacement.ADVANCE_IF_UNAMBIGUOUS -> {
                     val staged = queue.receiveAtWaitingTail(action.registrations)
-                    val plan = RoundPlanner.enterPlayingPosition(staged)
+                    val plan = RoundPlanner.enterPlayingPosition(forRound(staged))
                     roundPreview = plan.preview
                     availabilityConfirmation = staged.playing.isEmpty() &&
                         plan.preview?.changedByAvailability == true
@@ -915,7 +1237,7 @@ object QueueEngine {
                 }
             }
 
-            is QueueAction.FinishRound -> RoundPlanner.finishRound(queue).let { plan ->
+            is QueueAction.FinishRound -> RoundPlanner.finishRound(forRound(queue)).let { plan ->
                 roundPreview = plan.preview
                 confirmation = true
                 plan.execute(context.atMillis)
@@ -926,12 +1248,12 @@ object QueueEngine {
                 plan.execute(context.atMillis)
             }
             is QueueAction.RemoveCurrentRoundAndStartNext ->
-                RoundPlanner.removeCurrentRoundAndStartNext(queue).let { plan ->
+                RoundPlanner.removeCurrentRoundAndStartNext(forRound(queue)).let { plan ->
                     roundPreview = plan.preview
                     confirmation = true
                     plan.execute(context.atMillis)
                 }
-            is QueueAction.EnterPlayingPosition -> RoundPlanner.enterPlayingPosition(queue).let { plan ->
+            is QueueAction.EnterPlayingPosition -> RoundPlanner.enterPlayingPosition(forRound(queue)).let { plan ->
                 roundPreview = plan.preview
                 confirmation = plan.preview?.changedByAvailability == true
                 plan.execute(context.atMillis)
@@ -948,39 +1270,12 @@ object QueueEngine {
                 queue.moveFirstWaitingRegistrationIntoCurrentRound(action.registrationKey)
             is QueueAction.AdvanceToWaitingPosition ->
                 queue.advanceToWaitingPosition(action.registrationKeys, context.atMillis)
-            is QueueAction.DeferOneRound -> {
-                val staged = queue.deferOneRound(
-                    registrationKey = action.registrationKey,
-                    atMillis = context.atMillis,
-                    advanceWhenPlayingBecomesEmpty = false
-                )
-                if (queue.playing.isNotEmpty() && staged.playing.isEmpty()) {
-                    RoundPlanner.enterPlayingPosition(staged).let { plan ->
-                        roundPreview = plan.preview
-                        plan.execute(context.atMillis)
-                    }
-                } else {
-                    staged
-                }
-            }
+            is QueueAction.DeferOneRound -> queue.deferOneRound(action.registrationKey)
             is QueueAction.CancelDeferOneRound -> queue.cancelDeferOneRound(action.registrationKey)
-            is QueueAction.TemporarilyLeave -> {
-                val affectedKeys = queue.fixedGroupKeys(action.registrationKey)
-                val staged = queue.temporarilyLeave(
-                    registrationKey = action.registrationKey,
-                    atMillis = context.atMillis,
-                    advanceWhenPlayingBecomesEmpty = false
-                )
-                if (queue.playing.isNotEmpty() && staged.playing.isEmpty()) {
-                    RoundPlanner.advance(staged, affectedKeys).let { plan ->
-                        roundPreview = plan.preview
-                        plan.execute(context.atMillis)
-                    }
-                } else {
-                    staged
-                }
-            }
+            is QueueAction.TemporarilyLeave -> queue.temporarilyLeave(action.registrationKey)
             is QueueAction.CancelTemporaryLeave -> queue.cancelTemporaryLeave(action.registrationKey)
+            is QueueAction.SkipOneTurn -> queue.skipOneTurn(action.registrationKey)
+            is QueueAction.CancelSkipOneTurn -> queue.cancelSkipOneTurn(action.registrationKey)
             is QueueAction.ChangePreference ->
                 queue.changePreference(action.registrationKey, action.preference)
             is QueueAction.CreateFixedPair -> {
@@ -992,7 +1287,7 @@ object QueueEngine {
                 confirmation = plan?.movedBackRegistrations?.isNotEmpty() == true
                 val paired = plan?.let(queue::applyFriendPair) ?: queue
                 if (action.advanceWhenPlayingEmpty && paired.playing.isEmpty()) {
-                    val roundPlan = RoundPlanner.enterPlayingPosition(paired)
+                    val roundPlan = RoundPlanner.enterPlayingPosition(forRound(paired))
                     roundPreview = roundPlan.preview
                     availabilityConfirmation = roundPlan.preview?.changedByAvailability == true
                     if (availabilityConfirmation) paired else roundPlan.execute(context.atMillis)
@@ -1003,7 +1298,7 @@ object QueueEngine {
             is QueueAction.CreateFixedPairWithRegistration -> {
                 val paired = queue.createFriendPair(action.registrationKey, action.friend)
                 if (action.advanceWhenPlayingEmpty && paired.playing.isEmpty()) {
-                    val roundPlan = RoundPlanner.enterPlayingPosition(paired)
+                    val roundPlan = RoundPlanner.enterPlayingPosition(forRound(paired))
                     roundPreview = roundPlan.preview
                     availabilityConfirmation = roundPlan.preview?.changedByAvailability == true
                     if (availabilityConfirmation) paired else roundPlan.execute(context.atMillis)
@@ -1031,24 +1326,35 @@ object QueueEngine {
                 }
             )
             is QueueAction.MarkNoShow -> {
-                val staged = when (action.resolution) {
-                    NoShowResolution.DEFER_ONE_ROUND -> queue.markNoShowDeferOneRound(
-                        action.registrationKeys.singleOrNull() ?: return AppliedBehavior(state),
+                // A registration the system arranged here and that did not show up is not
+                // treated as a no-show of its own making: it goes back to where it came from.
+                val returned = PairedMachineQueues.returnAbsentArrivals(
+                    state = state,
+                    policy = context.policy,
+                    machineId = action.machineId,
+                    registrationKeys = action.registrationKeys
+                )
+                workingState = returned.state
+                val noShowQueue = returned.state.queue(action.machineId) ?: queue
+                val noShowKeys = action.registrationKeys - returned.returnedKeys
+                val staged = if (noShowKeys.isEmpty()) noShowQueue else when (action.resolution) {
+                    NoShowResolution.DEFER_ONE_ROUND -> noShowQueue.markNoShowDeferOneRound(
+                        noShowKeys.singleOrNull() ?: return AppliedBehavior(state),
                         startNextWhenPlayingBecomesEmpty = false,
                         atMillis = context.atMillis
                     )
-                    NoShowResolution.DEFER_GROUP_ONE_ROUND -> queue.markNoShowGroupDeferOneRound(
-                        action.registrationKeys,
+                    NoShowResolution.DEFER_GROUP_ONE_ROUND -> noShowQueue.markNoShowGroupDeferOneRound(
+                        noShowKeys,
                         startNextWhenPlayingBecomesEmpty = false,
                         atMillis = context.atMillis
                     )
-                    NoShowResolution.MOVE_TO_TAIL -> queue.markNoShowMoveToEnd(
-                        action.registrationKeys,
+                    NoShowResolution.MOVE_TO_TAIL -> noShowQueue.markNoShowMoveToEnd(
+                        noShowKeys,
                         startNextWhenPlayingBecomesEmpty = false,
                         atMillis = context.atMillis
                     )
-                    NoShowResolution.REMOVE -> queue.markNoShowAndRemove(
-                        action.registrationKeys,
+                    NoShowResolution.REMOVE -> noShowQueue.markNoShowAndRemove(
+                        noShowKeys,
                         startNextWhenPlayingBecomesEmpty = false,
                         atMillis = context.atMillis
                     )
@@ -1057,11 +1363,24 @@ object QueueEngine {
                     val skippedThisOpportunity = if (
                         action.resolution == NoShowResolution.MOVE_TO_TAIL
                     ) {
-                        action.registrationKeys
+                        noShowKeys
                     } else {
                         emptySet()
                     }
-                    RoundPlanner.advance(staged, skippedThisOpportunity).let { plan ->
+                    val returnedToFront = if (
+                        noShowKeys.isNotEmpty() && (
+                            action.resolution == NoShowResolution.DEFER_ONE_ROUND ||
+                                action.resolution == NoShowResolution.DEFER_GROUP_ONE_ROUND
+                            )
+                    ) {
+                        noShowQueue.playing.mapTo(mutableSetOf()) { it.key }
+                    } else {
+                        emptySet()
+                    }
+                    RoundPlanner.advance(
+                        forRound(staged, returnedToFront),
+                        skippedThisOpportunity
+                    ).let { plan ->
                         roundPreview = plan.preview
                         plan.execute(context.atMillis)
                     }
@@ -1070,7 +1389,10 @@ object QueueEngine {
                 }
             }
             is QueueAction.CheckIn -> queue.checkIn(action.registrationKey)
+            is QueueAction.SetPairedMachineQueueing ->
+                queue.setPairedMachineQueueing(action.registrationKey, action.enabled)
             is QueueAction.RemoveRegistrations -> queue.removeAll(action.registrationKeys)
+            is QueueAction.LeaveQueue -> queue.removeAll(setOf(action.registrationKey))
             is QueueAction.RemoveExpiredOnlineRegistrations ->
                 queue.removeExpiredOnlineRegistrations(context.atMillis)
             is QueueAction.MoveWaitingPosition ->
@@ -1082,18 +1404,217 @@ object QueueEngine {
                 context.policy
             )
             is QueueAction.ClearRegistrations -> error("handled before queue lookup")
-            is QueueAction.RestoreSnapshot -> normalizeQueueForCapacity(
-                action.restoredQueue.removeAll(action.excludedRegistrationKeys),
-                context.policy.machineCapacity(action.machineId)
-            )
+            is QueueAction.RestoreSnapshot -> {
+                val restoredQueues = buildMap {
+                    putAll(state.queues)
+                    put(
+                        action.machineId,
+                        normalizeQueueForCapacity(
+                            action.restoredQueue.removeAll(action.excludedRegistrationKeys),
+                            context.policy.machineCapacity(action.machineId)
+                        )
+                    )
+                    action.alsoRestoredQueues.forEach { (machineId, restored) ->
+                        put(
+                            machineId,
+                            normalizeQueueForCapacity(
+                                restored.restoredQueue,
+                                context.policy.machineCapacity(machineId)
+                            )
+                        )
+                    }
+                }
+                return AppliedBehavior(
+                    state.copy(
+                        queues = restoredQueues,
+                        pairedMachineOrders = action.restoredPairedMachineOrders
+                            ?.filterKeys { it in restoredQueues }
+                            ?: state.pairedMachineOrders,
+                        pairedArrangements = action.restoredPairedArrangements
+                            ?: state.pairedArrangements
+                    )
+                )
+            }
+        }
+        val round = stagedRound
+        val updatedState = if (
+            round != null && PairedMachineQueues.isStagedResult(round, updatedQueue)
+        ) {
+            PairedMachineQueues.settleRound(workingState, context.policy, round, updatedQueue)
+        } else {
+            workingState.replace(action.machineId, updatedQueue)
         }
         return AppliedBehavior(
-            state = state.replace(action.machineId, updatedQueue),
+            state = updatedState,
             roundPreview = roundPreview,
             friendPairPlan = friendPairPlan,
             requiresAvailabilityConfirmation = availabilityConfirmation,
             requiresConfirmation = confirmation
         )
+    }
+
+    /**
+     * Re-derives the places held across paired machines after settings changed outside a queue
+     * action, for example a pair was configured or removed, or a machine resumed operation.
+     */
+    fun settlePairedMachines(
+        state: QueueEngineState,
+        policy: QueueEnginePolicy,
+        atMillis: Long = System.currentTimeMillis()
+    ): QueueEngineState = PairedMachineQueues.fillIdleMachines(
+        PairedMachineQueues.normalize(state, policy),
+        policy,
+        atMillis
+    )
+
+    /**
+     * Brings the previews that announce an arrangement up to date with the clock: which
+     * registrations have one, since when, and whose player is to be told now. Call it after
+     * every change of the queues and regularly while time passes; it also lets a machine that
+     * stands empty take a registration whose announcement has run long enough. Without
+     * [QueueEnginePolicy.pairedArrangementRules] it changes nothing.
+     */
+    fun refreshPairedArrangements(
+        state: QueueEngineState,
+        policy: QueueEnginePolicy,
+        durations: Map<String, PairedMachineForecast.RoundDurations>,
+        nowMillis: Long
+    ): PairedArrangementRefresh =
+        PairedArrangementAnnouncements.refresh(state, policy, durations, nowMillis)
+
+    /**
+     * What the player of a waiting registration should be told about a coming arrangement;
+     * null while no preview announces one.
+     */
+    fun pairedArrangementOutlook(
+        state: QueueEngineState,
+        policy: QueueEnginePolicy,
+        registrationKey: Int
+    ): PairedArrangementOutlook? {
+        val rules = policy.pairedArrangementRules ?: return null
+        val record = state.pairedArrangements[registrationKey] ?: return null
+        val since = record.previewSinceMillis ?: return null
+        return PairedArrangementOutlook(
+            notBeforeMillis = (since + rules.leadMillis)
+                .takeIf { record.previewPausedAtMillis == null }
+        )
+    }
+
+    /**
+     * Of [registrationKeys] in the playing position of [machineId], those that the system
+     * arranged there and that go back to the machine they came from when they are marked as not
+     * having shown up, with that machine. The ordinary no-show rules apply to all others.
+     */
+    fun absentArrivalOrigins(
+        state: QueueEngineState,
+        policy: QueueEnginePolicy,
+        machineId: String,
+        registrationKeys: Set<Int>
+    ): Map<Int, String> {
+        val returned = PairedMachineQueues
+            .returnAbsentArrivals(state, policy, machineId, registrationKeys)
+            .returnedKeys
+        return buildMap {
+            returned.forEach { key ->
+                state.pairedArrangements[key]?.arrangedFromMachineId?.let { put(key, it) }
+            }
+        }
+    }
+
+    /**
+     * [records] as they stand after the terminal did not run from [stoppedAtMillis] until
+     * [nowMillis]. No preview could be kept up in that time, so it does not count towards the
+     * time an arrangement has to be announced for.
+     */
+    fun pairedArrangementsAfterDowntime(
+        records: Map<Int, PairedArrangementRecord>,
+        stoppedAtMillis: Long,
+        nowMillis: Long
+    ): Map<Int, PairedArrangementRecord> {
+        val downtime = nowMillis - stoppedAtMillis
+        if (downtime <= 0L) return records
+        return records.mapValues { (_, record) ->
+            record.copy(
+                previewSinceMillis = record.previewSinceMillis?.plus(downtime),
+                previewPausedAtMillis = record.previewPausedAtMillis?.plus(downtime)
+            )
+        }
+    }
+
+    private fun settlePairedMachines(
+        applied: QueueEngineState,
+        action: QueueAction,
+        source: QueueEngineState,
+        context: QueueActionContext
+    ): QueueEngineState {
+        if (
+            context.policy.machinePartners.isEmpty() &&
+            applied.pairedMachineOrders.isEmpty() &&
+            applied.allRegistrations.none(Registration::alsoQueuesAtPairedMachine)
+        ) {
+            // No pair is configured and nothing refers to one: behave exactly as before.
+            return applied
+        }
+        val sourceQueue = source.queue(action.machineId)
+        // Registrations an operator or a rule put back at the very front keep that place ahead
+        // of the places held by the other machine.
+        val frontReturnedKeys: Set<Int> = when (action) {
+            is QueueAction.ReturnPlayingToWaitingFront -> action.registrationKeys
+            is QueueAction.MarkNoShow -> if (
+                action.resolution == NoShowResolution.DEFER_ONE_ROUND ||
+                action.resolution == NoShowResolution.DEFER_GROUP_ONE_ROUND
+            ) {
+                sourceQueue?.playing?.mapTo(mutableSetOf()) { it.key } ?: emptySet()
+            } else {
+                emptySet()
+            }
+            else -> emptySet()
+        }
+        val normalized = PairedMachineQueues.normalize(
+            state = PairedMachineQueues.giveUpPlacesForThisRound(
+                state = applied,
+                machineId = action.machineId,
+                registrationKeys = keysMovedByHand(action, sourceQueue, applied.queue(action.machineId))
+            ),
+            policy = context.policy,
+            frontReturnedMachineId = action.machineId,
+            frontReturnedKeys = frontReturnedKeys
+        )
+        return PairedMachineQueues.fillIdleMachines(normalized, context.policy, context.atMillis)
+    }
+
+    /**
+     * The registration always counts first: whenever its place in the waiting order is changed
+     * by hand, the place it held at the paired machine is given up for this round instead of
+     * being carried along. Likewise a waiting registration for which the paired machine is
+     * turned on later does not get a place there before it has played. This names the
+     * registrations such an action concerns.
+     */
+    private fun keysMovedByHand(
+        action: QueueAction,
+        before: MachineQueue?,
+        after: MachineQueue?
+    ): Set<Int> {
+        if (before == null || after == null) return emptySet()
+        fun reordered(declared: Set<Int>): Set<Int> {
+            val formerOrder = before.waiting.map(Registration::key).filterNot { it in declared }
+            val newOrder = after.waiting.map(Registration::key).filterNot { it in declared }
+            return declared + PairedMachineQueues.reorderedKeys(formerOrder, newOrder)
+        }
+        return when (action) {
+            is QueueAction.ReturnPlayingToWaitingFront -> action.registrationKeys
+            is QueueAction.MoveWaitingPosition -> reordered(
+                before.waitingPositions().getOrNull(action.sourceIndex).orEmpty()
+                    .mapTo(mutableSetOf(), Registration::key)
+            )
+            is QueueAction.ReplaceOrder -> reordered(action.movedRegistrationKeys.orEmpty())
+            // Turned on for a registration that is already waiting: it only counts from the
+            // round after the one it is waiting for. A new registration that is created with
+            // it on, and one that is playing right now, start at once.
+            is QueueAction.SetPairedMachineQueueing ->
+                if (action.enabled) setOf(action.registrationKey) else emptySet()
+            else -> emptySet()
+        }
     }
 
     private fun applyTransfer(
@@ -1116,8 +1637,23 @@ object QueueEngine {
                 }
             }
         if (registrations.size != action.registrationKeys.size) return AppliedBehavior(state)
+        // Moved by hand to the other machine of its pair, a registration keeps being arranged
+        // between the two: it joins the tail there and is treated like a registration that has
+        // just started to wait. Moved anywhere else, that choice ends.
+        val withinPair = PairedMachineQueues.activePartner(state, policy, action.sourceMachineId) ==
+            action.destinationMachineId
+        val movedRegistrations = registrations.map { registration ->
+            when {
+                !registration.alsoQueuesAtPairedMachine -> registration
+                withinPair -> registration.copy(skipsPairedMachineThisRound = false)
+                else -> registration.copy(
+                    alsoQueuesAtPairedMachine = false,
+                    skipsPairedMachineThisRound = false
+                )
+            }
+        }
         val updatedSource = source.removeAll(action.registrationKeys)
-        val updatedDestination = destination.receiveAtWaitingTail(registrations)
+        val updatedDestination = destination.receiveAtWaitingTail(movedRegistrations)
         if (
             updatedSource == source ||
             updatedDestination.registrationCount != destination.registrationCount + registrations.size
@@ -1128,7 +1664,21 @@ object QueueEngine {
             state.copy(
                 queues = state.queues +
                     (action.sourceMachineId to updatedSource) +
-                    (action.destinationMachineId to updatedDestination)
+                    (action.destinationMachineId to updatedDestination),
+                // Whatever position the moved registrations had in the order of the machine
+                // they left is forgotten: a place they hold there from now on is a new one and
+                // goes to the tail.
+                pairedMachineOrders = state.pairedMachineOrders.mapValues { (machineId, order) ->
+                    if (machineId == action.sourceMachineId) {
+                        order.filterNot { it in action.registrationKeys }
+                    } else {
+                        order
+                    }
+                },
+                // A preview announced a move away from the machine the registrations have now
+                // left. A move back there has not been announced by anything, so what was
+                // remembered about them is forgotten and an announcement starts afresh.
+                pairedArrangements = state.pairedArrangements - action.registrationKeys
             ),
             requiresConfirmation = true
         )

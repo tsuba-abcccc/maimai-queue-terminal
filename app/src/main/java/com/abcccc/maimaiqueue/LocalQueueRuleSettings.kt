@@ -85,7 +85,14 @@ data class QueueRuleSettings(
      * revision so harmless changes such as a remark do not invalidate queue
      * commands that only depend on capacity and machine identity.
      */
-    val managementSettingsRevision: Long = 0L
+    val managementSettingsRevision: Long = 0L,
+    /** Whether registrations may queue at both machines of a configured pair. */
+    val pairedMachineQueueEnabled: Boolean = false,
+    /**
+     * Pairs of machines whose registrations may queue at both, by stable machine identity so a
+     * pair follows its machines through renumbering. A machine belongs to at most one pair.
+     */
+    val pairedMachineStableIds: List<Pair<String, String>> = emptyList()
 ) {
     val allowsAnyAbsenceAction: Boolean
         get() = allowDeferOneRound || allowTemporaryLeave
@@ -135,6 +142,48 @@ data class QueueRuleSettings(
 
     fun machinesInGroup(groupId: String): List<MachineId> =
         configuredMachineIds.filter { machineGroupId(it) == groupId }
+
+    /** The configured pairs resolved to machines, whether or not the feature is switched on. */
+    val configuredMachinePairs: List<Pair<MachineId, MachineId>>
+        get() {
+            val machineByStableId = configuredMachineIds.associateBy(::machineStableId)
+            val used = mutableSetOf<MachineId>()
+            return pairedMachineStableIds.mapNotNull { (firstId, secondId) ->
+                val first = machineByStableId[firstId] ?: return@mapNotNull null
+                val second = machineByStableId[secondId] ?: return@mapNotNull null
+                if (first == second || first in used || second in used) return@mapNotNull null
+                // Moving between machines of different capacity would rewrite play preferences.
+                if (machineConfiguration(first).capacity != machineConfiguration(second).capacity) {
+                    return@mapNotNull null
+                }
+                used += first
+                used += second
+                if (first.ordinal <= second.ordinal) first to second else second to first
+            }
+        }
+
+    /** Pairs in effect: empty while the feature is switched off. */
+    val activeMachinePairs: List<Pair<MachineId, MachineId>>
+        get() = if (pairedMachineQueueEnabled) configuredMachinePairs else emptyList()
+
+    /** The other machine of [machineId]'s active pair, if it has one. */
+    fun pairedMachine(machineId: MachineId): MachineId? =
+        activeMachinePairs.firstNotNullOfOrNull { (first, second) ->
+            when (machineId) {
+                first -> second
+                second -> first
+                else -> null
+            }
+        }
+
+    /** Active pairs in both directions, keyed by machine name, as the queue engine expects. */
+    val machinePartnerNames: Map<String, String>
+        get() = buildMap {
+            activeMachinePairs.forEach { (first, second) ->
+                put(first.name, second.name)
+                put(second.name, first.name)
+            }
+        }
 }
 
 internal fun QueueRuleSettings.managementControlledContent(): QueueRuleSettings =
@@ -304,7 +353,14 @@ class LocalQueueRuleSettingsRepository(
             managementSettingsRevision = preferences.getLong(
                 KEY_MANAGEMENT_SETTINGS_REVISION,
                 0L
-            ).coerceAtLeast(0L)
+            ).coerceAtLeast(0L),
+            pairedMachineQueueEnabled = preferences.getBoolean(
+                KEY_PAIRED_MACHINE_QUEUE_ENABLED,
+                false
+            ),
+            pairedMachineStableIds = decodePairedMachineStableIds(
+                preferences.getString(KEY_PAIRED_MACHINES, null)
+            )
         )
         return normalizeMachineLayoutSettings(settings)
     }
@@ -316,6 +372,14 @@ class LocalQueueRuleSettingsRepository(
             .putBoolean(KEY_ALLOW_TEMPORARY_LEAVE, normalizedSettings.allowTemporaryLeave)
             .putBoolean(KEY_ALLOW_ONLINE_REGISTRATION, normalizedSettings.allowOnlineRegistration)
             .putBoolean(KEY_SHOW_COMMON_PLAY_PREVIEW, normalizedSettings.showCommonPlayPreview)
+            .putBoolean(
+                KEY_PAIRED_MACHINE_QUEUE_ENABLED,
+                normalizedSettings.pairedMachineQueueEnabled
+            )
+            .putString(
+                KEY_PAIRED_MACHINES,
+                encodePairedMachineStableIds(normalizedSettings.pairedMachineStableIds)
+            )
             .putBoolean(KEY_WEBSITE_SYNC_ENABLED, normalizedSettings.websiteSyncEnabled)
             .putBoolean(KEY_ONEBOT_SYNC_ENABLED, normalizedSettings.oneBotSyncEnabled)
             .putString(KEY_SYNC_MODE, normalizedSettings.syncMode.name)
@@ -557,6 +621,8 @@ class LocalQueueRuleSettingsRepository(
         const val KEY_ALLOW_TEMPORARY_LEAVE = "allow_temporary_leave"
         const val KEY_ALLOW_ONLINE_REGISTRATION = "allow_online_registration"
         const val KEY_SHOW_COMMON_PLAY_PREVIEW = "show_common_play_preview"
+        const val KEY_PAIRED_MACHINE_QUEUE_ENABLED = "paired_machine_queue_enabled"
+        const val KEY_PAIRED_MACHINES = "paired_machines"
         const val KEY_WEBSITE_SYNC_ENABLED = "website_sync_enabled"
         const val KEY_ONEBOT_SYNC_ENABLED = "onebot_sync_enabled"
         const val KEY_SYNC_MODE = "sync_mode"
@@ -648,6 +714,19 @@ internal fun normalizeMachineGroupName(value: String?, fallbackIndex: Int): Stri
     return limitMachineGroupNameLength(normalized).ifBlank { "分组 ${fallbackIndex + 1}" }
 }
 
+/** Stored as `first:second` items separated by commas; stable ids contain neither character. */
+internal fun encodePairedMachineStableIds(pairs: List<Pair<String, String>>): String =
+    pairs.joinToString(",") { (first, second) -> "$first:$second" }
+
+internal fun decodePairedMachineStableIds(value: String?): List<Pair<String, String>> =
+    value.orEmpty().split(',').mapNotNull { item ->
+        val parts = item.split(':')
+        if (parts.size != 2) return@mapNotNull null
+        val first = parts[0].trim()
+        val second = parts[1].trim()
+        if (first.isEmpty() || second.isEmpty() || first == second) null else first to second
+    }
+
 internal fun encodeMachineGroups(groups: List<MachineGroupConfiguration>): String =
     JSONArray().apply {
         groups.forEach { group ->
@@ -655,7 +734,14 @@ internal fun encodeMachineGroups(groups: List<MachineGroupConfiguration>): Strin
         }
     }.toString()
 
-internal fun normalizeMachineLayoutSettings(settings: QueueRuleSettings): QueueRuleSettings {
+/**
+ * [keepEmptyGroups]: the group table in the settings keeps a group without machines until the
+ * settings are saved, so that a new group can be filled; saving drops it (maintainer, 2026-11-25).
+ */
+internal fun normalizeMachineLayoutSettings(
+    settings: QueueRuleSettings,
+    keepEmptyGroups: Boolean = false
+): QueueRuleSettings {
     val machineCount = settings.configuredMachineCount.coerceIn(1, MachineId.entries.size)
     val configuredIds = configuredMachineIds(machineCount)
     val normalizedStableIds = linkedMapOf<MachineId, String>()
@@ -698,8 +784,10 @@ internal fun normalizeMachineLayoutSettings(settings: QueueRuleSettings): QueueR
         ).takeIf(validGroupIds::contains) ?: requestedDefaultGroupId
     }
     val usedGroupIds = configuredIds.mapTo(linkedSetOf()) { normalizedAssignments.getValue(it) }
-    val retainedGroups = normalizedGroups.filter { it.id in usedGroupIds }.ifEmpty {
-        DEFAULT_MACHINE_GROUPS
+    val retainedGroups = if (keepEmptyGroups) {
+        normalizedGroups
+    } else {
+        normalizedGroups.filter { it.id in usedGroupIds }.ifEmpty { DEFAULT_MACHINE_GROUPS }
     }
     val retainedGroupIds = retainedGroups.mapTo(mutableSetOf()) { it.id }
     val fallbackGroupId = retainedGroups.first().id
@@ -710,10 +798,20 @@ internal fun normalizeMachineLayoutSettings(settings: QueueRuleSettings): QueueR
     val defaultGroupId = requestedDefaultGroupId.takeIf(retainedGroupIds::contains)
         ?: fallbackGroupId
 
+    val layoutNormalized = settings.copy(
+        configuredMachineCount = machineCount,
+        machineConfigurations = MachineId.entries.associateWith(settings::machineConfiguration),
+        machineStableIds = normalizedStableIds
+    )
+    val normalizedPairs = layoutNormalized.configuredMachinePairs.map { (first, second) ->
+        normalizedStableIds.getValue(first) to normalizedStableIds.getValue(second)
+    }
+
     return settings.copy(
         configuredMachineCount = machineCount,
         machineConfigurations = MachineId.entries.associateWith(settings::machineConfiguration),
         machineStableIds = normalizedStableIds,
+        pairedMachineStableIds = normalizedPairs,
         machineGroupAssignments = finalAssignments,
         machineGroups = retainedGroups,
         defaultMachineGroupId = defaultGroupId,
@@ -823,7 +921,7 @@ internal fun renameMachineGroup(
     groupId: String,
     requestedName: String
 ): QueueRuleSettings {
-    val normalized = normalizeMachineLayoutSettings(settings)
+    val normalized = normalizeMachineLayoutSettings(settings, keepEmptyGroups = true)
     val index = normalized.machineGroups.indexOfFirst { it.id == groupId }
     if (index < 0) return normalized
     val updatedGroups = normalized.machineGroups.toMutableList().apply {
@@ -1006,4 +1104,71 @@ internal fun limitMachineRemarkLength(value: String): String {
 internal fun normalizeMachineRemark(value: String?, fallback: String): String {
     val normalized = value?.trim().orEmpty()
     return if (normalized.isBlank()) fallback else limitMachineRemarkLength(normalized)
+}
+
+// The 首页分组 table in the settings (docs/releases/ui-redesign-2026-11.md, 第十三节): groups are
+// made and filled separately, and a group may stay empty until the settings are saved.
+
+/** The smallest “分组 N” not in use, so that a new group never repeats a name. */
+internal fun nextMachineGroupName(groups: List<MachineGroupConfiguration>): String {
+    val used = groups.mapTo(mutableSetOf()) { it.name.trim() }
+    var number = 1
+    while ("分组 $number" in used) number++
+    return "分组 $number"
+}
+
+/** Adds an empty group and moves no machine; null when there are as many groups as machines. */
+internal fun addEmptyMachineGroup(settings: QueueRuleSettings): QueueRuleSettings? {
+    val normalized = normalizeMachineLayoutSettings(settings, keepEmptyGroups = true)
+    if (normalized.machineGroups.size >= normalized.configuredMachineCount) return null
+    return normalized.copy(
+        machineGroups = normalized.machineGroups + MachineGroupConfiguration(
+            id = newMachineInternalId(),
+            name = nextMachineGroupName(normalized.machineGroups)
+        )
+    )
+}
+
+/** Puts [machineId] into [groupId]; a group left without machines stays until saving. */
+internal fun assignMachineToGroup(
+    settings: QueueRuleSettings,
+    machineId: MachineId,
+    groupId: String
+): QueueRuleSettings {
+    val normalized = normalizeMachineLayoutSettings(settings, keepEmptyGroups = true)
+    if (machineId !in normalized.configuredMachineIds ||
+        normalized.machineGroups.none { it.id == groupId }
+    ) {
+        return normalized
+    }
+    return normalizeMachineLayoutSettings(
+        normalized.copy(
+            machineGroupAssignments = normalized.machineGroupAssignments + (machineId to groupId)
+        ),
+        keepEmptyGroups = true
+    )
+}
+
+/** Removes a group that has no machines; a group with machines is kept. */
+internal fun deleteEmptyMachineGroup(settings: QueueRuleSettings, groupId: String): QueueRuleSettings {
+    val normalized = normalizeMachineLayoutSettings(settings, keepEmptyGroups = true)
+    if (normalized.machineGroups.size <= 1 || normalized.machinesInGroup(groupId).isNotEmpty()) {
+        return normalized
+    }
+    val remaining = normalized.machineGroups.filterNot { it.id == groupId }
+    return normalizeMachineLayoutSettings(
+        normalized.copy(
+            machineGroups = remaining,
+            defaultMachineGroupId = normalized.defaultMachineGroupId
+                .takeIf { it != groupId } ?: remaining.first().id
+        ),
+        keepEmptyGroups = true
+    )
+}
+
+/** The group this terminal shows first; a group without machines cannot be it. */
+internal fun setDefaultMachineGroup(settings: QueueRuleSettings, groupId: String): QueueRuleSettings {
+    val normalized = normalizeMachineLayoutSettings(settings, keepEmptyGroups = true)
+    if (normalized.machinesInGroup(groupId).isEmpty()) return normalized
+    return normalized.copy(defaultMachineGroupId = groupId)
 }

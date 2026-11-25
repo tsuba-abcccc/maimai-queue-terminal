@@ -25,12 +25,6 @@ fun MachineQueue.invariantViolations(): List<String> = buildList {
         if (registration.temporaryAwaySkippedTurns !in 0..3) {
             add("暂时离开轮空次数必须在 0 到 3 次之间")
         }
-        if (
-            registration.absenceStatus != QueueAbsenceStatus.TEMPORARILY_AWAY &&
-            registration.temporaryAwaySkippedTurns != 0
-        ) {
-            add("非暂时离开登记不能保留轮空次数")
-        }
         if (registration.lastNoShowActionWasDefer && registration.noShowCount <= 0) {
             add("没有未到场记录时不能保留未到场处理方式")
         }
@@ -41,7 +35,7 @@ fun MachineQueue.invariantViolations(): List<String> = buildList {
             registration.requiresOnSiteCheckIn &&
             registration.absenceStatus != QueueAbsenceStatus.NONE
         ) {
-            add("待签到线上登记不能同时暂缓一次或暂时离开")
+            add("待签到线上登记不能同时暂缓一次、轮空一次或暂时离开")
         }
 
         val partnerKey = registration.fixedPartnerKey ?: return@forEach

@@ -42,7 +42,7 @@ class MainActivity : ComponentActivity() {
                 if (BuildConfig.MANAGEMENT_APP) {
                     ManagementApp()
                 } else {
-                    RegistrationApp()
+                    TerminalProportionalScale { RegistrationApp() }
                 }
             }
         }

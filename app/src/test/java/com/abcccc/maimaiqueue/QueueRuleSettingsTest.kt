@@ -7,6 +7,89 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class QueueRuleSettingsTest {
+    private fun fourMachines(): QueueRuleSettings = normalizeMachineLayoutSettings(
+        QueueRuleSettings(configuredMachineCount = 4)
+    )
+
+    @Test
+    fun machinePairsFollowTheirMachinesAndAreOnlyActiveWhileSwitchedOn() {
+        val base = fourMachines()
+        val paired = normalizeMachineLayoutSettings(
+            base.copy(
+                pairedMachineQueueEnabled = true,
+                pairedMachineStableIds = listOf(
+                    base.machineStableId(MachineId.B) to base.machineStableId(MachineId.A),
+                    base.machineStableId(MachineId.C) to base.machineStableId(MachineId.D)
+                )
+            )
+        )
+        assertEquals(
+            listOf(MachineId.A to MachineId.B, MachineId.C to MachineId.D),
+            paired.activeMachinePairs
+        )
+        assertEquals(MachineId.A, paired.pairedMachine(MachineId.B))
+        assertEquals(
+            mapOf("A" to "B", "B" to "A", "C" to "D", "D" to "C"),
+            paired.machinePartnerNames
+        )
+
+        val switchedOff = paired.copy(pairedMachineQueueEnabled = false)
+        assertTrue(switchedOff.activeMachinePairs.isEmpty())
+        assertEquals(2, switchedOff.configuredMachinePairs.size)
+        assertNull(switchedOff.pairedMachine(MachineId.A))
+    }
+
+    @Test
+    fun unusableMachinePairsAreDropped() {
+        val base = fourMachines()
+        val idA = base.machineStableId(MachineId.A)
+        val idB = base.machineStableId(MachineId.B)
+        val idC = base.machineStableId(MachineId.C)
+
+        // A machine belongs to at most one pair; a machine cannot pair with itself or with a
+        // machine that does not exist.
+        val overlapping = normalizeMachineLayoutSettings(
+            base.copy(
+                pairedMachineQueueEnabled = true,
+                pairedMachineStableIds = listOf(idA to idB, idB to idC, idC to idC, idC to "missing")
+            )
+        )
+        assertEquals(listOf(MachineId.A to MachineId.B), overlapping.activeMachinePairs)
+
+        // Different play capacity: moving between them would rewrite the play preference.
+        val mismatched = normalizeMachineLayoutSettings(
+            base.copy(
+                pairedMachineQueueEnabled = true,
+                pairedMachineStableIds = listOf(idA to idB),
+                machineConfigurations = base.machineConfigurations + (
+                    MachineId.B to base.machineConfiguration(MachineId.B).copy(capacity = 1)
+                )
+            )
+        )
+        assertTrue(mismatched.pairedMachineStableIds.isEmpty())
+        assertTrue(mismatched.activeMachinePairs.isEmpty())
+
+        // The paired machine is removed.
+        val shrunk = normalizeMachineLayoutSettings(
+            base.copy(
+                pairedMachineQueueEnabled = true,
+                pairedMachineStableIds = listOf(idC to base.machineStableId(MachineId.D)),
+                configuredMachineCount = 3
+            )
+        )
+        assertTrue(shrunk.pairedMachineStableIds.isEmpty())
+        assertTrue(shrunk.activeMachinePairs.isEmpty())
+    }
+
+    @Test
+    fun machinePairsAreStoredAsText() {
+        val pairs = listOf("aa" to "bb", "cc" to "dd")
+        assertEquals("aa:bb,cc:dd", encodePairedMachineStableIds(pairs))
+        assertEquals(pairs, decodePairedMachineStableIds("aa:bb,cc:dd"))
+        assertEquals(emptyList<Pair<String, String>>(), decodePairedMachineStableIds(null))
+        assertEquals(listOf("aa" to "bb"), decodePairedMachineStableIds("aa:bb,broken,cc:cc,:dd"))
+    }
+
     @Test
     fun emptyUnconfiguredConnectionIsNotTreatedAsAnInvalidDraftChange() {
         assertFalse(
@@ -94,6 +177,13 @@ class QueueRuleSettingsTest {
                 ))
         )
 
+        // Which machines let registrations queue at both is a venue setting like the others.
+        val pairedQueueSwitchChange = original.copy(pairedMachineQueueEnabled = true)
+        val pairedQueuePairsChange = original.copy(
+            pairedMachineStableIds = listOf(
+                original.machineStableId(MachineId.A) to original.machineStableId(MachineId.B)
+            )
+        )
         listOf(
             policyChange,
             displayChange,
@@ -101,7 +191,9 @@ class QueueRuleSettingsTest {
             businessHoursChange,
             machineChange,
             machineGroupChange,
-            machineMetadataChange
+            machineMetadataChange,
+            pairedQueueSwitchChange,
+            pairedQueuePairsChange
         ).forEach { updated ->
             assertTrue(
                 original.managementControlledContent() !=
@@ -329,7 +421,7 @@ class QueueRuleSettingsTest {
         assertTrue(descriptions.contains("删除机台：原机台 B（墙侧）"))
         assertTrue(
             descriptions.contains(
-                "后续机台编号已重排：原机台 C 改为机台 B、原机台 D 改为机台 C"
+                "后续机台编号已重排：原机台 C 改为 机台 B、原机台 D 改为 机台 C"
             )
         )
         assertFalse(descriptions.any { "备注改为" in it || "游玩容量改为" in it })
@@ -346,7 +438,7 @@ class QueueRuleSettingsTest {
 
         val groupDescriptions = machineLayoutChangeDescriptions(original, updated)
 
-        assertTrue(groupDescriptions.contains("新增首页分组“二楼”"))
+        assertTrue(groupDescriptions.contains("创建首页分组“二楼”"))
         assertTrue(groupDescriptions.contains("机台 C 移至首页分组“二楼”"))
         assertTrue(groupDescriptions.contains("本终端默认分组改为“二楼”"))
 

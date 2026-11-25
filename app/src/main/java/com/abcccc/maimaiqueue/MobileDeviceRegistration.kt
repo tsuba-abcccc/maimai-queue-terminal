@@ -30,7 +30,9 @@ internal data class MobileDeviceRegistrationCommand(
     val expectedProfileRevision: Long?,
     val completion: MobileProfileCompletion?,
     val newProfile: MobileNewPlayerProfile?,
-    val machineConfigurationRevision: Long? = null
+    val machineConfigurationRevision: Long? = null,
+    /** The answer given on the phone; null when the page did not ask. */
+    val alsoQueuesAtPairedMachine: Boolean? = null
 ) : RemoteTerminalCommand {
     val createsProfile: Boolean
         get() = newProfile != null
@@ -82,7 +84,7 @@ internal fun decideMobileDeviceRegistration(
         )
     }
     if (command.queueId != state.queueId) {
-        return reject("排队批次已经变化，请在终端重新打开移动设备登记。")
+        return reject("现场已开始新的队列，请在终端重新打开移动设备登记。")
     }
     if (
         command.machineConfigurationRevision != null &&
@@ -100,10 +102,10 @@ internal fun decideMobileDeviceRegistration(
         return reject("与服务端同步已关闭，暂不能使用移动设备登记。")
     }
     if (!state.allowOnlineRegistration) {
-        return reject("现场规则暂不允许线上登记。")
+        return reject("系统规则不允许线上登记，暂不能使用移动设备登记。")
     }
     if (!state.acceptingNewRegistrations) {
-        return reject("现场当前没有使用登记排队。")
+        return reject("现场当前未使用登记排队。")
     }
     val queue = state.queues[command.machineId] ?: return reject("目标机台不存在。")
     if (state.machineStatuses[command.machineId]?.isOperational != true) {
@@ -147,7 +149,7 @@ internal fun decideMobileDeviceRegistration(
     } else {
         val profile = existingProfile ?: return reject("所选玩家资料已经不存在。")
         val expectedRevision = command.expectedProfileRevision
-            ?: return reject("所选玩家资料缺少版本信息，请重新扫码。")
+            ?: return reject("所选玩家资料的信息不完整，请重新扫码。")
         val completion = command.completion
         when {
             profile.revision == expectedRevision && completion != null -> {
@@ -231,11 +233,17 @@ internal fun decideMobileDeviceRegistration(
             atMillis = maxOf(
                 command.createdAtMillis,
                 profileBeforeUsage.updatedAtMillis + 1L
-            )
+            ),
+            // The phone page opens the explanation before it sends a ticked box.
+            pairedMachineQueueingIntroducedNow = command.alsoQueuesAtPairedMachine == true
         )
     } else {
         profileBeforeUsage
     }
+    val queuesAtPairedMachine = state.resolvePairedMachineQueueing(
+        machineId = command.machineId,
+        requested = command.alsoQueuesAtPairedMachine
+    ) ?: return reject("一对机台的设置已经变化，请重新确认。")
     val registration = Registration(
         key = state.nextRegistrationKey,
         displayId = usedProfile.nickname,
@@ -245,7 +253,8 @@ internal fun decideMobileDeviceRegistration(
         gender = usedProfile.gender,
         playerProfileId = usedProfile.id,
         requiresOnSiteCheckIn = false,
-        originatingCommandId = command.commandId
+        originatingCommandId = command.commandId,
+        alsoQueuesAtPairedMachine = queuesAtPairedMachine
     )
     val execution = state.executeQueueAction(
         action = QueueAction.AddRegistrations(
@@ -256,25 +265,28 @@ internal fun decideMobileDeviceRegistration(
         origin = QueueActionOrigin.MOBILE_DEVICE,
         atMillis = appliedAtMillis
     ) as? QueueActionExecution.Applied
-    val updatedQueue = execution?.state?.queue(command.machineId)
-    if (execution == null ||
-        updatedQueue == null ||
-        updatedQueue.registrationCount != queue.registrationCount + 1
-    ) {
-        return reject("终端未能建立登记，请重新扫码后再试。")
-    }
+    // The registration may already be on the other machine of the pair, which took it at once.
+    val holdingMachineId = execution?.state?.machineHolding(registration.key)
+        ?: return reject("终端未能创建登记，请重新扫码后再试。")
     return MobileDeviceRegistrationDecision.Apply(
         state = state.copy(
             queues = execution.state.queues,
+            pairedMachineOrders = execution.state.pairedMachineOrders,
+            pairedArrangements = execution.state.pairedArrangements,
             nextRegistrationKey = state.nextRegistrationKey + 1
         ),
         profileToPersist = usedProfile.takeIf { it != existingProfile },
         changedMachineId = command.machineId,
         needsAvailabilityConfirmation = execution.impact.requiresAvailabilityConfirmation,
-        detail = if (singlePlayerMachine) {
-            "已通过移动设备加入排队。该机台仅能容纳一人游玩，本次已使用“单人游玩”。"
-        } else {
-            "已通过移动设备加入排队。"
+        detail = buildString {
+            append("已通过移动设备加入排队。")
+            if (singlePlayerMachine) append("机台 ${command.machineId} 仅能容纳一人游玩，本次已使用“单人游玩”。")
+            if (holdingMachineId != command.machineId) {
+                append(
+                    "机台 $holdingMachineId 当前可以游玩，" +
+                        "登记已自动转至 机台 $holdingMachineId 并进入游玩位置。"
+                )
+            }
         }
     )
 }

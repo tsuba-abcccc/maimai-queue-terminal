@@ -279,4 +279,167 @@ class QueueRiskSequenceTest {
         assertEquals(listOf(1), timedOut.state.queue("A")!!.playing.map(Registration::key))
         assertEquals(listOf(available.key), timedOut.state.queue("A")!!.waiting.map(Registration::key))
     }
+
+    @Test
+    fun comingBackAndLeavingAgainDoesNotStartTheMissedTurnsAnew() {
+        var state = QueueEngineState.single(
+            "A",
+            MachineQueue(
+                playing = listOf(registration(1, PlayPreference.SOLO)),
+                waiting = listOf(
+                    registration(9, PlayPreference.SOLO).copy(
+                        absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+                        temporaryAwaySkippedTurns = 3
+                    ),
+                    registration(2, PlayPreference.SOLO)
+                ),
+                playingStartedAtMillis = 1L
+            )
+        )
+
+        state = apply(state, QueueAction.CancelTemporaryLeave("A", 9))
+        assertEquals(3, state.queue("A")!!.waiting.first { it.key == 9 }.temporaryAwaySkippedTurns)
+        state = apply(state, QueueAction.TemporarilyLeave("A", 9))
+        assertEquals(3, state.queue("A")!!.waiting.first { it.key == 9 }.temporaryAwaySkippedTurns)
+
+        // It is reached for the fourth time while away and leaves the queue.
+        state = apply(state, QueueAction.FinishRound("A"))
+        assertTrue(state.queue("A")!!.allRegistrations.none { it.key == 9 })
+    }
+
+    @Test
+    fun missedTurnsAndNoShowsAreBothClearedByPlayingARoundAndByNothingElse() {
+        var state = QueueEngineState.single(
+            "A",
+            MachineQueue(
+                playing = listOf(registration(1, PlayPreference.SOLO)),
+                waiting = listOf(
+                    registration(9, PlayPreference.SOLO).copy(
+                        absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
+                        temporaryAwaySkippedTurns = 2,
+                        noShowCount = 1
+                    ),
+                    registration(2, PlayPreference.SOLO)
+                ),
+                playingStartedAtMillis = 1L
+            )
+        )
+        fun player() = state.queue("A")!!.allRegistrations.first { it.key == 9 }
+
+        state = apply(state, QueueAction.CancelTemporaryLeave("A", 9))
+        state = apply(state, QueueAction.DeferOneRound("A", 9))
+        state = apply(state, QueueAction.CancelDeferOneRound("A", 9))
+        assertEquals(2, player().temporaryAwaySkippedTurns)
+        assertEquals(1, player().noShowCount)
+
+        // Entering the playing position clears neither; being taken back out keeps both.
+        state = apply(state, QueueAction.FinishRound("A"))
+        assertEquals(listOf(9), state.queue("A")!!.playing.map { it.key })
+        assertEquals(2, player().temporaryAwaySkippedTurns)
+        assertEquals(1, player().noShowCount)
+        state = apply(state, QueueAction.ReturnPlayingToWaitingFront("A", setOf(9)))
+        assertEquals(2, player().temporaryAwaySkippedTurns)
+        assertEquals(1, player().noShowCount)
+
+        // The end of a round it played clears both.
+        state = apply(state, QueueAction.EnterPlayingPosition("A"))
+        state = apply(state, QueueAction.FinishRound("A"))
+        assertEquals(0, player().temporaryAwaySkippedTurns)
+        assertEquals(0, player().noShowCount)
+    }
+
+    @Test
+    fun aCheckedInOnlineRegistrationThatMissesItsFirstTurnCanOnlyBeRemoved() {
+        var state = QueueEngineState.single(
+            "A",
+            MachineQueue(
+                playing = listOf(registration(1, PlayPreference.SOLO)),
+                waiting = listOf(
+                    registration(9, PlayPreference.SOLO, pendingCheckIn = true),
+                    registration(2, PlayPreference.SOLO)
+                ),
+                playingStartedAtMillis = 1L
+            )
+        )
+        // Anybody on site can do this for the player.
+        state = apply(state, QueueAction.CheckIn("A", 9))
+        assertTrue(state.queue("A")!!.waiting.first().mustBeRemovedWhenAbsent)
+
+        listOf(NoShowResolution.DEFER_ONE_ROUND, NoShowResolution.MOVE_TO_TAIL).forEach { resolution ->
+            val execution = QueueEngine.execute(
+                state,
+                QueueAction.MarkNoShow("A", setOf(9), resolution),
+                QueueActionContext(atMillis = 100_000L)
+            )
+            assertEquals(
+                QueueActionFailureCode.NO_SHOW_REMOVAL_ONLY,
+                (execution as QueueActionExecution.Rejected).failure.code
+            )
+        }
+        val removed = apply(state, QueueAction.MarkNoShow("A", setOf(9), NoShowResolution.REMOVE))
+        assertTrue(removed.queue("A")!!.allRegistrations.none { it.key == 9 })
+
+        // Once it has played a round the ordinary choices are back.
+        state = apply(state, QueueAction.FinishRound("A"))
+        assertEquals(listOf(9), state.queue("A")!!.playing.map { it.key })
+        state = apply(state, QueueAction.FinishRound("A"))
+        state = apply(state, QueueAction.FinishRound("A"))
+        assertEquals(9, state.queue("A")!!.waiting.first().key)
+        assertFalse(state.queue("A")!!.waiting.first().mustBeRemovedWhenAbsent)
+        state = apply(state, QueueAction.MarkNoShow("A", setOf(9), NoShowResolution.MOVE_TO_TAIL))
+        assertEquals(1, state.queue("A")!!.waiting.last().noShowCount)
+    }
+
+    @Test
+    fun registrationsMadeOnSiteKeepEveryNoShowChoiceOnTheirFirstTurn() {
+        val state = QueueEngineState.single(
+            "A",
+            MachineQueue(
+                playing = listOf(registration(1, PlayPreference.SOLO)),
+                waiting = listOf(registration(9, PlayPreference.SOLO), registration(2, PlayPreference.SOLO)),
+                playingStartedAtMillis = 1L
+            )
+        )
+        val deferred = apply(state, QueueAction.MarkNoShow("A", setOf(9), NoShowResolution.DEFER_ONE_ROUND))
+        assertEquals(QueueAbsenceStatus.DEFER_ONE_ROUND, deferred.queue("A")!!.waiting.first().absenceStatus)
+        val moved = apply(state, QueueAction.MarkNoShow("A", setOf(9), NoShowResolution.MOVE_TO_TAIL))
+        assertEquals(9, moved.queue("A")!!.waiting.last().key)
+    }
+
+    @Test
+    fun deferringAFixedPairIsRefusedWhileOneOfTheTwoHasToBeRemovedWhenAbsent() {
+        val online = registration(9).copy(fixedPartnerKey = 8, wasOnlineRegistration = true)
+        val partner = registration(8).copy(fixedPartnerKey = 9)
+        val state = QueueEngineState.single(
+            "A",
+            MachineQueue(
+                playing = listOf(registration(1, PlayPreference.SOLO)),
+                waiting = listOf(partner, online, registration(2, PlayPreference.SOLO)),
+                playingStartedAtMillis = 1L
+            )
+        )
+
+        // Marked for the partner alone, a deferral would still defer both.
+        val deferred = QueueEngine.execute(
+            state,
+            QueueAction.MarkNoShow("A", setOf(8), NoShowResolution.DEFER_ONE_ROUND),
+            QueueActionContext(atMillis = 100_000L)
+        )
+        assertEquals(
+            QueueActionFailureCode.NO_SHOW_REMOVAL_ONLY,
+            (deferred as QueueActionExecution.Rejected).failure.code
+        )
+        val group = QueueEngine.execute(
+            state,
+            QueueAction.MarkNoShow("A", setOf(8, 9), NoShowResolution.DEFER_GROUP_ONE_ROUND),
+            QueueActionContext(atMillis = 100_000L)
+        )
+        assertEquals(
+            QueueActionFailureCode.NO_SHOW_REMOVAL_ONLY,
+            (group as QueueActionExecution.Rejected).failure.code
+        )
+        // The partner, who registered on site, can still be moved to the tail alone.
+        val moved = apply(state, QueueAction.MarkNoShow("A", setOf(8), NoShowResolution.MOVE_TO_TAIL))
+        assertEquals(8, moved.queue("A")!!.waiting.last().key)
+    }
 }

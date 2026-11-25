@@ -18,7 +18,7 @@ class MobileDeviceRegistrationTest {
         )
 
         assertEquals(
-            "现场当前没有使用登记排队。",
+            "现场当前未使用登记排队。",
             (closed as MobileDeviceRegistrationDecision.Reject).detail
         )
         assertTrue(reopened is MobileDeviceRegistrationDecision.Apply)
@@ -33,7 +33,7 @@ class MobileDeviceRegistrationTest {
 
         assertTrue(result is MobileDeviceRegistrationDecision.Reject)
         assertEquals(
-            "现场规则暂不允许线上登记。",
+            "系统规则不允许线上登记，暂不能使用移动设备登记。",
             (result as MobileDeviceRegistrationDecision.Reject).detail
         )
     }
@@ -451,6 +451,72 @@ class MobileDeviceRegistrationTest {
             direct.impact.requiresAvailabilityConfirmation,
             mobile.needsAvailabilityConfirmation
         )
+    }
+
+    @Test
+    fun mobileRegistrationFollowsTheTickBoxOfThatOneRegistration() {
+        val busyA = MachineQueue(
+            playing = listOf(
+                Registration(key = 5, displayId = "机台甲玩家", preference = PlayPreference.SOLO)
+            ),
+            playingStartedAtMillis = 1_000L
+        )
+        val busyB = MachineQueue(
+            playing = listOf(
+                Registration(key = 6, displayId = "机台乙玩家", preference = PlayPreference.SOLO)
+            ),
+            playingStartedAtMillis = 1_000L
+        )
+        fun register(
+            requested: Boolean?,
+            machineB: MachineQueue = busyB,
+            paired: Boolean = true
+        ) = decideMobileDeviceRegistration(
+            command().copy(alsoQueuesAtPairedMachine = requested),
+            stateWithQueues(
+                queues = linkedMapOf("A" to busyA, "B" to machineB),
+                profile = profile(),
+                nextKey = 7
+            ).copy(
+                machinePartners = if (paired) mapOf("A" to "B", "B" to "A") else emptyMap()
+            )
+        )
+
+        val ticked = register(requested = true) as MobileDeviceRegistrationDecision.Apply
+        assertTrue(ticked.state.queues.getValue("A").waiting.single().alsoQueuesAtPairedMachine)
+        // The phone page showed the explanation before it sent the box turned on.
+        assertTrue(ticked.profileToPersist!!.pairedMachineQueueingIntroduced)
+        assertFalse(
+            (register(requested = false) as MobileDeviceRegistrationDecision.Apply)
+                .profileToPersist!!.pairedMachineQueueingIntroduced
+        )
+        assertEquals(listOf(7), ticked.state.pairedMachineOrders["B"])
+        assertEquals("已通过移动设备加入排队。", ticked.detail)
+
+        // Not ticked, or a page that does not mention it: the registration stays at machine A.
+        listOf(false, null).forEach { requested ->
+            val plain = register(requested) as MobileDeviceRegistrationDecision.Apply
+            assertFalse(plain.state.queues.getValue("A").waiting.single().alsoQueuesAtPairedMachine)
+        }
+
+        // Ticked for a machine that has no pair any more.
+        assertEquals(
+            "一对机台的设置已经变化，请重新确认。",
+            (
+                register(requested = true, paired = false)
+                    as MobileDeviceRegistrationDecision.Reject
+                ).detail
+        )
+
+        // Machine B stands empty, but an arrangement is announced first: the registration
+        // waits at machine A like any other.
+        val waiting = register(
+            requested = true,
+            machineB = MachineQueue()
+        ) as MobileDeviceRegistrationDecision.Apply
+        assertEquals("资料玩家", waiting.state.queues.getValue("A").waiting.single().displayId)
+        assertTrue(waiting.state.queues.getValue("B").playing.isEmpty())
+        assertEquals("已通过移动设备加入排队。", waiting.detail)
     }
 
     private fun command() = MobileDeviceRegistrationCommand(

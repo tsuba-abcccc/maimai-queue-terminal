@@ -1,6 +1,7 @@
 package com.abcccc.maimaiqueue
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -455,7 +456,7 @@ class RoundPlannerTest {
     }
 
     @Test
-    fun deferringOnePlayerFromSharedPlayingPositionConsumesOnlyCurrentOpportunity() {
+    fun aRegistrationInThePlayingPositionCanNeitherDeferNorLeaveTemporarily() {
         val first = registration(1)
         val second = registration(2)
         val queue = MachineQueue(
@@ -463,12 +464,36 @@ class RoundPlannerTest {
             waiting = listOf(registration(3, PlayPreference.SOLO)),
             playingStartedAtMillis = 100L
         )
+        val state = QueueEngineState.single("A", queue)
 
-        val result = queue.deferOneRound(first.key, atMillis = 21_000L)
+        assertEquals(queue, queue.deferOneRound(first.key))
+        assertEquals(queue, queue.temporarilyLeave(first.key))
+        listOf(
+            QueueAction.DeferOneRound("A", first.key),
+            QueueAction.TemporarilyLeave("A", first.key)
+        ).forEach { action ->
+            val execution = QueueEngine.execute(state, action, QueueActionContext(atMillis = 21_000L))
+            assertEquals(
+                QueueActionFailureCode.PLAYING_POSITION_NOT_ALLOWED,
+                (execution as QueueActionExecution.Rejected).failure.code
+            )
+        }
 
+        // Taken back to the front of the waiting order first, the registration can defer.
+        val takenBack = QueueEngine.execute(
+            state,
+            QueueAction.ReturnPlayingToWaitingFront("A", setOf(first.key)),
+            QueueActionContext(atMillis = 21_000L)
+        ) as QueueActionExecution.Applied
+        val deferred = QueueEngine.execute(
+            takenBack.state,
+            QueueAction.DeferOneRound("A", first.key),
+            QueueActionContext(atMillis = 21_001L)
+        ) as QueueActionExecution.Applied
+        val result = deferred.state.queue("A")!!
         assertEquals(listOf(second.key), result.playing.map { it.key })
         assertEquals(listOf(first.key, 3), result.waiting.map { it.key })
-        assertEquals(QueueAbsenceStatus.NONE, result.waiting.first().absenceStatus)
+        assertEquals(QueueAbsenceStatus.DEFER_ONE_ROUND, result.waiting.first().absenceStatus)
         assertEquals(100L, result.playingStartedAtMillis)
     }
 
@@ -504,7 +529,12 @@ class RoundPlannerTest {
 
         val plan = QueueEngine.plan(
             state = QueueEngineState.single("A", queue),
-            action = QueueAction.DeferOneRound("A", current.key),
+            action = QueueAction.MarkNoShow(
+                "A",
+                setOf(current.key),
+                NoShowResolution.DEFER_ONE_ROUND,
+                startNextWhenPlayingBecomesEmpty = true
+            ),
             context = QueueActionContext(atMillis = 23_000L)
         )
         val result = plan.resultState.queue("A")!!
@@ -584,6 +614,10 @@ class RoundPlannerTest {
                     assertTrue(remainingPair.all { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND })
                 }
                 QueueAbsenceStatus.TEMPORARILY_AWAY -> {
+                    assertEquals(2, remainingPair.size)
+                    assertTrue(remainingPair.all { it.temporaryAwaySkippedTurns == skippedTurns })
+                }
+                QueueAbsenceStatus.SKIP_ONE_TURN -> {
                     assertEquals(2, remainingPair.size)
                     assertTrue(remainingPair.all { it.temporaryAwaySkippedTurns == skippedTurns })
                 }
@@ -673,41 +707,29 @@ class RoundPlannerTest {
     }
 
     @Test
-    fun temporarilyLeavingAPlayingFixedPairDoesNotConsumeTwoAwayTurns() {
+    fun aFixedPairInThePlayingPositionCanNeitherDeferNorLeaveTemporarily() {
         val first = registration(10).copy(fixedPartnerKey = 11)
         val second = registration(11).copy(fixedPartnerKey = 10)
-        val pending = registration(1, PlayPreference.SOLO).copy(
-            requiresOnSiteCheckIn = true
-        )
-        val next = registration(2, PlayPreference.SOLO)
         val queue = MachineQueue(
             playing = listOf(first, second),
-            waiting = listOf(pending, next),
+            waiting = listOf(registration(2, PlayPreference.SOLO)),
             playingStartedAtMillis = 100L
         )
 
-        val plan = QueueEngine.plan(
-            state = QueueEngineState.single("A", queue),
-            action = QueueAction.TemporarilyLeave("A", first.key),
-            context = QueueActionContext(atMillis = 27_000L)
-        )
-        val result = plan.resultState.queue("A")!!
-        val awayPair = result.waiting.filter { it.key == first.key || it.key == second.key }
-
-        assertTrue(plan.canApply)
-        assertEquals(listOf(next.key), result.playing.map { it.key })
-        assertTrue(result.allRegistrations.none { it.key == pending.key })
-        assertEquals(2, awayPair.size)
-        assertTrue(awayPair.all {
-            it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
-                it.temporaryAwaySkippedTurns == 1
-        })
-        assertEquals(setOf(first.key, second.key), awayPair.mapTo(mutableSetOf()) { it.fixedPartnerKey!! })
-        assertEquals(
-            listOf(pending.key),
-            plan.impact.roundPreview?.unavailableRegistrations?.map { it.key }
-        )
-        assertTrue(result.invariantViolations().isEmpty())
+        listOf(
+            QueueAction.DeferOneRound("A", first.key),
+            QueueAction.DeferOneRound("A", second.key),
+            QueueAction.TemporarilyLeave("A", first.key),
+            QueueAction.TemporarilyLeave("A", second.key)
+        ).forEach { action ->
+            val plan = QueueEngine.plan(
+                state = QueueEngineState.single("A", queue),
+                action = action,
+                context = QueueActionContext(atMillis = 27_000L)
+            )
+            assertFalse(plan.canApply)
+            assertEquals(QueueActionFailureCode.PLAYING_POSITION_NOT_ALLOWED, plan.failure?.code)
+        }
     }
 
     @Test

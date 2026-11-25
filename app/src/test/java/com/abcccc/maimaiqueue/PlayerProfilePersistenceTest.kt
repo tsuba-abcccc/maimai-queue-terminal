@@ -185,6 +185,40 @@ class PlayerProfilePersistenceTest {
         assertEquals(result.profiles, repository.replacedProfiles)
     }
 
+    @Test
+    fun recordOfHavingSeenTheExplanationOnlyEverTurnsOn() = runBlocking {
+        val repository = FakePlayerProfileRepository()
+        val coordinator = PlayerProfilePersistenceCoordinator(repository)
+        val seenHere = profile("00000000-0000-0000-0000-000000000911")
+            .copy(qqNumber = "11111111", pairedMachineQueueingIntroduced = true)
+        val seenElsewhere = profile("00000000-0000-0000-0000-000000000912")
+            .copy(qqNumber = "22222222")
+
+        val result = coordinator.reconcileCloudProfiles(
+            cloudProfiles = listOf(
+                // A newer copy from the cloud that knows nothing about it must not clear it.
+                seenHere.copy(
+                    pairedMachineQueueingIntroduced = false,
+                    revision = seenHere.revision + 1L,
+                    updatedAtMillis = seenHere.updatedAtMillis + 1L
+                ),
+                // Nothing else is newer, yet the record made on the website arrives here.
+                seenElsewhere.copy(pairedMachineQueueingIntroduced = true)
+            ),
+            profileAliases = emptyMap(),
+            currentProfiles = { listOf(seenHere, seenElsewhere) },
+            nicknameConflictsWithQueue = { _, _, _ -> false }
+        ) as CloudPlayerProfilePersistenceResult.Success
+
+        assertEquals(
+            listOf(true, true),
+            result.profiles.map(PlayerProfile::pairedMachineQueueingIntroduced)
+        )
+        assertEquals(seenHere.revision + 1L, result.profiles.first().revision)
+        assertEquals(seenElsewhere.revision, result.profiles.last().revision)
+        assertEquals(result.profiles, repository.replacedProfiles)
+    }
+
     private fun profile(id: String) = PlayerProfile(
         id = id,
         nickname = "玩家$id",

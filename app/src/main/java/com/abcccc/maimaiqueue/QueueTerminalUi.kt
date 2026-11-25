@@ -13,6 +13,7 @@ import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandHorizontally
 import androidx.compose.animation.fadeIn
@@ -35,7 +36,9 @@ import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -59,6 +62,13 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.wrapContentHeight
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -69,13 +79,18 @@ import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -93,6 +108,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -103,10 +119,13 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -114,31 +133,48 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.addPathNodes
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.toSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
@@ -153,6 +189,7 @@ import java.time.DayOfWeek
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -184,6 +221,14 @@ private class MachineRuntimeStateStore {
 
     fun setStatus(machineId: MachineId, status: MachineStatus) {
         states[machineId] = state(machineId).copy(status = status)
+    }
+
+    fun pairedOrder(machineId: MachineId): List<Int> = state(machineId).pairedOrder
+
+    fun setPairedOrder(machineId: MachineId, order: List<Int>) {
+        if (state(machineId).pairedOrder != order) {
+            states[machineId] = state(machineId).copy(pairedOrder = order)
+        }
     }
 
     fun replace(machineStates: Map<MachineId, PersistedMachineState>) {
@@ -223,7 +268,7 @@ private suspend fun processPlayerProfileDeleteCommand(
     val profile = profiles.firstOrNull { it.id == command.profileId }
     val rejection = when {
         profile == null -> null
-        hasRegistration(profile) -> "玩家资料仍关联当前登记，必须先退出或移除登记后再删除。"
+        hasRegistration(profile) -> "这份玩家资料仍有登记在队列中，请先退出排队或移除登记后再删除。"
         profile.revision != command.expectedRevision ||
             profile.updatedAtMillis != command.expectedUpdatedAtMillis ->
             "玩家资料已在终端发生更新，请刷新管理后台后重试。"
@@ -390,6 +435,11 @@ internal fun RegistrationApp() {
         )
     }
     val machineStates = remember { MachineRuntimeStateStore() }
+    // What the engine remembers about registrations that may be arranged to the other machine
+    // of a pair: since when a preview announces it, and where an arranged one came from.
+    var pairedArrangements by remember {
+        mutableStateOf<Map<Int, PairedArrangementRecord>>(emptyMap())
+    }
     var terminalInstallation by remember { mutableStateOf(initialTerminalInstallation) }
     var onboardingMigrationChecked by remember { mutableStateOf(false) }
     var screen by remember {
@@ -478,6 +528,19 @@ internal fun RegistrationApp() {
     var playerAccountBindingProfileId by remember { mutableStateOf<String?>(null) }
     var profileJoinPreference by remember { mutableStateOf<PlayPreference?>(null) }
     var rememberProfileJoinPreference by remember { mutableStateOf(false) }
+    // The tick box of the registration being created: let the system arrange it between the
+    // two machines of the pair. Never ticked in advance.
+    var joinAlsoQueuesAtPairedMachine by remember { mutableStateOf(false) }
+    // Machine labels of the pair whose explanation is on screen.
+    var pairedMachineQueueIntroduction by remember { mutableStateOf<Pair<String, String>?>(null) }
+    // True when it opened by itself on first use: it can then only be closed after five seconds.
+    // The question mark opens the same explanation without the wait.
+    var pairedMachineQueueIntroductionCountsDown by remember { mutableStateOf(false) }
+    // Profiles that were shown the explanation since the app started, so that it does not open
+    // a second time while the record on the profile is still being saved.
+    var pairedExplanationShownProfileIds by remember { mutableStateOf(emptySet<String>()) }
+    // Machine labels (the registration's machine, the machine showing the preview).
+    var pairedPreviewExplanation by remember { mutableStateOf<Pair<String, String>?>(null) }
     var playerProfileContext by remember { mutableStateOf(PlayerProfileContext.JOIN_QUEUE) }
     var playerProfileEditorReturnScreen by remember { mutableStateOf(Screen.PLAYER_LIBRARY) }
     var claimPreferenceMismatchProfileId by remember { mutableStateOf<String?>(null) }
@@ -502,6 +565,7 @@ internal fun RegistrationApp() {
         mutableStateOf<QueueOperationConfirmationRequest?>(null)
     }
     var moreMenuVisible by remember { mutableStateOf(false) }
+    var cloudSyncInfoVisible by remember { mutableStateOf(false) }
     var appDetailsVisible by remember { mutableStateOf(false) }
     var versionHistoryVisible by remember { mutableStateOf(false) }
     var editMachineChoiceVisible by remember { mutableStateOf(false) }
@@ -583,7 +647,7 @@ internal fun RegistrationApp() {
         showHomeOperationFeedback(
             title = "本次调整未执行",
             detail = if (machineOperational) {
-                "队列已发生变化，请根据当前队列重新调整。"
+                "队列已发生变化，请按当前队列重新调整。"
             } else {
                 "${configuredMachineName(machineId)}已停止使用，恢复正常使用后才能调整队列。"
             },
@@ -609,7 +673,7 @@ internal fun RegistrationApp() {
         showHomeOperationFeedback(
             title = if (queueChanged) "队列已更新" else "${operationLabel}未执行",
             detail = if (queueChanged) {
-                "本次${operationLabel}操作未执行，请按当前队列重新确认。"
+                "${operationLabel}未执行，请按当前队列重新确认。"
             } else {
                 "队列状态或操作条件已经变化，请按当前队列重新确认。"
             },
@@ -624,7 +688,12 @@ internal fun RegistrationApp() {
         queueUndoAction = null
     }
 
-    fun showNewRegistrationFeedback(machineId: MachineId, registrationKey: Int) {
+    fun showNewRegistrationFeedback(requestedMachineId: MachineId, registrationKey: Int) {
+        // A registration that queues at both machines may already have been taken by the other
+        // machine of the pair when that machine stood empty.
+        val machineId = configuredMachineIds.firstOrNull { candidate ->
+            machineStates.queue(candidate).allRegistrations.any { it.key == registrationKey }
+        } ?: requestedMachineId
         homeSidePanelFeedback = null
         queueUndoAction = null
         newRegistrationHighlight = NewRegistrationHighlight(
@@ -641,7 +710,8 @@ internal fun RegistrationApp() {
         registrationOpen = registrationOpen,
         nextRegistrationKey = nextKey,
         savedAtMillis = System.currentTimeMillis(),
-        terminalCommandReceipts = terminalCommandReceipts.values.toList()
+        terminalCommandReceipts = terminalCommandReceipts.values.toList(),
+        pairedArrangements = pairedArrangements
     )
 
     fun currentPublicDisplaySettings(
@@ -686,6 +756,19 @@ internal fun RegistrationApp() {
                 registrationClosesAtMillis =
                     currentBusinessHoursStatus.registrationClosesAtMillis
                         ?.takeIf { currentClosingGracePeriod }
+            ),
+            machinePartners = buildMap {
+                queueRuleSettings.activeMachinePairs.forEach { (first, second) ->
+                    put(first, second)
+                    put(second, first)
+                }
+            },
+            pairedMachineQueueSettings = PairedMachineQueueConfiguration(
+                enabled = queueRuleSettings.pairedMachineQueueEnabled,
+                pairs = queueRuleSettings.configuredMachinePairs.map { (first, second) ->
+                    queueRuleSettings.machineStableId(first) to
+                        queueRuleSettings.machineStableId(second)
+                }
             )
         )
     }
@@ -1033,6 +1116,7 @@ internal fun RegistrationApp() {
         playerProfilesLoaded,
         pendingQueueRestore,
         configuredMachineStateSnapshot,
+        pairedArrangements,
         registrationOpen,
         nextKey,
         queueId,
@@ -1132,7 +1216,7 @@ internal fun RegistrationApp() {
             schemaNegotiator = QueueSchemaNegotiator(pending.schemaVersion)
         )
         if (!publisher.isConfigured) {
-            syncDisableFailureDetail = "远端关闭状态尚未确认：服务器连接配置无效。"
+            syncDisableFailureDetail = "尚未确认服务端已关闭线上操作：服务器连接配置无效。"
             syncDisableRetryStartedAtMillis =
                 syncDisableRetryStartedAtMillis ?: System.currentTimeMillis()
             syncDisableLastErrorAtMillis = System.currentTimeMillis()
@@ -1173,7 +1257,7 @@ internal fun RegistrationApp() {
                 is QueuePublishResult.Failure -> {
                     val failedAtMillis = System.currentTimeMillis()
                     syncDisableFailureDetail =
-                        "远端关闭状态尚未确认：${result.detail}"
+                        "尚未确认服务端已关闭线上操作：${result.detail}"
                     syncDisableRetryStartedAtMillis =
                         syncDisableRetryStartedAtMillis ?: failedAtMillis
                     syncDisableLastErrorAtMillis = failedAtMillis
@@ -1194,13 +1278,30 @@ internal fun RegistrationApp() {
         machineStates.setQueue(machineId, queue)
     }
 
+    fun storePairedMachineOrders(
+        orders: Map<String, List<Int>>,
+        arrangements: Map<Int, PairedArrangementRecord>
+    ) {
+        configuredMachineIds.forEach { machineId ->
+            machineStates.setPairedOrder(machineId, orders[machineId.name].orEmpty())
+        }
+        if (pairedArrangements != arrangements) pairedArrangements = arrangements
+    }
+
     fun queueOperationConfirmation(machineId: MachineId) =
         QueueOperationConfirmationRequest(machineId, queueFor(machineId))
 
     fun currentQueueEngineState(): QueueEngineState = QueueEngineState(
-        configuredMachineIds.associateTo(linkedMapOf()) { machineId ->
+        queues = configuredMachineIds.associateTo(linkedMapOf()) { machineId ->
             machineId.name to queueFor(machineId)
-        }
+        },
+        pairedMachineOrders = buildMap {
+            configuredMachineIds.forEach { machineId ->
+                val order = machineStates.pairedOrder(machineId)
+                if (order.isNotEmpty()) put(machineId.name, order)
+            }
+        },
+        pairedArrangements = pairedArrangements
     )
 
     fun currentQueueEnginePolicy(): QueueEnginePolicy = QueueEnginePolicy(
@@ -1215,8 +1316,83 @@ internal fun RegistrationApp() {
             machineId.name to queueRuleSettings.machineConfiguration(machineId).capacity
         },
         maxRegistrationsPerMachine = 20,
-        requireOperationalForPlayerActions = true
+        requireOperationalForPlayerActions = true,
+        machinePartners = queueRuleSettings.machinePartnerNames,
+        // An arrangement to the other machine is announced by a preview before it happens.
+        pairedArrangementRules = PairedArrangementRules()
     )
+
+    fun pairedForecastDurations(): Map<String, PairedMachineForecast.RoundDurations> =
+        configuredMachineIds.associate { machineId ->
+            val configuration = queueRuleSettings.machineConfiguration(machineId)
+            machineId.name to PairedMachineForecast.RoundDurations(
+                soloMillis = configuration.soloRoundMinutes * 60_000L,
+                sharedMillis = configuration.sharedRoundMinutes * 60_000L
+            )
+        }
+
+    /** Where and when each registration of a paired machine is expected to play first. */
+    fun pairedMachineForecast(nowMillis: Long): PairedMachineForecast.Result =
+        if (queueRuleSettings.activeMachinePairs.isEmpty()) {
+            PairedMachineForecast.EMPTY
+        } else {
+            PairedMachineForecast.forecast(
+                state = currentQueueEngineState(),
+                policy = currentQueueEnginePolicy(),
+                durations = pairedForecastDurations(),
+                nowMillis = nowMillis
+            )
+        }
+
+    // Wait estimates (docs/releases/wait-estimate-2026-11.md). The replays take a moment, so
+    // they run away from the main thread, twice a minute and after every queue change.
+    var waitEstimates by remember { mutableStateOf(WaitEstimator.EMPTY) }
+    LaunchedEffect(
+        configuredMachineStateSnapshot,
+        pairedArrangements,
+        queueRuleSettings,
+        nowMillis / 30_000L
+    ) {
+        val state = currentQueueEngineState()
+        val policy = currentQueueEnginePolicy()
+        val durations = pairedForecastDurations()
+        val atMillis = System.currentTimeMillis()
+        waitEstimates = withContext(Dispatchers.Default) {
+            WaitEstimator.estimate(state, policy, durations, atMillis)
+        }
+    }
+
+    /** The middle wait of a registration that would join [machineId] now, as shown. */
+    fun newRegistrationWaitMinutes(machineId: MachineId): Long? =
+        waitEstimates.newRegistrationWaitMillis[machineId.name]
+            ?.let { WaitEstimator.displayMinutes(it, roundDown = false) }
+
+    // Recomputed when a queue or the pair settings change, and twice a minute as time passes.
+    // It decides the previews of a pair; the waits shown come from [waitEstimates].
+    val homePairedForecast = remember(
+        configuredMachineStateSnapshot,
+        pairedArrangements,
+        queueRuleSettings,
+        nowMillis / 30_000L
+    ) { pairedMachineForecast(nowMillis) }
+    val homeNewRegistrationWaits = configuredMachineIds.associateWith(::newRegistrationWaitMinutes)
+
+    /**
+     * Where the other machine of [machineId]'s pair shows the preview of [registrationKey], such
+     * as B1; null when it shows none (maintainer, 2026-11-25: "合理引用位置编号").
+     */
+    fun pairedPreviewPosition(machineId: MachineId, registrationKey: Int): String? {
+        val partnerId = queueRuleSettings.pairedMachine(machineId) ?: return null
+        val index = PairedMachineForecast.displayQueue(
+            state = currentQueueEngineState(),
+            policy = currentQueueEnginePolicy(),
+            machineId = partnerId.name,
+            forecast = homePairedForecast
+        ).first.waitingProjection().positions.indexOfFirst { position ->
+            position.registrations.any { it.key == registrationKey }
+        }
+        return if (index >= 0) "${partnerId.name}${index + 1}" else null
+    }
 
     fun planQueueAction(
         action: QueueAction,
@@ -1235,6 +1411,32 @@ internal fun RegistrationApp() {
             policy = currentQueueEnginePolicy()
         )
     )
+
+    /**
+     * What a confirmation says when [action] changes a waiting place by hand and registrations
+     * that queue at both machines of the pair give up their place at the other machine for it.
+     * The engine decides which registrations those are; null when there are none.
+     */
+    fun pairedQueuePlaceNotice(
+        machineId: MachineId,
+        action: QueueAction,
+        operationWord: String
+    ): String? {
+        val partner = queueRuleSettings.pairedMachine(machineId) ?: return null
+        val before = currentQueueEngineState().queue(machineId.name) ?: return null
+        val after = planQueueAction(action, atMillis = 1L).resultState.queue(machineId.name)
+            ?: return null
+        val alreadyGivenUp = before.allRegistrations
+            .filter { it.skipsPairedMachineThisRound }
+            .mapTo(mutableSetOf()) { it.key }
+        return pairedMachinePlaceGivenUpNotice(
+            displayIds = after.waiting
+                .filter { it.skipsPairedMachineThisRound && it.key !in alreadyGivenUp }
+                .map(Registration::displayId),
+            operationWord = operationWord,
+            pairedMachineName = configuredMachineName(partner)
+        )
+    }
 
     fun appendAuditLog(entry: AuditLogEntry) {
         val enrichedEntry = entry
@@ -1268,7 +1470,7 @@ internal fun RegistrationApp() {
         ) {
             Toast.makeText(
                 context,
-                panguSpacing("终端敏感设置已由管理后台接管，请从管理后台修改。"),
+                panguSpacing("终端敏感策略已由管理后台接管，只能从管理后台修改。"),
                 Toast.LENGTH_LONG
             ).show()
             return false
@@ -1399,7 +1601,7 @@ internal fun RegistrationApp() {
                 )
                 pendingSyncDisableSnapshot = pending
                 val pendingAtMillis = System.currentTimeMillis()
-                syncDisableFailureDetail = "正在确认远端已关闭线上操作。"
+                syncDisableFailureDetail = "正在确认服务端已关闭线上操作。"
                 syncDisableRetryStartedAtMillis = pendingAtMillis
                 syncDisableLastErrorAtMillis = null
             }
@@ -1544,7 +1746,7 @@ internal fun RegistrationApp() {
         appendAuditLog(
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
-                title = "更新应用设置",
+                title = "应用设置已更新",
                 detail = changeDescriptions.takeIf { it.isNotEmpty() }
                     ?.joinToString(separator = "；", postfix = "。")
                     ?: "应用设置已更新。",
@@ -1597,7 +1799,7 @@ internal fun RegistrationApp() {
         if (registrationOpen) {
             Toast.makeText(
                 context,
-                panguSpacing("请先关闭登记排队，再重新绑定机厅。"),
+                panguSpacing("请先关闭登记排队，再重新绑定当前服务器。"),
                 Toast.LENGTH_LONG
             ).show()
             return false
@@ -1632,8 +1834,8 @@ internal fun RegistrationApp() {
         appendAuditLog(
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
-                title = "重新绑定机厅身份",
-                detail = "管理员已确认使用当前服务器重新核对机厅身份；本地队列、玩家资料和历史记录均未清除。"
+                title = "机厅身份已重新绑定",
+                detail = "已确认使用当前服务器重新核对机厅身份；本机的队列、玩家资料和历史记录均未清除。"
             )
         )
         return true
@@ -1650,7 +1852,8 @@ internal fun RegistrationApp() {
         affectedRegistrationKeysOverride: Collection<Int> = emptyList(),
         source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
         classifyAvailabilityOutcomes: Boolean = false,
-        semanticAction: QueueAction? = null
+        semanticAction: QueueAction? = null,
+        detailNote: String? = null
     ): List<AuditLogEntry> {
         val entries = createQueueAuditLogs(
             category = auditCategoryFor(machineId),
@@ -1663,7 +1866,9 @@ internal fun RegistrationApp() {
             source = source,
             classifyAvailabilityOutcomes = classifyAvailabilityOutcomes,
             semanticAction = semanticAction
-        )
+        ).map { entry ->
+            if (detailNote == null) entry else entry.copy(detail = entry.detail.trimEnd() + detailNote)
+        }
         val contactRegistrations = beforeQueue.allRegistrations + afterQueue.allRegistrations
         entries.asReversed().forEach { entry ->
             appendAuditLog(
@@ -1683,6 +1888,176 @@ internal fun RegistrationApp() {
             .mapTo(mutableSetOf()) { it.key }
     }
 
+    /**
+     * Applies and logs what an engine result changed on machines the caller does not handle
+     * itself, which happens when a registration moves across a pair of machines.
+     */
+    fun commitPairedMachineQueues(
+        beforeQueues: Map<String, MachineQueue>,
+        afterQueues: Map<String, MachineQueue>,
+        handledMachineNames: Set<String>,
+        source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL
+    ) {
+        configuredMachineIds.forEach { machineId ->
+            if (machineId.name in handledMachineNames) return@forEach
+            val beforeQueue = beforeQueues[machineId.name] ?: return@forEach
+            val afterQueue = afterQueues[machineId.name] ?: return@forEach
+            if (afterQueue == beforeQueue) return@forEach
+            setQueue(machineId, afterQueue)
+            val baseline = pairedAuditBaseline(machineId.name, beforeQueues, afterQueues)
+            if (baseline != afterQueue) {
+                appendQueueAuditLog(
+                    machineId = machineId,
+                    beforeQueue = baseline,
+                    afterQueue = afterQueue,
+                    source = source,
+                    classifyAvailabilityOutcomes = true
+                )
+            }
+        }
+    }
+
+    /** Logs registrations that reached a machine through the place they held there. */
+    fun appendPairedPlaceArrivalLogs(
+        beforeQueues: Map<String, MachineQueue>,
+        afterQueues: Map<String, MachineQueue>,
+        source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL
+    ) {
+        configuredMachineIds.forEach { destinationId ->
+            val partnerId = queueRuleSettings.pairedMachine(destinationId) ?: return@forEach
+            val heldPlaceKeys = beforeQueues[partnerId.name]?.waiting.orEmpty()
+                .filter { it.alsoQueuesAtPairedMachine }
+                .mapTo(mutableSetOf()) { it.key }
+            val arrived = afterQueues[destinationId.name]?.playing.orEmpty()
+                .filter { it.key in heldPlaceKeys }
+            createPairedPlaceArrivalAuditLog(
+                category = auditCategoryFor(destinationId),
+                sourceMachineLabel = configuredMachineName(partnerId),
+                destinationMachineLabel = configuredMachineName(destinationId),
+                registrations = arrived,
+                source = source
+            )?.let(::appendAuditLog)
+        }
+        // Registrations that did not show up after the system arranged them to the other
+        // machine: they are back in the waiting order of the machine they came from.
+        configuredMachineIds.forEach { originId ->
+            val arrangedId = queueRuleSettings.pairedMachine(originId) ?: return@forEach
+            val wasPlayingThere = beforeQueues[arrangedId.name]?.playing.orEmpty()
+                .mapTo(mutableSetOf()) { it.key }
+            val ownBeforeKeys = beforeQueues[originId.name]?.allRegistrations.orEmpty()
+                .mapTo(mutableSetOf()) { it.key }
+            val returned = afterQueues[originId.name]?.waiting.orEmpty()
+                .filter { it.key in wasPlayingThere && it.key !in ownBeforeKeys }
+            createPairedArrivalReturnedAuditLog(
+                category = auditCategoryFor(originId),
+                originMachineLabel = configuredMachineName(originId),
+                arrangedMachineLabel = configuredMachineName(arrangedId),
+                registrations = returned,
+                source = source
+            )?.let(::appendAuditLog)
+        }
+    }
+
+    /**
+     * Re-derives the places held across paired machines after something other than a queue
+     * action changed: the pair settings, a machine's status, or the state loaded at start.
+     */
+    fun settlePairedMachineQueues() {
+        val before = currentQueueEngineState()
+        val settled = QueueEngine.settlePairedMachines(before, currentQueueEnginePolicy())
+        if (settled == before) return
+        commitPairedMachineQueues(
+            beforeQueues = before.queues,
+            afterQueues = settled.queues,
+            handledMachineNames = emptySet(),
+            source = AuditLogSource.SYSTEM_AUTOMATIC
+        )
+        storePairedMachineOrders(settled.pairedMachineOrders, settled.pairedArrangements)
+        appendPairedPlaceArrivalLogs(before.queues, settled.queues, AuditLogSource.SYSTEM_AUTOMATIC)
+    }
+
+    /**
+     * Brings the previews that announce an arrangement up to date with the queues and the
+     * clock: which registrations have one, whose player is to be told now, and whether a
+     * machine that stands empty may take a registration whose announcement has run long enough.
+     */
+    fun refreshPairedArrangements(nowMillis: Long = System.currentTimeMillis()) {
+        if (queueRuleSettings.activeMachinePairs.isEmpty() && pairedArrangements.isEmpty()) return
+        val before = currentQueueEngineState()
+        val refresh = QueueEngine.refreshPairedArrangements(
+            state = before,
+            policy = currentQueueEnginePolicy(),
+            durations = pairedForecastDurations(),
+            nowMillis = nowMillis
+        )
+        refresh.notices.forEach { notice ->
+            val homeId = configuredMachineIds.firstOrNull { it.name == notice.homeMachineId }
+                ?: return@forEach
+            val pairedId = configuredMachineIds.firstOrNull { it.name == notice.pairedMachineId }
+                ?: return@forEach
+            val registration = before.queue(notice.homeMachineId)?.waiting
+                ?.firstOrNull { it.key == notice.registrationKey }
+                ?: return@forEach
+            appendAuditLog(
+                createPairedArrangementNoticeAuditLog(
+                    category = auditCategoryFor(homeId),
+                    homeMachineLabel = configuredMachineName(homeId),
+                    pairedMachineLabel = configuredMachineName(pairedId),
+                    registration = registration,
+                    earliestArrangementClockTime = formatClockTime(
+                        notice.earliestArrangementAtMillis
+                    ),
+                    timestampMillis = nowMillis
+                )
+            )
+        }
+        val settled = refresh.state
+        if (settled == before) return
+        commitPairedMachineQueues(
+            beforeQueues = before.queues,
+            afterQueues = settled.queues,
+            handledMachineNames = emptySet(),
+            source = AuditLogSource.SYSTEM_AUTOMATIC
+        )
+        storePairedMachineOrders(settled.pairedMachineOrders, settled.pairedArrangements)
+        appendPairedPlaceArrivalLogs(before.queues, settled.queues, AuditLogSource.SYSTEM_AUTOMATIC)
+        if (settled.queues != before.queues) queueSoundPlayer.play(QueueSoundCue.QUEUE_CHANGE)
+    }
+
+    fun snapshotMachineQueues(): Map<String, MachineQueue> =
+        configuredMachineIds.associate { it.name to queueFor(it) }
+
+    /**
+     * After a remote command changed the queues: stores the orders shared by paired machines and
+     * logs what moved across a pair. [handledMachineNames] lists the machines the caller logs
+     * itself; pass null when it already logs every changed machine.
+     */
+    fun commitPairedCommandEffects(
+        beforeQueues: Map<String, MachineQueue>,
+        result: RemoteQueueExecutionState,
+        handledMachineNames: Set<String>?,
+        source: AuditLogSource
+    ) {
+        val resultQueues = result.queues
+        storePairedMachineOrders(result.pairedMachineOrders, result.pairedArrangements)
+        appendPairedPlaceArrivalLogs(beforeQueues, resultQueues, source)
+        if (handledMachineNames != null) {
+            commitPairedMachineQueues(beforeQueues, resultQueues, handledMachineNames, source)
+        }
+    }
+
+    /** A manual transfer is logged as such; any other move across a pair uses the baseline. */
+    fun commandAuditBaseline(
+        machineName: String,
+        beforeQueues: Map<String, MachineQueue>,
+        resultQueues: Map<String, MachineQueue>,
+        action: QueueAction?
+    ): MachineQueue = if (action is QueueAction.TransferRegistrations) {
+        beforeQueues.getValue(machineName)
+    } else {
+        pairedAuditBaseline(machineName, beforeQueues, resultQueues)
+    }
+
     fun updateQueue(
         machineId: MachineId,
         soundCue: QueueSoundCue? = null,
@@ -1694,11 +2069,24 @@ internal fun RegistrationApp() {
         homeFeedbackTone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS,
         homeFeedbackTitle: String? = null,
         semanticAction: QueueAction? = null,
+        auditDetailNote: String? = null,
+        engineResult: () -> QueueEngineState? = { null },
         transform: (MachineQueue) -> MachineQueue
     ): Boolean {
+        val beforeQueues = configuredMachineIds.associate { it.name to queueFor(it) }
         val beforeQueue = queueFor(machineId)
         val afterQueue = transform(beforeQueue)
-        if (afterQueue == beforeQueue) return false
+        // On a paired machine the engine may also have moved a registration to or from the
+        // other machine; its queue and the orders shared by the pair are committed with this one.
+        val resultState = engineResult()
+        val afterQueues = beforeQueues.mapValues { (machineName, queue) ->
+            if (machineName == machineId.name) {
+                afterQueue
+            } else {
+                resultState?.queue(machineName) ?: queue
+            }
+        }
+        if (afterQueues == beforeQueues) return false
         val missedOnlineRegistrationKeys = if (classifyMissedOnlineRegistrations) {
             removedPendingCheckInKeys(beforeQueue, afterQueue)
         } else {
@@ -1707,9 +2095,12 @@ internal fun RegistrationApp() {
         queueUndoAction = null
         homeSidePanelFeedback = null
         setQueue(machineId, afterQueue)
+        commitPairedMachineQueues(beforeQueues, afterQueues, setOf(machineId.name), source)
+        resultState?.let { storePairedMachineOrders(it.pairedMachineOrders, it.pairedArrangements) }
+        appendPairedPlaceArrivalLogs(beforeQueues, afterQueues, source)
         val auditEntries = appendQueueAuditLog(
             machineId,
-            beforeQueue,
+            pairedAuditBaseline(machineId.name, beforeQueues, afterQueues),
             afterQueue,
             publicEventTypeOverride = publicEventTypeOverride
                 ?: PublicQueueEventType.ONLINE_CHECK_IN_MISSED
@@ -1718,7 +2109,8 @@ internal fun RegistrationApp() {
                 affectedRegistrationKeysOverride + missedOnlineRegistrationKeys,
             source = source,
             classifyAvailabilityOutcomes = classifyMissedOnlineRegistrations,
-            semanticAction = semanticAction
+            semanticAction = semanticAction,
+            detailNote = auditDetailNote
         )
         if (surfaceHomeFeedback && auditEntries.isNotEmpty()) {
             val machineLabel = configuredMachineName(machineId)
@@ -1752,12 +2144,16 @@ internal fun RegistrationApp() {
         surfaceHomeFeedback: Boolean = false,
         homeFeedbackTone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS,
         homeFeedbackTitle: String? = null,
-        executionAtMillis: Long = plan.context.atMillis
+        executionAtMillis: Long = plan.context.atMillis,
+        auditDetailNote: String? = null
     ): Boolean {
         val machineId = MachineId.entries.firstOrNull { it.name == plan.action.machineId }
             ?: return false
+        var appliedState: QueueEngineState? = null
         return updateQueue(
             machineId = machineId,
+            auditDetailNote = auditDetailNote,
+            engineResult = { appliedState },
             soundCue = soundCue,
             publicEventTypeOverride = publicEventTypeOverride,
             affectedRegistrationKeysOverride = affectedRegistrationKeysOverride,
@@ -1774,8 +2170,10 @@ internal fun RegistrationApp() {
                 currentQueueEnginePolicy(),
                 executionAtMillis
             )) {
-                is QueueActionExecution.Applied ->
+                is QueueActionExecution.Applied -> {
+                    appliedState = execution.state
                     execution.state.queue(machineId.name) ?: currentQueue
+                }
                 is QueueActionExecution.Rejected -> currentQueue
             }
         }
@@ -1792,7 +2190,9 @@ internal fun RegistrationApp() {
         homeFeedbackTone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS,
         homeFeedbackTitle: String? = null,
         origin: QueueActionOrigin = QueueActionOrigin.ON_SITE_TERMINAL,
-        atMillis: Long = System.currentTimeMillis()
+        atMillis: Long = System.currentTimeMillis(),
+        /** Added to the log entry, such as who removed a registration. */
+        auditDetailNote: String? = null
     ): Boolean = updateQueueByPlan(
         plan = planQueueAction(action, origin, atMillis),
         soundCue = soundCue,
@@ -1802,7 +2202,8 @@ internal fun RegistrationApp() {
         source = source,
         surfaceHomeFeedback = surfaceHomeFeedback,
         homeFeedbackTone = homeFeedbackTone,
-        homeFeedbackTitle = homeFeedbackTitle
+        homeFeedbackTitle = homeFeedbackTitle,
+        auditDetailNote = auditDetailNote
     )
 
     fun updateQueueAfterOnSiteRegistration(
@@ -1847,19 +2248,34 @@ internal fun RegistrationApp() {
         feedbackDetail: String = "$message。",
         classifyAvailabilityOutcomes: Boolean = false,
         semanticAction: QueueAction? = null,
+        engineResult: () -> QueueEngineState? = { null },
         transform: (MachineQueue) -> MachineQueue
     ): Boolean {
+        val beforeQueues = configuredMachineIds.associate { it.name to queueFor(it) }
+        val beforePairedOrders = currentQueueEngineState().pairedMachineOrders
+        val beforePairedArrangements = pairedArrangements
         val beforeQueue = queueFor(machineId)
         val afterQueue = transform(beforeQueue)
-        if (afterQueue == beforeQueue) return false
+        val resultState = engineResult()
+        val afterQueues = beforeQueues.mapValues { (machineName, queue) ->
+            if (machineName == machineId.name) {
+                afterQueue
+            } else {
+                resultState?.queue(machineName) ?: queue
+            }
+        }
+        if (afterQueues == beforeQueues) return false
         val feedbackOutcome = queueUndoFeedbackOutcome(beforeQueue, afterQueue)
         val nonRestorableRegistrationKeys = feedbackOutcome.nonRestorableRegistrationKeys
         homeSidePanelFeedback = null
         newRegistrationHighlight = null
         setQueue(machineId, afterQueue)
+        commitPairedMachineQueues(beforeQueues, afterQueues, setOf(machineId.name))
+        resultState?.let { storePairedMachineOrders(it.pairedMachineOrders, it.pairedArrangements) }
+        appendPairedPlaceArrivalLogs(beforeQueues, afterQueues)
         appendQueueAuditLog(
             machineId = machineId,
-            beforeQueue = beforeQueue,
+            beforeQueue = pairedAuditBaseline(machineId.name, beforeQueues, afterQueues),
             afterQueue = afterQueue,
             titleOverride = message,
             publicEventTypeOverride = PublicQueueEventType.ONLINE_CHECK_IN_MISSED
@@ -1882,7 +2298,17 @@ internal fun RegistrationApp() {
             },
             contextLabel = configuredMachineName(machineId),
             feedbackTone = feedbackOutcome.tone,
-            nonRestorableRegistrationKeys = nonRestorableRegistrationKeys
+            nonRestorableRegistrationKeys = nonRestorableRegistrationKeys,
+            otherMachineQueues = buildMap {
+                configuredMachineIds.forEach { otherMachineId ->
+                    if (otherMachineId == machineId) return@forEach
+                    val before = beforeQueues.getValue(otherMachineId.name)
+                    val after = afterQueues.getValue(otherMachineId.name)
+                    if (after != before) put(otherMachineId, before to after)
+                }
+            },
+            beforePairedOrders = beforePairedOrders.takeIf { resultState != null },
+            beforePairedArrangements = beforePairedArrangements.takeIf { resultState != null }
         )
         queueSoundPlayer.play(QueueSoundCue.QUEUE_CHANGE)
         return true
@@ -1897,8 +2323,10 @@ internal fun RegistrationApp() {
     ): Boolean {
         val machineId = MachineId.entries.firstOrNull { it.name == plan.action.machineId }
             ?: return false
+        var appliedState: QueueEngineState? = null
         return updateQueueWithUndo(
             machineId = machineId,
+            engineResult = { appliedState },
             message = message,
             feedbackTitle = feedbackTitle,
             feedbackDetail = feedbackDetail,
@@ -1911,8 +2339,10 @@ internal fun RegistrationApp() {
                 currentQueueEnginePolicy(),
                 executionAtMillis
             )) {
-                is QueueActionExecution.Applied ->
+                is QueueActionExecution.Applied -> {
+                    appliedState = execution.state
                     execution.state.queue(machineId.name) ?: currentQueue
+                }
                 is QueueActionExecution.Rejected -> currentQueue
             }
         }
@@ -1940,7 +2370,15 @@ internal fun RegistrationApp() {
                 machineId = action.machineId.name,
                 expectedCurrentQueue = action.afterQueue,
                 restoredQueue = action.beforeQueue,
-                excludedRegistrationKeys = action.nonRestorableRegistrationKeys
+                excludedRegistrationKeys = action.nonRestorableRegistrationKeys,
+                alsoRestoredQueues = action.otherMachineQueues.entries.associate { (otherId, queues) ->
+                    otherId.name to QueueAction.RestoredMachineQueue(
+                        expectedCurrentQueue = queues.second,
+                        restoredQueue = queues.first
+                    )
+                },
+                restoredPairedMachineOrders = action.beforePairedOrders,
+                restoredPairedArrangements = action.beforePairedArrangements
             ),
             context = QueueActionContext(
                 origin = QueueActionOrigin.SYSTEM,
@@ -1951,6 +2389,13 @@ internal fun RegistrationApp() {
             val restoredQueue = restoreExecution.state.queue(action.machineId.name)
                 ?: action.afterQueue
             setQueue(action.machineId, restoredQueue)
+            action.otherMachineQueues.keys.forEach { otherId ->
+                restoreExecution.state.queue(otherId.name)?.let { queue -> setQueue(otherId, queue) }
+            }
+            storePairedMachineOrders(
+                restoreExecution.state.pairedMachineOrders,
+                restoreExecution.state.pairedArrangements
+            )
             appendQueueAuditLog(
                 action.machineId,
                 action.afterQueue,
@@ -1966,9 +2411,9 @@ internal fun RegistrationApp() {
             showHomeOperationFeedback(
                 title = "操作已撤销",
                 detail = if (action.nonRestorableRegistrationKeys.isEmpty()) {
-                    "${action.feedbackTitle}已撤销，队列已经恢复到操作前的状态。"
+                    "已撤销上一次操作（${action.feedbackTitle}），队列已经恢复到操作前的状态。"
                 } else {
-                    "${action.feedbackTitle}已撤销；此前因未签到而退出的登记不会恢复。"
+                    "已撤销上一次操作（${action.feedbackTitle}）；此前因未签到而自动移除的登记不会恢复。"
                 },
                 contextLabel = action.contextLabel,
                 tone = HomeSidePanelFeedbackTone.INFO
@@ -1976,7 +2421,7 @@ internal fun RegistrationApp() {
         } else {
             showHomeOperationFeedback(
                 title = "无法撤销这次操作",
-                detail = "队列已经发生新的变化，为避免覆盖后续操作，本次撤销没有执行。",
+                detail = "队列已经发生新的变化，为避免覆盖后续操作，本次撤销未执行。",
                 contextLabel = action.contextLabel,
                 tone = HomeSidePanelFeedbackTone.WARNING
             )
@@ -2088,7 +2533,7 @@ internal fun RegistrationApp() {
             if (restoredQueue.playing.isNotEmpty()) {
                 append("保留的登记顺序已经恢复，本轮游玩计时已从头开始。")
             } else {
-                append("这台机台现在可以继续接收和处理排队登记。")
+                append("${configuredMachineName(machineId)} 可以继续接收和处理排队登记。")
             }
             if (pendingCheckInCount > 0) {
                 append("$pendingCheckInCount 份待签到线上登记的 30 分钟签到计时也已从头开始。")
@@ -2096,6 +2541,7 @@ internal fun RegistrationApp() {
         }
         setQueue(machineId, restoredQueue)
         updateStatus(machineId) { it.restore() }
+        settlePairedMachineQueues()
         queueSoundPlayer.play(QueueSoundCue.CONFIRM)
         appendAuditLog(
             createAuditLogEntry(
@@ -2112,6 +2558,30 @@ internal fun RegistrationApp() {
             detail = restoredQueueDetail,
             contextLabel = configuredMachineName(machineId)
         )
+    }
+
+    /**
+     * The waiting position, as the home screen numbers it (previews of the other machine of a
+     * pair included), that holds [registrationKeys] on [machineId] in [state], such as B3; null
+     * when they are not in exactly one waiting position.
+     */
+    fun waitingPositionLabel(state: QueueEngineState, machineId: MachineId, registrationKeys: Set<Int>): String? {
+        val queue = state.queue(machineId.name) ?: return null
+        val policy = currentQueueEnginePolicy()
+        val shown = if (queueRuleSettings.pairedMachine(machineId) != null) {
+            PairedMachineForecast.displayQueue(
+                state = state,
+                policy = policy,
+                machineId = machineId.name,
+                forecast = PairedMachineForecast.forecast(state, policy, pairedForecastDurations(), System.currentTimeMillis())
+            ).first
+        } else {
+            queue
+        }
+        val indices = shown.waitingProjection().positions.mapIndexedNotNull { index, position ->
+            index.takeIf { position.registrations.any { it.key in registrationKeys } }
+        }
+        return indices.singleOrNull()?.let { "${machineId.name}${it + 1}" }
     }
 
     fun transferRegistrations(request: MachineTransferRequest): Boolean {
@@ -2148,6 +2618,7 @@ internal fun RegistrationApp() {
         queueUndoAction = null
         setQueue(request.sourceMachineId, updatedSource)
         setQueue(destinationMachineId, updatedDestination)
+        storePairedMachineOrders(execution.state.pairedMachineOrders, execution.state.pairedArrangements)
         val transferAuditLog = createMachineTransferAuditLog(
             category = auditCategoryFor(request.sourceMachineId),
             sourceMachineLabel = configuredMachineName(request.sourceMachineId),
@@ -2162,10 +2633,16 @@ internal fun RegistrationApp() {
         queueSoundPlayer.play(QueueSoundCue.QUEUE_CHANGE)
         val sourceMachineName = configuredMachineName(request.sourceMachineId)
         val destinationMachineName = configuredMachineName(destinationMachineId)
+        // The banner names the position the registrations now hold, such as 位置 B3, when they
+        // hold one (maintainer, 2026-11-25: "合理引用位置编号"); the log keeps the machine.
+        // Only a machine name is set off by a space (docs/copywriting-guide.md).
+        val destination = waitingPositionLabel(execution.state, destinationMachineId, registrationKeys)
+            ?.let { "位置 $it" }
+            ?: " $destinationMachineName"
         showHomeOperationFeedback(
-            title = if (registrations.size == 1) "登记已切换机台" else "多份登记已切换机台",
+            title = if (registrations.size == 1) "登记已转至$destination" else "多份登记已转至$destination",
             detail = transferAuditLog?.detail
-                ?: "${registrations.joinToString("、") { "“${it.displayId}”" }}已转至 $destinationMachineName 的等待顺序末端。",
+                ?: "${registrations.joinToString("、") { "“${it.displayId}”" }}已转至 $destinationMachineName 的队尾。",
             contextLabel = "$sourceMachineName·转至 $destinationMachineName"
         )
         return true
@@ -2309,7 +2786,7 @@ internal fun RegistrationApp() {
         when (result) {
             CloudPlayerProfilePersistenceResult.PersistenceFailed -> {
                 cloudProfileRestoreFailureDetail =
-                    "云端玩家资料暂时无法写入本机，将继续重试。"
+                    "服务端的玩家资料暂时无法写入本机，应用将继续重试。"
                 cloudProfileRestoreFailureAtMillis = System.currentTimeMillis()
             }
 
@@ -2338,17 +2815,17 @@ internal fun RegistrationApp() {
                 if (result.profilesChanged) {
                     val details = buildList {
                         if (result.appliedProfiles.isNotEmpty()) {
-                            add("写入 ${result.appliedProfiles.size} 份新增或较新的资料")
+                            add("写入 ${result.appliedProfiles.size} 份新的或已更新的玩家资料")
                         }
                         if (result.appliedAliases.isNotEmpty()) {
-                            add("清理 ${result.appliedAliases.size} 份旧资料副本")
+                            add("合并 ${result.appliedAliases.size} 份重复的玩家资料")
                         }
                     }.joinToString("，")
                     appendAuditLog(
                         createAuditLogEntry(
                             category = AuditLogCategory.PLAYER_PROFILE,
-                            title = "同步云端玩家资料",
-                            detail = "已从服务器$details。",
+                            title = "玩家资料已从服务端同步",
+                            detail = "已从服务端${details}。",
                             source = AuditLogSource.SYSTEM_AUTOMATIC
                         )
                     )
@@ -2384,14 +2861,14 @@ internal fun RegistrationApp() {
         appendAuditLog(
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
-                title = "重新开放登记排队",
+                title = "登记排队已重新开启",
                 detail = "已重新载入机台配置和状态，并开始新的空队列；现在可以创建新的排队登记。",
                 source = source,
                 publicEventType = PublicQueueEventType.REGISTRATION_OPENED
             )
         )
         showHomeOperationFeedback(
-            title = "登记排队已启用",
+            title = "登记排队已重新开启",
             detail = "机台配置和状态已刷新，现在可以创建新的排队登记。",
             contextLabel = if (source == AuditLogSource.MANAGEMENT_APP) "管理后台" else "现场终端"
         )
@@ -2428,6 +2905,10 @@ internal fun RegistrationApp() {
                 clearExecution?.state?.queue(machineId.name) ?: MachineQueue()
             )
         }
+        storePairedMachineOrders(
+            clearExecution?.state?.pairedMachineOrders.orEmpty(),
+            clearExecution?.state?.pairedArrangements.orEmpty()
+        )
         registrationOpen = false
         queueSoundPlayer.play(QueueSoundCue.CAUTION)
         val detail = if (removedCount == 0) {
@@ -2435,8 +2916,8 @@ internal fun RegistrationApp() {
                 BusinessHoursCloseTrigger.QUEUE_EMPTY_DURING_GRACE ->
                     "今日营业时间已结束，现有队列已经处理完毕，登记排队现已关闭。"
                 BusinessHoursCloseTrigger.GRACE_PERIOD_EXPIRED ->
-                    "今日营业时间结束已 20 分钟，登记排队现已关闭。"
-                null -> "新的排队登记已停止接收。"
+                    "今日营业时间已结束 20 分钟，登记排队现已关闭。"
+                null -> "已停止接收新的排队登记。"
             }
         } else {
             when (businessHoursTrigger) {
@@ -2451,7 +2932,7 @@ internal fun RegistrationApp() {
         appendAuditLog(
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
-                title = if (automaticBusinessHours) "营业结束，关闭登记排队" else "关闭登记排队",
+                title = if (automaticBusinessHours) "营业结束，登记排队已关闭" else "关闭登记排队",
                 detail = detail,
                 source = if (automaticBusinessHours) {
                     AuditLogSource.SYSTEM_AUTOMATIC
@@ -2506,6 +2987,12 @@ internal fun RegistrationApp() {
                 } ?: PersistedMachineState()
             }
         )
+        // While the terminal did not run no preview was kept up, so that time does not count.
+        pairedArrangements = QueueEngine.pairedArrangementsAfterDowntime(
+            records = savedState.pairedArrangements,
+            stoppedAtMillis = savedState.savedAtMillis,
+            nowMillis = System.currentTimeMillis()
+        )
         registrationOpen = savedState.registrationOpen
         nextKey = savedState.safeNextRegistrationKey
         queueUndoAction = null
@@ -2515,7 +3002,7 @@ internal fun RegistrationApp() {
         appendAuditLog(
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
-                title = "恢复上次队列",
+                title = "上次队列已恢复",
                 detail = savedState.configuredMachineIds.joinToString(
                     separator = "，",
                     prefix = "已恢复",
@@ -2557,8 +3044,8 @@ internal fun RegistrationApp() {
         appendAuditLog(
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
-                title = "开始新的队列",
-                detail = "未载入上次保存的 ${savedState.totalRegistrationCount} 个登记，已从空队列开始。",
+                title = "已开始新的队列",
+                detail = "未载入上次保存的 ${savedState.totalRegistrationCount} 份登记，已从空队列开始。",
                 publicEventType = PublicQueueEventType.QUEUE_RESET
             )
         )
@@ -2632,6 +3119,10 @@ internal fun RegistrationApp() {
         qqVisibility = profileQqVisibilityDraft,
         notificationPreferences = profileNotificationDraft
     )
+
+    /** Whether [profile] has to be completed in the editor before it can be used. */
+    fun playerProfileNeedsCompletion(profile: PlayerProfile): Boolean =
+        profile.needsCompletionBeforeUse()
 
     fun openLocalPlayerProfileEditor() {
         playerProfileEditorReturnScreen = Screen.PLAYER_LIBRARY
@@ -2732,6 +3223,7 @@ internal fun RegistrationApp() {
             profile.defaultPreference.toPlayPreferenceOrNull()
         }
         rememberProfileJoinPreference = false
+        joinAlsoQueuesAtPairedMachine = false
         screen = Screen.PLAYER_PROFILE_DETAIL
     }
 
@@ -2826,6 +3318,78 @@ internal fun RegistrationApp() {
         }
     }
 
+    /**
+     * Opens the explanation by itself when the box is turned on for the first time: every time
+     * for a temporary registration, once for a player profile. The profile remembers it.
+     */
+    fun showPairedExplanationOnFirstUse(
+        profileId: String?,
+        machineLabel: String,
+        partnerLabel: String
+    ) {
+        if (profileId != null) {
+            if (profileId in pairedExplanationShownProfileIds) return
+            if (
+                playerProfiles.firstOrNull { it.id == profileId }
+                    ?.pairedMachineQueueingIntroduced == true
+            ) return
+            pairedExplanationShownProfileIds = pairedExplanationShownProfileIds + profileId
+            // A failure to save only means that the explanation opens once more another day.
+            coroutineScope.launch {
+                playerProfilePersistence.mutateAndApply(
+                    profileId = profileId,
+                    currentProfiles = { playerProfiles },
+                    mutation = { latestProfile ->
+                        if (latestProfile.pairedMachineQueueingIntroduced) {
+                            latestProfile
+                        } else {
+                            latestProfile.copy(
+                                pairedMachineQueueingIntroduced = true,
+                                revision = latestProfile.revision + 1L,
+                                updatedAtMillis = maxOf(
+                                    System.currentTimeMillis(),
+                                    latestProfile.updatedAtMillis + 1
+                                )
+                            )
+                        }
+                    },
+                    onPersisted = { persistedProfile ->
+                        applyPlayerProfileToState(persistedProfile, recordAudit = false)
+                    }
+                )
+            }
+        }
+        pairedMachineQueueIntroductionCountsDown = true
+        pairedMachineQueueIntroduction = machineLabel to partnerLabel
+    }
+
+    /**
+     * The tick box for the machine chosen in the running registration; null when that machine
+     * is not part of an active pair. Every registration gets the same one, with or without a
+     * player profile ([profileId] is null for a temporary registration).
+     */
+    fun pairedQueueJoinOption(profileId: String?): PairedMachineQueueJoinOption? {
+        val machineId = selectedMachine ?: return null
+        val partnerId = queueRuleSettings.pairedMachine(machineId) ?: return null
+        val machineLabel = configuredMachineName(machineId)
+        val partnerLabel = configuredMachineName(partnerId)
+        return PairedMachineQueueJoinOption(
+            machineLabel = machineLabel,
+            pairedMachineLabel = partnerLabel,
+            checked = joinAlsoQueuesAtPairedMachine,
+            onToggle = {
+                joinAlsoQueuesAtPairedMachine = !joinAlsoQueuesAtPairedMachine
+                if (joinAlsoQueuesAtPairedMachine) {
+                    showPairedExplanationOnFirstUse(profileId, machineLabel, partnerLabel)
+                }
+            },
+            onShowDetails = {
+                pairedMachineQueueIntroductionCountsDown = false
+                pairedMachineQueueIntroduction = machineLabel to partnerLabel
+            }
+        )
+    }
+
     fun completePlayerProfileRegistration() {
         val requestedQueueId = queueId
         val machineId = selectedMachine ?: return
@@ -2839,10 +3403,11 @@ internal fun RegistrationApp() {
         } else {
             profile.defaultPreference.toPlayPreferenceOrNull() ?: profileJoinPreference ?: return
         }
+        val queuesAtPairedMachine = queueRuleSettings.pairedMachine(machineId) != null &&
+            joinAlsoQueuesAtPairedMachine
         if (
             !acceptingNewRegistrations ||
-            !profile.hasValidContact ||
-            !profile.hasCompleteRequiredDetails ||
+            playerProfileNeedsCompletion(profile) ||
             playerProfileAlreadyRegistered(profile) ||
             !statusFor(machineId).isOperational ||
             queueFor(machineId).registrationCount >= 20
@@ -2868,7 +3433,7 @@ internal fun RegistrationApp() {
                     preferenceToRemember = preferenceToRemember
                 )
             },
-            failureDetail = "玩家资料的本次使用记录未能保存，因此尚未加入排队。请稍后重试。"
+            failureDetail = "玩家资料的使用记录未能保存到本机，尚未加入排队；请稍后重试。"
         ) persisted@{ persistedProfile ->
             if (
                 queueId != requestedQueueId ||
@@ -2886,7 +3451,9 @@ internal fun RegistrationApp() {
                 preference = preference,
                 isTemporary = false,
                 gender = persistedProfile.gender,
-                playerProfileId = persistedProfile.id
+                playerProfileId = persistedProfile.id,
+                alsoQueuesAtPairedMachine = queuesAtPairedMachine &&
+                    queueRuleSettings.pairedMachine(machineId) != null
             )
             val registrationAdded = updateQueueAfterOnSiteRegistration(
                 machineId = machineId,
@@ -2920,8 +3487,7 @@ internal fun RegistrationApp() {
             !statusFor(selection.machineId).isOperational ||
             currentQueue.registrationCount >= 20 ||
             target.requiresOnSiteCheckIn ||
-            !profile.hasValidContact ||
-            !profile.hasCompleteRequiredDetails ||
+            playerProfileNeedsCompletion(profile) ||
             playerProfileAlreadyRegistered(profile)
         ) return
 
@@ -2937,7 +3503,7 @@ internal fun RegistrationApp() {
                     )
                 )
             },
-            failureDetail = "朋友的玩家资料使用记录未能保存，因此尚未创建登记。请稍后重试。"
+            failureDetail = "朋友的玩家资料使用记录未能保存到本机，尚未创建登记；请稍后重试。"
         ) persisted@{ persistedProfile ->
             val latestQueue = queueFor(selection.machineId)
             val latestTarget = latestQueue.waiting.firstOrNull {
@@ -3028,8 +3594,7 @@ internal fun RegistrationApp() {
         val registration = queueFor(selection.machineId).allRegistrations
             .firstOrNull { it.key == selection.registrationKey } ?: return
         if (
-            !profile.hasValidContact ||
-            !profile.hasCompleteRequiredDetails ||
+            playerProfileNeedsCompletion(profile) ||
             !registration.isTemporary ||
             !statusFor(selection.machineId).isOperational ||
             playerProfileAlreadyRegistered(profile, exceptKey = registration.key)
@@ -3046,7 +3611,7 @@ internal fun RegistrationApp() {
                     )
                 )
             },
-            failureDetail = "玩家资料的本次使用记录未能保存，因此尚未认领登记。请稍后重试。"
+            failureDetail = "玩家资料的使用记录未能保存到本机，尚未认领登记；请稍后重试。"
         ) { persistedProfile ->
             val latestRegistration = queueFor(selection.machineId).allRegistrations
                 .firstOrNull { it.key == registration.key }
@@ -3093,11 +3658,7 @@ internal fun RegistrationApp() {
         return estimatedWaitExtendsPastClosing(
             status = businessHoursStatus,
             nowMillis = nowMillis,
-            estimatedWaitMinutes = estimatedWaitForNewOpenRegistration(
-                queueFor(machineId),
-                nowMillis,
-                queueRuleSettings.machineConfiguration(machineId)
-            )
+            estimatedWaitMinutes = newRegistrationWaitMinutes(machineId)
         )
     }
 
@@ -3114,6 +3675,7 @@ internal fun RegistrationApp() {
     fun continueRegistrationForMachine(machineId: MachineId) {
         isBatchFlow = false
         selectedMachine = machineId
+        joinAlsoQueuesAtPairedMachine = false
         mobileRegistrationSession = null
         mobileRegistrationFailureDetail = null
         draftId = ""
@@ -3208,6 +3770,7 @@ internal fun RegistrationApp() {
 
     fun continueSelectedRegistrationMachine(machineId: MachineId) {
         selectedMachine = machineId
+        joinAlsoQueuesAtPairedMachine = false
         selectedPreference = if (
             queueRuleSettings.machineConfiguration(machineId).capacity == 1
         ) {
@@ -3219,6 +3782,179 @@ internal fun RegistrationApp() {
             batchAmount = minOf(2, 20 - queueFor(machineId).registrationCount).toString()
         }
         screen = if (isBatchFlow) Screen.BATCH_AMOUNT else Screen.CREATE_REGISTRATION
+    }
+
+    /** The summary pane of the join flow at [page] (docs/ui-guide.md, 分步填写). */
+    fun joinFlowSummary(page: JoinFlowPage): FlowSummary {
+        val machineId = selectedMachine
+        val machine = machineId?.let { id -> configuredMachines.firstOrNull { it.machineId == id } }
+        val singlePlayer = machineId?.let { queueRuleSettings.machineConfiguration(it).capacity == 1 } == true
+        val profilePath = page == JoinFlowPage.PROFILE || page == JoinFlowPage.CONFIRM
+        fun state(index: Int) = when {
+            index < page.index -> FlowStepState.DONE
+            index == page.index -> FlowStepState.CURRENT
+            else -> FlowStepState.PENDING
+        }
+        fun preferenceLabel(preference: PlayPreference?) = when (preference) {
+            PlayPreference.SOLO -> "单人游玩"
+            PlayPreference.OPEN_TO_JOIN -> "允许他人加入"
+            null -> null
+        }
+        val steps = buildList {
+            add(
+                FlowStep(
+                    "机台",
+                    machine?.name?.takeIf { page.index > 0 },
+                    state(0),
+                    onEdit = { screen = Screen.MACHINE }
+                )
+            )
+            add(
+                FlowStep(
+                    "登记方式",
+                    when {
+                        profilePath -> "使用玩家资料库"
+                        page.index > 1 -> "创建临时登记"
+                        else -> null
+                    },
+                    state(1),
+                    onEdit = {
+                        temporarySelected = false
+                        screen = Screen.CREATE_REGISTRATION
+                    }
+                )
+            )
+            if (profilePath) {
+                add(
+                    FlowStep(
+                        "玩家资料",
+                        selectedPlayerProfileId?.takeIf { page.index > 2 }?.let { id ->
+                            playerProfiles.firstOrNull { it.id == id }?.nickname
+                        },
+                        state(2),
+                        onEdit = { screen = Screen.PLAYER_LIBRARY }
+                    )
+                )
+                add(FlowStep("确认加入", preferenceLabel(profileJoinPreference)?.takeIf { page.index == 3 }, state(3)))
+            } else {
+                add(
+                    FlowStep(
+                        "昵称",
+                        draftId.takeIf { page.index > 2 && it.isNotBlank() },
+                        state(2),
+                        placeholder = "请填写",
+                        onEdit = {
+                            temporarySelected = true
+                            screen = Screen.CREATE_REGISTRATION
+                        }
+                    )
+                )
+                if (!singlePlayer) {
+                    add(FlowStep("游玩偏好", preferenceLabel(selectedPreference)?.takeIf { page.index == 3 }, state(3)))
+                }
+            }
+        }
+        val info = machine?.takeIf { page != JoinFlowPage.MACHINE }?.let {
+            FlowInfo(
+                "新登记预计等待",
+                newRegistrationEstimateLabel(it, homeNewRegistrationWaits),
+                "按当前队列估算，实际以轮到时为准。"
+            )
+        }
+        return FlowSummary("创建登记并加入排队", steps, info)
+    }
+
+    /** The summary pane of claiming a temporary registration: 0 the way, 1 the profile, 2 confirming. */
+    fun claimFlowSummary(page: Int): FlowSummary {
+        val registration = claimTarget?.let { selection ->
+            queueFor(selection.machineId).allRegistrations.firstOrNull { it.key == selection.registrationKey }
+        }
+        fun state(index: Int) = when {
+            index < page -> FlowStepState.DONE
+            index == page -> FlowStepState.CURRENT
+            else -> FlowStepState.PENDING
+        }
+        return FlowSummary(
+            "认领临时登记",
+            listOf(
+                FlowStep(
+                    "认领方式",
+                    "使用玩家资料库".takeIf { page > 0 },
+                    state(0),
+                    onEdit = { screen = Screen.CLAIM_REGISTRATION }
+                ),
+                FlowStep(
+                    "玩家资料",
+                    selectedPlayerProfileId?.takeIf { page > 1 }?.let { id ->
+                        playerProfiles.firstOrNull { it.id == id }?.nickname
+                    },
+                    state(1),
+                    onEdit = { screen = Screen.PLAYER_LIBRARY }
+                ),
+                FlowStep("确认认领", null, state(2), placeholder = "请核对")
+            ),
+            registration?.let {
+                FlowInfo("认领的登记", it.displayId, "认领后，当前位置和等待顺序不会改变。")
+            }
+        )
+    }
+
+    /** The summary pane of pairing with a friend's profile: 0 the profile, 1 confirming. */
+    fun friendPairFlowSummary(page: Int): FlowSummary {
+        val selection = friendPairProfileTarget
+        val registration = selection?.let { selected ->
+            queueFor(selected.machineId).waiting.firstOrNull { it.key == selected.registrationKey }
+        }
+        return FlowSummary(
+            "与朋友共同游玩",
+            listOf(
+                FlowStep(
+                    "朋友的玩家资料",
+                    selectedPlayerProfileId?.takeIf { page > 0 }?.let { id ->
+                        playerProfiles.firstOrNull { it.id == id }?.nickname
+                    },
+                    if (page > 0) FlowStepState.DONE else FlowStepState.CURRENT,
+                    onEdit = { screen = Screen.PLAYER_LIBRARY }
+                ),
+                FlowStep(
+                    "确认组成固定组合",
+                    null,
+                    if (page > 0) FlowStepState.CURRENT else FlowStepState.PENDING,
+                    placeholder = "请核对"
+                )
+            ),
+            registration?.let {
+                FlowInfo(
+                    "现有登记",
+                    it.displayId,
+                    "位于 ${configuredMachineName(selection.machineId)}。"
+                )
+            }
+        )
+    }
+
+    /** The summary pane of batch creation: 0 choosing the machine, 1 the amount. */
+    fun batchFlowSummary(page: Int): FlowSummary {
+        val machine = selectedMachine?.let { id -> configuredMachines.firstOrNull { it.machineId == id } }
+        return FlowSummary(
+            "批量创建登记",
+            listOf(
+                FlowStep(
+                    "机台",
+                    machine?.name?.takeIf { page > 0 },
+                    if (page > 0) FlowStepState.DONE else FlowStepState.CURRENT,
+                    onEdit = { screen = Screen.MACHINE }
+                ),
+                FlowStep(
+                    "数量",
+                    batchAmount.toIntOrNull()?.let { "$it 份" }?.takeIf { page > 0 },
+                    if (page > 0) FlowStepState.CURRENT else FlowStepState.PENDING
+                )
+            ),
+            machine?.takeIf { page > 0 }?.let {
+                FlowInfo("当前机台", "${it.queue.registrationCount} 份登记", "每台机台最多 20 份登记。")
+            }
+        )
     }
 
     fun beginRegistration(batch: Boolean) {
@@ -3314,7 +4050,15 @@ internal fun RegistrationApp() {
             soundCue = QueueSoundCue.CONFIRM,
             action = QueueAction.AddRegistrations(
                 machineId.name,
-                listOf(Registration(registrationKey, normalizedId, preference)),
+                listOf(
+                    Registration(
+                        key = registrationKey,
+                        displayId = normalizedId,
+                        preference = preference,
+                        alsoQueuesAtPairedMachine = joinAlsoQueuesAtPairedMachine &&
+                            queueRuleSettings.pairedMachine(machineId) != null
+                    )
+                ),
                 RegistrationPlacement.ADVANCE_IF_UNAMBIGUOUS
             )
         )
@@ -3446,7 +4190,7 @@ internal fun RegistrationApp() {
             showHomeOperationFeedback(
                 title = "未签到登记已自动移除",
                 detail = removalNotices.joinToString("\n") +
-                    "\n以上线上登记未在本次 30 分钟签到时限内完成现场签到，现已退出排队。",
+                    "\n以上线上登记未在本次 30 分钟签到时限内完成现场签到，已自动移除。",
                 contextLabel = "系统自动",
                 tone = HomeSidePanelFeedbackTone.WARNING
             )
@@ -3544,8 +4288,81 @@ internal fun RegistrationApp() {
             machineId.name to queueRuleSettings.machineStableId(machineId)
         },
         machineConfigurationRevision = queueRuleSettings.machineConfigurationRevision,
-        managementPolicyRevision = queueRuleSettings.managementPolicyRevision
+        managementPolicyRevision = queueRuleSettings.managementPolicyRevision,
+        pairedMachineOrders = currentQueueEngineState().pairedMachineOrders,
+        pairedArrangements = pairedArrangements,
+        machinePartners = queueRuleSettings.machinePartnerNames
     )
+
+    // Places held across paired machines depend on the pair settings and on which machines are
+    // in operation, neither of which changes through a queue action.
+    val pairedMachineSettleKey = queueRuleSettings.machinePartnerNames to
+        configuredMachineIds.map { machineStates.status(it).isOperational }
+    LaunchedEffect(queuePersistenceReady, pendingQueueRestore == null, pairedMachineSettleKey) {
+        if (queuePersistenceReady && pendingQueueRestore == null) settlePairedMachineQueues()
+    }
+    // A preview that announces an arrangement follows the queues and the clock.
+    LaunchedEffect(
+        queuePersistenceReady,
+        pendingQueueRestore == null,
+        pairedMachineSettleKey,
+        configuredMachineStateSnapshot,
+        queueRuleSettings.machineConfigurations,
+        nowMillis / 30_000L
+    ) {
+        if (queuePersistenceReady && pendingQueueRestore == null) refreshPairedArrangements()
+    }
+
+    /**
+     * Applies what a command of the management app changed in the queues, with its logs, the
+     * undo entry and the feedback on the home screen. Kept out of the command loop below, whose
+     * compiled form is close to the size limit of a single method.
+     */
+    fun applyManagementQueueResult(result: ManagementQueueActionDecision.Apply) {
+        val beforeQueues = configuredMachineIds.associate { machineId ->
+            machineId.name to queueFor(machineId)
+        }
+        configuredMachineIds.forEach { machineId ->
+            result.state.queues[machineId.name]?.let { queue ->
+                setQueue(machineId, queue)
+            }
+        }
+        commitPairedCommandEffects(beforeQueues, result.state, null, AuditLogSource.MANAGEMENT_APP)
+        nextKey = maxOf(nextKey, result.state.nextRegistrationKey)
+        homeSidePanelFeedback = null
+        newRegistrationHighlight = null
+        result.changedMachineIds.forEach { machineName ->
+            val machineId = MachineId.entries.firstOrNull {
+                it.name == machineName
+            } ?: return@forEach
+            val beforeQueue = beforeQueues.getValue(machineName)
+            val afterQueue = result.state.queues.getValue(machineName)
+            appendQueueAuditLog(
+                machineId = machineId,
+                beforeQueue = commandAuditBaseline(machineName, beforeQueues, result.state.queues, result.action),
+                afterQueue = afterQueue,
+                titleOverride = "管理后台：${result.detail.removeSuffix("。")}",
+                source = AuditLogSource.MANAGEMENT_APP,
+                classifyAvailabilityOutcomes = true,
+                semanticAction = result.action
+            )
+        }
+        // What the management app decided is not offered for undoing at the terminal, where
+        // anybody could take it back.
+        queueUndoAction = null
+        if (result.changedMachineIds.isNotEmpty()) {
+            queueSoundPlayer.play(QueueSoundCue.QUEUE_CHANGE)
+            showHomeOperationFeedback(
+                title = "管理后台操作已执行",
+                detail = result.detail,
+                contextLabel = result.changedMachineIds.mapNotNull { name ->
+                    MachineId.entries.firstOrNull { it.name == name }
+                        ?.let(::configuredMachineName)
+                }.joinToString("、"),
+                tone = HomeSidePanelFeedbackTone.INFO
+            )
+        }
+    }
 
     LaunchedEffect(
         queueCommandClient,
@@ -3626,7 +4443,7 @@ internal fun RegistrationApp() {
                                 !persistTerminalCommandReceipt(existingReceipt)
                             ) {
                                 localWriteFailureDetail =
-                                    "远程命令结果暂时无法写入本机，应用将继续重试。"
+                                    "远程操作的结果暂时无法写入本机，应用将继续重试。"
                                 localWriteFailureAtMillis = System.currentTimeMillis()
                                 continue
                             }
@@ -3643,13 +4460,13 @@ internal fun RegistrationApp() {
                             is TerminalPolicyUpdateCommand -> {
                                 val detail = when {
                                     command.queueId != queueId ->
-                                        "终端策略所属队列已经变化，请管理后台刷新后重试。"
+                                        "现场已经开始新的队列，请刷新后再提交。"
                                     command.expectedPolicyRevision !=
                                         queueRuleSettings.managementPolicyRevision ->
                                         "终端敏感策略已经更新，请管理后台刷新后重试。"
                                     command.nextPolicyRevision !=
                                         command.expectedPolicyRevision + 1L ->
-                                        "终端策略版本无效，未应用这次修改。"
+                                        "终端敏感策略的修改未能应用，请刷新后再提交。"
                                     else -> null
                                 }
                                 val applied = if (detail == null) {
@@ -3709,19 +4526,19 @@ internal fun RegistrationApp() {
                                     }
                                 val detail = when {
                                     command.queueId != queueId ->
-                                        "登记开关所属队列已经变化，请管理后台刷新后重试。"
+                                        "现场已经开始新的队列，请刷新后再提交。"
                                     !queueRuleSettings.managementAppBound ->
-                                        "现场终端已经解除管理后台接管，请重新绑定后再提交。"
+                                        "现场终端已解除管理后台接管，请重新绑定后再提交。"
                                     command.expectedPolicyRevision != null &&
                                         command.expectedPolicyRevision != queueRuleSettings.managementPolicyRevision ->
                                         "终端接管策略已经更新，请管理后台刷新后重试。"
                                     command.expectedQueueRevision != queueRevision.get() ->
-                                        "现场队列已经更新，请管理后台刷新后重试。"
+                                        "现场队列已经更新，请刷新后再提交。"
                                     command.expectedMachineConfigurationRevision !=
                                         queueRuleSettings.machineConfigurationRevision ->
                                         "现场机台配置已经更新，请管理后台刷新后重试。"
                                     command.expectedRegistrationOpen != registrationOpen ->
-                                        "登记开放状态已经更新，请管理后台刷新后重试。"
+                                        "登记排队状态已经更新，请管理后台刷新后重试。"
                                     command.expectedRegistrationIds != currentRegistrationIds ->
                                         "当前队列登记已经更新，请管理后台重新确认。"
                                     else -> null
@@ -3742,10 +4559,10 @@ internal fun RegistrationApp() {
                                     if (command.registrationOpen) {
                                         "登记排队已由管理后台开启，并开始新的空队列。"
                                     } else {
-                                        "登记排队已由管理后台关闭，确认时的队列登记已全部清空。"
+                                        "登记排队已由管理后台关闭，所有机台的登记已全部清空。"
                                     }
                                 } else {
-                                    detail ?: "登记开放状态未能在终端更新。"
+                                    detail ?: "登记排队状态未能在终端更新。"
                                 }
                                 if (!persistTerminalCommandReceipt(
                                         TerminalCommandReceipt(
@@ -3769,53 +4586,14 @@ internal fun RegistrationApp() {
                             }
 
                             is TerminalSettingsUpdateCommand -> {
-                                val detail = when {
-                                    command.queueId != queueId ->
-                                        "终端设置所属队列已经变化，请管理后台刷新后重试。"
-                                    !queueRuleSettings.managementAppBound ->
-                                        "现场终端已经解除管理后台接管，请重新绑定后再提交。"
-                                    command.expectedPolicyRevision !=
-                                        queueRuleSettings.managementPolicyRevision ->
-                                        "终端接管策略已经更新，请管理后台刷新后重试。"
-                                    command.expectedSettingsRevision !=
-                                        queueRuleSettings.managementSettingsRevision ->
-                                        "终端设置已经更新，请管理后台刷新后重试。"
-                                    command.nextSettingsRevision !=
-                                        command.expectedSettingsRevision + 1L ->
-                                        "终端设置版本无效，未应用这次修改。"
-                                    command.expectedMachineConfigurationRevision !=
-                                        queueRuleSettings.machineConfigurationRevision ->
-                                        "现场机台配置已经更新，请管理后台刷新后重试。"
-                                    command.expectedRegistrationOpen != registrationOpen ->
-                                        "登记开放状态已经更新，请管理后台刷新后重试。"
-                                    else -> null
-                                }
+                                val detail = command.rejectionDetail(
+                                    currentQueueId = queueId,
+                                    settings = queueRuleSettings,
+                                    registrationOpen = registrationOpen
+                                )
                                 val applied = if (detail == null) {
-                                    val requested = queueRuleSettings.copy(
-                                        showCommonPlayPreview = command.showCommonPlayPreview,
-                                        businessHours = command.businessHours,
-                                        configuredMachineCount = command.configuredMachineCount,
-                                        machineConfigurations = MachineId.entries.associateWith {
-                                            machineId ->
-                                            command.machineConfigurations[machineId]
-                                                ?: DEFAULT_MACHINE_CONFIGURATIONS.getValue(machineId)
-                                        },
-                                        machineStableIds = MachineId.entries.associateWith {
-                                            machineId ->
-                                            command.machineStableIds[machineId]
-                                                ?: defaultMachineStableId(machineId)
-                                        },
-                                        machineGroupAssignments = MachineId.entries.associateWith {
-                                            machineId ->
-                                            command.machineGroupAssignments[machineId]
-                                                ?: command.defaultMachineGroupId
-                                        },
-                                        machineGroups = command.machineGroups,
-                                        defaultMachineGroupId = command.defaultMachineGroupId,
-                                        managementSettingsRevision = command.nextSettingsRevision
-                                    )
                                     updateQueueRuleSettings(
-                                        requested,
+                                        command.requestedSettings(queueRuleSettings),
                                         fromManagementCommand = true
                                     ) &&
                                         queueRuleSettings.managementSettingsRevision ==
@@ -3853,7 +4631,7 @@ internal fun RegistrationApp() {
                                 val currentStatus = statusFor(command.machineId)
                                 val detail = when {
                                     command.queueId != queueId ->
-                                        "机台状态命令所属队列已经变化，请管理后台刷新后重试。"
+                                        "现场已经开始新的队列，请刷新后再提交。"
                                     !queueRuleSettings.managementAppBound ->
                                         "现场终端已经解除管理后台接管，请重新绑定后再提交。"
                                     command.expectedPolicyRevision != null &&
@@ -3981,7 +4759,7 @@ internal fun RegistrationApp() {
                                     }
 
                                     PlayerProfileCommandPersistenceResult.AlreadyApplied -> {
-                                        val detail = "玩家资料已经是请求的内容。"
+                                        val detail = "玩家资料已与提交的内容一致，无需修改。"
                                         if (!persistTerminalCommandReceipt(
                                                 TerminalCommandReceipt(
                                                     commandId = command.commandId,
@@ -4077,70 +4855,7 @@ internal fun RegistrationApp() {
                                 )
                                 when (val result = decision) {
                                     is ManagementQueueActionDecision.Apply -> {
-                                        val beforeQueues = configuredMachineIds.associate { machineId ->
-                                            machineId.name to queueFor(machineId)
-                                        }
-                                        configuredMachineIds.forEach { machineId ->
-                                            result.state.queues[machineId.name]?.let { queue ->
-                                                setQueue(machineId, queue)
-                                            }
-                                        }
-                                        nextKey = maxOf(nextKey, result.state.nextRegistrationKey)
-                                        homeSidePanelFeedback = null
-                                        newRegistrationHighlight = null
-                                        result.changedMachineIds.forEach { machineName ->
-                                            val machineId = MachineId.entries.firstOrNull {
-                                                it.name == machineName
-                                            } ?: return@forEach
-                                            val beforeQueue = beforeQueues.getValue(machineName)
-                                            val afterQueue = result.state.queues.getValue(machineName)
-                                            appendQueueAuditLog(
-                                                machineId = machineId,
-                                                beforeQueue = beforeQueue,
-                                                afterQueue = afterQueue,
-                                                titleOverride = "管理后台：${result.detail}",
-                                                source = AuditLogSource.MANAGEMENT_APP,
-                                                classifyAvailabilityOutcomes = true,
-                                                semanticAction = result.action
-                                            )
-                                        }
-                                        queueUndoAction = result.changedMachineIds.singleOrNull()
-                                            ?.let { machineName ->
-                                                val machineId = MachineId.entries.firstOrNull {
-                                                    it.name == machineName
-                                                } ?: return@let null
-                                                val beforeQueue = beforeQueues.getValue(machineName)
-                                                val afterQueue = result.state.queues.getValue(machineName)
-                                                val feedback = queueUndoFeedbackOutcome(
-                                                    beforeQueue,
-                                                    afterQueue
-                                                )
-                                                QueueUndoAction(
-                                                    id = nextQueueUndoId++,
-                                                    machineId = machineId,
-                                                    beforeQueue = beforeQueue,
-                                                    afterQueue = afterQueue,
-                                                    message = result.detail.removeSuffix("。"),
-                                                    feedbackTitle = result.detail.removeSuffix("。"),
-                                                    feedbackDetail = result.detail,
-                                                    contextLabel = configuredMachineName(machineId),
-                                                    feedbackTone = feedback.tone,
-                                                    nonRestorableRegistrationKeys =
-                                                        feedback.nonRestorableRegistrationKeys
-                                                )
-                                            }
-                                        if (result.changedMachineIds.isNotEmpty()) {
-                                            queueSoundPlayer.play(QueueSoundCue.QUEUE_CHANGE)
-                                            showHomeOperationFeedback(
-                                                title = "管理后台操作已执行",
-                                                detail = result.detail,
-                                                contextLabel = result.changedMachineIds.mapNotNull { name ->
-                                                    MachineId.entries.firstOrNull { it.name == name }
-                                                        ?.let(::configuredMachineName)
-                                                }.joinToString("、"),
-                                                tone = HomeSidePanelFeedbackTone.INFO
-                                            )
-                                        }
+                                        applyManagementQueueResult(result)
                                         persistQueueStateBeforeRemoteAcknowledgement()
                                         if (result.updatedProfile != null) {
                                             val persisted = playerProfilePersistence.persistAndApply(
@@ -4253,6 +4968,7 @@ internal fun RegistrationApp() {
                                                 setQueue(machineId, queue)
                                             }
                                         }
+                                        commitPairedCommandEffects(beforeQueues, result.state, result.changedMachineIds, command.source.auditLogSource)
                                         nextKey = maxOf(
                                             nextKey,
                                             result.state.nextRegistrationKey
@@ -4302,7 +5018,7 @@ internal fun RegistrationApp() {
                                                 } ?: return@forEach
                                                 appendQueueAuditLog(
                                                     machineId = machineId,
-                                                    beforeQueue = beforeQueues.getValue(machineName),
+                                                    beforeQueue = pairedAuditBaseline(machineName, beforeQueues, result.state.queues),
                                                     afterQueue = result.state.queues.getValue(machineName),
                                                      publicEventTypeOverride = when (command.operation) {
                                                         RemoteQueueOperation.JOIN_QUEUE ->
@@ -4531,12 +5247,14 @@ internal fun RegistrationApp() {
                                         }
                                         val beforeQueue = machineId?.let(::queueFor)
                                             ?: MachineQueue()
+                                        val beforeMobileQueues = snapshotMachineQueues()
                                         configuredMachineIds.forEach { configuredMachineId ->
                                             result.state.queues[configuredMachineId.name]
                                                 ?.let { queue ->
                                                     setQueue(configuredMachineId, queue)
                                                 }
                                         }
+                                        commitPairedCommandEffects(beforeMobileQueues, result.state, setOf(result.changedMachineId), AuditLogSource.MOBILE_DEVICE)
                                         nextKey = maxOf(nextKey, result.state.nextRegistrationKey)
                                         queueUndoAction = null
                                         homeSidePanelFeedback = null
@@ -5016,6 +5734,16 @@ internal fun RegistrationApp() {
                     machineName = configuredMachineName(activeReorder.machineId),
                     initialQueue = activeReorder.queueSnapshot,
                     explicitEditMode = activeReorder.explicitEditMode,
+                    pairedQueueNotice = if (
+                        queueRuleSettings.pairedMachine(activeReorder.machineId) != null &&
+                        activeReorder.queueSnapshot.waiting.any {
+                            it.alsoQueuesAtPairedMachine && !it.skipsPairedMachineThisRound
+                        }
+                    ) {
+                        PAIRED_MACHINE_PLACE_GIVEN_UP_GENERAL_NOTICE
+                    } else {
+                        null
+                    },
                     onCancel = { reorderSession = null },
                         onCommit = { registrations ->
                         val changed =
@@ -5027,8 +5755,8 @@ internal fun RegistrationApp() {
                                     activeReorder.machineId.name,
                                     registrations
                                 ),
-                                message = "${configuredMachineName(activeReorder.machineId)} 的登记顺序已调整",
-                                feedbackTitle = "登记顺序已调整",
+                                message = "${configuredMachineName(activeReorder.machineId)} 的等待顺序已调整",
+                                feedbackTitle = "等待顺序已调整",
                                 feedbackDetail = "等待登记已经按照确认后的顺序重新排列。"
                             )
                         if (!changed) showQueueAdjustmentNotApplied(activeReorder.machineId)
@@ -5079,6 +5807,47 @@ internal fun RegistrationApp() {
                         )
 
                         Screen.HOME -> HomeScreen(
+                            newRegistrationWaits = homeNewRegistrationWaits,
+                            pairedArrangementNotices = { machineId ->
+                                // The same record decides what the registration's menu says.
+                                queueRuleSettings.pairedMachine(machineId)?.let { partnerId ->
+                                    // Where the other machine shows the registration's preview,
+                                    // the notice names that position, such as 可能转至 B2
+                                    // (maintainer, 2026-11-25); otherwise the machine.
+                                    queueFor(machineId).waiting
+                                        .filter {
+                                            it.alsoQueuesAtPairedMachine &&
+                                                pairedArrangements[it.key]?.previewSinceMillis != null
+                                        }
+                                        .associate { registration ->
+                                            registration.key to pairedMachineArrangementTileNotice(
+                                                pairedPreviewPosition(machineId, registration.key)
+                                                    ?: "机台 ${partnerId.name}"
+                                            )
+                                        }
+                                }.orEmpty()
+                            },
+                            pairedPreview = { machineId, queue ->
+                                if (
+                                    queueRuleSettings.pairedMachine(machineId) == null ||
+                                    queue != queueFor(machineId)
+                                ) {
+                                    queue to emptySet()
+                                } else {
+                                    PairedMachineForecast.displayQueue(
+                                        state = currentQueueEngineState(),
+                                        policy = currentQueueEnginePolicy(),
+                                        machineId = machineId.name,
+                                        forecast = homePairedForecast
+                                    )
+                                }
+                            },
+                            onPairedPreviewClick = { machineId, _ ->
+                                queueRuleSettings.pairedMachine(machineId)?.let { homeMachineId ->
+                                    pairedPreviewExplanation = configuredMachineName(homeMachineId) to
+                                        configuredMachineName(machineId)
+                                }
+                            },
                             machines = configuredMachines,
                             machineGroups = queueRuleSettings.configuredMachineGroups,
                             machineGroupAssignments = queueRuleSettings.configuredMachineIds
@@ -5122,10 +5891,6 @@ internal fun RegistrationApp() {
                             onJoinMachine = { machineId ->
                                 dismissHomeSidePanelContent()
                                 beginRegistrationForMachine(machineId)
-                            },
-                            onBatch = {
-                                dismissHomeSidePanelContent()
-                                beginRegistration(true)
                             },
                             onCompletedRegistrationClick = { machineId, registrationKey ->
                                 newRegistrationHighlight = null
@@ -5212,6 +5977,8 @@ internal fun RegistrationApp() {
                         Screen.MACHINE -> MachineSelectionScreen(
                             machines = configuredMachines,
                             batch = isBatchFlow,
+                            summary = if (isBatchFlow) batchFlowSummary(0) else joinFlowSummary(JoinFlowPage.MACHINE),
+                            newRegistrationWaits = homeNewRegistrationWaits,
                             onBack = { screen = Screen.HOME },
                             onSelect = ::selectRegistrationMachine
                         )
@@ -5229,6 +5996,10 @@ internal fun RegistrationApp() {
                                 temporarySelected = true
                                 draftId = randomUnusedId()
                             },
+                            onSuggestNicknames = { count ->
+                                generateSequence { randomUnusedId() }.take(count * 4)
+                                    .distinct().filter { it != draftId }.take(count).toList()
+                            },
                             onPlayerLibrary = {
                                 openPlayerLibrary(PlayerProfileContext.JOIN_QUEUE)
                             },
@@ -5245,7 +6016,7 @@ internal fun RegistrationApp() {
                                     "请先在应用设置中配置并开启与服务端同步。"
                                 terminalInstallation.registrationState ==
                                     TerminalInstallationRegistrationState.VENUE_MISMATCH ->
-                                    "当前服务器属于另一机厅。请先在应用设置中修正连接。"
+                                    "当前服务器属于另一机厅，请先在应用设置中修正连接。"
                                 else -> "正在核对服务器所属机厅，完成后才能使用移动设备登记。"
                             },
                             mobileRegistrationLoading = mobileRegistrationLoading,
@@ -5254,8 +6025,16 @@ internal fun RegistrationApp() {
                             singlePlayerMachine = selectedMachine?.let {
                                 queueRuleSettings.machineConfiguration(it).capacity == 1
                             } == true,
+                            summary = joinFlowSummary(
+                                if (temporarySelected) JoinFlowPage.NICKNAME else JoinFlowPage.METHOD
+                            ),
+                            // A temporary registration cannot be arranged between two machines.
+                            pairedQueueOption = null,
                             onMobileRegistration = ::requestMobileRegistrationSession,
-                            onBack = { screen = Screen.MACHINE },
+                            onBack = {
+                                if (temporarySelected) temporarySelected = false
+                                else screen = Screen.MACHINE
+                            },
                             onContinue = {
                                 val machineId = selectedMachine
                                 if (
@@ -5271,7 +6050,10 @@ internal fun RegistrationApp() {
                         )
 
                         Screen.PREFERENCE -> PreferenceScreen(
+                            // A temporary registration cannot be arranged between two machines.
+                            pairedQueueOption = null,
                             selected = selectedPreference,
+                            summary = joinFlowSummary(JoinFlowPage.PREFERENCE),
                             onSelect = { selectedPreference = it },
                             onBack = { screen = Screen.CREATE_REGISTRATION },
                             onComplete = ::completeRegistration,
@@ -5283,15 +6065,15 @@ internal fun RegistrationApp() {
                             searchQuery = playerProfileSearch,
                             sortMode = playerProfileSort,
                             listState = playerProfileListState,
-                            contextLabel = when (playerProfileContext) {
-                                PlayerProfileContext.CLAIM_REGISTRATION -> "认领登记"
-                                PlayerProfileContext.FRIEND_PAIR -> "与朋友共同游玩"
-                                PlayerProfileContext.JOIN_QUEUE -> "本机玩家资料"
+                            summary = when (playerProfileContext) {
+                                PlayerProfileContext.CLAIM_REGISTRATION -> claimFlowSummary(1)
+                                PlayerProfileContext.FRIEND_PAIR -> friendPairFlowSummary(0)
+                                PlayerProfileContext.JOIN_QUEUE -> joinFlowSummary(JoinFlowPage.PROFILE)
                             },
                             title = when (playerProfileContext) {
                                 PlayerProfileContext.CLAIM_REGISTRATION -> "选择玩家资料"
                                 PlayerProfileContext.FRIEND_PAIR -> "选择朋友的玩家资料"
-                                PlayerProfileContext.JOIN_QUEUE -> "玩家资料库"
+                                PlayerProfileContext.JOIN_QUEUE -> "选择玩家资料"
                             },
                             subtitle = when (playerProfileContext) {
                                 PlayerProfileContext.CLAIM_REGISTRATION ->
@@ -5299,7 +6081,7 @@ internal fun RegistrationApp() {
                                 PlayerProfileContext.FRIEND_PAIR ->
                                     "选择朋友的玩家资料，确认后创建登记并组成固定组合。"
                                 PlayerProfileContext.JOIN_QUEUE ->
-                                    "选择玩家资料，确认后加入当前机台的排队。"
+                                    "选择玩家资料后，确认本次游玩偏好即可加入排队。"
                             },
                             onSearchQueryChange = {
                                 playerProfileSearch = it
@@ -5372,6 +6154,7 @@ internal fun RegistrationApp() {
                                 ClaimPlayerProfileDetailScreen(
                                     profile = profile,
                                     registration = registration,
+                                    summary = claimFlowSummary(2),
                                     alreadyRegistered = profile?.let {
                                         playerProfileAlreadyRegistered(it, exceptKey = registration?.key)
                                     } == true,
@@ -5417,6 +6200,7 @@ internal fun RegistrationApp() {
                                     profile = profile,
                                     registration = registration,
                                     currentPartner = currentPartner,
+                                    summary = friendPairFlowSummary(1),
                                     alreadyRegistered = profile?.let(::playerProfileAlreadyRegistered) == true,
                                     machineLabel = selection?.machineId
                                         ?.let(::configuredMachineName)
@@ -5442,6 +6226,8 @@ internal fun RegistrationApp() {
                             } else {
                                 PlayerProfileDetailScreen(
                                     profile = profile,
+                                    summary = joinFlowSummary(JoinFlowPage.CONFIRM),
+                                    pairedQueueOption = pairedQueueJoinOption(profileId = profile?.id),
                                     selectedPreference = profileJoinPreference,
                                     rememberPreference = rememberProfileJoinPreference,
                                     alreadyRegistered = profile?.let(::playerProfileAlreadyRegistered) == true,
@@ -5469,10 +6255,10 @@ internal fun RegistrationApp() {
                                         !cloudSyncAvailable ||
                                             !queueRuleSettings.websiteSyncEnabled ||
                                             !queueCommandClient.isConfigured ->
-                                            "请先在设置中配置并开启与服务端同步。"
+                                            "请先在应用设置中配置并开启与服务端同步。"
                                         terminalInstallation.registrationState ==
                                             TerminalInstallationRegistrationState.VENUE_MISMATCH ->
-                                            "当前服务器属于另一机厅，请先在设置中修正连接。"
+                                            "当前服务器属于另一机厅，请先在应用设置中修正连接。"
                                         else -> "正在核对服务器所属机厅，完成后才能绑定网页账户。"
                                     },
                                     onPreferenceChange = { profileJoinPreference = it },
@@ -5494,12 +6280,7 @@ internal fun RegistrationApp() {
                         Screen.BATCH_AMOUNT -> BatchAmountScreen(
                             amount = batchAmount,
                             maximum = selectedMachine?.let { 20 - queueFor(it).registrationCount } ?: 20,
-                            onAmountChange = { value ->
-                                if (value.all(Char::isDigit)) {
-                                    batchAmount = value.take(2)
-                                    hostActivity?.recordUserInteraction()
-                                }
-                            },
+                            summary = batchFlowSummary(1),
                             onDecrease = {
                                 batchAmount = ((batchAmount.toIntOrNull() ?: 2) - 1).coerceAtLeast(1).toString()
                             },
@@ -5516,6 +6297,7 @@ internal fun RegistrationApp() {
                                 queueFor(selection.machineId).allRegistrations
                                     .firstOrNull { it.key == selection.registrationKey }?.displayId
                             } ?: "这份登记",
+                            summary = claimFlowSummary(0),
                             onPlayerLibrary = {
                                 openPlayerLibrary(PlayerProfileContext.CLAIM_REGISTRATION)
                             },
@@ -5532,6 +6314,15 @@ internal fun RegistrationApp() {
                         originalQueue = proposal.originalQueue,
                         proposedOrder = proposal.proposedOrder,
                         movedKey = proposal.movedKey,
+                        pairedQueueNotice = pairedQueuePlaceNotice(
+                            proposal.machineId,
+                            QueueAction.ReplaceOrder(
+                                proposal.machineId.name,
+                                proposal.proposedOrder,
+                                setOf(proposal.movedKey)
+                            ),
+                            "调整"
+                        ),
                         onKeepOriginal = {
                             inlineReorderProposal = null
                             inlineReorderResetToken++
@@ -5547,10 +6338,11 @@ internal fun RegistrationApp() {
                                 updateQueueWithUndoByAction(
                                     action = QueueAction.ReplaceOrder(
                                         proposal.machineId.name,
-                                        proposal.proposedOrder
+                                        proposal.proposedOrder,
+                                        setOf(proposal.movedKey)
                                     ),
-                                    message = "${configuredMachineName(proposal.machineId)} 的登记顺序已调整",
-                                    feedbackTitle = "登记顺序已调整",
+                                    message = "${configuredMachineName(proposal.machineId)} 的等待顺序已调整",
+                                    feedbackTitle = "等待顺序已调整",
                                     feedbackDetail = "等待登记已经按照确认后的顺序重新排列。"
                                 )
                             if (!changed) showQueueAdjustmentNotApplied(proposal.machineId)
@@ -5563,6 +6355,15 @@ internal fun RegistrationApp() {
                 positionReorderProposal?.let { proposal ->
                     PositionReorderConfirmation(
                         proposal = proposal,
+                        pairedQueueNotice = pairedQueuePlaceNotice(
+                            proposal.machineId,
+                            QueueAction.ReplaceOrder(
+                                proposal.machineId.name,
+                                proposal.proposedOrder,
+                                proposal.movedRegistrationKeys
+                            ),
+                            "调整"
+                        ),
                         onKeepOriginal = {
                             positionReorderProposal = null
                             positionReorderResetToken++
@@ -5575,11 +6376,12 @@ internal fun RegistrationApp() {
                                 updateQueueWithUndoByAction(
                                     action = QueueAction.ReplaceOrder(
                                         proposal.machineId.name,
-                                        proposal.proposedOrder
+                                        proposal.proposedOrder,
+                                        proposal.movedRegistrationKeys
                                     ),
                                     message = "${configuredMachineName(proposal.machineId)} 的队列位置已调整",
                                     feedbackTitle = "队列位置已调整",
-                                    feedbackDetail = "组间位置已经交换，队列位置编号也已同步更新。"
+                                    feedbackDetail = "两个位置已经交换，位置编号已同步更新。"
                                 )
                             if (!changed) showQueueAdjustmentNotApplied(proposal.machineId)
                             positionReorderProposal = null
@@ -5619,7 +6421,10 @@ internal fun RegistrationApp() {
                                     status = it.status,
                                     queue = it.queue,
                                     incomingRegistrations = listOf(registration),
-                                    machineCapacity = it.configuration.capacity
+                                    machineCapacity = it.configuration.capacity,
+                                    destinationIsPairedMachine =
+                                        queueRuleSettings.pairedMachine(selection.machineId) ==
+                                            it.machineId
                                 )
                             }
                             transferDestinations.none {
@@ -5628,7 +6433,10 @@ internal fun RegistrationApp() {
                                     status = it.status,
                                     queue = it.queue,
                                     incomingRegistrations = listOf(registration),
-                                    machineCapacity = it.configuration.capacity
+                                    machineCapacity = it.configuration.capacity,
+                                    destinationIsPairedMachine =
+                                        queueRuleSettings.pairedMachine(selection.machineId) ==
+                                            it.machineId
                                 ) == null
                             } -> "其他机台当前都不能接收这份登记。"
                             else -> null
@@ -5637,6 +6445,7 @@ internal fun RegistrationApp() {
                             registration = registration,
                             playerProfileGender = linkedPlayerProfile?.gender ?: registration.gender,
                             playerProfileQqNumber = linkedPlayerProfile?.qqNumber,
+                            playerProfile = linkedPlayerProfile,
                             fixedPartnerDisplayId = playArrangement?.fixedPartnerDisplayId,
                             playingPartnerDisplayId = playArrangement?.playingPartnerDisplayId,
                             waitingPartnerDisplayId = playArrangement?.waitingPartnerDisplayId,
@@ -5657,8 +6466,7 @@ internal fun RegistrationApp() {
                                 selection.machineId
                             ).capacity == 2,
                             machineOperational = statusFor(selection.machineId).isOperational,
-                            transferMachineName = transferDestinations.singleOrNull()?.name
-                                ?: "其他机台",
+                            transferMachineName = transferDestinations.singleOrNull()?.name,
                             transferUnavailableReason = transferUnavailableReason,
                             canEditPlayerProfile = linkedPlayerProfile != null,
                             mode = registrationActionMode,
@@ -5692,17 +6500,37 @@ internal fun RegistrationApp() {
                                 )
                                 selectedRegistration = null
                             },
-                            onPauseOrLeave = {
-                                if (queueRuleSettings.allowsAnyAbsenceAction) {
-                                    val currentQueue = queueFor(selection.machineId)
-                                    absenceChoiceTarget = selection.copy(
-                                        confirmationSnapshots = currentQueue
-                                            .registrationConfirmationSnapshots(
-                                                setOf(selection.registrationKey)
-                                            )
-                                    )
-                                    selectedRegistration = null
-                                }
+                            onPauseOrLeave = { absenceChoice ->
+                                // 轮空一次 is always allowed, so the choice always opens.
+                                val currentQueue = queueFor(selection.machineId)
+                                absenceChoiceTarget = selection.copy(
+                                    confirmationSnapshots = currentQueue
+                                        .registrationConfirmationSnapshots(
+                                            setOf(selection.registrationKey)
+                                        ),
+                                    initialAbsenceChoice = absenceChoice
+                                )
+                                selectedRegistration = null
+                            },
+                            onlineRegistrationNotPlayed = queueFor(selection.machineId)
+                                .allRegistrations.any {
+                                    it.key in setOfNotNull(registration.key, registration.fixedPartnerKey) &&
+                                        it.mustBeRemovedWhenAbsent
+                                },
+                            onCancelSkipOneTurn = {
+                                updateQueueByAction(
+                                    action = QueueAction.CancelSkipOneTurn(
+                                        selection.machineId.name,
+                                        registration.key
+                                    ),
+                                    surfaceHomeFeedback = true,
+                                    homeFeedbackTitle = if (registration.fixedPartnerKey == null) {
+                                        "轮空一次已取消"
+                                    } else {
+                                        "固定组合已取消轮空一次"
+                                    }
+                                )
+                                selectedRegistration = null
                             },
                             onCancelDeferOneRound = {
                                 updateQueueByAction(
@@ -5734,6 +6562,74 @@ internal fun RegistrationApp() {
                                 )
                                 selectedRegistration = null
                             },
+                            pairedQueueOption = queueRuleSettings.pairedMachine(selection.machineId)
+                                // Only a registration of a player profile gets the tick box.
+                                ?.takeIf { !registration.isTemporary }
+                                ?.let { partnerId ->
+                                    val machineLabel = configuredMachineName(selection.machineId)
+                                    val partnerLabel = configuredMachineName(partnerId)
+                                    val turnedOn = registration.alsoQueuesAtPairedMachine
+                                    PairedMachineQueueJoinOption(
+                                        machineLabel = machineLabel,
+                                        pairedMachineLabel = partnerLabel,
+                                        checked = turnedOn,
+                                        onToggle = {
+                                            updateQueueByAction(
+                                                action = QueueAction.SetPairedMachineQueueing(
+                                                    selection.machineId.name,
+                                                    registration.key,
+                                                    !turnedOn
+                                                ),
+                                                surfaceHomeFeedback = true,
+                                                homeFeedbackTitle = if (turnedOn) {
+                                                    "已取消系统在两台机台之间的安排"
+                                                } else {
+                                                    "已允许系统在两台机台之间安排"
+                                                }
+                                            )
+                                            if (!turnedOn) {
+                                                showPairedExplanationOnFirstUse(
+                                                    registration.playerProfileId,
+                                                    machineLabel,
+                                                    partnerLabel
+                                                )
+                                            }
+                                            selectedRegistration = null
+                                        },
+                                        onShowDetails = {
+                                            pairedMachineQueueIntroductionCountsDown = false
+                                            pairedMachineQueueIntroduction =
+                                                machineLabel to partnerLabel
+                                        },
+                                        // Ticked for a registration that is already waiting,
+                                        // it only counts after that registration has played.
+                                        startsAfterNextRound = !turnedOn &&
+                                            queueFor(selection.machineId).waiting
+                                                .any { it.key == registration.key },
+                                        disabledReason = PAIRED_MACHINE_ARRANGEMENT_FIXED_PAIR_REASON
+                                            .takeIf { !turnedOn && registration.fixedPartnerKey != null },
+                                        announcement = QueueEngine.pairedArrangementOutlook(
+                                            currentQueueEngineState(),
+                                            currentQueueEnginePolicy(),
+                                            registration.key
+                                        )?.takeIf { turnedOn }?.let { outlook ->
+                                            val notBefore = outlook.notBeforeMillis
+                                            when {
+                                                notBefore == null ->
+                                                    PairedMachineArrangementAnnouncement.Held
+                                                notBefore <= nowMillis ->
+                                                    PairedMachineArrangementAnnouncement.AnyMoment
+                                                else -> PairedMachineArrangementAnnouncement.NotBefore(
+                                                    formatClockTime(notBefore)
+                                                )
+                                            }
+                                        },
+                                        previewPosition = pairedPreviewPosition(
+                                            selection.machineId,
+                                            registration.key
+                                        )?.takeIf { turnedOn }
+                                    )
+                                },
                             onChangePreference = {
                                 registrationActionMode = RegistrationActionMode.PREFERENCE
                             },
@@ -5944,6 +6840,13 @@ internal fun RegistrationApp() {
                         val temporarilyLeavePlan = planQueueAction(
                             QueueAction.TemporarilyLeave(selection.machineId.name, registration.key)
                         )
+                        val skipPlan = planQueueAction(
+                            QueueAction.SkipOneTurn(selection.machineId.name, registration.key)
+                        )
+                        val skipResultQueue = skipPlan.resultState.queue(selection.machineId.name)
+                        val skipResultRegistrations = affectedKeys.map { key ->
+                            skipResultQueue?.allRegistrations?.firstOrNull { it.key == key }
+                        }
                         val deferResultQueue = deferPlan.resultState.queue(selection.machineId.name)
                         val deferCompletesImmediately = deferPlan.canApply &&
                             affectedKeys.isNotEmpty() &&
@@ -5968,7 +6871,52 @@ internal fun RegistrationApp() {
                                 temporarilyLeavePlan.impact.roundPreview,
                                 affectedKeys
                             ),
+                            skipAdvanceNotice = actionAdvanceOutcomeMessage(
+                                skipPlan.impact.roundPreview,
+                                affectedKeys
+                            ),
+                            deferOneRoundUsed = deferPlan.failure?.code ==
+                                QueueActionFailureCode.DEFER_ONE_ROUND_ALREADY_USED,
+                            retainedSkippedTurns = registration.temporaryAwaySkippedTurns,
+                            initialChoice = selection.initialAbsenceChoice,
                             onDismiss = { absenceChoiceTarget = null },
+                            onSkipOneTurn = {
+                                val currentQueue = queueFor(selection.machineId)
+                                val stateStillMatches = currentQueue
+                                    .matchesRegistrationConfirmationSnapshots(
+                                        selection.confirmationSnapshots
+                                    )
+                                val currentPlan = planQueueAction(
+                                    QueueAction.SkipOneTurn(
+                                        selection.machineId.name,
+                                        selection.registrationKey
+                                    )
+                                )
+                                val single = registration.fixedPartnerKey == null
+                                val changed = stateStillMatches && updateQueueByPlan(
+                                    plan = currentPlan,
+                                    soundCue = QueueSoundCue.QUEUE_CHANGE,
+                                    classifyMissedOnlineRegistrations = true,
+                                    surfaceHomeFeedback = true,
+                                    // When the registration is reached at once, the skip is
+                                    // carried out (or, at the limit, the registration removed).
+                                    homeFeedbackTitle = when {
+                                        !skipPlan.canApply -> null
+                                        skipResultRegistrations.any { it == null } ->
+                                            "已达轮空上限，登记已移除"
+                                        skipResultRegistrations.all {
+                                            it?.absenceStatus == QueueAbsenceStatus.NONE
+                                        } -> if (single) "轮空一次已执行" else "固定组合已完成轮空一次"
+                                        single -> "登记将轮空一次"
+                                        else -> "固定组合将轮空一次"
+                                    },
+                                    executionAtMillis = System.currentTimeMillis()
+                                )
+                                if (!changed) {
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
+                                absenceChoiceTarget = null
+                            },
                             onDeferOneRound = {
                                 if (queueRuleSettings.allowDeferOneRound) {
                                     val currentQueue = queueFor(selection.machineId)
@@ -5994,9 +6942,9 @@ internal fun RegistrationApp() {
                                                 "固定组合已完成暂缓一次"
                                             }
                                         } else if (registration.fixedPartnerKey == null) {
-                                            "登记已暂缓一次"
+                                            "登记将暂缓一次"
                                         } else {
-                                            "固定组合已暂缓一次"
+                                            "固定组合将暂缓一次"
                                         },
                                         executionAtMillis = System.currentTimeMillis()
                                     )
@@ -6180,7 +7128,7 @@ internal fun RegistrationApp() {
                                 finishConfirmation = null
                                 showQueueConfirmationNotApplied(
                                     machineId,
-                                    operationLabel = "本轮结束",
+                                    operationLabel = "结束本轮",
                                     queueChanged = true
                                 )
                             }
@@ -6198,7 +7146,17 @@ internal fun RegistrationApp() {
                     )
                     val playingRegistrations = sourceQueue.playing
                     val finishPreview = finishPlan.impact.roundPreview
-                    val nextPlayingNotice = nextPlayingChangeMessage(finishPreview)
+                    val pairedMachineName = queueRuleSettings.pairedMachine(machineId)
+                        ?.let(::configuredMachineName)
+                    val nextPlayingNotice = joinNotices(
+                        nextPlayingChangeMessage(finishPreview),
+                        pairedArrivalNotice(
+                            finishPreview,
+                            sourceQueue,
+                            pairedMachineName,
+                            configuredMachineName(machineId)
+                        )
+                    )
                     val removalPreview = removalPlan.impact.roundPreview
                     RoundEndConfirmation(
                         machineName = configuredMachineName(machineId),
@@ -6207,6 +7165,7 @@ internal fun RegistrationApp() {
                             "“${it.displayId}”"
                         },
                         nextPlayingNotice = nextPlayingNotice,
+                        nextGroup = roundEndNextGroup(machineId, sourceQueue, finishPreview),
                         closingGracePeriod = activeClosingGracePeriod,
                         onDismiss = { finishConfirmation = null },
                         onConfirm = {
@@ -6214,7 +7173,7 @@ internal fun RegistrationApp() {
                                 finishConfirmation = null
                                 showQueueConfirmationNotApplied(
                                     machineId,
-                                    operationLabel = "本轮结束",
+                                    operationLabel = "结束本轮",
                                     queueChanged = true
                                 )
                                 return@RoundEndConfirmation
@@ -6238,14 +7197,14 @@ internal fun RegistrationApp() {
                                         postfix = "进入${playingPositionName(machineId)}。",
                                         separator = "、"
                                     ) { "“${it.displayId}”" }
-                                    ?: "本轮已经结束，${playingPositionName(machineId)}目前为空。",
+                                    ?: "本轮已结束，${playingPositionName(machineId)}当前为空。",
                                 executionAtMillis = atMillis
                             )
                             finishConfirmation = null
                             if (!changed) {
                                 showQueueConfirmationNotApplied(
                                     machineId,
-                                    operationLabel = "本轮结束",
+                                    operationLabel = "结束本轮",
                                     queueChanged = false
                                 )
                             }
@@ -6281,7 +7240,15 @@ internal fun RegistrationApp() {
                             .orEmpty()
                             .joinToString("、") { "“${it.displayId}”" }
                             .takeIf { it.isNotEmpty() },
-                        removalNextPlayingNotice = nextPlayingChangeMessage(removalPreview),
+                        removalNextPlayingNotice = joinNotices(
+                            nextPlayingChangeMessage(removalPreview),
+                            pairedArrivalNotice(
+                                removalPreview,
+                                sourceQueue,
+                                pairedMachineName,
+                                configuredMachineName(machineId)
+                            )
+                        ),
                         onRemoveAndStartNext = {
                             if (!request.queueSnapshot.hasSameQueueOperationState(queueFor(machineId))) {
                                 finishConfirmation = null
@@ -6314,17 +7281,12 @@ internal fun RegistrationApp() {
                 }
 
                 joinClosingWarningRequest?.let { request ->
-                    val waitEstimateNowMillis = System.currentTimeMillis()
                     JoinClosingWarningDialog(
                         request = request,
                         machineNames = configuredMachineIds.associateWith(::configuredMachineName),
                         closingAtMillis = businessHoursStatus.activeClosingAtMillis,
                         estimatedWaitMinutes = request.lateMachineIds.associateWith { machineId ->
-                            estimatedWaitForNewOpenRegistration(
-                                queueFor(machineId),
-                                waitEstimateNowMillis,
-                                queueRuleSettings.machineConfiguration(machineId)
-                            )
+                            newRegistrationWaitMinutes(machineId)
                         },
                         onDismiss = { joinClosingWarningRequest = null },
                         onConfirm = {
@@ -6346,6 +7308,32 @@ internal fun RegistrationApp() {
                     )
                 }
 
+                pairedPreviewExplanation?.let { (homeMachineLabel, previewMachineLabel) ->
+                    ModalSurface({ pairedPreviewExplanation = null }, width = 480.dp) {
+                        Text(
+                            PAIRED_MACHINE_PREVIEW_TITLE,
+                            color = PrimaryText,
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            pairedMachinePreviewExplanation(homeMachineLabel, previewMachineLabel),
+                            color = SecondaryText,
+                            fontSize = 14.sp,
+                            lineHeight = 20.sp
+                        )
+                        Spacer(Modifier.height(18.dp))
+                        PrimaryButton("我知道了", { pairedPreviewExplanation = null }, Modifier.fillMaxWidth())
+                    }
+                }
+                pairedMachineQueueIntroduction?.let { (_, partnerLabel) ->
+                    PairedMachineQueueIntroductionDialog(
+                        pairedMachineLabel = partnerLabel,
+                        countsDown = pairedMachineQueueIntroductionCountsDown,
+                        onDismiss = { pairedMachineQueueIntroduction = null }
+                    )
+                }
                 enterPlayingConfirmation?.let { request ->
                     val machineId = request.machineId
                     val queue = queueFor(machineId)
@@ -6418,6 +7406,24 @@ internal fun RegistrationApp() {
                         canReportMachineStop = !queueRuleSettings.managementAppBound &&
                             configuredMachines.any { it.status.isOperational },
                         machineManagementLocked = queueRuleSettings.managementAppBound,
+                        cloudSyncStatus = displayedCloudSyncStatus.takeIf { cloudSyncAvailable },
+                        canBatchCreate = acceptingNewRegistrations && configuredMachines.any {
+                            it.status.isOperational && it.queue.registrationCount < 20
+                        },
+                        batchCreateDisabledReason = when {
+                            !registrationOpen -> "当前未使用登记排队，请按照现场顺序排队。"
+                            !acceptingNewRegistrations -> "闭店收尾期间不再接收新的排队登记。"
+                            else -> "所有机台当前都不能接收新的登记。"
+                        },
+                        onBatchCreate = {
+                            moreMenuVisible = false
+                            dismissHomeSidePanelContent()
+                            beginRegistration(true)
+                        },
+                        onOpenSyncStatus = {
+                            moreMenuVisible = false
+                            cloudSyncInfoVisible = true
+                        },
                         onDismiss = { moreMenuVisible = false },
                         onEditRegistrations = {
                             moreMenuVisible = false
@@ -6445,6 +7451,12 @@ internal fun RegistrationApp() {
                             else reopenRegistration()
                         }
                     )
+                }
+
+                if (cloudSyncInfoVisible) {
+                    displayedCloudSyncStatus.takeIf { cloudSyncAvailable }?.let { status ->
+                        CloudSyncInfoDialog(status = status, onDismiss = { cloudSyncInfoVisible = false })
+                    } ?: LaunchedEffect(Unit) { cloudSyncInfoVisible = false }
                 }
 
                 if (appDetailsVisible) {
@@ -6568,7 +7580,10 @@ internal fun RegistrationApp() {
                                 status = it.status,
                                 queue = it.queue,
                                 incomingRegistrations = selectedPositionRegistrations,
-                                machineCapacity = it.configuration.capacity
+                                machineCapacity = it.configuration.capacity,
+                                destinationIsPairedMachine =
+                                    queueRuleSettings.pairedMachine(selection.machineId) ==
+                                        it.machineId
                             )
                         }
                         transferDestinations.none {
@@ -6577,20 +7592,23 @@ internal fun RegistrationApp() {
                                 status = it.status,
                                 queue = it.queue,
                                 incomingRegistrations = selectedPositionRegistrations,
-                                machineCapacity = it.configuration.capacity
+                                machineCapacity = it.configuration.capacity,
+                                destinationIsPairedMachine =
+                                    queueRuleSettings.pairedMachine(selection.machineId) ==
+                                        it.machineId
                             ) == null
                         } -> "其他机台当前都不能接收这些登记。"
                         else -> null
                     }
                     PositionActions(
+                        waitEstimates = waitEstimates,
                         selection = selection,
                         queue = queueFor(selection.machineId),
                         machineConfiguration = queueRuleSettings.machineConfiguration(
                             selection.machineId
                         ),
                         machineOperational = statusFor(selection.machineId).isOperational,
-                        transferMachineName = transferDestinations.singleOrNull()?.name
-                            ?: "其他机台",
+                        transferMachineName = transferDestinations.singleOrNull()?.name,
                         transferUnavailableReason = transferUnavailableReason,
                         onDismiss = { selectedPosition = null },
                         onRegistrationClick = { registrationKey ->
@@ -6667,19 +7685,8 @@ internal fun RegistrationApp() {
                             selectedPosition = null
                         },
                         onRemove = {
-                            if (selection.registrationKeys.size == 1) {
-                                val currentQueue = queueFor(selection.machineId)
-                                exitTarget = SelectedRegistration(
-                                    selection.machineId,
-                                    selection.registrationKeys.first(),
-                                    confirmationSnapshots = currentQueue
-                                        .registrationConfirmationSnapshots(
-                                            selection.registrationKeys
-                                        )
-                                )
-                            } else {
-                                removeGroupTarget = selection
-                            }
+                            // The confirmation asks who is doing it, for one registration too.
+                            removeGroupTarget = selection
                             selectedPosition = null
                         }
                     )
@@ -6704,6 +7711,14 @@ internal fun RegistrationApp() {
                     if (queue.matchesExactPosition(selection)) {
                         ReturnPlayingToWaitingConfirmation(
                             playingPositionLabel = playingPositionName(selection.machineId),
+                            pairedQueueNotice = pairedQueuePlaceNotice(
+                                selection.machineId,
+                                QueueAction.ReturnPlayingToWaitingFront(
+                                    selection.machineId.name,
+                                    selection.registrationKeys.toSet()
+                                ),
+                                "撤回"
+                            ),
                             onDismiss = { returnPlayingTarget = null },
                             onConfirm = {
                                 if (queueFor(selection.machineId).matchesExactPosition(selection)) {
@@ -6713,7 +7728,7 @@ internal fun RegistrationApp() {
                                             selection.registrationKeys.toSet()
                                         ),
                                         surfaceHomeFeedback = true,
-                                        homeFeedbackTitle = "已撤回等待顺序前端"
+                                        homeFeedbackTitle = "登记已撤回至等待顺序"
                                     )
                                 } else {
                                     showStalePositionActionNotApplied(selection.machineId)
@@ -6749,6 +7764,14 @@ internal fun RegistrationApp() {
                             remainingPlayer = remainingPlayer,
                             isFixedPair = isFixedPair,
                             playingPositionLabel = playingPositionName(selection.machineId),
+                            pairedQueueNotice = pairedQueuePlaceNotice(
+                                selection.machineId,
+                                QueueAction.ReturnPlayingToWaitingFront(
+                                    selection.machineId.name,
+                                    setOf(selection.registrationKey)
+                                ),
+                                "撤回"
+                            ),
                             onDismiss = { returnPlayingRegistrationTarget = null },
                             onConfirm = {
                                 if (queueFor(selection.machineId)
@@ -6762,7 +7785,7 @@ internal fun RegistrationApp() {
                                             setOf(selection.registrationKey)
                                         ),
                                         surfaceHomeFeedback = true,
-                                        homeFeedbackTitle = "已撤回等待顺序前端"
+                                        homeFeedbackTitle = "已撤回至等待顺序"
                                     )
                                 } else {
                                     showStalePositionActionNotApplied(selection.machineId)
@@ -6828,7 +7851,7 @@ internal fun RegistrationApp() {
                                         ),
                                         message = "${playingPositionName(selection.machineId)} 已校正",
                                         feedbackTitle = "游玩位置已校正",
-                                        feedbackDetail = "已将${textBeforeAppMiddleDot(selection.label)}及其之前的队列位置按实际进度完成处理。"
+                                        feedbackDetail = "${textBeforeAppMiddleDot(selection.label)}之前的登记已按实际进度处理，${textBeforeAppMiddleDot(selection.label)}的登记已进入${playingPositionName(selection.machineId)}。"
                                     )
                                 } else {
                                     showStalePositionActionNotApplied(selection.machineId)
@@ -6896,11 +7919,9 @@ internal fun RegistrationApp() {
                     if (sourcePositionStillMatches && sourceStateStillMatches) {
                         val sourceUnavailableReason = when {
                             requestedKeys.isEmpty() || registrations.size != requestedKeys.size ->
-                                "待转移的登记已经发生变化，请关闭窗口后重试。"
-                            !statusFor(request.sourceMachineId).isOperational ->
-                                "${configuredMachineName(request.sourceMachineId)} 已停止使用，暂时不能转出。"
+                                "待转至其他机台的登记已经发生变化，请关闭窗口后重试。"
                             sourceQueue.playing.any { it.key in requestedKeys } ->
-                                "登记已经进入${playingPositionName(request.sourceMachineId)}，不能转移。"
+                                "登记已经进入${playingPositionName(request.sourceMachineId)}，不能转至其他机台。"
                             else -> null
                         }
                         val destinationMachineId = request.destinationMachineId
@@ -6912,6 +7933,8 @@ internal fun RegistrationApp() {
                                 },
                                 registrations = registrations,
                                 sourceUnavailableReason = sourceUnavailableReason,
+                                pairedMachineId =
+                                    queueRuleSettings.pairedMachine(request.sourceMachineId),
                                 onDismiss = { machineTransferTarget = null },
                                 onSelect = { selectedDestination ->
                                     machineTransferTarget = request.copy(
@@ -6931,7 +7954,10 @@ internal fun RegistrationApp() {
                                     incomingRegistrations = registrations,
                                     machineCapacity = queueRuleSettings.machineConfiguration(
                                         destinationMachineId
-                                    ).capacity
+                                    ).capacity,
+                                    destinationIsPairedMachine =
+                                        queueRuleSettings.pairedMachine(request.sourceMachineId) ==
+                                            destinationMachineId
                                 )
                             MachineTransferConfirmation(
                                 registrations = registrations,
@@ -6944,11 +7970,27 @@ internal fun RegistrationApp() {
                                 destinationCapacity = queueRuleSettings.machineConfiguration(
                                     destinationMachineId
                                 ).capacity,
+                                pairedArrangementNotice = queueRuleSettings
+                                    .pairedMachine(request.sourceMachineId)
+                                    ?.let { partnerId ->
+                                        pairedMachineTransferNotice(
+                                            displayIds = registrations
+                                                .filter { it.alsoQueuesAtPairedMachine }
+                                                .map(Registration::displayId),
+                                            sourceMachineName =
+                                                configuredMachineName(request.sourceMachineId),
+                                            pairedMachineName = configuredMachineName(partnerId),
+                                            destinationIsPairedMachine =
+                                                partnerId == destinationMachineId,
+                                            destinationMachineName =
+                                                configuredMachineName(destinationMachineId)
+                                        )
+                                    },
                                 onDismiss = { machineTransferTarget = null },
                                 onConfirm = {
                                     if (!transferRegistrations(request)) {
                                         showHomeOperationFeedback(
-                                            title = "切换机台未执行",
+                                            title = "转至其他机台未执行",
                                             detail = "原位置、登记状态或目标机台状态已经变化，请核对当前队列后重试。",
                                             contextLabel = configuredMachineName(request.sourceMachineId),
                                             tone = HomeSidePanelFeedbackTone.WARNING
@@ -6961,7 +8003,7 @@ internal fun RegistrationApp() {
                             LaunchedEffect(request, configuredMachineIds) {
                                 machineTransferTarget = null
                                 showHomeOperationFeedback(
-                                    title = "切换机台未执行",
+                                    title = "转至其他机台未执行",
                                     detail = "目标机台已经不在当前配置中，请重新选择。",
                                     contextLabel = configuredMachineName(request.sourceMachineId),
                                     tone = HomeSidePanelFeedbackTone.WARNING
@@ -6995,8 +8037,67 @@ internal fun RegistrationApp() {
                         val deferPlan = noShowPlan(NoShowResolution.DEFER_ONE_ROUND)
                         val movePlan = noShowPlan(NoShowResolution.MOVE_TO_TAIL)
                         val removePlan = noShowPlan(NoShowResolution.REMOVE)
+                        // A registration the system arranged here goes back to the machine it
+                        // came from, whatever would otherwise be chosen: there is one outcome.
+                        val arrangedFromId = QueueEngine.absentArrivalOrigins(
+                            currentQueueEngineState(),
+                            currentQueueEnginePolicy(),
+                            selection.machineId.name,
+                            setOf(registration.key)
+                        )[registration.key]?.let { originName ->
+                            configuredMachineIds.firstOrNull { it.name == originName }
+                        }
+                        if (arrangedFromId != null) {
+                            val names = "“${registration.displayId}”"
+                            val arrangedLabel = configuredMachineName(selection.machineId)
+                            val originLabel = configuredMachineName(arrangedFromId)
+                            PairedArrivalNoShowDialog(
+                                detail = pairedMachineArrivalNoShowDetail(
+                                    names = names,
+                                    group = false,
+                                    arrangedMachineName = arrangedLabel,
+                                    originMachineName = originLabel
+                                ),
+                                leavesPlayingPositionEmpty = selection.fromPlayingPosition,
+                                advanceNotice = actionAdvanceOutcomeMessage(
+                                    movePlan.impact.roundPreview,
+                                    setOf(registration.key)
+                                ),
+                                confirmLabel = pairedMachineArrivalNoShowConfirmLabel(originLabel),
+                                onDismiss = { noShowTarget = null },
+                                onConfirm = {
+                                    if (
+                                        currentTargetStillMatches() &&
+                                        updateQueueByPlan(
+                                            plan = movePlan,
+                                            soundCue = QueueSoundCue.CAUTION,
+                                            classifyMissedOnlineRegistrations = true,
+                                            executionAtMillis = System.currentTimeMillis()
+                                        )
+                                    ) {
+                                        showHomeOperationFeedback(
+                                            title = "登记已回到 $originLabel",
+                                            detail = pairedArrivalReturnedDetail(
+                                                names = names,
+                                                originMachineLabel = originLabel,
+                                                arrangedMachineLabel = arrangedLabel
+                                            ),
+                                            contextLabel = arrangedLabel,
+                                            tone = HomeSidePanelFeedbackTone.WARNING
+                                        )
+                                    } else {
+                                        showStalePositionActionNotApplied(selection.machineId)
+                                    }
+                                    noShowTarget = null
+                                }
+                            )
+                        } else
                         NoShowDialog(
                             registration = registration,
+                            removalOnly = movePlan.failure?.code ==
+                                QueueActionFailureCode.NO_SHOW_REMOVAL_ONLY,
+                            deferUsed = deferPlan.failure?.code ==
+                                QueueActionFailureCode.DEFER_ONE_ROUND_ALREADY_USED,
                             fromPlayingPosition = selection.fromPlayingPosition,
                             playingPositionLabel = playingPositionName(selection.machineId),
                             waitingFrontPositionLabel = waitingFrontPositionName(selection.machineId),
@@ -7104,8 +8205,79 @@ internal fun RegistrationApp() {
                         val deferPlan = groupNoShowPlan(NoShowResolution.DEFER_GROUP_ONE_ROUND)
                         val movePlan = groupNoShowPlan(NoShowResolution.MOVE_TO_TAIL)
                         val removePlan = groupNoShowPlan(NoShowResolution.REMOVE)
+                        // Registrations the system arranged here go back to the machine they
+                        // came from; only the others are handled the way that is chosen.
+                        val arrangedOrigins = QueueEngine.absentArrivalOrigins(
+                            currentQueueEngineState(),
+                            currentQueueEnginePolicy(),
+                            selection.machineId.name,
+                            targetKeys
+                        )
+                        val arrangedFromId = arrangedOrigins.values.firstOrNull()
+                            ?.let { originName ->
+                                configuredMachineIds.firstOrNull { it.name == originName }
+                            }
+                        val arrangedNames = registrations
+                            .filter { it.key in arrangedOrigins }
+                            .joinToString("、") { "“${it.displayId}”" }
+                        val ordinaryNoShowKeys = targetKeys - arrangedOrigins.keys
+                        val arrangedLabel = configuredMachineName(selection.machineId)
+                        if (arrangedFromId != null && ordinaryNoShowKeys.isEmpty()) {
+                            val originLabel = configuredMachineName(arrangedFromId)
+                            PairedArrivalNoShowDialog(
+                                detail = pairedMachineArrivalNoShowDetail(
+                                    names = arrangedNames,
+                                    group = true,
+                                    arrangedMachineName = arrangedLabel,
+                                    originMachineName = originLabel
+                                ),
+                                leavesPlayingPositionEmpty = selection.fromPlayingPosition,
+                                advanceNotice = actionAdvanceOutcomeMessage(
+                                    movePlan.impact.roundPreview,
+                                    targetKeys
+                                ),
+                                confirmLabel = pairedMachineArrivalNoShowConfirmLabel(originLabel),
+                                onDismiss = { groupNoShowTarget = null },
+                                onConfirm = {
+                                    if (
+                                        currentTargetStillMatches() &&
+                                        updateQueueByPlan(
+                                            plan = movePlan,
+                                            soundCue = QueueSoundCue.CAUTION,
+                                            classifyMissedOnlineRegistrations = true,
+                                            executionAtMillis = System.currentTimeMillis()
+                                        )
+                                    ) {
+                                        showHomeOperationFeedback(
+                                            title = "登记已回到 $originLabel",
+                                            detail = pairedArrivalReturnedDetail(
+                                                names = arrangedNames,
+                                                originMachineLabel = originLabel,
+                                                arrangedMachineLabel = arrangedLabel
+                                            ),
+                                            contextLabel = arrangedLabel,
+                                            tone = HomeSidePanelFeedbackTone.WARNING
+                                        )
+                                    } else {
+                                        showStalePositionActionNotApplied(selection.machineId)
+                                    }
+                                    groupNoShowTarget = null
+                                }
+                            )
+                        } else
                         GroupNoShowDialog(
+                            arrangedArrivalNotice = arrangedFromId?.let { originId ->
+                                pairedMachineArrivalNoShowMixedNotice(
+                                    names = arrangedNames,
+                                    arrangedMachineName = arrangedLabel,
+                                    originMachineName = configuredMachineName(originId)
+                                )
+                            },
                             registrations = registrations,
+                            removalOnly = movePlan.failure?.code ==
+                                QueueActionFailureCode.NO_SHOW_REMOVAL_ONLY,
+                            deferUsed = deferPlan.failure?.code ==
+                                QueueActionFailureCode.DEFER_ONE_ROUND_ALREADY_USED,
                             fromPlayingPosition = selection.fromPlayingPosition,
                             playingPositionLabel = playingPositionName(selection.machineId),
                             waitingFrontPositionLabel = waitingFrontPositionName(selection.machineId),
@@ -7133,7 +8305,7 @@ internal fun RegistrationApp() {
                                         soundCue = QueueSoundCue.CAUTION,
                                         publicEventTypeOverride =
                                             PublicQueueEventType.NO_SHOW_DEFERRED,
-                                        affectedRegistrationKeysOverride = targetKeys,
+                                        affectedRegistrationKeysOverride = ordinaryNoShowKeys,
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
                                         homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
@@ -7151,7 +8323,7 @@ internal fun RegistrationApp() {
                                         soundCue = QueueSoundCue.CAUTION,
                                         publicEventTypeOverride =
                                             PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL,
-                                        affectedRegistrationKeysOverride = targetKeys,
+                                        affectedRegistrationKeysOverride = ordinaryNoShowKeys,
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
                                         homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
@@ -7168,7 +8340,7 @@ internal fun RegistrationApp() {
                                         plan = removePlan,
                                         soundCue = QueueSoundCue.CAUTION,
                                         publicEventTypeOverride = PublicQueueEventType.NO_SHOW_REMOVED,
-                                        affectedRegistrationKeysOverride = targetKeys,
+                                        affectedRegistrationKeysOverride = ordinaryNoShowKeys,
                                         classifyMissedOnlineRegistrations = true,
                                         surfaceHomeFeedback = true,
                                         homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
@@ -7208,11 +8380,12 @@ internal fun RegistrationApp() {
                                 buildString {
                                     append("“${exitRegistration.displayId}”退出后，这份登记将立即失效。与“${fixedPartner.displayId}”的固定组合也会解除；对方会保留在原位置，并恢复为允许他人加入。")
                                     remainingPartnerAbsenceNotice(fixedPartner)?.let { append(it) }
-                                    append("若仍想游玩，需要重新加入队尾。")
+                                    append("如需继续游玩，需要重新加入队尾。")
                                 }
                             } else {
-                                "“${exitRegistration.displayId}”退出后，这份登记将立即失效。若仍想游玩，需要重新加入队尾。"
+                                "“${exitRegistration.displayId}”退出后，这份登记将立即失效。如需继续游玩，需要重新加入队尾。"
                             },
+                            notice = "只有玩家本人可以退出排队。即使认为这名玩家已经离开，现场其他玩家也不得代为退出。如果这名玩家轮到时不在现场，现场玩家应点击“这名玩家未到场”，按引导处理这份登记。",
                             confirmText = "确认退出",
                             onDismiss = { exitTarget = null },
                             onConfirm = {
@@ -7222,9 +8395,9 @@ internal fun RegistrationApp() {
                                         )
                                 ) {
                                     updateQueueByAction(
-                                        action = QueueAction.RemoveRegistrations(
+                                        action = QueueAction.LeaveQueue(
                                             selection.machineId.name,
-                                            setOf(selection.registrationKey)
+                                            selection.registrationKey
                                         ),
                                         publicEventTypeOverride =
                                             PublicQueueEventType.REGISTRATION_REMOVED,
@@ -7250,24 +8423,50 @@ internal fun RegistrationApp() {
                     val queue = queueFor(selection.machineId)
                     val targetKeys = selection.registrationKeys.toSet()
                     if (queue.matchesExactPosition(selection)) {
-                        RemoveRegistrationConfirmation(
-                            title = "移除这组登记？",
-                            message = "这会同时移除该位置中的 ${targetKeys.size} 份登记。玩家如需继续游玩，只能重新加入队尾。",
-                            confirmText = "移除这组登记",
+                        val targetRegistrations = queue.allRegistrations.filter { it.key in targetKeys }
+                        val group = targetRegistrations.size > 1
+                        RemoveWithOperatorConfirmation(
+                            title = if (group) "移除这组登记？" else "移除登记？",
+                            message = if (group) {
+                                "确认后会同时移除这个位置中的 ${targetKeys.size} 份登记；玩家如需继续游玩，需要重新加入队尾。"
+                            } else {
+                                "确认后会移除这份登记；玩家如需继续游玩，需要重新加入队尾。"
+                            },
+                            registrations = targetRegistrations,
+                            confirmText = if (group) "移除这组登记" else "移除登记",
                             onDismiss = { removeGroupTarget = null },
-                            onConfirm = {
+                            onConfirm = { operatorKey ->
                                 if (queueFor(selection.machineId).matchesExactPosition(selection)) {
-                                    updateQueueByAction(
-                                        action = QueueAction.RemoveRegistrations(
-                                            selection.machineId.name,
-                                            targetKeys
-                                        ),
-                                        publicEventTypeOverride =
-                                            PublicQueueEventType.REGISTRATION_REMOVED,
-                                        surfaceHomeFeedback = true,
-                                        homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
-                                        homeFeedbackTitle = "这组登记已移除"
-                                    )
+                                    val operator = targetRegistrations.firstOrNull { it.key == operatorKey }
+                                    if (!group && operator != null) {
+                                        // The player removing their own registration leaves the queue.
+                                        updateQueueByAction(
+                                            action = QueueAction.LeaveQueue(
+                                                selection.machineId.name,
+                                                operator.key
+                                            ),
+                                            publicEventTypeOverride =
+                                                PublicQueueEventType.REGISTRATION_REMOVED,
+                                            surfaceHomeFeedback = true,
+                                            homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                            homeFeedbackTitle = "登记已退出排队",
+                                            auditDetailNote = "由“${operator.displayId}”本人操作。"
+                                        )
+                                    } else {
+                                        updateQueueByAction(
+                                            action = QueueAction.RemoveRegistrations(
+                                                selection.machineId.name,
+                                                targetKeys
+                                            ),
+                                            publicEventTypeOverride =
+                                                PublicQueueEventType.REGISTRATION_REMOVED,
+                                            surfaceHomeFeedback = true,
+                                            homeFeedbackTone = HomeSidePanelFeedbackTone.WARNING,
+                                            homeFeedbackTitle = if (group) "这组登记已移除" else "登记已移除",
+                                            auditDetailNote = operator?.let { "由“${it.displayId}”操作。" }
+                                                ?: "由现场其他玩家操作。"
+                                        )
+                                    }
                                 } else {
                                     showStalePositionActionNotApplied(selection.machineId)
                                 }
@@ -7494,7 +8693,7 @@ private fun AuditLogScreen(
     onBack: () -> Unit
 ) {
     BackHandler(onBack = onBack)
-    var selectedFilter by remember { mutableStateOf(AuditLogFilter()) }
+    var selectedFilter by remember { mutableStateOf(AuditLogFilter(label = "全部")) }
     var selectedSource by remember { mutableStateOf<AuditLogSource?>(null) }
     val machinesByStableId = machines.associateBy(MachineDisplayState::stableId)
     val filters = buildList {
@@ -7502,7 +8701,7 @@ private fun AuditLogScreen(
         machines.forEach { machine ->
             add(AuditLogFilter(machineStableId = machine.stableId, label = machine.name))
         }
-        add(AuditLogFilter(category = AuditLogCategory.SYSTEM, label = "系统"))
+        add(AuditLogFilter(category = AuditLogCategory.SYSTEM, label = "机厅"))
         add(AuditLogFilter(category = AuditLogCategory.PLAYER_PROFILE, label = "玩家资料"))
     }
     val sourceFilters: List<Pair<AuditLogSource?, String>> = listOf(
@@ -7510,7 +8709,7 @@ private fun AuditLogScreen(
         AuditLogSource.ON_SITE_TERMINAL to "现场终端",
         AuditLogSource.QQ_BOT to "QQ Bot",
         AuditLogSource.SYSTEM_AUTOMATIC to "系统自动",
-        AuditLogSource.WEBSITE_REMOTE to "网站远程",
+        AuditLogSource.WEBSITE_REMOTE to "网页端",
         AuditLogSource.MOBILE_DEVICE to "移动设备",
         AuditLogSource.MANAGEMENT_APP to "管理后台"
     )
@@ -7524,8 +8723,6 @@ private fun AuditLogScreen(
     Column(Modifier.fillMaxSize().padding(horizontal = 36.dp, vertical = 24.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             AppBackButton(onBack)
-            Spacer(Modifier.weight(1f))
-            Text("操作日志", color = TertiaryText, fontSize = 12.sp)
         }
         Spacer(Modifier.height(14.dp))
         Column(
@@ -7534,66 +8731,21 @@ private fun AuditLogScreen(
                 .align(Alignment.CenterHorizontally)
         ) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
-                Text("操作日志", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
+                Text("操作日志", color = PrimaryText, fontSize = QueueTextSize.PageTitle, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.weight(1f))
                 Text("共 ${displayedLogs.size} 条记录", color = SecondaryText, fontSize = 12.sp)
             }
             Spacer(Modifier.height(16.dp))
-            Row(
-                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
+            // Two groups of filters, each with its title (docs/ui-guide.md, 筛选标签).
+            FilterRow("类别") {
                 filters.forEach { filter ->
-                    val selected = selectedFilter == filter
-                    Box(
-                        Modifier.height(40.dp).widthIn(min = 112.dp, max = 220.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(if (selected) PrimaryText else CardBackground)
-                            .border(
-                                1.dp,
-                                if (selected) PrimaryText else Separator,
-                                RoundedCornerShape(8.dp)
-                            )
-                            .clickable(enabled = !selected) { selectedFilter = filter }
-                            .padding(horizontal = 16.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            filter.label,
-                            color = if (selected) Color.White else PrimaryText,
-                            fontSize = 12.sp,
-                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                            maxLines = 1
-                        )
-                    }
+                    FilterPill(filter.label, selectedFilter == filter) { selectedFilter = filter }
                 }
             }
             Spacer(Modifier.height(8.dp))
-            Row(
-                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
+            FilterRow("来源") {
                 sourceFilters.forEach { (source, label) ->
-                    val selected = selectedSource == source
-                    Box(
-                        Modifier.width(112.dp).height(36.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(if (selected) SoftBlue else CardBackground)
-                            .border(
-                                1.dp,
-                                if (selected) SystemBlue.copy(alpha = .38f) else Separator,
-                                RoundedCornerShape(8.dp)
-                            )
-                            .clickable(enabled = !selected) { selectedSource = source },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            label,
-                            color = if (selected) SystemBlue else SecondaryText,
-                            fontSize = 11.sp,
-                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
-                        )
-                    }
+                    FilterPill(label, selectedSource == source) { selectedSource = source }
                 }
             }
             Spacer(Modifier.height(14.dp))
@@ -7603,11 +8755,11 @@ private fun AuditLogScreen(
                         Text(
                             if (logs.isEmpty()) "还没有操作日志" else "此分类还没有记录",
                             color = PrimaryText,
-                            fontSize = 18.sp,
+                            fontSize = QueueTextSize.CardTitle,
                             fontWeight = FontWeight.Medium
                         )
                         Spacer(Modifier.height(6.dp))
-                        Text("新的变动会显示在这里。", color = SecondaryText, fontSize = 12.sp)
+                        Text("新的操作会记入操作日志。", color = SecondaryText, fontSize = 12.sp)
                     }
                 }
             } else {
@@ -7634,11 +8786,11 @@ private enum class QueueSettingsSection(
     val title: String,
     val summary: String
 ) {
-    VENUE_AND_TERMINAL("机厅与终端", "机厅名称、终端名称与安装身份"),
+    VENUE_AND_TERMINAL("机厅与终端", "机厅名称、终端名称与机厅 ID"),
     SERVER_AND_LINKS("服务端与联动", "服务器连接、同步、线上登记与 QQ Bot"),
     BUSINESS_HOURS("营业时间", "机厅共用的开闭店时间与每周安排"),
-    QUEUE_RULES("排队规则", "暂缓一次、暂时离开与共同游玩预览"),
-    MACHINES_AND_GROUPS("机台与分组", "机台管理、分组与详细配置")
+    QUEUE_RULES("排队规则", "暂缓一次、暂时离开、共同游玩预览与一对机台"),
+    MACHINES_AND_GROUPS("机台与分组", "首页分组、机台管理与详细配置")
 }
 
 @Composable
@@ -7649,8 +8801,8 @@ private fun QueueSettingsNavigation(
     modifier: Modifier = Modifier
 ) {
     Column(
-        modifier.clip(RoundedCornerShape(14.dp)).background(CardBackground)
-            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(14.dp))
+        modifier.clip(RoundedCornerShape(CardRadius)).background(CardBackground)
+            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(CardRadius))
             .verticalScroll(rememberScrollState())
             .padding(7.dp),
         verticalArrangement = Arrangement.spacedBy(5.dp)
@@ -7664,7 +8816,7 @@ private fun QueueSettingsNavigation(
             )
             Row(
                 Modifier.fillMaxWidth().heightIn(min = 62.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .clip(RoundedCornerShape(12.dp))
                     .background(backgroundColor)
                     .clickable(enabled = !isSelected) { onSelect(section) }
                     .padding(horizontal = 13.dp, vertical = 10.dp),
@@ -7679,14 +8831,14 @@ private fun QueueSettingsNavigation(
                     Text(
                         section.title,
                         color = if (isSelected) SystemBlue else PrimaryText,
-                        fontSize = 13.sp,
+                        fontSize = 15.sp,
                         fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
                     )
                     Spacer(Modifier.height(2.dp))
                     Text(
                         section.summary,
                         color = SecondaryText,
-                        fontSize = 9.sp,
+                        fontSize = 11.sp,
                         lineHeight = 13.sp,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
@@ -7694,7 +8846,7 @@ private fun QueueSettingsNavigation(
                 }
 
                 Spacer(Modifier.width(5.dp))
-                Text("›", color = if (isSelected) SystemBlue else TertiaryText, fontSize = 18.sp)
+                Text("›", color = if (isSelected) SystemBlue else TertiaryText, fontSize = 15.sp)
             }
         }
     }
@@ -7715,6 +8867,7 @@ private fun QueueRuleSettingsScreen(
     val context = LocalContext.current
     val hostActivity = context as? MainActivity
     var settings by remember(persistedSettings) { mutableStateOf(persistedSettings) }
+    var addingMachinePair by remember { mutableStateOf(false) }
     var selectedMachineConfigurationId by remember { mutableStateOf(MachineId.A) }
     var machineDeletionTarget by remember { mutableStateOf<MachineId?>(null) }
     var queueSyncEndpointDraft by remember(persistedSettings.queueSyncEndpoint) {
@@ -7844,7 +8997,7 @@ private fun QueueRuleSettingsScreen(
                 Text(
                     "应用设置",
                     color = PrimaryText,
-                    fontSize = 25.sp,
+                    fontSize = QueueTextSize.PageTitle,
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
@@ -7857,7 +9010,7 @@ private fun QueueRuleSettingsScreen(
             if (settingsChanged) {
                 Text(
                     "有未保存的修改",
-                    color = Color(0xFF9A5B00),
+                    color = WarningText,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Medium
                 )
@@ -7901,10 +9054,11 @@ private fun QueueRuleSettingsScreen(
                     Modifier.fillMaxSize().verticalScroll(rememberScrollState())
                         .padding(end = 8.dp, bottom = 18.dp)
                 ) {
+                    // Below the page title 应用设置 (30): one level down, as a dialog title.
                     Text(
                         visibleSection.title,
                         color = PrimaryText,
-                        fontSize = 28.sp,
+                        fontSize = QueueTextSize.DialogTitle,
                         fontWeight = FontWeight.SemiBold
                     )
                     Spacer(Modifier.height(4.dp))
@@ -7916,19 +9070,23 @@ private fun QueueRuleSettingsScreen(
                     Spacer(Modifier.height(18.dp))
             if (visibleSection == QueueSettingsSection.VENUE_AND_TERMINAL) {
             Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
-                    .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius)).background(CardBackground)
+                    .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(CardRadius))
                     .padding(horizontal = 16.dp, vertical = 14.dp)
             ) {
                 Text(
-                    "当前排队数据所属的现场",
+                    "当前排队数据所属的机厅",
                     color = PrimaryText,
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Medium
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "名称会显示在现场终端、网站和 QQ Bot。修改名称不会改变机厅 ID、队列、玩家资料或历史记录，也不要求关闭登记排队。",
+                    if (BuildConfig.CLOUD_SYNC_AVAILABLE) {
+                        "名称会显示在现场终端、网站和 QQ Bot。修改名称不会改变机厅 ID、队列、玩家资料或历史记录，也不要求关闭登记排队。"
+                    } else {
+                        "名称会显示在现场终端。修改名称不会改变机厅 ID、队列、玩家资料或历史记录，也不要求关闭登记排队。"
+                    },
                     color = SecondaryText,
                     fontSize = 11.sp,
                     lineHeight = 16.sp
@@ -7958,7 +9116,7 @@ private fun QueueRuleSettingsScreen(
                     singleLine = true,
                     isError = normalizedVenueNameDraft.isEmpty(),
                     supportingText = {
-                        Text("用于玩家识别现场，不作为数据主键。")
+                        Text("用于玩家辨认机厅。")
                     },
                     shape = RoundedCornerShape(ControlRadius),
                     colors = playerProfileTextFieldColors(),
@@ -7980,7 +9138,7 @@ private fun QueueRuleSettingsScreen(
                     singleLine = true,
                     isError = normalizedTerminalNameDraft.isEmpty(),
                     supportingText = {
-                        Text("用于以后区分同一机厅内的现场终端。")
+                        Text("用于区分同一机厅内的现场终端。")
                     },
                     shape = RoundedCornerShape(ControlRadius),
                     colors = playerProfileTextFieldColors(),
@@ -7990,7 +9148,7 @@ private fun QueueRuleSettingsScreen(
                     Spacer(Modifier.height(7.dp))
                     Text(
                         "名称已保存在本机，正在等待同步到服务端；现场排队不受影响。",
-                        color = Color(0xFF9A5B00),
+                        color = WarningText,
                         fontSize = 11.sp,
                         lineHeight = 16.sp
                     )
@@ -8029,8 +9187,8 @@ private fun QueueRuleSettingsScreen(
             }
             if (visibleSection == QueueSettingsSection.SERVER_AND_LINKS && cloudSyncAvailable) {
                 Column(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
-                        .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius)).background(CardBackground)
+                        .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(CardRadius))
                 ) {
                     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp)) {
                         Text(
@@ -8052,7 +9210,7 @@ private fun QueueRuleSettingsScreen(
                                 persistedSettings.websiteSyncEnabled &&
                                 !settings.websiteSyncEnabled
                             ) {
-                                "请先保存关闭同步的设置，再重新进入本页更换服务器。"
+                                "请先保存设置以关闭与服务端同步，再重新进入本页更换服务器。"
                             } else {
                                 "如需更换服务器，请先关闭与服务端同步。"
                             },
@@ -8125,7 +9283,7 @@ private fun QueueRuleSettingsScreen(
                         Text(
                             "服务器连接与本页其他设置会在页面底部一并保存。",
                             color = TertiaryText,
-                            fontSize = 10.sp
+                            fontSize = 11.sp
                         )
                     }
                     HorizontalDivider(color = Separator.copy(alpha = .72f))
@@ -8137,7 +9295,7 @@ private fun QueueRuleSettingsScreen(
                             !queueConnectionConfigured ->
                                 "请先填写有效的服务器地址与终端同步令牌。"
                             settings.websiteSyncEnabled ->
-                                "上传最新队列和玩家资料，并接收服务器待执行的修改。只有玩家允许公开的 QQ 才会显示在网站详情中。"
+                                "上传最新队列和玩家资料，并接收服务端待执行的修改。只有允许网站显示的 QQ 才会显示在网站登记详情中。"
                             else ->
                                 "队列与玩家资料只在本机更新。重新开启后，会同步当前完整数据。"
                         },
@@ -8174,7 +9332,7 @@ private fun QueueRuleSettingsScreen(
                             settings.allowOnlineRegistration ->
                                 "允许玩家通过网站和 QQ Bot 创建线上登记；到场后仍需在终端完成签到。"
                             else ->
-                                "网站和 QQ Bot 仍可查询队列、管理已有登记，但不能创建新的线上登记。"
+                                "网站和 QQ Bot 仍可查询队列、管理已有登记；不能创建新的线上登记。"
                         },
                         checked = settings.allowOnlineRegistration,
                         enabled = !managementSensitiveControlsLocked,
@@ -8205,27 +9363,34 @@ private fun QueueRuleSettingsScreen(
             }
             if (visibleSection == QueueSettingsSection.BUSINESS_HOURS) {
             Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
-                    .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius)).background(CardBackground)
+                    .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(CardRadius))
             ) {
                 if (managementSensitiveControlsLocked) {
                     Text(
                         managementSensitiveSettingsLockReason,
-                        color = Color(0xFF9A5B00),
+                        color = WarningText,
                         fontSize = 11.sp,
                         lineHeight = 16.sp,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
                     )
                     HorizontalDivider(color = Separator.copy(alpha = .72f))
                 }
+                // The local-only build has no server to synchronise with.
+                val businessHoursOwnership = if (cloudSyncAvailable) {
+                    "营业时间属于当前机厅，并与服务端同步。"
+                } else {
+                    "营业时间属于当前机厅。"
+                }
                 QueueRuleSettingRow(
                     title = "设置营业时间",
                     description = if (managementSensitiveControlsLocked) {
                         managementSensitiveSettingsLockReason
                     } else if (settings.businessHours.enabled) {
-                        "营业时间属于当前机厅，并与服务端同步。闭店后停止接收新登记，并为现有队列保留最多 20 分钟的收尾时间；到开店时间不会自动重新开启。"
+                        businessHoursOwnership +
+                            "闭店后停止接收新登记，并为现有队列保留最多 20 分钟的收尾时间；到开店时间时，登记排队不会自动重新开启。"
                     } else {
-                        "营业时间属于当前机厅，并与服务端同步。不开启时，登记排队不会受到营业时间影响。"
+                        businessHoursOwnership + "不开启时，登记排队不会受到营业时间影响。"
                     },
                     checked = settings.businessHours.enabled,
                     enabled = !managementSensitiveControlsLocked,
@@ -8313,7 +9478,7 @@ private fun QueueRuleSettingsScreen(
                                     Text(
                                         businessDayLabel(day),
                                         color = PrimaryText,
-                                        fontSize = 13.sp,
+                                        fontSize = 14.sp,
                                         modifier = Modifier.width(58.dp)
                                     )
                                     BusinessTimeButton(
@@ -8362,13 +9527,13 @@ private fun QueueRuleSettingsScreen(
             }
             if (visibleSection == QueueSettingsSection.QUEUE_RULES) {
             Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
-                    .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius)).background(CardBackground)
+                    .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(CardRadius))
             ) {
                 if (managementSensitiveControlsLocked) {
                     Text(
-                        "暂缓、暂时离开等敏感规则已由管理后台接管。终端仍保留正常拖动排序和现场执行。",
-                        color = Color(0xFF9A5B00),
+                        "暂缓一次、暂时离开等终端敏感策略已由管理后台接管，只能从管理后台修改；终端仍可拖动调整等待顺序。",
+                        color = WarningText,
                         fontSize = 11.sp,
                         lineHeight = 16.sp,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
@@ -8394,7 +9559,7 @@ private fun QueueRuleSettingsScreen(
                     description = if (managementSensitiveControlsLocked) {
                         "已由管理后台接管，只能从管理后台修改。"
                     } else {
-                        "允许玩家在返回前持续轮空，并在返回后手动恢复。"
+                        "允许玩家暂时离开现场。暂时离开的登记每次轮到时移至队尾，直到玩家手动取消暂时离开；第 4 次轮到时，系统会将其移除。"
                     },
                     checked = settings.allowTemporaryLeave,
                     enabled = !managementSensitiveControlsLocked,
@@ -8411,25 +9576,41 @@ private fun QueueRuleSettingsScreen(
                         updateDraft(settings.copy(showCommonPlayPreview = it))
                     }
                 )
+                HorizontalDivider(color = Separator.copy(alpha = .72f))
+                PairedMachineQueueSettings(
+                    settings = settings,
+                    locked = managementSensitiveControlsLocked,
+                    onSettingsChange = { updated -> updateDraft(updated) },
+                    onAddPair = { addingMachinePair = true }
+                )
             }
             }
             if (visibleSection == QueueSettingsSection.MACHINES_AND_GROUPS) {
+            MachineGroupTable(
+                settings = settings,
+                enabled = !managementSensitiveControlsLocked,
+                disabledReason = managementSensitiveSettingsLockReason,
+                onSettingsChange = ::updateDraft
+            )
+            Spacer(Modifier.height(QueueSpacing.M))
             Column(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius)).background(CardBackground)
                     .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(CardRadius))
             ) {
                 Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                Text("机台", color = PrimaryText, fontSize = QueueTextSize.CardTitle, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(6.dp))
                 if (managementSensitiveControlsLocked) {
                     Text(
                         managementSensitiveSettingsLockReason,
-                        color = Color(0xFF9A5B00),
+                        color = WarningText,
                         fontSize = 11.sp,
                         lineHeight = 16.sp
                     )
                     Spacer(Modifier.height(8.dp))
                 }
                 Text(
-                    "按现场实际情况添加或删除机台。机台编号始终从 A 开始连续排列，最多支持到 J；分组只改变首页显示，不改变各机台的独立队列。",
+                    "按现场实际情况添加或删除机台。机台编号始终从 A 开始连续排列，最多支持到 J。",
                     color = SecondaryText,
                     fontSize = 11.sp,
                     lineHeight = 16.sp
@@ -8438,7 +9619,7 @@ private fun QueueRuleSettingsScreen(
                     Spacer(Modifier.height(8.dp))
                     Text(
                         "关闭登记排队后才能添加、删除机台、修改游玩容量或计划游玩时间。分组、备注与机台详情仍可直接更新。",
-                        color = Color(0xFF9A5B00),
+                        color = WarningText,
                         fontSize = 11.sp,
                         lineHeight = 16.sp
                     )
@@ -8472,14 +9653,6 @@ private fun QueueRuleSettingsScreen(
                     },
                     onDelete = { machineDeletionTarget = activeMachineId }
                 )
-                Spacer(Modifier.height(14.dp))
-                MachineGroupingEditor(
-                    settings = settings,
-                    machineId = activeMachineId,
-                    enabled = !managementSensitiveControlsLocked,
-                    disabledReason = managementSensitiveSettingsLockReason,
-                    onSettingsChange = ::updateDraft
-                )
                 Spacer(Modifier.height(18.dp))
                 MachineConfigurationEditor(
                     machineId = activeMachineId,
@@ -8511,8 +9684,8 @@ private fun QueueRuleSettingsScreen(
         ) {
             val validationMessage = when {
                 !installationNamesValid -> "请填写有效的机厅名称和终端名称。"
-                !remarksValid -> "请填写所有已启用机台的备注。"
-                !machineDetailsValid -> "请填写选择为“其他”的机台类型或服务器名称。"
+                !remarksValid -> "请填写所有机台的备注。"
+                !machineDetailsValid -> "请填写选择为“其他”的游戏类型或服务器名称。"
                 !machineGroupsValid -> "请填写所有机台分组的名称。"
                 !connectionChangeValid -> "请填写有效的服务器地址和终端同步令牌。"
                 !settings.websiteSyncEnabled || queueConnectionConfigured -> null
@@ -8554,7 +9727,7 @@ private fun QueueRuleSettingsScreen(
                     } else if (queueSettingsSaved) {
                         Toast.makeText(
                             context,
-                            panguSpacing("排队设置已保存，但机厅与终端名称未能写入本机，请重试。"),
+                            panguSpacing("应用设置已保存；机厅与终端名称未能写入本机，请重试。"),
                             Toast.LENGTH_LONG
                         ).show()
                     }
@@ -8576,7 +9749,7 @@ private fun QueueRuleSettingsScreen(
     if (showTakeoverConfirmation) {
         RemoveRegistrationConfirmation(
             title = "接管同步身份？",
-            message = "接管后，网站和 QQ Bot 将以本机队列作为正式数据。请仅在确实需要用本机替代当前同步终端时继续；后台重试不会自行完成接管。",
+            message = "接管后，网站和 QQ Bot 将以本机队列作为正式数据。请仅在确实需要用本机替代当前同步终端时继续。",
             confirmText = "确认接管",
             onDismiss = { showTakeoverConfirmation = false },
             onConfirm = {
@@ -8590,14 +9763,14 @@ private fun QueueRuleSettingsScreen(
         val targetIndex = configuredIds.indexOf(target)
         val reindexedIds = configuredIds.drop(targetIndex + 1)
         RemoveRegistrationConfirmation(
-            title = "删除${machineName(target, settings.machineRemark(target))}？",
+            title = "删除 ${machineName(target, settings.machineRemark(target))}？",
             message = buildString {
                 append("这台机台将从当前配置中移除。")
                 if (reindexedIds.isNotEmpty()) {
                     append("删除后，")
                     append(
                         reindexedIds.joinToString("、") { machineId ->
-                            "原机台 ${machineId.name} 改为机台 ${MachineId.entries[machineId.ordinal - 1].name}"
+                            "原机台 ${machineId.name} 改为 机台 ${MachineId.entries[machineId.ordinal - 1].name}"
                         }
                     )
                     append("。机台详情、分组和运行状态会一同移动。")
@@ -8617,6 +9790,13 @@ private fun QueueRuleSettingsScreen(
             }
         )
     }
+    if (addingMachinePair) {
+        AddMachinePairDialogs(
+            settings = settings,
+            onSettingsChange = { updated -> updateDraft(updated) },
+            onDismiss = { addingMachinePair = false }
+        )
+    }
     if (showDiscardConfirmation) {
         RemoveRegistrationConfirmation(
             title = "放弃未保存的设置？",
@@ -8632,7 +9812,7 @@ private fun QueueRuleSettingsScreen(
     if (showVenueRebindConfirmation) {
         RemoveRegistrationConfirmation(
             title = "重新绑定当前服务器？",
-            message = "确认后，终端会放弃原服务端机厅 ID，并将当前服务器登记为本终端所属机厅。核对成功后，本机现有队列和玩家资料会同步到当前服务器；本地队列、玩家资料和历史记录不会被清除。请仅在已经核对服务器地址与现场归属后继续。",
+            message = "确认后，终端会放弃原有的机厅 ID，并在当前服务器上重新注册本终端所属的机厅。核对成功后，本机现有队列和玩家资料会同步到服务端；本机的队列、玩家资料和历史记录不会被清除。请仅在已经核对服务器地址与现场归属后继续。",
             confirmText = "确认重新绑定",
             onDismiss = { showVenueRebindConfirmation = false },
             onConfirm = {
@@ -8721,289 +9901,281 @@ private fun TerminalOnboardingScreen(
         onProgress(step, venueNameDraft, terminalNameDraft)
     }
 
-    BackHandler(enabled = step > 0 && !submitting) {
-        goTo(previousOnboardingStep(step, cloudSyncAvailable))
+    val goBack: (() -> Unit)? = if (step > 0) {
+        { if (!submitting) goTo(previousOnboardingStep(step, cloudSyncAvailable)) }
+    } else {
+        null
     }
-    Column(Modifier.fillMaxSize().imePadding().padding(horizontal = 36.dp, vertical = 24.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text("maimai Q", color = PrimaryText, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.weight(1f))
-            Text(
-                "首次设置·${step + 1}/${LAST_ONBOARDING_STEP + 1}",
-                color = TertiaryText,
-                fontSize = 12.sp
+    // The pages of this build; a build without a server skips 连接服务端 (page 1).
+    val pages = if (cloudSyncAvailable) listOf(0, 1, 2, 3) else listOf(0, 2, 3)
+    val summary = FlowSummary(
+        title = "首次设置",
+        steps = pages.map { page ->
+            val state = when {
+                page < step -> FlowStepState.DONE
+                page == step -> FlowStepState.CURRENT
+                else -> FlowStepState.PENDING
+            }
+            FlowStep(
+                label = when (page) {
+                    0 -> "设置说明"
+                    1 -> "连接服务端"
+                    2 -> "机厅身份"
+                    else -> "确认"
+                },
+                value = when (page) {
+                    0 -> "已阅读"
+                    1 -> if (useServer) "现在连接" else "暂时跳过"
+                    2 -> preparedIdentity.venueName.ifBlank { null }
+                    else -> null
+                }?.takeIf { state == FlowStepState.DONE },
+                state = state,
+                placeholder = when (page) {
+                    0 -> "请阅读"
+                    2 -> "请填写"
+                    3 -> "请核对"
+                    else -> "请选择"
+                },
+                onEdit = if (page > 0 && page < 3) {
+                    { if (!submitting) goTo(page) }
+                } else {
+                    null
+                }
             )
         }
-        Spacer(Modifier.height(12.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            repeat(LAST_ONBOARDING_STEP + 1) { index ->
-                Box(
-                    Modifier.weight(1f).height(4.dp).clip(CircleShape)
-                        .background(if (index <= step) SystemBlue else Separator)
+    )
+    when (step) {
+        0 -> StepFlowPage(
+            summary = summary,
+            title = "开始设置现场终端",
+            subtitle = if (cloudSyncAvailable) {
+                "接下来会确认是否连接服务端、填写机厅与终端名称，并核对开始使用前的关键设置。排队数据始终先保存在本机。"
+            } else {
+                "这是纯本地版本。接下来填写机厅与终端名称，并核对开始使用前的关键设置；所有排队数据只保存在本机。"
+            },
+            onBack = goBack
+        ) {
+            Spacer(Modifier.height(18.dp))
+            FlowNoteCard(
+                "不会改变既有排队规则",
+                "此流程只设置机厅身份和必要配置，不会修改轮换、闭店收尾、暂缓一次、暂时离开、签到或共同游玩规则。"
+            )
+            FlowActions {
+                FlowPrimaryButton("开始设置", { goTo(if (cloudSyncAvailable) 1 else 2) })
+            }
+        }
+
+        1 -> StepFlowPage(
+            summary = summary,
+            title = "连接服务端",
+            subtitle = "联网后，网站和 QQ Bot 可以读取队列，并按照终端规则提交线上操作。也可以暂时跳过，之后在应用设置中连接。",
+            onBack = goBack
+        ) {
+            Spacer(Modifier.height(18.dp))
+            FlowListGroup {
+                FlowListRow(
+                    title = "现在连接服务端",
+                    description = "填写服务器地址和终端同步令牌。",
+                    onClick = {
+                        useServer = true
+                        connectionFailure = null
+                    },
+                    leading = { RadioDot(useServer) },
+                    selected = useServer
+                )
+                FlowListRow(
+                    title = "暂时跳过",
+                    description = "终端只在本机使用，之后可以在应用设置中连接。",
+                    onClick = {
+                        useServer = false
+                        connectionFailure = null
+                    },
+                    leading = { RadioDot(!useServer) },
+                    dividerInset = FlowTextDividerInset,
+                    selected = !useServer
+                )
+            }
+            if (useServer) {
+                FlowSectionLabel("服务器地址")
+                Spacer(Modifier.height(10.dp))
+                FlowTextField(
+                    value = endpointDraft,
+                    onValueChange = {
+                        endpointDraft = it.filterNot(Char::isISOControl)
+                        connectionFailure = null
+                    },
+                    placeholder = "https://example.com/api/queue-status",
+                    isError = endpointDraft.isNotBlank() && normalizedEndpoint == null,
+                    height = 60.dp,
+                    fontSize = 17.sp,
+                    keyboardType = KeyboardType.Uri
+                )
+                FlowSectionLabel("终端同步令牌")
+                Spacer(Modifier.height(10.dp))
+                FlowTextField(
+                    value = tokenDraft,
+                    onValueChange = {
+                        tokenDraft = it.filterNot(Char::isISOControl)
+                        connectionFailure = null
+                    },
+                    placeholder = "输入终端同步令牌",
+                    isError = tokenDraft.isNotBlank() && !isValidQueueSyncToken(normalizedToken),
+                    height = 60.dp,
+                    fontSize = 17.sp,
+                    keyboardType = KeyboardType.Password,
+                    visualTransformation = PasswordVisualTransformation()
+                )
+                connectionFailure?.let { detail -> FlowNote(detail, Destructive) }
+            }
+            FlowActions {
+                FlowPrimaryButton(
+                    text = if (useServer) "保存连接并继续" else "暂时跳过并继续",
+                    onClick = {
+                        onSaveConnection(
+                            normalizedEndpoint.orEmpty(),
+                            normalizedToken,
+                            useServer
+                        )
+                        preparedIdentity = prepareOnboardingIdentityForConnectionChoice(
+                            current = preparedIdentity,
+                            useServer = useServer,
+                            queueStatusEndpoint = normalizedEndpoint
+                        )
+                        onPreparedIdentity(preparedIdentity)
+                        goTo(2)
+                    },
+                    enabled = !useServer || connectionValid,
+                    disabledReason = "请填写有效的 HTTPS 服务器地址和终端同步令牌。"
                 )
             }
         }
-        Box(
-            Modifier.fillMaxSize()
-                .widthIn(max = terminalContentMaxWidth(820.dp))
-                .align(Alignment.CenterHorizontally)
+
+        2 -> StepFlowPage(
+            summary = summary,
+            title = "设置机厅身份",
+            subtitle = if (BuildConfig.CLOUD_SYNC_AVAILABLE) {
+                "机厅名称会显示在现场终端、网站和 QQ Bot；终端名称用于区分同一机厅内的现场终端。两者都可以在应用设置中修改。"
+            } else {
+                "机厅名称会显示在现场终端；终端名称用于区分同一机厅内的现场终端。两者都可以在应用设置中修改。"
+            },
+            onBack = goBack
         ) {
-            Column(
-                Modifier.fillMaxWidth().align(Alignment.Center)
-                    .verticalScroll(rememberScrollState()).padding(vertical = 24.dp)
-            ) {
-                when (step) {
-                    0 -> {
-                        Text("开始设置现场终端", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            if (cloudSyncAvailable) {
-                                "接下来会确认是否连接服务端、填写机厅与终端名称，并核对开始使用前的关键设置。排队数据始终先保存在本机。"
+            Spacer(Modifier.height(2.dp))
+            FlowSectionLabel("机厅名称")
+            Spacer(Modifier.height(10.dp))
+            FlowTextField(
+                value = venueNameDraft,
+                onValueChange = {
+                    venueNameDraft = limitCodePointLength(it.filterNot(Char::isISOControl), MAX_VENUE_NAME_CHARACTERS)
+                    connectionFailure = null
+                },
+                placeholder = "例如：星海游戏厅",
+                height = 60.dp,
+                fontSize = 17.sp
+            )
+            FlowSectionLabel("终端名称")
+            Spacer(Modifier.height(10.dp))
+            FlowTextField(
+                value = terminalNameDraft,
+                onValueChange = {
+                    terminalNameDraft = limitCodePointLength(it.filterNot(Char::isISOControl), MAX_TERMINAL_NAME_CHARACTERS)
+                    connectionFailure = null
+                },
+                placeholder = DEFAULT_TERMINAL_NAME,
+                height = 60.dp,
+                fontSize = 17.sp
+            )
+            connectionFailure?.let { detail -> FlowNote(detail, Destructive) }
+            FlowActions {
+                FlowPrimaryButton(
+                    text = when {
+                        submitting -> "正在保存…"
+                        useServer -> "注册机厅并继续"
+                        else -> "保存机厅身份并继续"
+                    },
+                    onClick = {
+                        if (submitting) return@FlowPrimaryButton
+                        submitting = true
+                        connectionFailure = null
+                        coroutineScope.launch {
+                            val base = preparedIdentity.copy(
+                                venueName = venueName,
+                                terminalName = terminalName,
+                                onboardingStep = 3,
+                                onboardingCompleted = false,
+                                lastUpdatedAtMillis = System.currentTimeMillis()
+                            )
+                            val result = if (useServer) {
+                                installationClient.register(
+                                    venueName = venueName,
+                                    terminalName = terminalName,
+                                    expectedVenueId = base.expectedServerVenueId
+                                )
                             } else {
-                                "这是纯本地版本。接下来填写机厅与终端名称，并核对开始使用前的关键设置；所有排队数据只保存在本机。"
-                            },
-                            color = SecondaryText,
-                            fontSize = 14.sp,
-                            lineHeight = 21.sp
-                        )
-                        Spacer(Modifier.height(22.dp))
-                        Column(
-                            Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
-                                .background(CardBackground)
-                                .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(14.dp))
-                                .padding(17.dp)
-                        ) {
-                            Text("不会改变既有排队规则", color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                            Spacer(Modifier.height(5.dp))
-                            Text(
-                                "此流程只建立安装身份和必要配置，不会修改轮换、闭店收尾、暂缓一次、暂时离开、签到或共同游玩规则。",
-                                color = SecondaryText,
-                                fontSize = 12.sp,
-                                lineHeight = 18.sp
-                            )
-                        }
-                        Spacer(Modifier.height(22.dp))
-                        PrimaryButton("开始设置", { goTo(if (cloudSyncAvailable) 1 else 2) }, Modifier.fillMaxWidth())
-                    }
-
-                    1 -> {
-                        Text("连接服务端", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
-                        Spacer(Modifier.height(7.dp))
-                        Text(
-                            "联网后，网站和 QQ Bot 可以读取队列，并按照终端规则提交线上操作。也可以暂时跳过，之后在应用设置中连接。",
-                            color = SecondaryText,
-                            fontSize = 14.sp,
-                            lineHeight = 21.sp
-                        )
-                        Spacer(Modifier.height(20.dp))
-                        FriendConsentConfirmation(
-                            checked = useServer,
-                            text = "现在连接服务端",
-                            onToggle = {
-                                useServer = !useServer
-                                connectionFailure = null
+                                null
                             }
-                        )
-                        if (useServer) {
-                            Spacer(Modifier.height(14.dp))
-                            OutlinedTextField(
-                                value = endpointDraft,
-                                onValueChange = {
-                                    endpointDraft = it.filterNot(Char::isISOControl)
-                                    connectionFailure = null
-                                },
-                                label = { Text("服务器地址") },
-                                placeholder = { Text("https://example.com/api/queue-status") },
-                                singleLine = true,
-                                isError = endpointDraft.isNotBlank() && normalizedEndpoint == null,
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                            Spacer(Modifier.height(10.dp))
-                            OutlinedTextField(
-                                value = tokenDraft,
-                                onValueChange = {
-                                    tokenDraft = it.filterNot(Char::isISOControl)
-                                    connectionFailure = null
-                                },
-                                label = { Text("终端同步令牌") },
-                                singleLine = true,
-                                visualTransformation = PasswordVisualTransformation(),
-                                isError = tokenDraft.isNotBlank() && !isValidQueueSyncToken(normalizedToken),
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                            connectionFailure?.let { detail ->
-                                Spacer(Modifier.height(10.dp))
-                                Text(detail, color = Destructive, fontSize = 12.sp, lineHeight = 18.sp)
-                            }
-                        }
-                        Spacer(Modifier.height(20.dp))
-                        PrimaryButton(
-                            text = if (useServer) "保存连接并继续" else "暂时跳过并继续",
-                            onClick = {
-                                onSaveConnection(
-                                    normalizedEndpoint.orEmpty(),
-                                    normalizedToken,
-                                    useServer
-                                )
-                                preparedIdentity = prepareOnboardingIdentityForConnectionChoice(
-                                    current = preparedIdentity,
-                                    useServer = useServer,
-                                    queueStatusEndpoint = normalizedEndpoint
-                                )
-                                onPreparedIdentity(preparedIdentity)
-                                goTo(2)
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = !useServer || connectionValid,
-                            disabledReason = "请填写有效的 HTTPS 服务器地址和终端同步令牌。"
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        SecondaryButton("返回", { goTo(0) }, Modifier.fillMaxWidth())
-                    }
-
-                    2 -> {
-                        Text("设置机厅身份", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
-                        Spacer(Modifier.height(7.dp))
-                        Text(
-                            "机厅名称会显示在终端、网站和 QQ Bot 的合适位置；终端名称用于以后区分同一机厅内的设备。两者都可以在设置中修改。",
-                            color = SecondaryText,
-                            fontSize = 14.sp,
-                            lineHeight = 21.sp
-                        )
-                        Spacer(Modifier.height(18.dp))
-                        OutlinedTextField(
-                            value = venueNameDraft,
-                            onValueChange = {
-                                venueNameDraft = limitCodePointLength(it.filterNot(Char::isISOControl), MAX_VENUE_NAME_CHARACTERS)
-                                connectionFailure = null
-                            },
-                            label = { Text("机厅名称") },
-                            placeholder = { Text("例如：星海游戏厅") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        Spacer(Modifier.height(10.dp))
-                        OutlinedTextField(
-                            value = terminalNameDraft,
-                            onValueChange = {
-                                terminalNameDraft = limitCodePointLength(it.filterNot(Char::isISOControl), MAX_TERMINAL_NAME_CHARACTERS)
-                                connectionFailure = null
-                            },
-                            label = { Text("终端名称") },
-                            placeholder = { Text(DEFAULT_TERMINAL_NAME) },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        connectionFailure?.let { detail ->
-                            Spacer(Modifier.height(10.dp))
-                            Text(detail, color = Destructive, fontSize = 12.sp, lineHeight = 18.sp)
-                        }
-                        Spacer(Modifier.height(20.dp))
-                        PrimaryButton(
-                            text = if (useServer) "注册机厅并继续" else "保存本地身份并继续",
-                            onClick = {
-                                if (submitting) return@PrimaryButton
-                                submitting = true
-                                connectionFailure = null
-                                coroutineScope.launch {
-                                    val base = preparedIdentity.copy(
-                                        venueName = venueName,
-                                        terminalName = terminalName,
-                                        onboardingStep = 3,
+                            val ready = when (result) {
+                                is TerminalInstallationFetchResult.Success ->
+                                    result.identity.copy(
                                         onboardingCompleted = false,
-                                        lastUpdatedAtMillis = System.currentTimeMillis()
+                                        onboardingStep = 3,
+                                        venueBindingServerEndpoint = normalizedEndpoint,
+                                        verifiedServerEndpoint = normalizedEndpoint,
+                                        venueName = venueName,
+                                        terminalName = terminalName
                                     )
-                                    val result = if (useServer) {
-                                        installationClient.register(
-                                            venueName = venueName,
-                                            terminalName = terminalName,
-                                            expectedVenueId = base.expectedServerVenueId
-                                        )
-                                    } else {
-                                        null
-                                    }
-                                    val ready = when (result) {
-                                        is TerminalInstallationFetchResult.Success ->
-                                            result.identity.copy(
-                                                onboardingCompleted = false,
-                                                onboardingStep = 3,
-                                                venueBindingServerEndpoint = normalizedEndpoint,
-                                                verifiedServerEndpoint = normalizedEndpoint,
-                                                venueName = venueName,
-                                                terminalName = terminalName
-                                            )
-                                        TerminalInstallationFetchResult.UnsupportedServer ->
-                                            markLegacyInstallationEndpointVerified(base, normalizedEndpoint.orEmpty())
-                                                .copy(onboardingStep = 3)
-                                        is TerminalInstallationFetchResult.Failure -> {
-                                            connectionFailure = result.detail
-                                            null
-                                        }
-                                        null -> base.copy(
-                                            venueId = base.venueId ?: java.util.UUID.randomUUID().toString(),
-                                            registrationState = TerminalInstallationRegistrationState.LOCAL_ONLY,
-                                            verifiedServerEndpoint = null
-                                        )
-                                    }
-                                    if (ready != null) {
-                                        preparedIdentity = ready
-                                        onPreparedIdentity(ready)
-                                        goTo(3)
-                                    }
-                                    submitting = false
+                                TerminalInstallationFetchResult.UnsupportedServer ->
+                                    markLegacyInstallationEndpointVerified(base, normalizedEndpoint.orEmpty())
+                                        .copy(onboardingStep = 3)
+                                is TerminalInstallationFetchResult.Failure -> {
+                                    connectionFailure = result.detail
+                                    null
                                 }
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = identityValid && !submitting,
-                            disabledReason = if (submitting) "正在保存机厅身份。" else
-                                "请填写机厅名称和终端名称。"
-                        )
-                        if (step > 0) {
-                            Spacer(Modifier.height(8.dp))
-                            SecondaryButton("返回", { goTo(if (cloudSyncAvailable) 1 else 0) }, Modifier.fillMaxWidth(), enabled = !submitting)
-                        }
-                    }
-
-                    else -> {
-                        Text("可以开始使用", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
-                        Spacer(Modifier.height(7.dp))
-                        Text(
-                            "请核对以下信息。进入首页后，可以从“更多 → 应用设置”继续调整机台配置、营业时间和线上登记。",
-                            color = SecondaryText,
-                            fontSize = 14.sp,
-                            lineHeight = 21.sp
-                        )
-                        Spacer(Modifier.height(18.dp))
-                        Column(
-                            Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
-                                .background(CardBackground)
-                                .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(14.dp))
-                                .padding(horizontal = 17.dp)
-                        ) {
-                            AppDetailRow("机厅", preparedIdentity.venueName.ifBlank { "尚未填写" })
-                            HorizontalDivider(color = Separator.copy(alpha = .72f))
-                            AppDetailRow("终端", preparedIdentity.terminalName)
-                            HorizontalDivider(color = Separator.copy(alpha = .72f))
-                            AppDetailRow(
-                                "连接状态",
-                                when (preparedIdentity.registrationState) {
-                                    TerminalInstallationRegistrationState.REGISTERED -> "已在服务端注册"
-                                    TerminalInstallationRegistrationState.WAITING_FOR_SERVER -> "兼容服务端连接"
-                                    TerminalInstallationRegistrationState.LOCAL_ONLY -> "仅在本机使用"
-                                    TerminalInstallationRegistrationState.VENUE_MISMATCH -> "机厅身份不一致"
-                                }
-                            )
-                            preparedIdentity.venueCode?.let { code ->
-                                HorizontalDivider(color = Separator.copy(alpha = .72f))
-                                AppDetailRow("机厅 ID", code)
+                                null -> base.copy(
+                                    venueId = base.venueId ?: java.util.UUID.randomUUID().toString(),
+                                    registrationState = TerminalInstallationRegistrationState.LOCAL_ONLY,
+                                    verifiedServerEndpoint = null
+                                )
                             }
+                            if (ready != null) {
+                                preparedIdentity = ready
+                                onPreparedIdentity(ready)
+                                goTo(3)
+                            }
+                            submitting = false
                         }
-                        Spacer(Modifier.height(20.dp))
-                        PrimaryButton("进入排队首页", onComplete, Modifier.fillMaxWidth())
-                        Spacer(Modifier.height(8.dp))
-                        SecondaryButton("返回修改", { goTo(2) }, Modifier.fillMaxWidth())
+                    },
+                    enabled = identityValid && !submitting,
+                    disabledReason = if (submitting) "正在保存机厅身份。" else
+                        "请填写机厅名称和终端名称。"
+                )
+            }
+        }
+
+        else -> StepFlowPage(
+            summary = summary,
+            title = "可以开始使用",
+            subtitle = "请核对以下信息。进入首页后，可以从“更多 → 应用设置”继续调整机台配置、营业时间和线上登记。",
+            onBack = goBack
+        ) {
+            Spacer(Modifier.height(18.dp))
+            FlowListGroup {
+                FlowDetailRow("机厅", preparedIdentity.venueName.ifBlank { "尚未填写" }, first = true)
+                FlowDetailRow("终端", preparedIdentity.terminalName)
+                FlowDetailRow(
+                    "连接状态",
+                    when (preparedIdentity.registrationState) {
+                        TerminalInstallationRegistrationState.REGISTERED -> "已在服务端注册"
+                        TerminalInstallationRegistrationState.WAITING_FOR_SERVER ->
+                            if (preparedIdentity.verifiedServerEndpoint != null) "已连接旧版服务端" else "等待核对服务端"
+                        TerminalInstallationRegistrationState.LOCAL_ONLY -> "仅在本机使用"
+                        TerminalInstallationRegistrationState.VENUE_MISMATCH -> "机厅身份不一致"
                     }
-                }
+                )
+                preparedIdentity.venueCode?.let { code -> FlowDetailRow("机厅 ID", code) }
+            }
+            FlowActions {
+                FlowPrimaryButton("进入排队首页", onComplete)
             }
         }
     }
@@ -9017,7 +10189,7 @@ private fun QueueSyncModeSetting(
 ) {
     val description = when (mode) {
         QueueSyncMode.UNSPECIFIED ->
-            "沿用当前同步身份；发现其他终端的数据时不会自动接管。需要切换终端时，请明确选择测试或接管。"
+            "沿用当前同步身份；发现其他终端的数据时不会自动接管。需要切换终端时，请选择测试同步或接管同步。"
         QueueSyncMode.TEST ->
             "网站和 QQ Bot 完整使用本机数据，并标记为测试数据；主终端恢复联网后，正式队列会重新生效。"
         QueueSyncMode.TAKEOVER ->
@@ -9049,12 +10221,12 @@ private fun QueueSyncModeSetting(
             ).forEach { (candidate, label) ->
                 val selected = mode == candidate
                 Box(
-                    Modifier.weight(1f).height(38.dp).clip(RoundedCornerShape(7.dp))
+                    Modifier.weight(1f).height(38.dp).clip(RoundedCornerShape(10.dp))
                         .background(if (selected) CardBackground else Color.Transparent)
                         .border(
                             1.dp,
                             if (selected) SystemBlue.copy(alpha = .34f) else Color.Transparent,
-                            RoundedCornerShape(7.dp)
+                            RoundedCornerShape(10.dp)
                         )
                         .clickable(enabled = enabled && !selected) { onSelect(candidate) },
                     contentAlignment = Alignment.Center
@@ -9097,7 +10269,7 @@ private fun MachineRosterSelector(
         Text(
             "当前配置 ${machineIds.size} 台机台",
             color = PrimaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             fontWeight = FontWeight.Medium
         )
         Spacer(Modifier.weight(1f))
@@ -9122,9 +10294,9 @@ private fun MachineRosterSelector(
     Spacer(Modifier.height(9.dp))
     Row(
         Modifier.fillMaxWidth().height(46.dp)
-            .clip(RoundedCornerShape(8.dp))
+            .clip(RoundedCornerShape(12.dp))
             .background(PageBackground)
-            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(8.dp))
+            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
             .horizontalScroll(rememberScrollState())
             .padding(3.dp),
         horizontalArrangement = Arrangement.spacedBy(3.dp)
@@ -9133,12 +10305,12 @@ private fun MachineRosterSelector(
             val selected = machineId == selectedMachineId
             Box(
                 Modifier.width(86.dp).fillMaxHeight()
-                    .clip(RoundedCornerShape(6.dp))
+                    .clip(RoundedCornerShape(10.dp))
                     .background(if (selected) CardBackground else Color.Transparent)
                     .border(
                         1.dp,
                         if (selected) SystemBlue.copy(alpha = .34f) else Color.Transparent,
-                        RoundedCornerShape(6.dp)
+                        RoundedCornerShape(10.dp)
                     )
                     .clickable(enabled = !selected) { onSelect(machineId) },
                 contentAlignment = Alignment.Center
@@ -9154,7 +10326,7 @@ private fun MachineRosterSelector(
         if (machineIds.size < MachineId.entries.size) {
             Box(
                 Modifier.width(92.dp).fillMaxHeight()
-                    .clip(RoundedCornerShape(6.dp))
+                    .clip(RoundedCornerShape(10.dp))
                     .clickable {
                         if (canAdd) onAdd()
                         else showDisabledActionReason(
@@ -9185,142 +10357,227 @@ private fun MachineRosterSelector(
     }
 }
 
+/**
+ * 首页分组 (docs/releases/ui-redesign-2026-11.md, 第十三节): every group in one table. A row is a
+ * group, named in place; a column is a machine, chosen in exactly one row; the last column is the
+ * group this terminal shows first. A new group starts empty and moves no machine; an empty group
+ * can be deleted and is dropped on saving. A pair of machines split over two groups is pointed
+ * out, not prevented.
+ */
 @Composable
-private fun MachineGroupingEditor(
+private fun MachineGroupTable(
     settings: QueueRuleSettings,
-    machineId: MachineId,
-    enabled: Boolean = true,
-    disabledReason: String = "当前不能修改这项设置。",
+    enabled: Boolean,
+    disabledReason: String,
     onSettingsChange: (QueueRuleSettings) -> Unit
 ) {
     val context = LocalContext.current
-    val groups = settings.configuredMachineGroups
-    val activeGroupId = settings.machineGroupId(machineId)
-    val activeGroup = groups.firstOrNull { it.id == activeGroupId } ?: groups.first()
-    val canCreateGroup = settings.machinesInGroup(activeGroup.id).size > 1 &&
-        groups.size < settings.configuredMachineCount
-    MachineConfigurationFieldLabel("首页分组")
-    Spacer(Modifier.height(7.dp))
-    Row(
-        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(7.dp)
+    val groups = settings.machineGroups
+    val machines = settings.configuredMachineIds
+    val nameColumnWidth = 240.dp
+    val deleteColumnWidth = 64.dp
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius)).background(CardBackground)
+            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(CardRadius))
+            .padding(horizontal = 16.dp, vertical = 16.dp)
     ) {
-        groups.forEach { group ->
-            val selected = group.id == activeGroup.id
-            Box(
-                Modifier.height(40.dp).widthIn(min = 92.dp, max = 180.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(if (selected) SoftBlue else PageBackground)
-                    .border(
-                        1.dp,
-                        if (selected) SystemBlue.copy(alpha = .34f) else Separator,
-                        RoundedCornerShape(8.dp)
-                    )
-                    .clickable {
-                        when {
-                            !enabled -> showDisabledActionReason(context, "首页分组", disabledReason)
-                            !selected -> onSettingsChange(moveMachineToGroup(settings, machineId, group.id))
-                        }
-                    }
-                    .padding(horizontal = 12.dp),
-                contentAlignment = Alignment.Center
-            ) {
+        Text("首页分组", color = PrimaryText, fontSize = QueueTextSize.CardTitle, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "分组只改变首页的分页显示，不改变各机台的独立队列。每台机台属于一个分组；只有一个分组时，首页不显示分组栏。",
+            color = SecondaryText,
+            fontSize = QueueTextSize.Caption,
+            lineHeight = 18.sp
+        )
+        Spacer(Modifier.height(QueueSpacing.M))
+        Row(Modifier.fillMaxWidth().padding(bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "分组名称",
+                color = SecondaryText,
+                fontSize = QueueTextSize.Caption,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.width(nameColumnWidth)
+            )
+            machines.forEach { machineId ->
                 Text(
-                    group.name.ifBlank { "未命名分组" },
-                    color = if (selected) SystemBlue else SecondaryText,
-                    fontSize = 12.sp,
-                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                    "机台 ${machineId.name}",
+                    color = SecondaryText,
+                    fontSize = QueueTextSize.Caption,
+                    fontWeight = FontWeight.SemiBold,
+                    textAlign = TextAlign.Center,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    modifier = Modifier.weight(1f)
                 )
             }
+            Text(
+                "默认显示",
+                color = SecondaryText,
+                fontSize = QueueTextSize.Caption,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(Modifier.width(deleteColumnWidth))
         }
-        if (canCreateGroup) {
-            Box(
-                Modifier.height(40.dp).width(108.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(PageBackground)
-                    .border(1.dp, Separator, RoundedCornerShape(8.dp))
-                    .clickable {
-                        if (enabled) {
-                            onSettingsChange(createMachineGroupForMachine(settings, machineId))
-                        } else {
-                            showDisabledActionReason(context, "新建分组", disabledReason)
-                        }
-                    },
-                contentAlignment = Alignment.Center
+        HorizontalDivider(color = Separator.copy(alpha = .6f))
+        groups.forEachIndexed { index, group ->
+            val members = settings.machinesInGroup(group.id)
+            val empty = members.isEmpty()
+            Row(
+                Modifier.fillMaxWidth().heightIn(min = 60.dp).padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        Icons.Default.Add,
-                        contentDescription = null,
-                        tint = SystemBlue,
-                        modifier = Modifier.size(16.dp)
+                Column(Modifier.width(nameColumnWidth)) {
+                    MachineGroupNameField(
+                        value = group.name,
+                        enabled = enabled,
+                        onValueChange = { onSettingsChange(renameMachineGroup(settings, group.id, it)) },
+                        modifier = Modifier.width(nameColumnWidth - 20.dp)
                     )
-                    Spacer(Modifier.width(3.dp))
-                    Text("新建分组", color = SystemBlue, fontSize = 12.sp)
+                    if (empty) {
+                        Spacer(Modifier.height(4.dp))
+                        Text("没有机台，保存后会删除。", color = TertiaryText, fontSize = QueueTextSize.Label)
+                    }
+                }
+                machines.forEach { machineId ->
+                    val selected = settings.machineGroupId(machineId) == group.id
+                    Box(
+                        Modifier.weight(1f).height(MinTouchTarget)
+                            .clickable {
+                                when {
+                                    !enabled -> showDisabledActionReason(context, "首页分组", disabledReason)
+                                    !selected -> onSettingsChange(
+                                        assignMachineToGroup(settings, machineId, group.id)
+                                    )
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) { RadioDot(selected) }
+                }
+                val isDefault = settings.defaultMachineGroupId == group.id
+                Box(
+                    Modifier.weight(1f).height(MinTouchTarget)
+                        .clickable {
+                            when {
+                                !enabled -> showDisabledActionReason(context, "默认显示", disabledReason)
+                                empty -> showDisabledActionReason(
+                                    context,
+                                    "默认显示",
+                                    "没有机台的分组不能设为默认显示。"
+                                )
+                                !isDefault -> onSettingsChange(setDefaultMachineGroup(settings, group.id))
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(Modifier.alpha(if (empty) .4f else 1f)) { RadioDot(isDefault && !empty) }
+                }
+                val deletable = enabled && empty && groups.size > 1
+                Box(
+                    Modifier.width(deleteColumnWidth).height(MinTouchTarget)
+                        .clip(RoundedCornerShape(ControlRadius))
+                        .clickable {
+                            when {
+                                !enabled -> showDisabledActionReason(context, "删除", disabledReason)
+                                !empty -> showDisabledActionReason(
+                                    context,
+                                    "删除",
+                                    "请先把机台移到其他分组。"
+                                )
+                                else -> onSettingsChange(deleteEmptyMachineGroup(settings, group.id))
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "删除",
+                        color = if (deletable) SystemBlue else TertiaryText,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
                 }
             }
+            if (index < groups.lastIndex) HorizontalDivider(color = Separator.copy(alpha = .4f))
         }
-    }
-    Spacer(Modifier.height(9.dp))
-    MachineConfigurationTextField(
-        label = "当前分组名称",
-        value = activeGroup.name,
-        maximumCharacters = MAX_MACHINE_GROUP_NAME_CHARACTERS,
-        enabled = enabled,
-        onValueChange = {
-            onSettingsChange(renameMachineGroup(settings, activeGroup.id, it))
-        }
-    )
-    Spacer(Modifier.height(12.dp))
-    MachineConfigurationFieldLabel("本终端默认分组")
-    Spacer(Modifier.height(7.dp))
-    Row(
-        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-        horizontalArrangement = Arrangement.spacedBy(7.dp)
-    ) {
-        groups.forEach { group ->
-            val selected = group.id == settings.defaultMachineGroupId
-            Box(
-                Modifier.height(40.dp).widthIn(min = 92.dp, max = 180.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(if (selected) SoftBlue else PageBackground)
-                    .border(
-                        1.dp,
-                        if (selected) SystemBlue.copy(alpha = .34f) else Separator,
-                        RoundedCornerShape(8.dp)
-                    )
-                    .clickable {
-                        when {
-                            !enabled -> showDisabledActionReason(context, "默认分组", disabledReason)
-                            !selected -> onSettingsChange(
-                                normalizeMachineLayoutSettings(
-                                    settings.copy(defaultMachineGroupId = group.id)
-                                )
-                            )
-                        }
+        val canAdd = groups.size < settings.configuredMachineCount
+        Row(
+            Modifier.heightIn(min = MinTouchTarget).clip(RoundedCornerShape(ControlRadius))
+                .clickable {
+                    when {
+                        !enabled -> showDisabledActionReason(context, "新建分组", disabledReason)
+                        !canAdd -> showDisabledActionReason(
+                            context,
+                            "新建分组",
+                            "分组数量不能超过机台数量。"
+                        )
+                        else -> addEmptyMachineGroup(settings)?.let(onSettingsChange)
                     }
-                    .padding(horizontal = 12.dp),
-                contentAlignment = Alignment.Center
-            ) {
+                }
+                .padding(end = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Default.Add,
+                contentDescription = null,
+                tint = if (enabled && canAdd) SystemBlue else TertiaryText,
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(
+                "新建分组",
+                color = if (enabled && canAdd) SystemBlue else TertiaryText,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+        settings.activeMachinePairs
+            .filter { (first, second) -> settings.machineGroupId(first) != settings.machineGroupId(second) }
+            .forEach { (first, second) ->
+                Spacer(Modifier.height(6.dp))
                 Text(
-                    group.name.ifBlank { "未命名分组" },
-                    color = if (selected) SystemBlue else SecondaryText,
-                    fontSize = 12.sp,
-                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    "机台 ${first.name} 和机台 ${second.name} 是一对机台，但分在不同分组。玩家在一个分组的页面上看不到另一台机台的队列，建议放在同一分组。",
+                    color = AbsenceStatusColor,
+                    fontSize = QueueTextSize.Caption,
+                    lineHeight = 19.sp,
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                        .background(AbsenceStatusBackground)
+                        .padding(horizontal = 13.dp, vertical = 10.dp)
                 )
             }
-        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "应用启动或 30 秒无操作后，首页回到默认显示的分组。",
+            color = SecondaryText,
+            fontSize = QueueTextSize.Caption
+        )
     }
-    Spacer(Modifier.height(7.dp))
-    Text(
-        "应用启动或 30 秒无操作后，首页会返回这个分组。",
-        color = TertiaryText,
-        fontSize = 11.sp,
-        lineHeight = 16.sp
+}
+
+/** A group's name in the 首页分组 table: one line, edited in place. */
+@Composable
+private fun MachineGroupNameField(
+    value: String,
+    enabled: Boolean,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    BasicTextField(
+        value = value,
+        onValueChange = onValueChange,
+        enabled = enabled,
+        singleLine = true,
+        textStyle = TextStyle(fontSize = QueueTextSize.Control, color = if (enabled) PrimaryText else TertiaryText),
+        cursorBrush = SolidColor(SystemBlue),
+        modifier = modifier.height(40.dp),
+        decorationBox = { innerTextField ->
+            Box(
+                Modifier.fillMaxSize().clip(RoundedCornerShape(12.dp))
+                    .border(1.dp, InputBorder, RoundedCornerShape(12.dp))
+                    .padding(horizontal = 12.dp),
+                contentAlignment = Alignment.CenterStart
+            ) { innerTextField() }
+        }
     )
 }
 
@@ -9443,7 +10700,7 @@ private fun MachineConfigurationEditor(
         } else if (configuration.gameVersion.isBlank()) {
             "填写游戏版本后可以开启显示。"
         } else {
-            "关闭后仍会在本机保留填写的版本，但不会向玩家显示。"
+            "关闭后，本机仍保留填写的版本，不会向玩家显示。"
         },
         checked = configuration.showGameVersion,
         enabled = editable && configuration.gameVersion.isNotBlank(),
@@ -9467,7 +10724,7 @@ private fun MachineConfigurationEditor(
     Spacer(Modifier.height(6.dp))
     Text(
         if (configuration.capacity == 1) {
-            "该机台仅能容纳一人游玩；玩家资料中的默认游玩偏好不会被修改。"
+            "这台机台仅能容纳一人游玩，登记会统一使用“单人游玩”。玩家资料中的默认游玩偏好不会改变。"
         } else {
             "该机台支持单人游玩和两人共同游玩。"
         },
@@ -9501,7 +10758,7 @@ private fun MachineConfigurationEditor(
 
 @Composable
 private fun MachineConfigurationFieldLabel(label: String) {
-    Text(label, color = PrimaryText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+    Text(label, color = PrimaryText, fontSize = 12.sp, fontWeight = FontWeight.Medium)
 }
 
 @Composable
@@ -9524,12 +10781,12 @@ private fun <T> MachineConfigurationOptionGrid(
                     val isSelected = value == selected
                     Box(
                         Modifier.weight(1f).height(40.dp)
-                            .clip(RoundedCornerShape(7.dp))
+                            .clip(RoundedCornerShape(6.dp))
                             .background(if (isSelected) PageBackground else Color.Transparent)
                             .border(
                                 1.dp,
                                 if (isSelected) SystemBlue.copy(alpha = .34f) else Separator,
-                                RoundedCornerShape(7.dp)
+                                RoundedCornerShape(6.dp)
                             )
                             .clickable {
                                 when {
@@ -9600,9 +10857,9 @@ private fun PlannedRoundMinutesStepper(
     val context = LocalContext.current
     Row(
         Modifier.fillMaxWidth().height(48.dp)
-            .clip(RoundedCornerShape(8.dp))
+            .clip(RoundedCornerShape(12.dp))
             .background(if (enabled) PageBackground else PageBackground.copy(alpha = 0.58f))
-            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(8.dp)),
+            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp)),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(
@@ -9701,7 +10958,7 @@ private fun MachineRemarkField(
             focusedTextColor = PrimaryText,
             unfocusedTextColor = PrimaryText,
             focusedBorderColor = SystemBlue,
-            unfocusedBorderColor = Color(0xFFA7A7AC),
+            unfocusedBorderColor = InputBorder,
             focusedLabelColor = SystemBlue,
             unfocusedLabelColor = SecondaryText,
             focusedPlaceholderColor = SecondaryText,
@@ -9806,9 +11063,9 @@ private fun BusinessTimeButton(
     val context = LocalContext.current
     Row(
         modifier.height(42.dp)
-            .clip(RoundedCornerShape(9.dp))
+            .clip(RoundedCornerShape(12.dp))
             .background(if (enabled) PageBackground else DisabledBackground)
-            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(9.dp))
+            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
             .clickable {
                 if (enabled) onClick() else showDisabledActionReason(context, label, disabledReason)
             }
@@ -9854,28 +11111,20 @@ private fun businessDayLabel(day: DayOfWeek): String = when (day) {
 
 @Composable
 private fun AuditLogRow(entry: AuditLogEntry, categoryLabel: String) {
-    val machineOrdinal = machineIdForAuditLogCategory(entry.category)?.ordinal
-    val (categoryBackground, categoryForeground) = when {
-        machineOrdinal != null -> when (machineOrdinal % 4) {
-            0 -> SoftBlue to SystemBlue
-            1 -> Color(0xFFEAF8EF) to Color(0xFF248A4B)
-            2 -> Color(0xFFFFF4E5) to Color(0xFF9A5A00)
-            else -> Color(0xFFF4EEFF) to Color(0xFF7444A8)
-        }
-        entry.category == AuditLogCategory.SYSTEM -> Color(0xFFEEEEF0) to SecondaryText
-        else -> Color(0xFFFFEDF3) to Color(0xFFC02D62)
-    }
+    // Category marks only label where an entry belongs; colour would suggest a meaning they do not
+    // have (green means done), so every category is the same neutral grey (docs/ui-guide.md).
+    val (categoryBackground, categoryForeground) = NeutralBadgeBackground to SecondaryText
     Row(
         Modifier.fillMaxWidth().heightIn(min = 76.dp)
-            .clip(RoundedCornerShape(8.dp))
+            .clip(RoundedCornerShape(CardRadius))
             .background(CardBackground)
-            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(8.dp))
+            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(CardRadius))
             .padding(horizontal = 14.dp, vertical = 12.dp),
         verticalAlignment = Alignment.Top
     ) {
         Box(
             Modifier.height(28.dp).widthIn(min = 72.dp, max = 180.dp)
-                .clip(RoundedCornerShape(7.dp))
+                .clip(RoundedCornerShape(6.dp))
                 .background(categoryBackground)
                 .padding(horizontal = 10.dp),
             contentAlignment = Alignment.Center
@@ -9901,8 +11150,8 @@ private fun AuditLogRow(entry: AuditLogEntry, categoryLabel: String) {
                 Text(
                     auditLogSourceLabel(entry.source),
                     color = SecondaryText,
-                    fontSize = 9.sp,
-                    modifier = Modifier.clip(RoundedCornerShape(5.dp))
+                    fontSize = 11.sp,
+                    modifier = Modifier.clip(RoundedCornerShape(6.dp))
                         .background(PageBackground)
                         .padding(horizontal = 6.dp, vertical = 3.dp)
                 )
@@ -9923,6 +11172,51 @@ private fun AuditLogRow(entry: AuditLogEntry, categoryLabel: String) {
     }
 }
 
+/**
+ * A group of filters with its title in front (docs/ui-guide.md, 筛选标签): used where a page has
+ * more than one group, such as the operation log.
+ */
+@Composable
+private fun FilterRow(title: String, content: @Composable RowScope.() -> Unit) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            title,
+            color = SecondaryText,
+            fontSize = QueueTextSize.Caption,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.width(40.dp)
+        )
+        Row(
+            Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            content = content
+        )
+    }
+}
+
+/** A filter: a pill, light blue with blue text when chosen (docs/ui-guide.md, 筛选标签). */
+@Composable
+private fun FilterPill(label: String, selected: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier.height(40.dp).widthIn(min = 72.dp)
+            .clip(RoundedCornerShape(100.dp))
+            .background(if (selected) SoftBlue else CardBackground)
+            .border(1.dp, if (selected) SystemBlue.copy(alpha = .38f) else Separator, RoundedCornerShape(100.dp))
+            .clickable(enabled = !selected, onClick = onClick)
+            .padding(horizontal = 16.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            label,
+            color = if (selected) SystemBlue else PrimaryText,
+            fontSize = QueueTextSize.Caption,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+            maxLines = 1
+        )
+    }
+}
+
 private data class AuditLogFilter(
     val machineStableId: String? = null,
     val category: AuditLogCategory? = null,
@@ -9939,7 +11233,7 @@ private fun auditLogCategoryLabel(
 } ?: machineIdForAuditLogCategory(entry.category)?.let { machineId ->
     "机台 ${machineId.name}"
 } ?: when (entry.category) {
-    AuditLogCategory.SYSTEM -> "系统"
+    AuditLogCategory.SYSTEM -> "机厅"
     AuditLogCategory.PLAYER_PROFILE -> "玩家资料"
     else -> "机台"
 }
@@ -9978,7 +11272,7 @@ private fun auditLogSourceLabel(source: AuditLogSource): String = when (source) 
     AuditLogSource.ON_SITE_TERMINAL -> "现场终端"
     AuditLogSource.QQ_BOT -> "QQ Bot"
     AuditLogSource.SYSTEM_AUTOMATIC -> "系统自动"
-    AuditLogSource.WEBSITE_REMOTE -> "网站远程"
+    AuditLogSource.WEBSITE_REMOTE -> "网页端"
     AuditLogSource.MOBILE_DEVICE -> "移动设备"
     AuditLogSource.MANAGEMENT_APP -> "管理后台"
 }
@@ -9986,22 +11280,25 @@ private fun auditLogSourceLabel(source: AuditLogSource): String = when (source) 
 private fun remoteQueueOperationFeedbackTitle(operation: RemoteQueueOperation): String =
     when (operation) {
         RemoteQueueOperation.JOIN_QUEUE -> "线上登记已加入"
-        RemoteQueueOperation.DEFER_ONE_ROUND -> "暂缓一次已执行"
+        RemoteQueueOperation.DEFER_ONE_ROUND -> "登记将暂缓一次"
         RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND -> "暂缓一次已取消"
+        RemoteQueueOperation.SKIP_ONE_TURN -> "登记将轮空一次"
+        RemoteQueueOperation.CANCEL_SKIP_ONE_TURN -> "轮空一次已取消"
         RemoteQueueOperation.TEMPORARILY_LEAVE -> "登记已设为暂时离开"
         RemoteQueueOperation.CANCEL_TEMPORARY_LEAVE -> "暂时离开已取消"
-        RemoteQueueOperation.TRANSFER_MACHINE -> "登记已切换机台"
-        RemoteQueueOperation.CHANGE_PLAY_PREFERENCE -> "游玩偏好已修改"
+        RemoteQueueOperation.TRANSFER_MACHINE -> "登记已转至其他机台"
+        RemoteQueueOperation.CHANGE_PLAY_PREFERENCE -> "游玩偏好已更改"
         RemoteQueueOperation.LEAVE_QUEUE -> "登记已退出排队"
         RemoteQueueOperation.CHECK_IN -> "线上登记已签到"
-        RemoteQueueOperation.CREATE_REGISTRATION -> "管理后台已新建登记"
-        RemoteQueueOperation.REORDER_QUEUE -> "队列顺序已调整"
+        RemoteQueueOperation.CREATE_REGISTRATION -> "管理后台已创建登记"
+        RemoteQueueOperation.REORDER_QUEUE -> "等待顺序已调整"
+        RemoteQueueOperation.SET_PAIRED_MACHINE_QUEUEING -> "两台机台之间的安排已更改"
     }
 
 private fun remoteQueueOperationSourceLabel(source: RemoteQueueOperationSource): String =
     when (source) {
         RemoteQueueOperationSource.QQ_BOT -> "QQ Bot"
-        RemoteQueueOperationSource.WEBSITE_REMOTE -> "网站远程"
+        RemoteQueueOperationSource.WEBSITE_REMOTE -> "网页端"
         RemoteQueueOperationSource.MANAGEMENT_APP -> "管理后台"
     }
 
@@ -10023,31 +11320,16 @@ private fun terminalContentMaxWidth(
 }
 
 @Composable
-private fun TerminalMiddleDot(
-    fontSize: TextUnit,
-    color: Color = TertiaryText
-) {
-    // Keep the separator in its own fixed visual cell.  Text remains the
-    // compact `·` glyph, so font-specific side bearings cannot become text
-    // spaces that vary between Android devices.
-    Box(
-        Modifier.width(12.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            "·",
-            modifier = Modifier.fillMaxWidth(),
-            color = color,
-            fontSize = fontSize,
-            textAlign = TextAlign.Center,
-            maxLines = 1,
-            softWrap = false
-        )
-    }
-}
-
-@Composable
 private fun HomeScreen(
+    /** Waits for a new registration on machines of a pair, from the forecast over both. */
+    newRegistrationWaits: Map<MachineId, Long?> = emptyMap(),
+    pairedPreview: (MachineId, MachineQueue) -> Pair<MachineQueue, Set<Int>> = { _, queue -> queue to emptySet() },
+    /**
+     * For a machine of a pair: its own registrations for which a preview at the other machine
+     * announces a move, each with the line shown in place of its play preference.
+     */
+    pairedArrangementNotices: (MachineId) -> Map<Int, String> = { emptyMap() },
+    onPairedPreviewClick: (MachineId, Registration) -> Unit = { _, _ -> },
     machines: List<MachineDisplayState>,
     machineGroups: List<MachineGroupConfiguration>,
     machineGroupAssignments: Map<MachineId, String>,
@@ -10075,7 +11357,6 @@ private fun HomeScreen(
     onEnableRegistration: () -> Unit,
     onJoin: () -> Unit,
     onJoinMachine: (MachineId) -> Unit,
-    onBatch: () -> Unit,
     onCompletedRegistrationClick: (MachineId, Int) -> Unit,
     onDismissCompletedRegistration: () -> Unit,
     onMore: () -> Unit,
@@ -10135,7 +11416,7 @@ private fun HomeScreen(
             null
         }
     }
-    var cloudSyncInfoVisible by remember { mutableStateOf(false) }
+    var bannerDetail by remember { mutableStateOf<HomeBannerContent?>(null) }
     LaunchedEffect(
         queueScrollResetToken,
         defaultGroupIndex,
@@ -10157,8 +11438,68 @@ private fun HomeScreen(
             groupPagerState.animateScrollToPage(highlightedGroupIndex)
         }
     }
-    val hasTransientSidePanelContent = completedRegistration != null ||
-        homeSidePanelFeedback != null || queueUndoAction != null
+    val joinableMachines = machines.filter {
+        it.status.isOperational && it.queue.registrationCount < 20
+    }
+    val joiningEnabled = acceptingNewRegistrations && joinableMachines.isNotEmpty()
+    val joiningDisabledReason = when {
+        closingGracePeriod -> "闭店收尾期间不再接收新的排队登记。"
+        !registrationOpen -> "当前未使用登记排队，请按照现场顺序排队。"
+        machines.all { !it.status.isOperational } -> "所有机台均已停止使用。"
+        joinableMachines.isEmpty() -> "所有机台当前都不能接收新的登记。"
+        else -> "当前暂不接收新的排队登记。"
+    }
+    val batteryStatus = rememberTerminalBatteryStatus(nowMillis)
+    val terminalNeedsAttention = batteryStatus.low || cloudSyncStatus?.needsAttention() == true
+    val banner = when {
+        queueUndoAction != null -> HomeBannerContent(
+            key = "undo-${queueUndoAction.id}",
+            tone = queueUndoAction.feedbackTone,
+            title = queueUndoAction.feedbackTitle,
+            contextLabel = "${queueUndoAction.contextLabel}·可在 10 秒内撤销",
+            detail = queueUndoAction.feedbackDetail,
+            actionText = "撤销本次操作",
+            onAction = onUndoQueueAction,
+            onDismiss = onDismissQueueUndo
+        )
+        completedRegistration != null -> {
+            val visibleDisplayId = queueDisplayId(completedRegistration.displayId)
+            HomeBannerContent(
+                key = "registration-${completedRegistration.requestId}",
+                tone = HomeSidePanelFeedbackTone.SUCCESS,
+                title = if (completedRegistration.requiresOnSiteCheckIn) "线上登记已加入" else "登记完成",
+                contextLabel = null,
+                detail = when {
+                    completedRegistration.requiresOnSiteCheckIn ->
+                        "“$visibleDisplayId”已加入 ${completedRegistration.machineName}，完成现场签到后会转换为正常登记。请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动移除。"
+                    completedRegistration.isPlaying ->
+                        "“$visibleDisplayId”已经进入 ${completedRegistration.machineName} 的游玩位置。"
+                    else ->
+                        "“$visibleDisplayId”已加入 ${completedRegistration.machineName} 的等待顺序。"
+                },
+                actionText = "查看${completedRegistration.positionLabel}",
+                onAction = {
+                    onCompletedRegistrationClick(
+                        completedRegistration.machineId,
+                        completedRegistration.registrationKey
+                    )
+                },
+                onDismiss = onDismissCompletedRegistration
+            )
+        }
+        homeSidePanelFeedback != null -> HomeBannerContent(
+            key = "operation-${homeSidePanelFeedback.id}",
+            tone = homeSidePanelFeedback.tone,
+            title = homeSidePanelFeedback.title,
+            contextLabel = homeSidePanelFeedback.contextLabel,
+            detail = homeSidePanelFeedback.detail,
+            onDismiss = onDismissHomeFeedback
+        )
+        else -> null
+    }
+    LaunchedEffect(banner?.key) {
+        if (banner == null) bannerDetail = null
+    }
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().padding(horizontal = 32.dp, vertical = 20.dp)) {
             AppHeader(
@@ -10168,40 +11509,23 @@ private fun HomeScreen(
                 machineCount = machines.size,
                 totalRegistrationCount = machines.sumOf { it.queue.registrationCount },
                 venueName = venueName,
-                cloudSyncStatus = cloudSyncStatus,
-                onCloudSyncClick = { cloudSyncInfoVisible = true },
+                banner = banner,
+                onBannerDetail = { bannerDetail = it },
+                joiningEnabled = joiningEnabled,
+                joiningDisabledReason = joiningDisabledReason,
+                terminalNeedsAttention = terminalNeedsAttention,
+                onJoin = onJoin,
                 onMore = onMore,
                 onVenueDetails = onVenueDetails
             )
-            Spacer(Modifier.height(11.dp))
-            HorizontalDivider(color = Separator.copy(alpha = .72f))
-            Spacer(Modifier.height(12.dp))
-            if (!registrationOpen && !hasStoppedMachine && !hasTransientSidePanelContent) {
+            Spacer(Modifier.height(QueueSpacing.M))
+            if (!registrationOpen && !hasStoppedMachine) {
                 ClosedHome(
                     outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
                     onEnableRegistration = onEnableRegistration
                 )
-            } else if (
-                isEmpty &&
-                !hasStoppedMachine &&
-                !businessHoursStatus.closingSoon &&
-                !hasTransientSidePanelContent
-            ) {
-                EmptyHome(
-                    outsideBusinessHours = businessHoursStatus.outsideBusinessHours,
-                    closingGracePeriod = closingGracePeriod,
-                    acceptingNewRegistrations = acceptingNewRegistrations,
-                    onJoin = onJoin,
-                    onBatch = onBatch
-                )
             } else {
-                Row(
-                    Modifier.fillMaxWidth().weight(1f),
-                    horizontalArrangement = Arrangement.spacedBy(18.dp)
-                ) {
-                    Column(
-                        Modifier.weight(1.9f).fillMaxHeight()
-                    ) {
+                Column(Modifier.fillMaxWidth().weight(1f)) {
                         HorizontalPager(
                             state = groupPagerState,
                             key = { page -> activeMachineGroups[page].first.id },
@@ -10224,7 +11548,7 @@ private fun HomeScreen(
                             }
                             BoxWithConstraints(Modifier.fillMaxSize()) {
                                 val laneHeight = (
-                                    maxHeight - ((groupMachines.size - 1).coerceAtLeast(0) * 18).dp
+                                    maxHeight - ((groupMachines.size - 1).coerceAtLeast(0) * 12).dp
                                     ) / groupMachines.size.coerceAtLeast(1)
                                 Column(laneColumnModifier) {
                                     groupMachines.forEachIndexed { index, machine ->
@@ -10232,6 +11556,13 @@ private fun HomeScreen(
                                     MachineLane(
                                         machineId = machineId,
                                         remark = machine.remark,
+                                        newRegistrationEstimate = if (
+                                            acceptingNewRegistrations && machine.status.isOperational
+                                        ) {
+                                            newRegistrationEstimateLabel(machine, newRegistrationWaits)
+                                        } else {
+                                            null
+                                        },
                                         queue = machine.queue,
                                         status = machine.status,
                                         registrationOpen = registrationOpen,
@@ -10240,6 +11571,11 @@ private fun HomeScreen(
                                         businessHoursClosingGrace = closingGracePeriod,
                                         showCommonPlayPreview = showCommonPlayPreview &&
                                             machine.configuration.capacity == 2,
+                                        pairedPreview = { queue -> pairedPreview(machineId, queue) },
+                                        pairedArrangementNotices = pairedArrangementNotices(machineId),
+                                        onPairedPreviewClick = { registration ->
+                                            onPairedPreviewClick(machineId, registration)
+                                        },
                                         machineManagementEditable = machineManagementEditable,
                                         nowMillis = nowMillis,
                                         inlineReorderSession = inlineReorderSession
@@ -10282,23 +11618,21 @@ private fun HomeScreen(
                                                 destinationIndex
                                             )
                                         },
-                                        centerContent = groupMachines.size == 1,
                                         modifier = if (groupMachines.size > 2) {
-                                            Modifier.height(laneHeight.coerceAtLeast(148.dp))
+                                            Modifier.height(laneHeight.coerceAtLeast(HomeMachineLaneMinHeight))
                                         } else {
                                             Modifier.weight(1f)
                                         }
                                     )
                                     if (index < groupMachines.lastIndex) {
-                                        Spacer(Modifier.height(6.dp))
-                                        HorizontalDivider(color = Separator.copy(alpha = .64f))
-                                        Spacer(Modifier.height(6.dp))
+                                        Spacer(Modifier.height(QueueSpacing.M))
                                     }
                                 }
                             }
                         }
                         }
                         if (activeMachineGroups.size > 1) {
+                            Spacer(Modifier.height(QueueSpacing.M))
                             MachineGroupPageSelector(
                                 groups = activeMachineGroups,
                                 currentPage = groupPagerState.currentPage,
@@ -10315,35 +11649,25 @@ private fun HomeScreen(
                             )
                         }
                     }
-                    HomeSidePanel(
-                        machines = machines,
-                        nowMillis = nowMillis,
-                        registrationOpen = registrationOpen,
-                        acceptingNewRegistrations = acceptingNewRegistrations,
-                        closingGracePeriod = closingGracePeriod,
-                        completedRegistration = completedRegistration,
-                        operationFeedback = homeSidePanelFeedback,
-                        queueUndoAction = queueUndoAction,
-                        onCompletedRegistrationClick = onCompletedRegistrationClick,
-                        onDismissCompletedRegistration = onDismissCompletedRegistration,
-                        onDismissOperationFeedback = onDismissHomeFeedback,
-                        onUndoQueueAction = onUndoQueueAction,
-                        onDismissQueueUndo = onDismissQueueUndo,
-                        onJoin = onJoin,
-                        onBatch = onBatch,
-                        modifier = Modifier.weight(.72f).fillMaxHeight()
-                    )
                 }
             }
-        }
-        if (cloudSyncInfoVisible && cloudSyncStatus != null) {
-            CloudSyncInfoDialog(
-                status = cloudSyncStatus,
-                onDismiss = { cloudSyncInfoVisible = false }
-            )
+        bannerDetail?.let { content ->
+            HomeBannerDetailDialog(content, onDismiss = { bannerDetail = null })
         }
     }
 }
+
+/**
+ * Height of the queue row. The home page sets it from the room each machine card has; elsewhere,
+ * such as the position drawn in the 结束本轮 dialog, it stays [QueueViewportHeight].
+ */
+private val LocalQueueViewportHeight = compositionLocalOf { QueueViewportHeight }
+
+/** The row does not grow beyond this, so one machine on its own does not get giant tiles. */
+private val QueueViewportMaxHeight = 240.dp
+
+/** With three or more machines the cards scroll; each keeps at least this height. */
+private val HomeMachineLaneMinHeight = 250.dp
 
 @Composable
 private fun MachineGroupPageSelector(
@@ -10363,13 +11687,15 @@ private fun MachineGroupPageSelector(
             activeItem.offset + activeItem.size <= layoutInfo.viewportEndOffset
         if (!activeItemFullyVisible) listState.animateScrollToItem(activePage)
     }
+    // The group bar under the queue (docs/ui-guide.md, 排队首页): the group's name, and its machines
+    // with how many registrations they hold, so a player can tell where to look.
     BoxWithConstraints(
-        Modifier.fillMaxWidth().height(52.dp)
-            .clip(RoundedCornerShape(9.dp))
+        Modifier.fillMaxWidth().height(56.dp)
+            .clip(RoundedCornerShape(14.dp))
             .background(Separator.copy(alpha = .38f))
     ) {
-        val itemSpacing = 3.dp
-        val horizontalPadding = 3.dp
+        val itemSpacing = 4.dp
+        val horizontalPadding = 4.dp
         val visibleItemCount = groups.size.coerceAtMost(4)
         val itemWidth = (
             (maxWidth - horizontalPadding * 2 - itemSpacing * (visibleItemCount - 1)) /
@@ -10378,7 +11704,7 @@ private fun MachineGroupPageSelector(
         LazyRow(
             state = listState,
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(horizontal = horizontalPadding, vertical = 2.dp),
+            contentPadding = PaddingValues(horizontal = horizontalPadding, vertical = 4.dp),
             horizontalArrangement = Arrangement.spacedBy(itemSpacing)
         ) {
             itemsIndexed(groups, key = { _, group -> group.first.id }) { index, group ->
@@ -10395,7 +11721,7 @@ private fun MachineGroupPageSelector(
                 )
                 Box(
                     Modifier.width(itemWidth).fillMaxHeight()
-                        .clip(RoundedCornerShape(7.dp))
+                        .clip(RoundedCornerShape(11.dp))
                         .background(backgroundColor)
                         .selectable(
                             selected = selected,
@@ -10409,15 +11735,16 @@ private fun MachineGroupPageSelector(
                         Text(
                             group.first.name,
                             color = textColor,
-                            fontSize = 11.sp,
+                            fontSize = QueueTextSize.Control,
                             fontWeight = FontWeight.SemiBold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        Spacer(Modifier.height(3.dp))
                         Text(
-                            group.second.joinToString("、") { it.machineId.name },
+                            machineGroupSummary(group.second),
                             color = if (selected) SecondaryText else TertiaryText,
-                            fontSize = 9.sp,
+                            fontSize = QueueTextSize.Caption,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -10428,6 +11755,57 @@ private fun MachineGroupPageSelector(
     }
 }
 
+/** The second line of a group in the group bar: “机台 A、B·14 份登记”, or 当前空闲. */
+internal fun machineGroupSummary(machines: List<MachineDisplayState>): String {
+    val count = machines.sumOf { it.queue.registrationCount }
+    val letters = "机台 " + machines.joinToString("、") { it.machineId.name }
+    return if (count == 0) "$letters·当前空闲" else "$letters·$count 份登记"
+}
+
+/** Feedback shown in the home header after an operation (docs/ui-guide.md, 排队首页). */
+private data class HomeBannerContent(
+    val key: String,
+    val tone: HomeSidePanelFeedbackTone,
+    val title: String,
+    val contextLabel: String?,
+    val detail: String,
+    val actionText: String? = null,
+    val onAction: (() -> Unit)? = null,
+    val onDismiss: () -> Unit
+)
+
+/** The terminal's battery, read again whenever the clock ticks. */
+internal data class TerminalBatteryStatus(val level: Int?, val charging: Boolean) {
+    /** Low and not being charged: 更多 turns orange until the terminal is plugged in. */
+    val low: Boolean get() = level != null && level <= LOW_BATTERY_PERCENT && !charging
+}
+
+internal const val LOW_BATTERY_PERCENT = 20
+
+/** A sync problem someone on site should look at. Switching sync off on purpose is not one. */
+internal fun QueueCloudSyncStatus.needsAttention(): Boolean =
+    phase == QueueCloudSyncPhase.WAITING_TO_RETRY || phase == QueueCloudSyncPhase.NOT_CONFIGURED
+
+@Composable
+private fun rememberTerminalBatteryStatus(nowMillis: Long): TerminalBatteryStatus {
+    val context = LocalContext.current
+    val batteryManager = remember(context) { context.getSystemService(BatteryManager::class.java) }
+    return remember(nowMillis, batteryManager) {
+        TerminalBatteryStatus(
+            level = batteryManager?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                ?.takeIf { it in 0..100 },
+            charging = batteryManager?.isCharging == true
+        )
+    }
+}
+
+private val HomeHeaderHeight = 96.dp
+
+/**
+ * The home header: venue and counts on the left, then the time; after the divider, 加入排队 and
+ * 更多 as one group. Feedback takes over everything left of the divider for a few seconds, so the
+ * queue below never moves.
+ */
 @Composable
 private fun AppHeader(
     nowMillis: Long,
@@ -10436,183 +11814,275 @@ private fun AppHeader(
     machineCount: Int,
     totalRegistrationCount: Int,
     venueName: String,
-    cloudSyncStatus: QueueCloudSyncStatus?,
-    onCloudSyncClick: () -> Unit,
+    banner: HomeBannerContent?,
+    onBannerDetail: (HomeBannerContent) -> Unit,
+    joiningEnabled: Boolean,
+    joiningDisabledReason: String,
+    terminalNeedsAttention: Boolean,
+    onJoin: () -> Unit,
     onMore: () -> Unit,
     onVenueDetails: () -> Unit
 ) {
-    val context = LocalContext.current
-    val batteryManager = remember(context) { context.getSystemService(BatteryManager::class.java) }
-    val batteryLevel = remember(nowMillis, batteryManager) {
-        batteryManager?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-            ?.takeIf { it in 0..100 }
+    Row(Modifier.fillMaxWidth().height(HomeHeaderHeight), verticalAlignment = Alignment.CenterVertically) {
+        AnimatedContent(
+            targetState = banner,
+            modifier = Modifier.weight(1f).fillMaxHeight(),
+            contentKey = { it?.key ?: "venue" },
+            transitionSpec = { fadeIn(tween(200)).togetherWith(fadeOut(tween(140))) },
+            contentAlignment = Alignment.CenterStart,
+            label = "首页顶栏反馈"
+        ) { shownBanner ->
+            if (shownBanner != null) {
+                HomeFeedbackBanner(shownBanner, onShowDetail = { onBannerDetail(shownBanner) })
+            } else {
+                Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        // The title says what the terminal is for: many first-time players do not
+                        // know (docs/ui-guide.md, 排队首页). The venue is secondary.
+                        Row {
+                            Text(
+                                "排队登记",
+                                color = PrimaryText,
+                                fontSize = QueueTextSize.PageTitle,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                modifier = Modifier.alignByBaseline()
+                            )
+                            if (venueName.isNotBlank()) {
+                                Spacer(Modifier.width(14.dp))
+                                Text(
+                                    venueName,
+                                    color = SecondaryText,
+                                    fontSize = QueueTextSize.Control,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.alignByBaseline()
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .clickable(onClick = onVenueDetails)
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                "$machineCount 台机台·当前共 $totalRegistrationCount 份登记",
+                                color = SecondaryText,
+                                fontSize = QueueTextSize.Body,
+                                maxLines = 1
+                            )
+                            if (!registrationOpen || outsideBusinessHours) {
+                                Spacer(Modifier.width(QueueSpacing.M))
+                                Box(
+                                    Modifier.size(7.dp).clip(CircleShape)
+                                        .background(if (outsideBusinessHours) Destructive else AttentionDot)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    if (outsideBusinessHours) "不在营业时间" else "未使用登记排队",
+                                    color = SecondaryText,
+                                    fontSize = QueueTextSize.Body,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+                    Spacer(Modifier.width(QueueSpacing.L))
+                    Text(
+                        SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(nowMillis)),
+                        color = PrimaryText,
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.width(QueueSpacing.L))
+        Box(Modifier.width(1.dp).height(28.dp).background(Separator))
+        Spacer(Modifier.width(QueueSpacing.L))
+        HomeActionGroup(
+            joiningEnabled = joiningEnabled,
+            joiningDisabledReason = joiningDisabledReason,
+            needsAttention = terminalNeedsAttention,
+            onJoin = onJoin,
+            onMore = onMore
+        )
     }
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Column {
-            if (venueName.isNotBlank()) {
-                Text(
-                    venueName,
-                    color = SecondaryText,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.clip(RoundedCornerShape(6.dp))
-                        .clickable(onClick = onVenueDetails)
-                        .padding(horizontal = 2.dp, vertical = 2.dp)
-                )
-                Spacer(Modifier.height(1.dp))
-            }
-            Text("排队登记", color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    if (machineCount == 1) "当前使用 1 台机台" else "$machineCount 台机台的登记顺序彼此独立",
-                    color = SecondaryText,
-                    fontSize = 13.sp
-                )
-                TerminalMiddleDot(fontSize = 13.sp)
-                Text(
-                    "当前共 $totalRegistrationCount 个登记",
-                    color = PrimaryText,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium
-                )
-            }
-        }
-        Spacer(Modifier.weight(1f))
-        Text(
-            SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(nowMillis)),
-            color = PrimaryText,
-            fontSize = 18.sp,
-            fontWeight = FontWeight.Medium
-        )
-        Spacer(Modifier.width(10.dp))
-        Box(Modifier.width(1.dp).height(16.dp).background(Separator))
-        Spacer(Modifier.width(10.dp))
-        Text(
-            "电量 ${batteryLevel?.let { "$it%" } ?: "--"}",
-            color = SecondaryText,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Medium
-        )
-        if (cloudSyncStatus != null) {
-            Spacer(Modifier.width(16.dp))
-            CloudSyncIndicator(cloudSyncStatus, onCloudSyncClick)
-        }
-        AnimatedVisibility(
-            visible = !registrationOpen || outsideBusinessHours,
-            enter = fadeIn(tween(180)) + expandHorizontally(tween(220), expandFrom = Alignment.End),
-            exit = fadeOut(tween(140)) + shrinkHorizontally(tween(180), shrinkTowards = Alignment.End)
+}
+
+/**
+ * 加入排队 and 更多 joined into one control. 更多 is light blue so that it does not read as a
+ * variant of joining, and turns solid orange while the battery or sync needs attention.
+ */
+@Composable
+private fun HomeActionGroup(
+    joiningEnabled: Boolean,
+    joiningDisabledReason: String,
+    needsAttention: Boolean,
+    onJoin: () -> Unit,
+    onMore: () -> Unit
+) {
+    val context = LocalContext.current
+    val joinShape = RoundedCornerShape(topStart = 12.dp, bottomStart = 12.dp)
+    val moreShape = RoundedCornerShape(topEnd = 12.dp, bottomEnd = 12.dp)
+    val moreBackground by animateColorAsState(
+        if (needsAttention) AttentionDot else SoftBlue,
+        tween(220),
+        label = "更多按钮底色"
+    )
+    val moreTint by animateColorAsState(
+        if (needsAttention) Color.White else SystemBlue,
+        tween(220),
+        label = "更多按钮图标颜色"
+    )
+    Row(Modifier.height(52.dp)) {
+        Row(
+            Modifier.fillMaxHeight().clip(joinShape)
+                .background(if (joiningEnabled) SystemBlue else DisabledBackground)
+                .clickable {
+                    if (joiningEnabled) onJoin()
+                    else showDisabledActionReason(context, "加入排队", joiningDisabledReason)
+                }
+                .padding(horizontal = 20.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Spacer(Modifier.width(18.dp))
-                Box(
-                    Modifier.size(8.dp).clip(CircleShape)
-                        .background(if (outsideBusinessHours) Color(0xFFFF3B30) else Color(0xFFFF9500))
-                )
-                Spacer(Modifier.width(7.dp))
-                Text(
-                    if (outsideBusinessHours) "不在营业时间" else "未使用登记排队",
-                    color = SecondaryText,
-                    fontSize = 12.sp
-                )
-            }
+            Icon(
+                imageVector = Icons.Default.Add,
+                contentDescription = null,
+                tint = if (joiningEnabled) Color.White else TertiaryText,
+                modifier = Modifier.size(20.dp)
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                "加入排队",
+                color = if (joiningEnabled) Color.White else TertiaryText,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold
+            )
         }
-        Spacer(Modifier.width(18.dp))
         Box(
-            Modifier.size(42.dp).clip(CircleShape).background(CardBackground)
-                .border(1.dp, Separator.copy(alpha = .7f), CircleShape)
+            Modifier.width(52.dp).fillMaxHeight().clip(moreShape)
+                .background(moreBackground)
+                .border(1.dp, if (needsAttention) AttentionDot else SystemBlue.copy(alpha = .22f), moreShape)
                 .clickable(onClick = onMore),
             contentAlignment = Alignment.Center
         ) {
             Icon(
                 imageVector = Icons.Default.MoreVert,
-                contentDescription = "更多",
-                tint = PrimaryText,
-                modifier = Modifier.size(21.dp)
+                contentDescription = if (needsAttention) "更多，终端状态需要处理" else "更多",
+                tint = moreTint,
+                modifier = Modifier.size(22.dp)
             )
         }
     }
 }
 
+/** Two lines of feedback in the header: title and source, then what happened. */
 @Composable
-private fun CloudSyncIndicator(status: QueueCloudSyncStatus, onClick: () -> Unit) {
-    val statusColor by animateColorAsState(
-        queueCloudSyncStatusColor(status.phase),
-        tween(220),
-        label = "同步状态颜色"
-    )
+private fun HomeFeedbackBanner(
+    content: HomeBannerContent,
+    onShowDetail: () -> Unit
+) {
+    val accent = when (content.tone) {
+        HomeSidePanelFeedbackTone.SUCCESS -> SuccessText
+        HomeSidePanelFeedbackTone.INFO -> SystemBlue
+        HomeSidePanelFeedbackTone.WARNING -> NoShowStatusColor
+    }
+    val background = when (content.tone) {
+        HomeSidePanelFeedbackTone.SUCCESS -> SuccessBackground
+        HomeSidePanelFeedbackTone.INFO -> SoftBlue
+        HomeSidePanelFeedbackTone.WARNING -> NoShowStatusBackground
+    }
+    var detailCut by remember(content.key) { mutableStateOf(false) }
+    val shape = RoundedCornerShape(14.dp)
     Row(
-        Modifier.heightIn(min = 38.dp).clip(RoundedCornerShape(8.dp))
-            .background(statusColor.copy(alpha = .09f))
-            .clickable(onClick = onClick)
-            .animateContentSize(tween(180))
-            .padding(horizontal = 10.dp, vertical = 6.dp),
+        Modifier.fillMaxWidth().wrapContentHeight().height(64.dp).clip(shape)
+            .background(background)
+            .border(1.dp, accent.copy(alpha = .22f), shape)
+            .padding(start = QueueSpacing.L, end = QueueSpacing.XS),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Box(Modifier.size(7.dp).clip(CircleShape).background(statusColor))
-        Spacer(Modifier.width(6.dp))
+        HomeFeedbackStatusIcon(content.tone, accent, size = 32.dp)
+        Spacer(Modifier.width(QueueSpacing.M))
         Text(
-            queueCloudSyncShortLabel(status.phase),
-            color = statusColor,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Medium,
+            content.title,
+            color = accent,
+            fontSize = QueueTextSize.Control,
+            fontWeight = FontWeight.SemiBold,
             maxLines = 1
         )
+        content.contextLabel?.let { contextLabel ->
+            Spacer(Modifier.width(10.dp))
+            Text(
+                contextLabel,
+                color = SecondaryText,
+                fontSize = 12.sp,
+                maxLines = 1
+            )
+        }
+        Spacer(Modifier.width(QueueSpacing.M))
+        Text(
+            content.detail,
+            color = PrimaryText,
+            fontSize = QueueTextSize.Control,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            onTextLayout = { detailCut = it.hasVisualOverflow },
+            modifier = Modifier.weight(1f)
+        )
+        if (detailCut) HomeBannerTextAction("详情", onShowDetail)
+        if (content.actionText != null && content.onAction != null) {
+            HomeBannerTextAction(content.actionText, content.onAction)
+        }
+        IconButton(onClick = content.onDismiss, modifier = Modifier.size(MinTouchTarget)) {
+            Icon(
+                imageVector = Icons.Default.Close,
+                contentDescription = "关闭提示",
+                tint = TertiaryText,
+                modifier = Modifier.size(20.dp)
+            )
+        }
     }
 }
 
 @Composable
-private fun EmptyHome(
-    outsideBusinessHours: Boolean,
-    closingGracePeriod: Boolean,
-    acceptingNewRegistrations: Boolean,
-    onJoin: () -> Unit,
-    onBatch: () -> Unit
-) {
-    val joinDisabledReason = if (closingGracePeriod) {
-        "闭店收尾期间不再接收新的排队登记。"
-    } else {
-        "当前暂不接收新的排队登记。"
-    }
-    Column(
-        Modifier.fillMaxSize(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+private fun HomeBannerTextAction(text: String, onClick: () -> Unit) {
+    Box(
+        Modifier.heightIn(min = MinTouchTarget).clip(RoundedCornerShape(ControlRadius))
+            .clickable(onClick = onClick)
+            .padding(horizontal = QueueSpacing.M),
+        contentAlignment = Alignment.Center
     ) {
-        Text("目前没有登记", color = PrimaryText, fontSize = 34.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(10.dp))
-        VisuallyCenteredSentence(
-            if (outsideBusinessHours) {
-                if (closingGracePeriod) {
-                    "今日营业时间已结束，登记排队正在完成最后的收尾。"
-                } else {
-                    "当前不在营业时间，登记排队已由现场手动开启。"
-                }
-            } else {
-                "所有机台都没有正在等待的玩家。"
-            },
-            SecondaryText,
-            16.sp
-        )
-        Spacer(Modifier.height(30.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            PrimaryButton(
-                "加入排队",
-                onJoin,
-                Modifier.width(260.dp),
-                enabled = acceptingNewRegistrations,
-                disabledReason = joinDisabledReason
-            )
-            SecondaryButton(
-                "批量创建登记",
-                onBatch,
-                Modifier.width(190.dp),
-                enabled = acceptingNewRegistrations,
-                disabledReason = joinDisabledReason
-            )
-        }
-        Spacer(Modifier.height(12.dp))
-        VisuallyCenteredSentence("创建你的登记并加入排队。", SecondaryText, 13.sp)
+        Text(text, color = SystemBlue, fontSize = QueueTextSize.Body, fontWeight = FontWeight.SemiBold)
     }
+}
+
+/** The whole text of a banner whose line was cut short. */
+@Composable
+private fun HomeBannerDetailDialog(content: HomeBannerContent, onDismiss: () -> Unit) {
+    ModalSurface(onDismiss, width = 480.dp) {
+        Text(content.title, color = PrimaryText, fontSize = QueueTextSize.DialogTitle, fontWeight = FontWeight.SemiBold)
+        content.contextLabel?.let { contextLabel ->
+            Spacer(Modifier.height(QueueSpacing.XS))
+            Text(contextLabel, color = SecondaryText, fontSize = QueueTextSize.Caption)
+        }
+        Spacer(Modifier.height(QueueSpacing.M))
+        Text(content.detail, color = PrimaryText, fontSize = QueueTextSize.Body, lineHeight = 21.sp)
+        Spacer(Modifier.height(QueueSpacing.L))
+        CancelAction("关闭", onDismiss)
+    }
+}
+
+/**
+ * What a machine card shows next to its 结束本轮: the middle wait of a new registration, in
+ * shown minutes (docs/releases/wait-estimate-2026-11.md).
+ */
+private fun newRegistrationEstimateLabel(
+    machine: MachineDisplayState,
+    newRegistrationWaits: Map<MachineId, Long?>
+): String = when {
+    machine.queue.registrationCount >= 20 -> "登记已满"
+    else -> formatJoinWaitEstimate(newRegistrationWaits[machine.machineId])
 }
 
 @Composable
@@ -10626,23 +12096,23 @@ private fun ClosedHome(
         verticalArrangement = Arrangement.Center
     ) {
         Text(
-            if (outsideBusinessHours) "不在营业时间" else "请在现场自然排队",
+            if (outsideBusinessHours) "不在营业时间" else "请按照现场顺序排队",
             color = PrimaryText,
-            fontSize = 34.sp,
+            fontSize = 30.sp,
             fontWeight = FontWeight.SemiBold
         )
         Spacer(Modifier.height(10.dp))
         VisuallyCenteredSentence(
             if (outsideBusinessHours) {
-                "现在已过闭店时间；你仍可以手动开启登记排队。"
+                "当前已过闭店时间；仍可以手动重新开启登记排队。"
             } else {
-                "当前未使用登记排队，请按照现场顺序依次游玩。"
+                "当前未使用登记排队，请按照现场顺序排队。"
             },
             SecondaryText,
             16.sp
         )
         Spacer(Modifier.height(30.dp))
-        PrimaryButton("重新开放登记排队", onEnableRegistration, Modifier.width(260.dp))
+        PrimaryButton("重新开启登记排队", onEnableRegistration, Modifier.width(260.dp))
     }
 }
 
@@ -10688,6 +12158,8 @@ private fun VisuallyCenteredSentence(
 private fun MachineLane(
     machineId: MachineId,
     remark: String,
+    /** The wait for a new registration, shown beside 结束本轮; null where nobody can join. */
+    newRegistrationEstimate: String? = null,
     queue: MachineQueue,
     status: MachineStatus,
     registrationOpen: Boolean,
@@ -10695,6 +12167,13 @@ private fun MachineLane(
     businessHoursClosingSoon: Boolean,
     businessHoursClosingGrace: Boolean,
     showCommonPlayPreview: Boolean,
+    /**
+     * For a machine of a pair: the queue to project for display, which also holds the
+     * registrations of the other machine expected here, and the keys of those registrations.
+     */
+    pairedPreview: (MachineQueue) -> Pair<MachineQueue, Set<Int>> = { it to emptySet() },
+    pairedArrangementNotices: Map<Int, String> = emptyMap(),
+    onPairedPreviewClick: (Registration) -> Unit = {},
     machineManagementEditable: Boolean = true,
     nowMillis: Long,
     inlineReorderSession: ReorderSession?,
@@ -10713,44 +12192,62 @@ private fun MachineLane(
     onRegistrationLongPress: (Int) -> Unit,
     onPositionClick: (PositionSelection) -> Unit,
     onPositionReorderRequest: (MachineQueue, Int, Int) -> Unit,
-    modifier: Modifier = Modifier,
-    centerContent: Boolean = false
+    modifier: Modifier = Modifier
 ) {
     val letter = machineId.name
     val displayedWaitingPositionCount = queue.waitingProjection(
         includeCommonPlayPreview = false
     ).positions.size
     val queueCountSummary =
-        "$displayedWaitingPositionCount 个等待位置·${queue.registrationCount} 个登记"
+        "$displayedWaitingPositionCount 个等待位置·${queue.registrationCount} 份登记"
     Column(
-        modifier.padding(horizontal = 2.dp, vertical = 3.dp),
-        verticalArrangement = if (centerContent) Arrangement.Center else Arrangement.Top
+        modifier.clip(RoundedCornerShape(CardRadius))
+            .background(CardBackground)
+            .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(CardRadius))
+            .padding(start = QueueSpacing.L, end = QueueSpacing.L, top = QueueSpacing.M, bottom = 14.dp),
+        verticalArrangement = Arrangement.Top
     ) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column {
-                Row(
-                    Modifier.clip(RoundedCornerShape(6.dp))
-                        .clickable(onClick = onMachineDetails)
-                        .padding(start = 2.dp, end = 4.dp, top = 3.dp, bottom = 3.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        buildAnnotatedString {
-                            withStyle(SpanStyle(color = SecondaryText, fontWeight = FontWeight.Medium)) {
-                                append(remark)
-                                append("·")
-                            }
-                            withStyle(SpanStyle(color = PrimaryText, fontWeight = FontWeight.SemiBold)) {
-                                append("机台 $letter")
-                            }
-                        },
-                        fontSize = 17.sp
-                    )
-                    Spacer(Modifier.width(2.dp))
-                    Text("›", color = TertiaryText, fontSize = 17.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        Modifier.clip(RoundedCornerShape(6.dp))
+                            .clickable(onClick = onMachineDetails)
+                            .padding(start = 2.dp, end = 4.dp, top = 3.dp, bottom = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            buildAnnotatedString {
+                                withStyle(SpanStyle(color = SecondaryText, fontWeight = FontWeight.Medium)) {
+                                    append(remark)
+                                    append("·")
+                                }
+                                withStyle(SpanStyle(color = PrimaryText, fontWeight = FontWeight.SemiBold)) {
+                                    append("机台 $letter")
+                                }
+                            },
+                            fontSize = 20.sp
+                        )
+                        Spacer(Modifier.width(2.dp))
+                        Text("›", color = TertiaryText, fontSize = 20.sp)
+                    }
+                    // The queue of a stopped machine stays on screen, so the stop has to be
+                    // recognisable at a glance from the heading itself.
+                    if (!status.isOperational) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "已停止使用",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.clip(RoundedCornerShape(6.dp))
+                                .background(MachineStoppedColor)
+                                .padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                    }
                 }
                 Spacer(Modifier.height(2.dp))
                 Text(
@@ -10758,17 +12255,30 @@ private fun MachineLane(
                         queue.registrationCount > 0 && inlineReorderSession != null ->
                             "$queueCountSummary·正在调整"
                         queue.registrationCount > 0 && !status.isOperational ->
-                            "$queueCountSummary·已停止使用"
+                            "$queueCountSummary·停止原因：${machineStopReasonLabel(status.stopReason, null)}"
                         queue.registrationCount > 0 -> queueCountSummary
                         !status.isOperational ->
-                            "已停止使用·${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}"
+                            "停止原因：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}"
                         else -> "当前空闲"
                     },
-                    color = SecondaryText,
-                    fontSize = 12.sp
+                    color = if (status.isOperational) SecondaryText else MachineStoppedColor,
+                    fontSize = 13.sp,
+                    fontWeight = if (status.isOperational) FontWeight.Normal else FontWeight.Medium
                 )
             }
             Spacer(Modifier.weight(1f))
+            if (newRegistrationEstimate != null && inlineReorderSession == null) {
+                Column(horizontalAlignment = Alignment.End) {
+                    Text("新登记预计等待", color = SecondaryText, fontSize = QueueTextSize.Caption)
+                    Text(
+                        newRegistrationEstimate,
+                        color = PrimaryText,
+                        fontSize = QueueTextSize.Control,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                Spacer(Modifier.width(QueueSpacing.L))
+            }
             when {
                 inlineReorderSession != null -> SmallActionButton("结束调整", onInlineReorderCancel)
                 !status.isOperational -> SmallActionButton(
@@ -10778,9 +12288,10 @@ private fun MachineLane(
                     disabledReason = "机台管理已由管理后台接管，只能从管理后台修改。"
                 )
                 queue.playing.isNotEmpty() -> SmallActionButton(
-                    "本轮结束",
+                    "结束本轮",
                     onFinishRequest,
-                    primary = true
+                    primary = true,
+                    leadingIcon = { color -> RoundAdvanceIcon(color, Modifier.size(18.dp)) }
                 )
                 queue.waiting.isNotEmpty() ->
                     SmallActionButton(
@@ -10791,41 +12302,49 @@ private fun MachineLane(
                     )
             }
         }
-        Spacer(Modifier.height(12.dp))
-        if (!status.isOperational) {
+        Spacer(Modifier.height(10.dp))
+        BoxWithConstraints(
+            Modifier.fillMaxWidth().weight(1f),
+            contentAlignment = Alignment.TopStart
+        ) {
+        // A card with room for two rows (a machine alone in its group) lays its positions out in
+        // two rows, read like lines of text; positions always start at the left
+        // (docs/ui-guide.md, 排队首页; maintainer, 2026-11-25).
+        val twoRows = maxHeight >= QueueViewportHeight * 2 + QueueRowGap
+        val queueRowHeight = if (twoRows) {
+            ((maxHeight - QueueRowGap) / 2).coerceAtMost(QueueViewportMaxHeight)
+        } else {
+            maxHeight.coerceIn(QueueViewportHeight, QueueViewportMaxHeight)
+        }
+        val queueAreaHeight = if (twoRows) queueRowHeight * 2 + QueueRowGap else queueRowHeight
+        CompositionLocalProvider(LocalQueueViewportHeight provides queueRowHeight) {
+        // A stopped machine keeps showing its queue: its registrations can still leave or move to
+        // another machine. Only when nothing is queued is there nothing to show but the reason.
+        if (!status.isOperational && queue.registrationCount == 0) {
             Column(
-                Modifier.fillMaxWidth().height(QueueViewportHeight).padding(horizontal = 10.dp),
+                Modifier.fillMaxWidth().height(queueRowHeight).padding(horizontal = 10.dp),
                 verticalArrangement = Arrangement.Center
             ) {
-                Text("机台已停止使用", color = PrimaryText, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                Text("机台已停止使用", color = PrimaryText, fontSize = QueueTextSize.CardTitle, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    if (queue.registrationCount > 0) {
-                        "停止原因：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}。现有 ${queue.registrationCount} 份登记、游玩位置和等待顺序均已保留。"
-                    } else {
-                        "停止原因：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}。当前没有排队登记。"
-                    },
+                    "停止原因：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}。当前没有排队登记。",
                     color = SecondaryText,
                     fontSize = 12.sp,
                     lineHeight = 18.sp
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    if (queue.registrationCount > 0) {
-                        "停止期间不能操作该队列，也不会继续游玩或签到计时；恢复后将按原顺序继续，相关计时会从头开始。"
-                    } else {
-                        "恢复正常使用后，可以继续创建登记。"
-                    },
+                    "恢复正常使用后，可以继续创建登记。",
                     color = TertiaryText,
                     fontSize = 11.sp
                 )
             }
-            return@Column
-        }
+        } else {
         AnimatedContent(
             targetState = inlineReorderSession,
-            modifier = Modifier.fillMaxWidth().height(QueueViewportHeight),
-            contentAlignment = if (centerContent) Alignment.Center else Alignment.CenterStart,
+            modifier = Modifier.fillMaxWidth().height(queueAreaHeight),
+            contentAlignment = Alignment.TopStart,
             transitionSpec = {
                 (fadeIn(tween(240)) + scaleIn(tween(240), initialScale = .965f))
                     .togetherWith(fadeOut(tween(150)) + scaleOut(tween(180), targetScale = .96f))
@@ -10843,7 +12362,7 @@ private fun MachineLane(
                 AnimatedContent(
                     targetState = queue,
                     modifier = Modifier.fillMaxSize(),
-                    contentAlignment = if (centerContent) Alignment.Center else Alignment.CenterStart,
+                    contentAlignment = Alignment.TopStart,
                     transitionSpec = {
                         (fadeIn(tween(260)) + slideInHorizontally(tween(300)) { width -> width / 10 })
                             .togetherWith(
@@ -10855,16 +12374,25 @@ private fun MachineLane(
                     val playingMinutes = displayedQueue.playingStartedAtMillis?.let {
                         (nowMillis - it).coerceAtLeast(0L) / 60_000L
                     }
-                    val playingOvertime = playingMinutes != null && playingMinutes > 20
+                    val machineStopped = !status.isOperational
+                    // No round runs on a stopped machine, and its waiting order is not rearranged.
+                    val playingOvertime = !machineStopped &&
+                        playingMinutes != null && playingMinutes > 20
+                    val registrationLongPress: (Int) -> Unit = if (machineStopped) {
+                        { _ -> }
+                    } else {
+                        onRegistrationLongPress
+                    }
                     val actualWaitingPositions = displayedQueue.waitingPositions()
-                    val projectedWaitingPositions = displayedQueue.waitingProjection(
+                    val (projectionQueue, pairedPreviewKeys) = pairedPreview(displayedQueue)
+                    val projectedWaitingPositions = projectionQueue.waitingProjection(
                         includeCommonPlayPreview = showCommonPlayPreview
                     ).positions
                     // A status, preference, nickname, or pair change can regroup or relabel
                     // a position even when the registration keys remain in the same order.
                     val waitingPositionSignature = Triple(
                         displayedQueue.playing,
-                        displayedQueue.waiting,
+                        projectionQueue.waiting,
                         showCommonPlayPreview
                     )
                     val visualWaitingPositions = remember(waitingPositionSignature) {
@@ -11025,47 +12553,86 @@ private fun MachineLane(
                         }
                     }
 
+                    val playingTimeLabel = when {
+                        displayedQueue.playing.isEmpty() || machineStopped -> null
+                        playingMinutes == null || playingMinutes == 0L -> "刚刚开始"
+                        else -> "已游玩 $playingMinutes 分钟"
+                    }
+                    val playingWarningTitle = when {
+                        machineStopped -> "机台已停止使用"
+                        businessHoursClosingGrace -> "今日营业时间已结束"
+                        businessHoursClosingSoon -> "将在 30 分钟内闭店"
+                        else -> null
+                    }
+                    val playingWarningDescription = when {
+                        machineStopped -> "登记仍可退出排队或转至其他机台。"
+                        businessHoursClosingGrace ->
+                            "不再接收新登记；登记排队会在现有队列处理完毕后关闭，最迟在闭店后 20 分钟关闭。"
+                        businessHoursClosingSoon && playingOvertime ->
+                            "本轮已超过 20 分钟，请确认机台是否仍在正常游玩，并留意后续队列安排。"
+                        businessHoursClosingSoon -> "请留意后续队列安排。"
+                        else -> null
+                    }
+                    if (twoRows) {
+                        TwoRowQueuePositions(
+                            machineId = machineId,
+                            rowHeight = queueRowHeight,
+                            displayedQueue = displayedQueue,
+                            playingTime = playingTimeLabel,
+                            playingOvertime = playingOvertime,
+                            playingWarningTitle = playingWarningTitle,
+                            playingWarningDescription = playingWarningDescription,
+                            projectedWaitingPositions = projectedWaitingPositions,
+                            actualWaitingPositions = actualWaitingPositions,
+                            waitingPositionSignature = waitingPositionSignature,
+                            pairedPreviewKeys = pairedPreviewKeys,
+                            pairedArrangementNotices = pairedArrangementNotices,
+                            onPairedPreviewClick = onPairedPreviewClick,
+                            machineStopped = machineStopped,
+                            joinPosition = if (machineStopped) null else {
+                                {
+                                    QueueJoinPosition(
+                                        machineId = machineId,
+                                        registrationOpen = registrationOpen,
+                                        acceptingNewRegistrations = acceptingNewRegistrations,
+                                        closingGracePeriod = businessHoursClosingGrace,
+                                        hasCapacity = displayedQueue.registrationCount < 20,
+                                        onClick = onJoinThisMachine
+                                    )
+                                }
+                            },
+                            highlightedRegistrationKey = highlightedRegistrationKey,
+                            queueScrollResetToken = queueScrollResetToken,
+                            positionReorderResetToken = positionReorderResetToken,
+                            onRegistrationClick = onRegistrationClick,
+                            onRegistrationLongPress = registrationLongPress,
+                            onPositionClick = onPositionClick,
+                            onPositionReorderRequest = { from, to ->
+                                onPositionReorderRequest(displayedQueue, from, to)
+                            }
+                        )
+                    } else {
+                    Box(Modifier.fillMaxSize()) {
                     LazyRow(
                         state = queueListState,
                         userScrollEnabled = draggedPositionKey == null,
                         modifier = Modifier.fillMaxSize().onGloballyPositioned {
                             queueViewportBounds = it.boundsInRoot()
                         },
-                        horizontalArrangement = if (centerContent) {
-                            Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)
-                        } else {
-                            Arrangement.spacedBy(10.dp)
-                        }
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         item(key = "${machineId.name}-playing-position") {
                         QueuePosition(
-                            label = when {
-                                displayedQueue.playing.isEmpty() -> playingPositionName(machineId)
-                                playingMinutes == null || playingMinutes == 0L ->
-                                    "${playingPositionName(machineId)}·刚刚"
-                                else -> "${playingPositionName(machineId)}·已游玩 $playingMinutes 分钟"
-                            },
+                            label = playingPositionName(machineId),
+                            playingTime = playingTimeLabel,
                             registrations = displayedQueue.playing,
                             isPlaying = true,
-                            overtimeWarning = playingOvertime &&
-                                !businessHoursClosingSoon &&
-                                !businessHoursClosingGrace,
-                            warningTitle = when {
-                                businessHoursClosingGrace -> "今日营业时间已结束"
-                                businessHoursClosingSoon -> "将在 30 分钟内闭店"
-                                else -> null
-                            },
-                            warningDescription = when {
-                                businessHoursClosingGrace ->
-                                    "不再接收新登记。现有队列处理完毕后将关闭，最迟保留 20 分钟。"
-                                businessHoursClosingSoon && playingOvertime ->
-                                    "本轮已超过 20 分钟，请确认机台是否仍在正常游玩，并留意后续队列安排。"
-                                businessHoursClosingSoon -> "请留意后续队列安排。"
-                                else -> null
-                            },
+                            overtimeWarning = playingOvertime,
+                            warningTitle = playingWarningTitle,
+                            warningDescription = playingWarningDescription,
                             highlightedRegistrationKey = highlightedRegistrationKey,
                             onRegistrationClick = onRegistrationClick,
-                            onRegistrationLongPress = onRegistrationLongPress,
+                            onRegistrationLongPress = registrationLongPress,
                             onPositionClick = {
                                 onPositionClick(
                                     PositionSelection(
@@ -11098,9 +12665,13 @@ private fun MachineLane(
                                 label = positionLabel,
                                 registrations = registrations,
                                 commonPlayPreview = position.commonPlayPreview,
+                                pairedPreviewKeys = pairedPreviewKeys,
+                                pairedArrangementNotices = pairedArrangementNotices,
+                                onPairedPreviewClick = onPairedPreviewClick,
                                 isPlaying = false,
                                 overtimeWarning = false,
-                                dragEnabled = mapsToSingleActualPosition && actualWaitingPositions.size > 1,
+                                dragEnabled = !machineStopped && mapsToSingleActualPosition &&
+                                    actualWaitingPositions.size > 1,
                                 isDragging = isDraggingPosition,
                                 dragOverlayOwner = positionDragOverlayOwner,
                                 highlightedRegistrationKey = highlightedRegistrationKey,
@@ -11127,9 +12698,11 @@ private fun MachineLane(
                                 // placement still reaches the existing confirmation flow.
                                 onPositionDragCancel = { finishPositionDrag(positionKey) },
                                 onRegistrationClick = onRegistrationClick,
-                                onRegistrationLongPress = onRegistrationLongPress,
+                                onRegistrationLongPress = registrationLongPress,
                                 onPositionClick = {
-                                    onPositionClick(
+                                    // A position that shows a preview of the other machine is
+                                    // not yet a position of this machine.
+                                    if (registrations.none { it.key in pairedPreviewKeys }) onPositionClick(
                                         PositionSelection(
                                             machineId = machineId,
                                             label = positionLabel,
@@ -11149,7 +12722,8 @@ private fun MachineLane(
                                 }
                             )
                         }
-                        item(key = "${machineId.name}-join-position") {
+                        // Nothing joins a stopped machine.
+                        if (!machineStopped) item(key = "${machineId.name}-join-position") {
                         QueueJoinPosition(
                             machineId = machineId,
                             registrationOpen = registrationOpen,
@@ -11160,8 +12734,436 @@ private fun MachineLane(
                         )
                         }
                     }
+                    if (draggedPositionKey == null) {
+                        QueueOverflowHint(
+                            listState = queueListState,
+                            trailingItems = if (machineStopped) 0 else 1
+                        )
+                    }
+                    }
+                    }
                 }
             }
+        }
+        }
+        }
+        }
+    }
+}
+
+/** The corner of a position card and the 加入 card on the home page, as in the home mockup (14). */
+private val PositionCardRadius = 14.dp
+
+/** The width of the 加入 机台 card at the end of a queue (docs/ui-guide.md, 排队首页). */
+private val QueueJoinPositionWidth = 150.dp
+
+/**
+ * The gap between the two rows of a queue: twice the gap between positions in a row, so that the
+ * rows read as lines of text and not as columns (maintainer, 2026-11-25).
+ */
+private val QueueRowGap = 20.dp
+
+/** What the two-row layout last placed in its second row, for the overflow hint. */
+private data class SecondRowExtent(val rights: List<Int>, val width: Int, val maxScroll: Int)
+
+/**
+ * The queue of a machine whose card has room for two rows, as when it is alone in its group
+ * (docs/ui-guide.md, 排队首页): the positions run left to right and go on in the second row like
+ * lines of text. The first row holds what fits whole; the second row holds the rest and scrolls
+ * sideways, ending with 还有 N 个位置 when it is too long. All positions share one layout, so a
+ * position can be dragged from one row to the other.
+ */
+@Composable
+private fun TwoRowQueuePositions(
+    machineId: MachineId,
+    rowHeight: Dp,
+    displayedQueue: MachineQueue,
+    playingTime: String?,
+    playingOvertime: Boolean,
+    playingWarningTitle: String?,
+    playingWarningDescription: String?,
+    projectedWaitingPositions: List<WaitingPositionProjection>,
+    actualWaitingPositions: List<List<Registration>>,
+    waitingPositionSignature: Any,
+    pairedPreviewKeys: Set<Int>,
+    pairedArrangementNotices: Map<Int, String>,
+    onPairedPreviewClick: (Registration) -> Unit,
+    machineStopped: Boolean,
+    joinPosition: (@Composable () -> Unit)?,
+    highlightedRegistrationKey: Int?,
+    queueScrollResetToken: Int,
+    positionReorderResetToken: Int,
+    onRegistrationClick: (Int) -> Unit,
+    onRegistrationLongPress: (Int) -> Unit,
+    onPositionClick: (PositionSelection) -> Unit,
+    onPositionReorderRequest: (Int, Int) -> Unit
+) {
+    val letter = machineId.name
+    val density = LocalDensity.current
+    val coroutineScope = rememberCoroutineScope()
+    val dragOverlayController = LocalGlobalDragOverlayController.current
+    val dragOverlayOwner = remember(waitingPositionSignature) { Any() }
+    val visualPositions = remember(waitingPositionSignature) {
+        mutableStateListOf<WaitingPositionProjection>().apply { addAll(projectedWaitingPositions) }
+    }
+    // Where each waiting position is on screen, in root coordinates and not clipped.
+    val positionBounds = remember(waitingPositionSignature) { mutableStateMapOf<String, Rect>() }
+    var draggedKey by remember(waitingPositionSignature) { mutableStateOf<String?>(null) }
+    var draggedOriginalIndex by remember(waitingPositionSignature) { mutableStateOf<Int?>(null) }
+    var pointer by remember(waitingPositionSignature) { mutableStateOf<Offset?>(null) }
+    var edgeScrollPerFrame by remember(waitingPositionSignature) { mutableFloatStateOf(0f) }
+    var layoutBounds by remember { mutableStateOf<Rect?>(null) }
+    var secondRowScroll by remember { mutableIntStateOf(0) }
+    var secondRowExtent by remember { mutableStateOf(SecondRowExtent(emptyList(), 0, 0)) }
+    var swipingSecondRow by remember { mutableStateOf(false) }
+    val spacing = 10.dp
+    val edgeZonePx = with(density) { 62.dp.toPx() }
+    val maximumEdgeScrollPx = with(density) { 7.dp.toPx() }
+    val secondRowTopPx = with(density) { (rowHeight + QueueRowGap).toPx() }
+
+    DisposableEffect(dragOverlayController, dragOverlayOwner) {
+        onDispose { dragOverlayController.clear(dragOverlayOwner) }
+    }
+
+    fun restoreOrder() {
+        if (visualPositions != projectedWaitingPositions) {
+            visualPositions.clear()
+            visualPositions.addAll(projectedWaitingPositions)
+        }
+    }
+
+    fun scrollSecondRowTo(target: Int) {
+        val end = target.coerceIn(0, secondRowExtent.maxScroll)
+        coroutineScope.launch {
+            animate(secondRowScroll.toFloat(), end.toFloat(), animationSpec = tween(320)) { value, _ ->
+                secondRowScroll = value.roundToInt()
+            }
+        }
+    }
+
+    // Moves the dragged position to the place under the finger, in either row. Within a row it
+    // moves only once the finger has passed the neighbour's centre, so it does not flicker.
+    fun moveDraggedPosition() {
+        val key = draggedKey ?: return
+        val at = pointer ?: return
+        val sourceIndex = visualPositions.indexOfFirst { waitingPositionKey(it.registrations) == key }
+        val sourceBounds = positionBounds[key]
+        if (sourceIndex < 0 || sourceBounds == null) return
+        val targetIndex = visualPositions.indexOfFirst { candidate ->
+            val candidateKey = waitingPositionKey(candidate.registrations)
+            candidateKey != key && positionBounds[candidateKey]?.contains(at) == true
+        }
+        if (targetIndex < 0) return
+        val target = positionBounds[waitingPositionKey(visualPositions[targetIndex].registrations)] ?: return
+        val sameRow = kotlin.math.abs(target.center.y - sourceBounds.center.y) < 1f
+        if (sameRow && (if (targetIndex > sourceIndex) at.x < target.center.x else at.x > target.center.x)) {
+            return
+        }
+        visualPositions.add(targetIndex, visualPositions.removeAt(sourceIndex))
+    }
+
+    fun updateEdgeScroll() {
+        val at = pointer
+        val area = layoutBounds
+        edgeScrollPerFrame = when {
+            at == null || area == null || at.y < area.top + secondRowTopPx -> 0f
+            at.x < area.left + edgeZonePx ->
+                -maximumEdgeScrollPx * ((area.left + edgeZonePx - at.x) / edgeZonePx).coerceIn(0f, 1f)
+            at.x > area.right - edgeZonePx ->
+                maximumEdgeScrollPx * ((at.x - (area.right - edgeZonePx)) / edgeZonePx).coerceIn(0f, 1f)
+            else -> 0f
+        }
+    }
+
+    fun finishDrag(positionKey: String) {
+        val originalIndex = draggedOriginalIndex
+        val destinationIndex = visualPositions.indexOfFirst {
+            waitingPositionKey(it.registrations) == positionKey
+        }
+        edgeScrollPerFrame = 0f
+        draggedKey = null
+        draggedOriginalIndex = null
+        pointer = null
+        if (originalIndex != null && destinationIndex >= 0 && destinationIndex != originalIndex) {
+            onPositionReorderRequest(originalIndex, destinationIndex)
+        } else {
+            restoreOrder()
+        }
+    }
+
+    LaunchedEffect(positionReorderResetToken, waitingPositionSignature) {
+        if (draggedKey == null) {
+            restoreOrder()
+            dragOverlayController.clear(dragOverlayOwner)
+        }
+    }
+    LaunchedEffect(queueScrollResetToken) {
+        if (secondRowScroll != 0) scrollSecondRowTo(0)
+    }
+    LaunchedEffect(draggedKey) {
+        while (draggedKey != null) {
+            val requested = edgeScrollPerFrame
+            if (kotlin.math.abs(requested) > .1f) {
+                secondRowScroll = (secondRowScroll + requested.roundToInt())
+                    .coerceIn(0, secondRowExtent.maxScroll)
+            }
+            delay(16L)
+            moveDraggedPosition()
+        }
+    }
+    // A highlighted registration in the second row is scrolled into view.
+    LaunchedEffect(highlightedRegistrationKey, waitingPositionSignature) {
+        val key = highlightedRegistrationKey ?: return@LaunchedEffect
+        delay(180L)
+        val position = visualPositions.firstOrNull { candidate ->
+            candidate.registrations.any { it.key == key }
+        } ?: return@LaunchedEffect
+        val bounds = positionBounds[waitingPositionKey(position.registrations)] ?: return@LaunchedEffect
+        val area = layoutBounds ?: return@LaunchedEffect
+        if (bounds.top >= area.top + secondRowTopPx - 1f) {
+            scrollSecondRowTo(secondRowScroll + (bounds.left - area.left).roundToInt())
+        }
+    }
+
+    val playingLabel = playingPositionName(machineId)
+    Box(Modifier.fillMaxSize()) {
+        Layout(
+            content = {
+                QueuePosition(
+                    label = playingLabel,
+                    playingTime = playingTime,
+                    registrations = displayedQueue.playing,
+                    isPlaying = true,
+                    overtimeWarning = playingOvertime,
+                    warningTitle = playingWarningTitle,
+                    warningDescription = playingWarningDescription,
+                    highlightedRegistrationKey = highlightedRegistrationKey,
+                    onRegistrationClick = onRegistrationClick,
+                    onRegistrationLongPress = onRegistrationLongPress,
+                    onPositionClick = {
+                        onPositionClick(
+                            PositionSelection(
+                                machineId = machineId,
+                                label = playingLabel,
+                                registrationKeys = displayedQueue.playing.map { it.key },
+                                isPlayingPosition = true
+                            )
+                        )
+                    }
+                )
+                visualPositions.forEachIndexed { index, position ->
+                    val registrations = position.registrations
+                    val positionKey = waitingPositionKey(registrations)
+                    key(positionKey) {
+                        val fixedPair = registrations.size == 2 &&
+                            registrations[0].fixedPartnerKey == registrations[1].key &&
+                            registrations[1].fixedPartnerKey == registrations[0].key
+                        val positionLabel = "位置 $letter${index + 1}" + if (fixedPair) "·固定组合" else ""
+                        val actualPositionIndex = actualWaitingPositions.indexOfFirst { actual ->
+                            actual.map { it.key }.toSet() == registrations.map { it.key }.toSet()
+                        }
+                        val mapsToSingleActualPosition = actualPositionIndex >= 0
+                        QueuePosition(
+                            label = positionLabel,
+                            registrations = registrations,
+                            commonPlayPreview = position.commonPlayPreview,
+                            pairedPreviewKeys = pairedPreviewKeys,
+                            pairedArrangementNotices = pairedArrangementNotices,
+                            onPairedPreviewClick = onPairedPreviewClick,
+                            isPlaying = false,
+                            overtimeWarning = false,
+                            dragEnabled = !machineStopped && mapsToSingleActualPosition &&
+                                actualWaitingPositions.size > 1,
+                            isDragging = draggedKey == positionKey,
+                            dragOverlayOwner = dragOverlayOwner,
+                            highlightedRegistrationKey = highlightedRegistrationKey,
+                            onPositionDragStart = { pointerInRoot ->
+                                visualPositions.clear()
+                                visualPositions.addAll(
+                                    actualWaitingPositions.map { WaitingPositionProjection(it) }
+                                )
+                                draggedKey = positionKey
+                                draggedOriginalIndex = actualPositionIndex
+                                pointer = pointerInRoot
+                                edgeScrollPerFrame = 0f
+                            },
+                            onPositionDrag = { dragAmount ->
+                                pointer = pointer?.plus(dragAmount)
+                                moveDraggedPosition()
+                                updateEdgeScroll()
+                            },
+                            onPositionDragEnd = { finishDrag(positionKey) },
+                            onPositionDragCancel = { finishDrag(positionKey) },
+                            onRegistrationClick = onRegistrationClick,
+                            onRegistrationLongPress = onRegistrationLongPress,
+                            onPositionClick = {
+                                // A position that shows a preview of the other machine is not yet
+                                // a position of this machine.
+                                if (registrations.none { it.key in pairedPreviewKeys }) onPositionClick(
+                                    PositionSelection(
+                                        machineId = machineId,
+                                        label = positionLabel,
+                                        registrationKeys = registrations.map { it.key },
+                                        isPlayingPosition = false,
+                                        waitingPositionIndex = actualPositionIndex
+                                            .takeIf { mapsToSingleActualPosition }
+                                    )
+                                )
+                            },
+                            modifier = Modifier.onGloballyPositioned {
+                                positionBounds[positionKey] = Rect(it.positionInRoot(), it.size.toSize())
+                            }
+                        )
+                    }
+                }
+                joinPosition?.invoke()
+            },
+            modifier = Modifier.fillMaxSize().clipToBounds()
+                .onGloballyPositioned { layoutBounds = it.boundsInRoot() }
+                .pointerInput(rowHeight) {
+                    // Swiping sideways in the second row scrolls it; the first row never scrolls.
+                    detectHorizontalDragGestures(
+                        onDragStart = { start -> swipingSecondRow = start.y >= secondRowTopPx },
+                        onDragEnd = { swipingSecondRow = false },
+                        onDragCancel = { swipingSecondRow = false }
+                    ) { change, dragAmount ->
+                        if (swipingSecondRow && draggedKey == null) {
+                            change.consume()
+                            secondRowScroll = (secondRowScroll - dragAmount.roundToInt())
+                                .coerceIn(0, secondRowExtent.maxScroll)
+                        }
+                    }
+                }
+        ) { measurables, constraints ->
+            val rowHeightPx = rowHeight.roundToPx()
+            val gapPx = QueueRowGap.roundToPx()
+            val spacingPx = spacing.roundToPx()
+            val width = constraints.maxWidth
+            val placeables = measurables.map {
+                it.measure(Constraints(maxWidth = Constraints.Infinity, maxHeight = rowHeightPx))
+            }
+            // The first row takes items while they fit whole; everything after the first item
+            // that does not fit goes to the second row, in order.
+            var x = 0
+            var firstRowCount = 0
+            for (placeable in placeables) {
+                val start = if (firstRowCount == 0) 0 else x + spacingPx
+                if (firstRowCount > 0 && start + placeable.width > width) break
+                x = start + placeable.width
+                firstRowCount++
+            }
+            val secondRow = placeables.drop(firstRowCount)
+            val rights = mutableListOf<Int>()
+            var secondX = 0
+            secondRow.forEachIndexed { index, placeable ->
+                if (index > 0) secondX += spacingPx
+                secondX += placeable.width
+                rights += secondX
+            }
+            val maxScroll = (secondX - width).coerceAtLeast(0)
+            val extent = SecondRowExtent(rights, width, maxScroll)
+            if (extent != secondRowExtent) secondRowExtent = extent
+            val scroll = secondRowScroll.coerceIn(0, maxScroll)
+            layout(width, constraints.maxHeight) {
+                var placeX = 0
+                placeables.take(firstRowCount).forEachIndexed { index, placeable ->
+                    if (index > 0) placeX += spacingPx
+                    placeable.place(placeX, 0)
+                    placeX += placeable.width
+                }
+                var rowX = -scroll
+                secondRow.forEachIndexed { index, placeable ->
+                    if (index > 0) rowX += spacingPx
+                    placeable.place(rowX, rowHeightPx + gapPx)
+                    rowX += placeable.width
+                }
+            }
+        }
+        // 还有 N 个位置 at the end of the second row, as at the end of a single row.
+        val extent = secondRowExtent
+        val scroll = secondRowScroll.coerceIn(0, extent.maxScroll)
+        if (draggedKey == null && scroll < extent.maxScroll) {
+            val trailing = if (joinPosition != null) 1 else 0
+            val hidden = extent.rights.dropLast(trailing).count { it > scroll + extent.width }
+            Box(
+                Modifier.align(Alignment.BottomEnd).height(rowHeight).width(150.dp)
+                    .background(
+                        Brush.horizontalGradient(
+                            0f to CardBackground.copy(alpha = 0f),
+                            .62f to CardBackground
+                        )
+                    ),
+                contentAlignment = Alignment.CenterEnd
+            ) {
+                if (hidden > 0) {
+                    Text(
+                        "还有 $hidden 个位置 ›",
+                        color = SystemBlue,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.heightIn(min = MinTouchTarget)
+                            .clip(RoundedCornerShape(100.dp))
+                            .background(CardBackground)
+                            .border(1.dp, Separator, RoundedCornerShape(100.dp))
+                            .clickable { scrollSecondRowTo(extent.maxScroll) }
+                            .padding(horizontal = 14.dp, vertical = 14.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Fades the right edge of a queue row that goes on beyond the screen and says how many positions
+ * are out of sight; tapping it scrolls to the end of the row.
+ */
+@Composable
+private fun BoxScope.QueueOverflowHint(listState: LazyListState, trailingItems: Int) {
+    val coroutineScope = rememberCoroutineScope()
+    val hiddenPositions by remember(listState, trailingItems) {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val total = info.totalItemsCount
+            if (total == 0 || !listState.canScrollForward) {
+                0
+            } else {
+                val viewportEnd = info.viewportEndOffset
+                val firstCut = info.visibleItemsInfo
+                    .firstOrNull { it.offset + it.size > viewportEnd }?.index
+                    ?: ((info.visibleItemsInfo.lastOrNull()?.index ?: -1) + 1)
+                (total - trailingItems - firstCut).coerceAtLeast(0)
+            }
+        }
+    }
+    if (!listState.canScrollForward) return
+    Box(
+        Modifier.align(Alignment.CenterEnd).fillMaxHeight().width(150.dp)
+            .background(
+                Brush.horizontalGradient(
+                    0f to CardBackground.copy(alpha = 0f),
+                    .62f to CardBackground
+                )
+            ),
+        contentAlignment = Alignment.CenterEnd
+    ) {
+        if (hiddenPositions > 0) {
+            Text(
+                "还有 $hiddenPositions 个位置 ›",
+                color = SystemBlue,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.heightIn(min = MinTouchTarget)
+                    .clip(RoundedCornerShape(100.dp))
+                    .background(CardBackground)
+                    .border(1.dp, Separator, RoundedCornerShape(100.dp))
+                    .clickable {
+                        coroutineScope.launch {
+                            listState.animateScrollToItem(listState.layoutInfo.totalItemsCount - 1)
+                        }
+                    }
+                    .padding(horizontal = 14.dp, vertical = 14.dp)
+            )
         }
     }
 }
@@ -11186,34 +13188,37 @@ private fun MachineDetailsDialog(
             } else {
                 "已停止使用：${machineStopReasonLabel(machine.status.stopReason, machine.status.stopReasonDetail)}"
             },
-            color = if (machine.status.isOperational) SecondaryText else Color(0xFF9A5B00),
+            color = if (machine.status.isOperational) SecondaryText else WarningText,
             fontSize = 12.sp,
             lineHeight = 18.sp
         )
         Spacer(Modifier.height(16.dp))
-        HorizontalDivider(color = Separator.copy(alpha = .72f))
-        Spacer(Modifier.height(12.dp))
-        MetadataRow("机台编号", machine.machineId.name)
-        MetadataRow("机台备注", configuration.remark)
-        MetadataRow("机台类型", machineGameTypeDisplayName(configuration))
-        if (
-            configuration.gameType.supportsServerConfiguration &&
-            configuration.server != MachineServer.HIDDEN
-        ) {
-            MetadataRow("服务器", machineServerDisplayName(configuration))
-        }
-        if (configuration.showGameVersion) {
-            MetadataRow("游戏版本", configuration.gameVersion)
-        }
-        MetadataRow("游玩容量", "${configuration.capacity} 人")
-        MetadataRow(
-            "计划游玩时间",
-            if (configuration.capacity == 1) {
-                "单人 ${configuration.soloRoundMinutes} 分钟"
-            } else {
-                "单人 ${configuration.soloRoundMinutes} 分钟，共同游玩 ${configuration.sharedRoundMinutes} 分钟"
+        // The same rows as the 机厅与终端 dialog; a dialog that only shows something closes with
+        // a text button (docs/ui-guide.md, 按钮和可点控件).
+        val rows = buildList {
+            add("机台编号" to machine.machineId.name)
+            add("机台备注" to configuration.remark)
+            add("游戏类型" to machineGameTypeDisplayName(configuration))
+            if (
+                configuration.gameType.supportsServerConfiguration &&
+                configuration.server != MachineServer.HIDDEN
+            ) {
+                add("服务器" to machineServerDisplayName(configuration))
             }
-        )
+            if (configuration.showGameVersion) add("游戏版本" to configuration.gameVersion)
+            add("游玩容量" to "${configuration.capacity} 人")
+            add(
+                "计划游玩时间" to if (configuration.capacity == 1) {
+                    "单人 ${configuration.soloRoundMinutes} 分钟"
+                } else {
+                    "单人 ${configuration.soloRoundMinutes} 分钟，共同游玩 ${configuration.sharedRoundMinutes} 分钟"
+                }
+            )
+        }
+        rows.forEachIndexed { index, (label, value) ->
+            if (index > 0) HorizontalDivider(color = Separator.copy(alpha = .72f))
+            AppDetailRow(label, value)
+        }
         if (configuration.capacity == 1) {
             Spacer(Modifier.height(8.dp))
             Text(
@@ -11223,8 +13228,8 @@ private fun MachineDetailsDialog(
                 lineHeight = 18.sp
             )
         }
-        Spacer(Modifier.height(18.dp))
-        PrimaryButton("关闭", onDismiss, Modifier.fillMaxWidth())
+        Spacer(Modifier.height(12.dp))
+        CancelAction("关闭", onDismiss)
     }
 }
 
@@ -11367,7 +13372,7 @@ internal fun machineLayoutChangeDescriptions(
                     separator = "、",
                     prefix = "后续机台编号已重排：",
                 ) { (previousId, updatedId) ->
-                    "原机台 ${previousId.name} 改为机台 ${updatedId.name}"
+                    "原机台 ${previousId.name} 改为 机台 ${updatedId.name}"
                 }
             )
         }
@@ -11386,7 +13391,7 @@ internal fun machineLayoutChangeDescriptions(
 
         normalizedUpdated.configuredMachineGroups
             .filter { it.id !in previousGroupsById }
-            .forEach { group -> add("新增首页分组“${group.name}”") }
+            .forEach { group -> add("创建首页分组“${group.name}”") }
         normalizedPrevious.configuredMachineGroups
             .filter { it.id !in updatedGroupsById }
             .forEach { group -> add("移除首页分组“${group.name}”") }
@@ -11620,7 +13625,7 @@ private fun InlineReorderRegistrationTile(
     var tileCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
     val background by animateColorAsState(
         when {
-            locked -> Color(0xFFEDEDF1)
+            locked -> PreviewBackground
             active -> SoftBlue
             else -> CardBackground
         },
@@ -11647,7 +13652,7 @@ private fun InlineReorderRegistrationTile(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(Modifier.weight(1f)) {
-            Text(orderLabel, color = TertiaryText, fontSize = 9.sp, maxLines = 1)
+            Text(orderLabel, color = TertiaryText, fontSize = 11.sp, maxLines = 1)
             Spacer(Modifier.height(3.dp))
             Text(
                 visibleDisplayId,
@@ -11661,13 +13666,13 @@ private fun InlineReorderRegistrationTile(
             Text(
                 playPreferenceLabel(registration),
                 color = if (locked) TertiaryText else SecondaryText,
-                fontSize = 9.sp,
+                fontSize = 11.sp,
                 maxLines = 1
             )
         }
         if (locked) {
             Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
-                Text("锁定", color = TertiaryText, fontSize = 9.sp, fontWeight = FontWeight.Medium)
+                Text("锁定", color = TertiaryText, fontSize = 11.sp, fontWeight = FontWeight.Medium)
             }
         } else {
             val dragHandleModifier = if (isDragOverlay) {
@@ -11717,7 +13722,7 @@ private fun InlineReorderRegistrationTile(
                     }
             }
             Box(
-                Modifier.size(40.dp).clip(RoundedCornerShape(10.dp))
+                Modifier.size(40.dp).clip(RoundedCornerShape(12.dp))
                     .background(if (active) SystemBlue.copy(alpha = .10f) else Color.Transparent)
                     .then(dragHandleModifier),
                 contentAlignment = Alignment.Center
@@ -11728,14 +13733,102 @@ private fun InlineReorderRegistrationTile(
     }
 }
 
+/** A position card's tile widths and its own width; the card and the two-row queue both use it. */
+private data class QueuePositionMeasure(val tileWidths: List<Dp>, val width: Dp)
+
+private fun measureQueuePosition(
+    textMeasurer: TextMeasurer,
+    density: Density,
+    label: String,
+    registrations: List<Registration>,
+    commonPlayPreview: Registration?,
+    pairedPreviewKeys: Set<Int>,
+    pairedArrangementNotices: Map<Int, String>,
+    isPlaying: Boolean,
+    playingTime: String?,
+    hasWarning: Boolean
+): QueuePositionMeasure {
+    val displayedRegistrations = registrations + listOfNotNull(commonPlayPreview)
+    val tileWidths = displayedRegistrations.map { registration ->
+        // A tile is as wide as its nickname needs, or as its status line needs when that is
+        // longer (a short nickname with 允许他人加入, or a notice such as 可能转至 B1), so that
+        // neither line is ever cut off.
+        val isCommonPlayPreview = registration.key == commonPlayPreview?.key
+        val isPairedPreview = registration.key in pairedPreviewKeys
+        val status = registrationTileStatus(
+            registration = registration,
+            commonPlayPreview = isCommonPlayPreview,
+            pairedPlacePreview = isPairedPreview,
+            pairedArrangementNotice = pairedArrangementNotices[registration.key]
+                ?.takeIf { !isPairedPreview && !isCommonPlayPreview }
+        )
+        val statusWidth = with(density) {
+            textMeasurer.measure(
+                text = AnnotatedString(panguSpacing(status)),
+                // The same size as the status line of [RegistrationTile]; measured in the
+                // heavier weight so that either weight fits.
+                style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            ).size.width.toDp()
+        }
+        maxOf(registrationTileWidth(registration.displayId), statusWidth + RegistrationTilePadding * 2)
+            .coerceAtMost(RegistrationTileMaxWidth)
+    }
+    val registrationContentWidth = tileWidths.fold(0.dp) { total, width -> total + width } +
+        if (tileWidths.size > 1) 8.dp * (tileWidths.size - 1) else 0.dp
+    val warningWidth = if (hasWarning) 178.dp else 0.dp
+    val contentSpacing = if (hasWarning && registrations.isNotEmpty()) 8.dp else 0.dp
+    val playingHeaderWidth = if (isPlaying && registrations.isNotEmpty()) {
+        val labelWidth = with(density) {
+            textMeasurer.measure(
+                text = AnnotatedString(panguSpacing(label)),
+                style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            ).size.width.toDp()
+        }
+        val timeWidth = playingTime?.let { time ->
+            with(density) {
+                textMeasurer.measure(
+                    text = AnnotatedString(panguSpacing(time)),
+                    style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                ).size.width.toDp()
+            } + 26.dp
+        } ?: 0.dp
+        val arrowWidth = with(density) {
+            textMeasurer.measure(
+                text = AnnotatedString("›"),
+                style = TextStyle(fontSize = 15.sp)
+            ).size.width.toDp()
+        }
+        labelWidth + timeWidth + arrowWidth + 30.dp
+    } else {
+        0.dp
+    }
+    val minimumWidth = when {
+        isPlaying && registrations.isEmpty() -> 148.dp
+        isPlaying -> maxOf(200.dp, playingHeaderWidth)
+        else -> 0.dp
+    }
+    val positionWidth = maxOf(
+        minimumWidth,
+        registrationContentWidth + warningWidth + contentSpacing + 20.dp
+    )
+    return QueuePositionMeasure(tileWidths, positionWidth)
+}
+
 @Composable
 private fun QueuePosition(
     label: String,
     registrations: List<Registration>,
     commonPlayPreview: Registration? = null,
+    pairedPreviewKeys: Set<Int> = emptySet(),
+    pairedArrangementNotices: Map<Int, String> = emptyMap(),
+    onPairedPreviewClick: (Registration) -> Unit = {},
     isPlaying: Boolean,
+    /** The round has run long: the time turns orange and the position gets an orange edge. */
     overtimeWarning: Boolean,
     modifier: Modifier = Modifier,
+    /** For the playing position: how long the round has run, beside the label. */
+    playingTime: String? = null,
+    /** Stopped machine or closing time: a card with the explanation before the registrations. */
     warningTitle: String? = null,
     warningDescription: String? = null,
     highlightedRegistrationKey: Int? = null,
@@ -11747,6 +13840,8 @@ private fun QueuePosition(
     onPositionDrag: (Offset) -> Unit = {},
     onPositionDragEnd: () -> Unit = {},
     onPositionDragCancel: () -> Unit = {},
+    /** False where the position is only shown, such as in a confirmation dialog. */
+    interactive: Boolean = true,
     onRegistrationClick: (Int) -> Unit,
     onRegistrationLongPress: (Int) -> Unit,
     onPositionClick: () -> Unit
@@ -11755,38 +13850,22 @@ private fun QueuePosition(
     val textMeasurer = rememberTextMeasurer()
     val density = LocalDensity.current
     val displayedRegistrations = registrations + listOfNotNull(commonPlayPreview)
-    val tileWidths = displayedRegistrations.map { registrationTileWidth(it.displayId) }
-    val registrationContentWidth = tileWidths.fold(0.dp) { total, width -> total + width } +
-        if (tileWidths.size > 1) 7.dp * (tileWidths.size - 1) else 0.dp
-    val hasWarning = overtimeWarning || warningTitle != null
-    val warningWidth = if (hasWarning) 178.dp else 0.dp
-    val contentSpacing = if (hasWarning && registrations.isNotEmpty()) 7.dp else 0.dp
-    val playingHeaderWidth = if (isPlaying && registrations.isNotEmpty()) {
-        val labelWidth = with(density) {
-            textMeasurer.measure(
-                text = AnnotatedString(panguSpacing(label)),
-                style = TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Medium)
-            ).size.width.toDp()
-        }
-        val arrowWidth = with(density) {
-            textMeasurer.measure(
-                text = AnnotatedString("›"),
-                style = TextStyle(fontSize = 16.sp)
-            ).size.width.toDp()
-        }
-        labelWidth + arrowWidth + 30.dp
-    } else {
-        0.dp
-    }
-    val minimumWidth = when {
-        isPlaying && registrations.isEmpty() -> 148.dp
-        isPlaying -> playingHeaderWidth
-        else -> 0.dp
-    }
-    val positionWidth = maxOf(
-        minimumWidth,
-        registrationContentWidth + warningWidth + contentSpacing + 22.dp
+    val viewportHeight = LocalQueueViewportHeight.current
+    val hasWarning = warningTitle != null
+    val measure = measureQueuePosition(
+        textMeasurer = textMeasurer,
+        density = density,
+        label = label,
+        registrations = registrations,
+        commonPlayPreview = commonPlayPreview,
+        pairedPreviewKeys = pairedPreviewKeys,
+        pairedArrangementNotices = pairedArrangementNotices,
+        isPlaying = isPlaying,
+        playingTime = playingTime,
+        hasWarning = hasWarning
     )
+    val tileWidths = measure.tileWidths
+    val positionWidth = measure.width
     val positionElevation by animateDpAsState(
         targetValue = if (isDragging) 16.dp else 0.dp,
         animationSpec = tween(150),
@@ -11803,7 +13882,8 @@ private fun QueuePosition(
     )
     val positionBorder by animateColorAsState(
         targetValue = when {
-            isPlaying -> SystemBlue.copy(alpha = .25f)
+            isPlaying && overtimeWarning -> OvertimeBorderColor
+            isPlaying -> PlayingPositionBorderColor
             isDragging -> SystemBlue.copy(alpha = .62f)
             else -> Separator
         },
@@ -11820,10 +13900,12 @@ private fun QueuePosition(
                     val pointerInRoot = dragSurfaceCoordinates?.localToRoot(position) ?: position
                     positionCoordinates?.boundsInRoot()?.let { itemBounds ->
                         dragOverlayController.start(activeDragOverlayOwner, pointerInRoot, itemBounds) {
+                            CompositionLocalProvider(LocalQueueViewportHeight provides viewportHeight) {
                             QueuePosition(
                                 label = label,
                                 registrations = registrations,
                                 commonPlayPreview = null,
+                                pairedArrangementNotices = pairedArrangementNotices,
                                 isPlaying = isPlaying,
                                 overtimeWarning = overtimeWarning,
                                 warningTitle = warningTitle,
@@ -11833,10 +13915,12 @@ private fun QueuePosition(
                                 isDragging = true,
                                 dragOverlayOwner = activeDragOverlayOwner,
                                 isDragOverlay = true,
+                                playingTime = playingTime,
                                 onRegistrationClick = {},
                                 onRegistrationLongPress = {},
                                 onPositionClick = {}
                             )
+                            }
                         }
                     }
                     onPositionDragStart(pointerInRoot)
@@ -11860,27 +13944,31 @@ private fun QueuePosition(
         Modifier
     }
     Column(
-        modifier.width(positionWidth).height(QueueViewportHeight)
+        modifier.width(positionWidth).height(viewportHeight)
             .zIndex(if (isDragging) 12f else 0f)
             .onGloballyPositioned { positionCoordinates = it }
             .graphicsLayer {
                 alpha = if (isDragging && !isDragOverlay) 0f else 1f
                 shadowElevation = positionElevation.toPx()
-                shape = RoundedCornerShape(CardRadius)
+                shape = RoundedCornerShape(PositionCardRadius)
             }
-            .clip(RoundedCornerShape(CardRadius))
+            .clip(RoundedCornerShape(PositionCardRadius))
             .clickable(
-                enabled = registrations.isNotEmpty() && !isDragging,
+                enabled = interactive && registrations.isNotEmpty() && !isDragging,
                 onClick = onPositionClick
             )
             .background(positionBackground)
-            .border(1.dp, positionBorder, RoundedCornerShape(CardRadius))
-            .padding(start = 11.dp, end = 11.dp, top = 8.dp, bottom = 10.dp)
+            .border(
+                if (isPlaying && overtimeWarning) 2.dp else 1.dp,
+                positionBorder,
+                RoundedCornerShape(PositionCardRadius)
+            )
+            .padding(10.dp)
     ) {
         Row(
-            Modifier.fillMaxWidth().height(20.dp).onGloballyPositioned {
+            Modifier.fillMaxWidth().height(22.dp).onGloballyPositioned {
                 dragSurfaceCoordinates = it
-            }.then(dragHeaderModifier).padding(bottom = 2.dp),
+            }.then(dragHeaderModifier),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
@@ -11888,14 +13976,31 @@ private fun QueuePosition(
                 color = when {
                     isPlaying -> SystemBlue
                     isDragging -> SystemBlue
-                    else -> TertiaryText
+                    else -> SecondaryText
                 },
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Medium,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = if (isPlaying) TextOverflow.Clip else TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
+            if (isPlaying && playingTime != null) {
+                Spacer(Modifier.width(QueueSpacing.S))
+                Text(
+                    playingTime,
+                    color = if (overtimeWarning) WarningText else SecondaryText,
+                    fontSize = 12.sp,
+                    fontWeight = if (overtimeWarning) FontWeight.SemiBold else FontWeight.Medium,
+                    lineHeight = 14.sp,
+                    maxLines = 1,
+                    modifier = if (overtimeWarning) {
+                        Modifier.clip(RoundedCornerShape(100.dp)).background(WarningBackground)
+                            .padding(horizontal = 9.dp, vertical = 3.dp)
+                    } else {
+                        Modifier
+                    }
+                )
+            }
             if (registrations.isNotEmpty()) {
                 if (dragEnabled) {
                     Spacer(Modifier.width(5.dp))
@@ -11910,51 +14015,65 @@ private fun QueuePosition(
                 Text(
                     "›",
                     color = if (isPlaying) SystemBlue.copy(alpha = .58f) else TertiaryText,
-                    fontSize = 16.sp
+                    fontSize = 15.sp
                 )
             }
         }
-        Spacer(Modifier.height(5.dp))
+        Spacer(Modifier.height(QueueSpacing.S))
         if (registrations.isEmpty() && !hasWarning) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("暂无登记", color = TertiaryText, fontSize = 13.sp)
+                Text("暂无登记", color = TertiaryText, fontSize = 12.sp)
             }
         } else {
+            // The tiles fill the position, as in the mockup: each takes width in proportion to its
+            // name, and all of the height below the heading.
             Row(
                 Modifier.fillMaxSize(),
-                horizontalArrangement = Arrangement.spacedBy(7.dp, Alignment.CenterHorizontally),
-                verticalAlignment = Alignment.CenterVertically
+                horizontalArrangement = Arrangement.spacedBy(QueueSpacing.S)
             ) {
                 if (hasWarning) {
                     Column(
-                        Modifier.width(178.dp).height(QueueRegistrationTileHeight)
+                        Modifier.width(178.dp).fillMaxHeight()
                             .clip(RoundedCornerShape(11.dp))
-                            .background(Color(0xFFFFF4E5)).padding(11.dp),
+                            .background(WarningBackground).padding(11.dp),
                         verticalArrangement = Arrangement.Center
                     ) {
                         Text(
                             warningTitle ?: "本轮已超过 20 分钟",
-                            color = Color(0xFF9A5B00),
+                            color = WarningText,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold
                         )
                         Spacer(Modifier.height(4.dp))
                         Text(
                             warningDescription ?: "请确认机台是否仍在正常游玩。",
-                            color = Color(0xFF9A5B00),
-                            fontSize = 10.sp,
+                            color = WarningText,
+                            fontSize = 11.sp,
                             lineHeight = 15.sp
                         )
                     }
                 }
                 registrations.forEachIndexed { index, registration ->
+                    val pairedPreview = registration.key in pairedPreviewKeys
                     RegistrationTile(
                         registration = registration,
                         isPlaying = isPlaying,
                         highlighted = registration.key == highlightedRegistrationKey,
-                        onClick = { onRegistrationClick(registration.key) },
-                        onLongClick = { onRegistrationLongPress(registration.key) },
-                        modifier = Modifier.width(tileWidths[index])
+                        interactive = interactive,
+                        pairedPlacePreview = pairedPreview,
+                        pairedArrangementNotice = pairedArrangementNotices[registration.key]
+                            ?.takeIf { !pairedPreview },
+                        onClick = {
+                            if (pairedPreview) {
+                                onPairedPreviewClick(registration)
+                            } else {
+                                onRegistrationClick(registration.key)
+                            }
+                        },
+                        onLongClick = {
+                            if (!pairedPreview) onRegistrationLongPress(registration.key)
+                        },
+                        modifier = Modifier.weight(tileWidths[index].value).fillMaxHeight()
                     )
                 }
                 commonPlayPreview?.let { preview ->
@@ -11965,13 +14084,63 @@ private fun QueuePosition(
                         commonPlayPreview = true,
                         onClick = {},
                         onLongClick = {},
-                        modifier = Modifier.width(tileWidths.last())
+                        modifier = Modifier.weight(tileWidths.last().value).fillMaxHeight()
                     )
                 }
             }
         }
     }
 }
+
+/** The inner padding of a registration tile on every side. */
+private val RegistrationTilePadding = QueueSpacing.M
+
+/**
+ * The narrowest tile: room for its longest play preference, 允许他人加入 (six characters at
+ * 12 sp), with the padding on both sides.
+ */
+private val RegistrationTileMinWidth = 96.dp
+
+/**
+ * The widest tile: a nickname of six characters, the most the queue shows (see
+ * [queueDisplayId]). A longer status line ends with an ellipsis; the full text is in the menu.
+ */
+private val RegistrationTileMaxWidth = 142.dp
+
+/** The state a registration tile shows in place of its play preference; null when none. */
+private fun registrationTileState(
+    registration: Registration,
+    commonPlayPreview: Boolean,
+    pairedPlacePreview: Boolean,
+    pairedArrangementNotice: String?
+): String? {
+    val absenceStatus = registrationAbsenceStatusLabel(registration, includeSkippedTurns = false)
+    return when {
+        commonPlayPreview -> "共同游玩预览"
+        // The small text of a paired-machine preview stays its play preference.
+        pairedPlacePreview -> null
+        registration.requiresOnSiteCheckIn -> "线上登记·待签到"
+        absenceStatus != null -> absenceStatus
+        // The coming move matters more at this moment than an earlier no-show.
+        pairedArrangementNotice != null -> pairedArrangementNotice
+        else -> registration.noShowCount.takeIf { it > 0 }?.let { "未到场 $it 次" }
+    }
+}
+
+private fun registrationTilePreference(registration: Registration): String = when {
+    registration.fixedPartnerKey != null -> "固定组合"
+    registration.preference == PlayPreference.SOLO -> "单人游玩"
+    else -> "允许他人加入"
+}
+
+/** The small line of a registration tile, as [RegistrationTile] shows it. */
+private fun registrationTileStatus(
+    registration: Registration,
+    commonPlayPreview: Boolean,
+    pairedPlacePreview: Boolean,
+    pairedArrangementNotice: String?
+): String = registrationTileState(registration, commonPlayPreview, pairedPlacePreview, pairedArrangementNotice)
+    ?: registrationTilePreference(registration)
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -11980,10 +14149,19 @@ private fun RegistrationTile(
     isPlaying: Boolean,
     highlighted: Boolean,
     commonPlayPreview: Boolean = false,
+    /** A registration of the paired machine that is expected to play here first. */
+    pairedPlacePreview: Boolean = false,
+    /**
+     * For a registration of this machine: a preview at the other machine announces that it may
+     * be moved there. This line then stands in place of its play preference.
+     */
+    pairedArrangementNotice: String? = null,
+    interactive: Boolean = true,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val previewStyle = commonPlayPreview || pairedPlacePreview
     val shape = RoundedCornerShape(ControlRadius)
     val absenceStatus = registrationAbsenceStatusLabel(
         registration,
@@ -11991,34 +14169,36 @@ private fun RegistrationTile(
     )
     val noShowStatus = registration.noShowCount.takeIf { it > 0 }?.let { "未到场 $it 次" }
     val pendingCheckIn = registration.requiresOnSiteCheckIn
-    val visibleStatus = when {
-        commonPlayPreview -> "共同游玩预览"
-        pendingCheckIn -> "线上登记·待签到"
-        absenceStatus != null -> absenceStatus
-        else -> noShowStatus
-    }
+    val visibleStatus = registrationTileState(
+        registration,
+        commonPlayPreview,
+        pairedPlacePreview,
+        pairedArrangementNotice
+    )
+    val showsArrangementNotice = !commonPlayPreview && !pendingCheckIn &&
+        absenceStatus == null && pairedArrangementNotice != null
     val showNoShowStatus = !pendingCheckIn && absenceStatus == null && noShowStatus != null
     val normalBackground = when {
-        commonPlayPreview -> Color(0xFFEDEDF1)
+        previewStyle -> PreviewBackground
         pendingCheckIn -> OnlineRegistrationStatusBackground
-        isPlaying -> PlayingRegistrationBackground
+        isPlaying -> PlayingRegistrationBackground.copy(alpha = RegistrationTileAlpha)
         showNoShowStatus -> NoShowStatusBackground
-        else -> CardBackground
+        else -> CardBackground.copy(alpha = RegistrationTileAlpha)
     }
     val normalBorder = when {
-        commonPlayPreview -> Separator.copy(alpha = .72f)
+        previewStyle -> Separator.copy(alpha = .72f)
         pendingCheckIn -> OnlineRegistrationStatusColor.copy(alpha = .20f)
         isPlaying -> SystemBlue.copy(alpha = .08f)
         showNoShowStatus -> NoShowStatusColor.copy(alpha = .16f)
         else -> Color.Transparent
     }
     val tileBackground by animateColorAsState(
-        if (highlighted) Color(0xFFEAF8EF) else normalBackground,
+        if (highlighted) SuccessBackground else normalBackground,
         tween(if (highlighted) 180 else 420),
         label = "新登记高亮背景"
     )
     val tileBorder by animateColorAsState(
-        if (highlighted) Color(0xFF248A4B).copy(alpha = .58f) else normalBorder,
+        if (highlighted) SuccessText.copy(alpha = .58f) else normalBorder,
         tween(if (highlighted) 180 else 420),
         label = "新登记高亮边框"
     )
@@ -12028,27 +14208,27 @@ private fun RegistrationTile(
         label = "新登记高亮缩放"
     )
     Column(
-        modifier.height(QueueRegistrationTileHeight)
+        modifier
             .graphicsLayer {
                 scaleX = tileScale
                 scaleY = tileScale
             }
             .clip(shape)
             .combinedClickable(
-                enabled = !commonPlayPreview,
+                enabled = interactive && !commonPlayPreview,
                 onClick = onClick,
                 onLongClick = onLongClick
             )
             .background(tileBackground)
             .border(1.dp, tileBorder, shape)
-            .padding(horizontal = 10.dp, vertical = 8.dp),
+            .padding(RegistrationTilePadding),
         verticalArrangement = Arrangement.Center
     ) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(
                 queueDisplayId(registration.displayId),
-                color = if (commonPlayPreview) SecondaryText else PrimaryText,
-                fontSize = 13.sp,
+                color = if (previewStyle) SecondaryText else PrimaryText,
+                fontSize = 17.sp,
                 fontWeight = FontWeight.Medium,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -12059,27 +14239,25 @@ private fun RegistrationTile(
                 Text(
                     "›",
                     color = if (isPlaying) SystemBlue.copy(alpha = .48f) else TertiaryText,
-                    fontSize = 17.sp
+                    fontSize = 15.sp
                 )
             }
         }
-        Spacer(Modifier.height(5.dp))
+        Spacer(Modifier.height(QueueSpacing.S))
         Text(
-            visibleStatus ?: when {
-                registration.fixedPartnerKey != null -> "固定组合"
-                registration.preference == PlayPreference.SOLO -> "单人游玩"
-                else -> "允许他人加入"
-            },
+            visibleStatus ?: registrationTilePreference(registration),
             color = when {
-                commonPlayPreview -> TertiaryText
+                previewStyle -> TertiaryText
                 pendingCheckIn -> OnlineRegistrationStatusColor
                 absenceStatus != null -> AbsenceStatusColor
+                showsArrangementNotice -> PairedArrangementNoticeColor
                 showNoShowStatus -> NoShowStatusColor
                 else -> SecondaryText
             },
-            fontSize = 10.sp,
+            fontSize = 12.sp,
             fontWeight = if (visibleStatus != null) FontWeight.Medium else FontWeight.Normal,
-            maxLines = 1
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
     }
 }
@@ -12096,22 +14274,31 @@ private fun QueueJoinPosition(
     val enabled = acceptingNewRegistrations && hasCapacity
     val disabledReason = when {
         closingGracePeriod -> "闭店收尾期间不再接收新的排队登记。"
-        !registrationOpen -> "当前未启用登记排队，请按照现场顺序排队。"
-        !hasCapacity -> "机台 ${machineId.name} 已达到 20 人上限。"
+        !registrationOpen -> "当前未使用登记排队，请按照现场顺序排队。"
+        !hasCapacity -> "机台 ${machineId.name} 已有 20 份登记，暂不能创建新的登记。"
         else -> "当前暂不接收新的排队登记。"
     }
     val context = LocalContext.current
+    val outline = if (enabled) JoinCardOutlineColor else Separator
     Column(
-        Modifier.width(148.dp).height(QueueViewportHeight).clip(RoundedCornerShape(CardRadius))
-            .background(if (enabled) SoftBlue.copy(alpha = .62f) else Color(0xFFF3F3F5))
-            .border(
-                1.dp,
-                if (enabled) SystemBlue.copy(alpha = .22f) else Separator.copy(alpha = .65f),
-                RoundedCornerShape(CardRadius)
-            )
+        Modifier.width(QueueJoinPositionWidth).height(LocalQueueViewportHeight.current).clip(RoundedCornerShape(PositionCardRadius))
+            .background(if (enabled) JoinCardBackground else DisabledBackground)
+            .drawBehind {
+                val inset = 0.75.dp.toPx()
+                drawRoundRect(
+                    color = outline,
+                    topLeft = Offset(inset, inset),
+                    size = Size(size.width - inset * 2, size.height - inset * 2),
+                    cornerRadius = CornerRadius(PositionCardRadius.toPx() - inset),
+                    style = Stroke(
+                        width = 1.5.dp.toPx(),
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 4.dp.toPx()))
+                    )
+                )
+            }
             .clickable {
                 if (enabled) onClick()
-                else showDisabledActionReason(context, "加入机台 ${machineId.name}", disabledReason)
+                else showDisabledActionReason(context, "加入 机台 ${machineId.name}", disabledReason)
             }
             .padding(horizontal = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -12126,468 +14313,634 @@ private fun QueueJoinPosition(
         Spacer(Modifier.height(5.dp))
         Text(
             when {
-                enabled -> "加入机台 ${machineId.name}"
+                enabled -> "加入 机台 ${machineId.name}"
                 closingGracePeriod -> "闭店收尾中"
-                !registrationOpen -> "未启用登记"
+                !registrationOpen -> "未使用登记排队"
                 else -> "机台 ${machineId.name} 已满"
             },
             color = if (enabled) SystemBlue else TertiaryText,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Medium
+            fontSize = QueueTextSize.Body,
+            fontWeight = FontWeight.SemiBold
         )
-    }
-}
-
-private sealed interface HomeSidePanelContent {
-    data object Join : HomeSidePanelContent
-    data class Registration(val value: HomeSidePanelRegistration) : HomeSidePanelContent
-    data class Operation(val value: HomeSidePanelFeedback) : HomeSidePanelContent
-    data class Undo(val value: QueueUndoAction) : HomeSidePanelContent
-}
-
-@Composable
-private fun HomeSidePanel(
-    machines: List<MachineDisplayState>,
-    nowMillis: Long,
-    registrationOpen: Boolean,
-    acceptingNewRegistrations: Boolean,
-    closingGracePeriod: Boolean,
-    completedRegistration: HomeSidePanelRegistration?,
-    operationFeedback: HomeSidePanelFeedback?,
-    queueUndoAction: QueueUndoAction?,
-    onCompletedRegistrationClick: (MachineId, Int) -> Unit,
-    onDismissCompletedRegistration: () -> Unit,
-    onDismissOperationFeedback: () -> Unit,
-    onUndoQueueAction: () -> Unit,
-    onDismissQueueUndo: () -> Unit,
-    onJoin: () -> Unit,
-    onBatch: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val joinableMachines = machines.filter {
-        it.status.isOperational && it.queue.registrationCount < 20
-    }
-    val joiningEnabled = acceptingNewRegistrations && joinableMachines.isNotEmpty()
-    val joiningDisabledReason = when {
-        closingGracePeriod -> "闭店收尾期间不再接收新的排队登记。"
-        !registrationOpen -> "当前未启用登记排队，请按照现场顺序排队。"
-        machines.all { !it.status.isOperational } -> "所有机台均已停止使用。"
-        joinableMachines.isEmpty() -> "所有机台的登记均已达到上限。"
-        else -> "当前暂不接收新的排队登记。"
-    }
-    val panelContent = when {
-        queueUndoAction != null -> HomeSidePanelContent.Undo(queueUndoAction)
-        completedRegistration != null -> HomeSidePanelContent.Registration(completedRegistration)
-        operationFeedback != null -> HomeSidePanelContent.Operation(operationFeedback)
-        else -> HomeSidePanelContent.Join
-    }
-    val panelShape = RoundedCornerShape(CardRadius)
-    Surface(
-        modifier = modifier,
-        shape = panelShape,
-        color = CardBackground,
-        border = BorderStroke(1.dp, Separator.copy(alpha = .92f))
-    ) {
-        AnimatedContent(
-            targetState = panelContent,
-            modifier = Modifier.fillMaxSize().clip(panelShape),
-            transitionSpec = {
-                if (targetState !is HomeSidePanelContent.Join) {
-                    (fadeIn(tween(220)) + slideInHorizontally(tween(280)) { width -> width / 5 })
-                        .togetherWith(
-                            fadeOut(tween(150)) + slideOutHorizontally(tween(220)) { width -> -width / 5 }
-                        )
-                } else {
-                    (fadeIn(tween(220)) + slideInHorizontally(tween(280)) { width -> -width / 5 })
-                        .togetherWith(
-                            fadeOut(tween(150)) + slideOutHorizontally(tween(220)) { width -> width / 5 }
-                        )
-                }
-            },
-            contentAlignment = Alignment.Center,
-            contentKey = { content ->
-                when (content) {
-                    HomeSidePanelContent.Join -> "join"
-                    is HomeSidePanelContent.Registration -> "registration-${content.value.requestId}"
-                    is HomeSidePanelContent.Operation -> "operation-${content.value.id}"
-                    is HomeSidePanelContent.Undo -> "undo-${content.value.id}"
-                }
-            },
-            label = "首页右侧动态区域"
-        ) { content ->
-            when (content) {
-                is HomeSidePanelContent.Registration -> RegistrationCompletedPanel(
-                    completion = content.value,
-                    joiningEnabled = joiningEnabled,
-                    onViewRegistration = {
-                        onCompletedRegistrationClick(
-                            content.value.machineId,
-                            content.value.registrationKey
-                        )
-                    },
-                    onContinueJoining = onJoin,
-                    onDismiss = onDismissCompletedRegistration,
-                    modifier = Modifier.fillMaxSize()
-                )
-
-                is HomeSidePanelContent.Operation -> HomeOperationFeedbackPanel(
-                    feedback = content.value,
-                    onDismiss = onDismissOperationFeedback,
-                    modifier = Modifier.fillMaxSize()
-                )
-
-                is HomeSidePanelContent.Undo -> HomeUndoFeedbackPanel(
-                    action = content.value,
-                    onUndo = onUndoQueueAction,
-                    onDismiss = onDismissQueueUndo,
-                    modifier = Modifier.fillMaxSize()
-                )
-
-                HomeSidePanelContent.Join -> JoinPanelContent(
-                    machines = machines,
-                    nowMillis = nowMillis,
-                    registrationOpen = registrationOpen,
-                    acceptingNewRegistrations = acceptingNewRegistrations,
-                    closingGracePeriod = closingGracePeriod,
-                    joiningEnabled = joiningEnabled,
-                    joiningDisabledReason = joiningDisabledReason,
-                    onJoin = onJoin,
-                    onBatch = onBatch,
-                    modifier = Modifier.fillMaxSize()
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun RegistrationCompletedPanel(
-    completion: HomeSidePanelRegistration,
-    joiningEnabled: Boolean,
-    onViewRegistration: () -> Unit,
-    onContinueJoining: () -> Unit,
-    onDismiss: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val visibleDisplayId = queueDisplayId(completion.displayId)
-    val statusText = when {
-        completion.requiresOnSiteCheckIn -> "线上登记·等待现场签到"
-        completion.isPlaying -> "已经进入游玩位置"
-        else -> "登记已加入等待顺序"
-    }
-    val summary = when {
-        completion.requiresOnSiteCheckIn ->
-            "“$visibleDisplayId”已加入${completion.machineName}，完成现场签到后会转换为正常登记。"
-        completion.isPlaying ->
-            "“$visibleDisplayId”已经进入${completion.machineName}的游玩位置。"
-        else ->
-            "“$visibleDisplayId”已加入${completion.machineName}的等待顺序。"
-    }
-    Box(modifier) {
-        Column(
-            Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 24.dp),
-            verticalArrangement = Arrangement.Center
-        ) {
-            Box(
-                Modifier.size(42.dp).clip(CircleShape).background(Color(0xFF248A4B)),
-                contentAlignment = Alignment.Center
-            ) {
-                StraightCheckMark(Modifier.size(19.dp))
-            }
-            Spacer(Modifier.height(14.dp))
-            Text(
-                if (completion.requiresOnSiteCheckIn) "线上登记已加入" else "登记完成",
-                color = PrimaryText,
-                fontSize = 22.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-            Spacer(Modifier.height(8.dp))
-            Text(summary, color = SecondaryText, fontSize = 13.sp, lineHeight = 19.sp)
-            Spacer(Modifier.height(20.dp))
-            Text(
-                completion.machineName,
-                color = TertiaryText,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                completion.positionLabel,
-                color = PrimaryText,
-                fontSize = 20.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-            Spacer(Modifier.height(5.dp))
-            Text(
-                statusText,
-                color = Color(0xFF248A4B),
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Medium
-            )
-            Spacer(Modifier.height(22.dp))
-            SecondaryButton(
-                "查看${completion.positionLabel}",
-                onViewRegistration,
-                Modifier.fillMaxWidth()
-            )
-            if (joiningEnabled) {
-                Spacer(Modifier.height(2.dp))
-                CancelAction("继续添加登记", onContinueJoining)
-            }
-            if (completion.requiresOnSiteCheckIn) {
-                Spacer(Modifier.height(10.dp))
-                Text(
-                    "请在 30 分钟内使用现场终端签到；如果更早轮到，也必须在进入游玩位置前完成签到。",
-                    color = TertiaryText,
-                    fontSize = 10.sp,
-                    lineHeight = 15.sp
-                )
-            }
-        }
-        HomeSidePanelCloseButton(onDismiss, Modifier.align(Alignment.TopEnd))
-    }
-}
-
-@Composable
-private fun HomeOperationFeedbackPanel(
-    feedback: HomeSidePanelFeedback,
-    onDismiss: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val accentColor = when (feedback.tone) {
-        HomeSidePanelFeedbackTone.SUCCESS -> Color(0xFF248A4B)
-        HomeSidePanelFeedbackTone.INFO -> SystemBlue
-        HomeSidePanelFeedbackTone.WARNING -> NoShowStatusColor
-    }
-    Box(modifier) {
-        Column(
-            Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 24.dp),
-            verticalArrangement = Arrangement.Center
-        ) {
-            HomeFeedbackStatusIcon(feedback.tone, accentColor)
-            Spacer(Modifier.height(14.dp))
-            Text(
-                feedback.title,
-                color = PrimaryText,
-                fontSize = 22.sp,
-                fontWeight = FontWeight.SemiBold,
-                lineHeight = 28.sp
-            )
-            Spacer(Modifier.height(8.dp))
-            Text(
-                feedback.detail,
-                color = SecondaryText,
-                fontSize = 13.sp,
-                lineHeight = 19.sp
-            )
-            feedback.contextLabel?.let { contextLabel ->
-                Spacer(Modifier.height(18.dp))
-                Text(
-                    contextLabel,
-                    color = accentColor,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                    lineHeight = 16.sp
-                )
-            }
-        }
-        HomeSidePanelCloseButton(onDismiss, Modifier.align(Alignment.TopEnd))
-    }
-}
-
-@Composable
-private fun HomeUndoFeedbackPanel(
-    action: QueueUndoAction,
-    onUndo: () -> Unit,
-    onDismiss: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val tone = action.feedbackTone
-    val accentColor = if (tone == HomeSidePanelFeedbackTone.SUCCESS) {
-        Color(0xFF248A4B)
-    } else {
-        NoShowStatusColor
-    }
-    Box(modifier) {
-        Column(
-            Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 24.dp),
-            verticalArrangement = Arrangement.Center
-        ) {
-            HomeFeedbackStatusIcon(tone, accentColor)
-            Spacer(Modifier.height(14.dp))
-            Text(
-                action.feedbackTitle,
-                color = PrimaryText,
-                fontSize = 22.sp,
-                fontWeight = FontWeight.SemiBold,
-                lineHeight = 28.sp
-            )
-            Spacer(Modifier.height(8.dp))
-            Text(
-                action.feedbackDetail,
-                color = SecondaryText,
-                fontSize = 13.sp,
-                lineHeight = 19.sp
-            )
-            Spacer(Modifier.height(18.dp))
-            Text(
-                action.contextLabel,
-                color = TertiaryText,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Medium
-            )
-            Spacer(Modifier.height(5.dp))
-            Text(
-                "可在 10 秒内撤销；关闭提示后将无法撤销",
-                color = SystemBlue,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Medium
-            )
-            Spacer(Modifier.height(22.dp))
-            SecondaryButton(
-                "撤销本次操作",
-                onUndo,
-                Modifier.fillMaxWidth()
-            )
-        }
-        HomeSidePanelCloseButton(onDismiss, Modifier.align(Alignment.TopEnd))
     }
 }
 
 @Composable
 private fun HomeFeedbackStatusIcon(
     tone: HomeSidePanelFeedbackTone,
-    accentColor: Color
+    accentColor: Color,
+    size: Dp = 42.dp
 ) {
     Box(
-        Modifier.size(42.dp).clip(CircleShape).background(accentColor),
+        Modifier.size(size).clip(CircleShape).background(accentColor),
         contentAlignment = Alignment.Center
     ) {
         when (tone) {
-            HomeSidePanelFeedbackTone.SUCCESS -> StraightCheckMark(Modifier.size(19.dp))
+            HomeSidePanelFeedbackTone.SUCCESS -> StraightCheckMark(Modifier.size(size * .45f))
             HomeSidePanelFeedbackTone.INFO -> Text(
                 "i",
                 color = Color.White,
-                fontSize = 20.sp,
+                fontSize = (size.value * .48f).sp,
                 fontWeight = FontWeight.SemiBold
             )
             HomeSidePanelFeedbackTone.WARNING -> Text(
                 "!",
                 color = Color.White,
-                fontSize = 20.sp,
+                fontSize = (size.value * .48f).sp,
                 fontWeight = FontWeight.Bold
             )
         }
     }
 }
 
-@Composable
-private fun HomeSidePanelCloseButton(
-    onDismiss: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    IconButton(
-        onClick = onDismiss,
-        modifier = modifier.padding(6.dp).size(48.dp)
-    ) {
-        Icon(
-            imageVector = Icons.Default.Close,
-            contentDescription = "关闭提示",
-            tint = TertiaryText,
-            modifier = Modifier.size(20.dp)
-        )
-    }
+// ---- Two-pane step flows (docs/ui-guide.md, 分步填写; mockup tmp/claude-work/ui-review/join-flow-mockup-3.html) ----
+
+private enum class FlowStepState { DONE, CURRENT, PENDING }
+
+/** One step in the summary pane: its name, what was chosen, and the way back to it. */
+private data class FlowStep(
+    val label: String,
+    val value: String? = null,
+    val state: FlowStepState,
+    val placeholder: String = "请选择",
+    val onEdit: (() -> Unit)? = null
+)
+
+/** The reading at the bottom of the summary pane, such as the wait for a new registration. */
+private data class FlowInfo(val caption: String, val value: String, val note: String? = null)
+
+/** The summary pane on the left of a step page. */
+private data class FlowSummary(val title: String, val steps: List<FlowStep>, val info: FlowInfo? = null)
+
+/** Where the join flow is, for its summary pane. Pages at the same index replace each other. */
+private enum class JoinFlowPage(val index: Int) {
+    MACHINE(0), METHOD(1), NICKNAME(2), PROFILE(2), PREFERENCE(3), CONFIRM(3)
 }
 
+private fun pathIcon(name: String, pathData: String): ImageVector =
+    ImageVector.Builder(
+        name = name,
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).addPath(pathData = addPathNodes(pathData), fill = SolidColor(Color.Black)).build()
+
+// Material Icons, rounded set: the same path data draws the mockup, so the two cannot differ.
+private val PersonRoundIcon: ImageVector by lazy {
+    pathIcon(
+        "PersonRound",
+        "M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v1c0 .55.45 1 1 1h14c.55 0 1-.45 1-1v-1c0-2.66-5.33-4-8-4z"
+    )
+}
+private val SmartphoneRoundIcon: ImageVector by lazy {
+    pathIcon(
+        "SmartphoneRound",
+        "M17 1.01L7 1c-1.1 0-2 .9-2 2v18c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V3c0-1.1-.9-1.99-2-1.99zM16 18H8c-.55 0-1-.45-1-1V7c0-.55.45-1 1-1h8c.55 0 1 .45 1 1v10c0 .55-.45 1-1 1z"
+    )
+}
+private val PeopleRoundIcon: ImageVector by lazy {
+    pathIcon(
+        "PeopleRound",
+        "M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5s-3 1.34-3 3 1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V18c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-1.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05.02.01.03.03.04.04 1.14.83 1.93 1.94 1.93 3.41V18c0 .35-.07.69-.18 1H22c.55 0 1-.45 1-1v-1.5c0-2.33-4.67-3.5-7-3.5z"
+    )
+}
+private val MinusIcon: ImageVector by lazy { pathIcon("Minus", "M5 11h14v2H5z") }
+
+/**
+ * A step of a flow on the whole screen: the summary of every step on the left, the step itself
+ * on the right. Nothing is centred in the empty space; both columns start at the top.
+ */
 @Composable
-private fun JoinPanelContent(
-    machines: List<MachineDisplayState>,
-    nowMillis: Long,
-    registrationOpen: Boolean,
-    acceptingNewRegistrations: Boolean,
-    closingGracePeriod: Boolean,
-    joiningEnabled: Boolean,
-    joiningDisabledReason: String,
-    onJoin: () -> Unit,
-    onBatch: () -> Unit,
-    modifier: Modifier = Modifier
+private fun StepFlowPage(
+    summary: FlowSummary,
+    title: String,
+    subtitle: String,
+    /** Null on the first page of a flow that cannot be left, such as first-run setup. */
+    onBack: (() -> Unit)?,
+    /** False when the content holds its own scrolling list. */
+    scrollable: Boolean = true,
+    content: @Composable ColumnScope.() -> Unit
 ) {
-    val joinableMachines = machines.filter {
-        it.status.isOperational && it.queue.registrationCount < 20
-    }
+    if (onBack != null) BackHandler(onBack = onBack)
+    val nowMillis = rememberCurrentTimeMillis()
     Column(
-        modifier.padding(horizontal = 22.dp, vertical = 24.dp),
-        verticalArrangement = Arrangement.Center
+        Modifier.fillMaxSize().imePadding()
+            .padding(start = 32.dp, end = 32.dp, top = 20.dp, bottom = QueueSpacing.XL)
     ) {
-        Text("加入排队", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(8.dp))
-        Text(
-            when {
-                closingGracePeriod -> "今日营业时间已结束，收尾期间不再接收新的排队登记。"
-                !registrationOpen -> "当前未使用登记排队，请在现场自然排队。"
-                machines.all { !it.status.isOperational } -> "所有机台均已停止使用。"
-                joinableMachines.isEmpty() -> "所有机台目前都无法接受新登记。"
-                else -> "创建你的登记并加入排队。"
-            },
-            color = SecondaryText,
-            fontSize = 13.sp,
-            lineHeight = 19.sp
-        )
-        if (acceptingNewRegistrations) {
-            Spacer(Modifier.height(17.dp))
-            Text("新登记预计等待", color = TertiaryText, fontSize = 10.sp, fontWeight = FontWeight.Medium)
-            Spacer(Modifier.height(7.dp))
-            machines.forEachIndexed { index, machine ->
-                if (index > 0) Spacer(Modifier.height(5.dp))
-                JoinEstimateRow(machine, nowMillis)
+        Row(Modifier.fillMaxWidth().height(MinTouchTarget), verticalAlignment = Alignment.CenterVertically) {
+            if (onBack != null) AppBackButton(onBack)
+            Spacer(Modifier.weight(1f))
+            Text(
+                SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(nowMillis)),
+                color = PrimaryText,
+                fontSize = QueueTextSize.Control,
+                fontWeight = FontWeight.Medium
+            )
+        }
+        Spacer(Modifier.height(QueueSpacing.M))
+        Row(Modifier.fillMaxWidth().weight(1f)) {
+            FlowSummaryPane(summary, Modifier.width(340.dp).fillMaxHeight())
+            Spacer(Modifier.width(QueueSpacing.XL))
+            Column(
+                Modifier.weight(1f).fillMaxHeight().let {
+                    if (scrollable) it.verticalScroll(rememberScrollState()) else it
+                }
+            ) {
+                Text(title, color = PrimaryText, fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(6.dp))
+                Text(subtitle, color = SecondaryText, fontSize = QueueTextSize.Body, lineHeight = 20.sp)
+                content()
             }
         }
-        Spacer(Modifier.height(22.dp))
-        PrimaryButton(
-            "开始",
-            onJoin,
-            Modifier.fillMaxWidth(),
-            enabled = joiningEnabled,
-            disabledReason = joiningDisabledReason
-        )
-        Spacer(Modifier.height(10.dp))
-        SecondaryButton(
-            "批量创建登记",
-            onBatch,
-            Modifier.fillMaxWidth(),
-            enabled = joiningEnabled,
-            disabledReason = joiningDisabledReason
-        )
-        Spacer(Modifier.height(20.dp))
-        Text("每位玩家只应保有一份有效登记。批量功能用于现场录入多名实际玩家。", color = TertiaryText, fontSize = 11.sp, lineHeight = 17.sp)
     }
 }
 
 @Composable
-private fun JoinEstimateRow(
-    machine: MachineDisplayState,
-    nowMillis: Long
+private fun FlowSummaryPane(summary: FlowSummary, modifier: Modifier = Modifier) {
+    val currentIndex = summary.steps.indexOfFirst { it.state == FlowStepState.CURRENT }
+    val shape = RoundedCornerShape(CardRadius)
+    Column(
+        modifier.clip(shape).background(CardBackground).border(1.dp, Separator, shape)
+            .padding(horizontal = QueueSpacing.L, vertical = 18.dp)
+    ) {
+        Text(summary.title, color = PrimaryText, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(QueueSpacing.XS))
+        Text(
+            "第 ${currentIndex + 1} 步，共 ${summary.steps.size} 步",
+            color = TertiaryText,
+            fontSize = QueueTextSize.Caption
+        )
+        Spacer(Modifier.height(14.dp))
+        Column(verticalArrangement = Arrangement.spacedBy(QueueSpacing.XS)) {
+            summary.steps.forEachIndexed { index, step -> FlowStepRow(index + 1, step) }
+        }
+        Spacer(Modifier.weight(1f))
+        summary.info?.let { info ->
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(PageBackground)
+                    .padding(horizontal = 14.dp, vertical = QueueSpacing.M)
+            ) {
+                Text(info.caption, color = SecondaryText, fontSize = QueueTextSize.Caption)
+                Spacer(Modifier.height(2.dp))
+                Text(info.value, color = PrimaryText, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                info.note?.let { note ->
+                    Spacer(Modifier.height(QueueSpacing.XS))
+                    Text(note, color = SecondaryText, fontSize = QueueTextSize.Caption, lineHeight = 17.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FlowStepRow(number: Int, step: FlowStep) {
+    val current = step.state == FlowStepState.CURRENT
+    val done = step.state == FlowStepState.DONE
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 56.dp).clip(RoundedCornerShape(12.dp))
+            .background(if (current) SoftBlue else Color.Transparent)
+            .padding(horizontal = 10.dp, vertical = QueueSpacing.S),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            Modifier.size(26.dp).clip(CircleShape)
+                .background(
+                    when {
+                        done -> SystemBlue
+                        current -> CardBackground
+                        else -> NeutralBadgeBackground
+                    }
+                )
+                .let { if (current) it.border(2.dp, SystemBlue, CircleShape) else it },
+            contentAlignment = Alignment.Center
+        ) {
+            if (done) {
+                StraightCheckMark(Modifier.size(13.dp))
+            } else {
+                Text(
+                    "$number",
+                    color = if (current) SystemBlue else TertiaryText,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+        Spacer(Modifier.width(QueueSpacing.M))
+        Column(Modifier.weight(1f)) {
+            Text(
+                step.label,
+                color = if (current) SystemBlue else TertiaryText,
+                fontSize = QueueTextSize.Caption,
+                fontWeight = if (current) FontWeight.SemiBold else FontWeight.Normal
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                step.value ?: if (current) step.placeholder else "—",
+                color = if (step.value != null) PrimaryText else FaintMarkColor,
+                fontSize = QueueTextSize.Control,
+                fontWeight = if (step.value != null) FontWeight.SemiBold else FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        if (done && step.onEdit != null) {
+            Box(
+                Modifier.heightIn(min = 40.dp).clip(RoundedCornerShape(ControlRadius))
+                    .clickable(onClick = step.onEdit)
+                    .padding(horizontal = QueueSpacing.XS),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("修改", color = SystemBlue, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+    }
+}
+
+/** A white group of rows with hairlines between them. */
+@Composable
+private fun FlowListGroup(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+    val shape = RoundedCornerShape(CardRadius)
+    Column(
+        modifier.fillMaxWidth().clip(shape).background(CardBackground).border(1.dp, Separator, shape),
+        content = content
+    )
+}
+
+/**
+ * One choice in a [FlowListGroup]: an optional leading mark, a title with one line of
+ * explanation, and an optional trailing mark. The hairline above starts under the text.
+ */
+@Composable
+private fun FlowListRow(
+    title: String,
+    description: String,
+    onClick: () -> Unit,
+    leading: (@Composable () -> Unit)? = null,
+    /** Start of the hairline above this row; null for the first row of a group. */
+    dividerInset: Dp? = null,
+    selected: Boolean = false,
+    enabled: Boolean = true,
+    disabledReason: String? = null,
+    /** What the explanation of a grey row is about; the title unless that reads badly. */
+    disabledActionTitle: String = title,
+    titleBadge: String? = null,
+    trailing: (@Composable () -> Unit)? = null
 ) {
-    val queue = machine.queue
-    val status = machine.status
-    val estimate = when {
-        !status.isOperational -> "已停止使用"
-        queue.registrationCount >= 20 -> "登记已满"
-        else -> formatJoinWaitEstimate(
-            estimatedWaitForNewOpenRegistration(queue, nowMillis, machine.configuration)
+    val context = LocalContext.current
+    Box(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 80.dp)
+                .background(if (selected) SelectedRowBackground else Color.Transparent)
+                .clickable {
+                    if (enabled) onClick() else showDisabledActionReason(context, disabledActionTitle, disabledReason)
+                }
+                .padding(horizontal = QueueSpacing.L, vertical = QueueSpacing.M),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            leading?.invoke()
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        title,
+                        color = if (enabled) PrimaryText else TertiaryText,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    titleBadge?.let { badge ->
+                        Spacer(Modifier.width(QueueSpacing.S))
+                        FlowBadge(badge)
+                    }
+                }
+                Spacer(Modifier.height(QueueSpacing.XS))
+                Text(
+                    description,
+                    color = if (enabled) SecondaryText else TertiaryText,
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp
+                )
+            }
+            trailing?.invoke()
+        }
+        if (dividerInset != null) {
+            HorizontalDivider(
+                Modifier.align(Alignment.TopStart).padding(start = dividerInset),
+                color = Separator.copy(alpha = .6f)
+            )
+        }
+    }
+}
+
+/** Inset of the hairline above a row that starts with a 42 dp tile. */
+private val FlowTileDividerInset = 72.dp
+private val FlowTextDividerInset = 16.dp
+
+/** A 42 dp tile in front of a row; its mark takes the colour it is given. */
+@Composable
+private fun FlowIconTile(enabled: Boolean = true, content: @Composable (Color) -> Unit) {
+    Box(
+        Modifier.size(42.dp).clip(RoundedCornerShape(12.dp))
+            .background(if (enabled) SoftBlue else NeutralBadgeBackground),
+        contentAlignment = Alignment.Center
+    ) {
+        content(if (enabled) SystemBlue else TertiaryText)
+    }
+}
+
+@Composable
+private fun FlowChevron(tint: Color = FaintMarkColor, size: Dp = 24.dp) {
+    Icon(
+        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+        contentDescription = null,
+        tint = tint,
+        modifier = Modifier.size(size)
+    )
+}
+
+@Composable
+private fun FlowBadge(text: String) {
+    Text(
+        text,
+        color = SystemBlue,
+        fontSize = QueueTextSize.Label,
+        fontWeight = FontWeight.SemiBold,
+        lineHeight = 15.sp,
+        modifier = Modifier.clip(RoundedCornerShape(100.dp)).background(SoftBlue)
+            .padding(horizontal = QueueSpacing.S, vertical = 2.dp)
+    )
+}
+
+@Composable
+private fun FlowGreyBadge(text: String) {
+    Text(
+        text,
+        color = SecondaryText,
+        fontSize = QueueTextSize.Label,
+        fontWeight = FontWeight.Medium,
+        lineHeight = 15.sp,
+        modifier = Modifier.clip(RoundedCornerShape(100.dp)).background(NeutralBadgeBackground)
+            .padding(horizontal = QueueSpacing.S, vertical = 3.dp)
+    )
+}
+
+/** A heading such as 也可以 that separates a second group of choices. */
+@Composable
+private fun FlowSectionLabel(text: String) {
+    Row(Modifier.fillMaxWidth().padding(top = QueueSpacing.L), verticalAlignment = Alignment.CenterVertically) {
+        Text(text, color = SecondaryText, fontSize = QueueTextSize.Caption, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.width(10.dp))
+        HorizontalDivider(Modifier.weight(1f), color = Separator.copy(alpha = .72f))
+    }
+}
+
+/** The step's buttons: right-aligned, below the content. */
+@Composable
+private fun FlowActions(content: @Composable RowScope.() -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(top = 18.dp),
+        horizontalArrangement = Arrangement.End,
+        verticalAlignment = Alignment.CenterVertically,
+        content = content
+    )
+}
+
+/** The main button of a step page: as wide as its words, not the whole column. */
+@Composable
+private fun FlowPrimaryButton(
+    text: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    disabledReason: String? = null
+) {
+    val context = LocalContext.current
+    Box(
+        Modifier.height(48.dp).clip(RoundedCornerShape(12.dp))
+            .background(if (enabled) SystemBlue else DisabledBackground)
+            .clickable { if (enabled) onClick() else showDisabledActionReason(context, text, disabledReason) }
+            .padding(horizontal = 28.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text,
+            color = if (enabled) Color.White else TertiaryText,
+            fontSize = QueueTextSize.Control,
+            fontWeight = FontWeight.SemiBold
         )
     }
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text(machine.name, color = SecondaryText, fontSize = 12.sp)
-        Spacer(Modifier.weight(1f))
+}
+
+/** The second button of a step page, to the left of the main one. */
+@Composable
+private fun FlowSecondaryButton(
+    text: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    disabledReason: String? = null
+) {
+    val context = LocalContext.current
+    Box(
+        Modifier.height(48.dp).clip(RoundedCornerShape(12.dp))
+            .background(if (enabled) SoftBlue else DisabledBackground)
+            .clickable { if (enabled) onClick() else showDisabledActionReason(context, text, disabledReason) }
+            .padding(horizontal = 24.dp),
+        contentAlignment = Alignment.Center
+    ) {
         Text(
-            estimate,
-            color = if (status.isOperational && queue.registrationCount < 20) PrimaryText else TertiaryText,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Medium
+            text,
+            color = if (enabled) SystemBlue else TertiaryText,
+            fontSize = QueueTextSize.Control,
+            fontWeight = FontWeight.SemiBold
         )
+    }
+}
+
+/** The gap between the two buttons of [FlowActions]. */
+private val FlowActionGap = 10.dp
+
+/** A label and its value in a [FlowListGroup], read-only. */
+@Composable
+private fun FlowDetailRow(
+    label: String,
+    value: String,
+    first: Boolean = false,
+    valueColor: Color = PrimaryText
+) {
+    FlowDetailRow(label, first) {
+        Text(value, color = valueColor, fontSize = QueueTextSize.Control, lineHeight = 21.sp)
+    }
+}
+
+@Composable
+private fun FlowDetailRow(label: String, first: Boolean = false, value: @Composable () -> Unit) {
+    Box(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 52.dp)
+                .padding(horizontal = QueueSpacing.L, vertical = QueueSpacing.M),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // One line height for label and value, so Latin and CJK text sit on the same centre line.
+            Text(
+                label,
+                color = SecondaryText,
+                fontSize = 13.sp,
+                lineHeight = 21.sp,
+                modifier = Modifier.width(128.dp)
+            )
+            Box(Modifier.weight(1f)) { value() }
+        }
+        if (!first) {
+            HorizontalDivider(
+                Modifier.align(Alignment.TopStart).padding(start = FlowTextDividerInset),
+                color = Separator.copy(alpha = .6f)
+            )
+        }
+    }
+}
+
+/** A short explanation on a white card, such as what a flow will and will not change. */
+@Composable
+private fun FlowNoteCard(title: String, text: String) {
+    val shape = RoundedCornerShape(CardRadius)
+    Column(
+        Modifier.fillMaxWidth().clip(shape).background(CardBackground).border(1.dp, Separator, shape)
+            .padding(horizontal = QueueSpacing.L, vertical = 14.dp)
+    ) {
+        Text(title, color = PrimaryText, fontSize = QueueTextSize.Control, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(QueueSpacing.XS))
+        Text(text, color = SecondaryText, fontSize = 13.sp, lineHeight = 19.sp)
+    }
+}
+
+/** An explanation under a step's content: grey, or orange when it warns, or red when it blocks. */
+@Composable
+private fun FlowNote(text: String, color: Color = SecondaryText) {
+    Text(
+        text,
+        color = color,
+        fontSize = 13.sp,
+        lineHeight = 19.sp,
+        modifier = Modifier.fillMaxWidth().padding(top = QueueSpacing.M)
+    )
+}
+
+/**
+ * The player profile a step is about: avatar, nickname with the gender mark, one line of
+ * details, and the profile's own buttons on the right.
+ */
+@Composable
+private fun FlowProfileCard(
+    profile: PlayerProfile,
+    details: String,
+    detailsColor: Color = SecondaryText,
+    actions: @Composable RowScope.() -> Unit = {}
+) {
+    val shape = RoundedCornerShape(CardRadius)
+    Row(
+        Modifier.fillMaxWidth().padding(top = 18.dp).clip(shape).background(CardBackground)
+            .border(1.dp, Separator, shape)
+            .padding(horizontal = 18.dp, vertical = QueueSpacing.L),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        PlayerAvatar(profile, 60.dp)
+        Spacer(Modifier.width(QueueSpacing.L))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    profile.nickname,
+                    color = PrimaryText,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+                if (profile.gender != PlayerGender.UNDISCLOSED) {
+                    Spacer(Modifier.width(6.dp))
+                    PlayerGenderMark(profile.gender, hideUndisclosed = true, fontSize = 18.sp)
+                }
+            }
+            Spacer(Modifier.height(QueueSpacing.XS))
+            Text(
+                details,
+                color = detailsColor,
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Spacer(Modifier.width(QueueSpacing.M))
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(QueueSpacing.S),
+            verticalAlignment = Alignment.CenterVertically,
+            content = actions
+        )
+    }
+}
+
+/** 编辑 on a [FlowProfileCard]: a small tinted button, greyed when the profile is locked. */
+@Composable
+private fun FlowProfileEditButton(profile: PlayerProfile, onEditProfile: () -> Unit) {
+    val context = LocalContext.current
+    Box(
+        Modifier.height(40.dp).clip(RoundedCornerShape(10.dp))
+            .background(if (profile.canEditOnTerminal) SoftBlue else DisabledBackground)
+            .clickable {
+                if (profile.canEditOnTerminal) onEditProfile()
+                else showDisabledActionReason(context, "编辑", terminalProfileEditingDisabledReason)
+            }
+            .padding(horizontal = 14.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            "编辑",
+            color = if (profile.canEditOnTerminal) SystemBlue else TertiaryText,
+            fontSize = QueueTextSize.Body,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+}
+
+/** One line of details on a [FlowProfileCard]. */
+private fun flowProfileDetails(profile: PlayerProfile, preferenceCaption: String = "默认游玩偏好"): String =
+    listOfNotNull(
+        profile.normalizedQqNumber()?.let { "QQ：$it" },
+        profile.publicPlayerId?.let { "玩家编号 $it" },
+        "$preferenceCaption：${profilePreferenceLabel(profile.defaultPreference)}"
+    ).joinToString("·")
+
+/**
+ * A single choice laid out across one row of a white group, for short options such as gender.
+ * Each cell has a radio dot; the chosen cell is tinted.
+ */
+@Composable
+private fun <T> FlowRadioCells(
+    options: List<T>,
+    selected: T?,
+    onSelect: (T) -> Unit,
+    label: @Composable (T) -> Unit
+) {
+    val shape = RoundedCornerShape(CardRadius)
+    Row(
+        Modifier.fillMaxWidth().height(64.dp).clip(shape).background(CardBackground)
+            .border(1.dp, Separator, shape)
+    ) {
+        options.forEachIndexed { index, option ->
+            if (index > 0) {
+                Box(Modifier.width(1.dp).fillMaxHeight().background(Separator.copy(alpha = .6f)))
+            }
+            Row(
+                Modifier.weight(1f).fillMaxHeight()
+                    .background(if (option == selected) SelectedRowBackground else Color.Transparent)
+                    .selectable(selected = option == selected, role = Role.RadioButton) { onSelect(option) }
+                    .padding(horizontal = QueueSpacing.L),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                RadioDot(option == selected)
+                Spacer(Modifier.width(QueueSpacing.M))
+                label(option)
+            }
+        }
     }
 }
 
@@ -12595,88 +14948,158 @@ private fun JoinEstimateRow(
 private fun MachineSelectionScreen(
     machines: List<MachineDisplayState>,
     batch: Boolean,
+    summary: FlowSummary,
+    newRegistrationWaits: Map<MachineId, Long?> = emptyMap(),
     onBack: () -> Unit,
     onSelect: (MachineId) -> Unit
 ) {
-    WizardPage(
-        step = if (batch) "1 / 2" else "1 / 3",
-        title = if (batch) "批量创建登记" else "选择机台",
+    val nowMillis = rememberCurrentTimeMillis()
+    StepFlowPage(
+        summary = summary,
+        title = "选择机台",
         subtitle = if (batch) "选择要录入登记的机台。每一份登记仍然对应一名实际玩家。"
         else if (machines.size == 1) "当前使用 1 台机台。"
-        else "${machines.size} 台机台分别维护独立的登记顺序。",
+        else "${machines.size} 台机台分别维护独立的等待顺序。",
         onBack = onBack
     ) {
-        val columnCount = machineSelectionColumnCount(machines.size)
-        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            machines.chunked(columnCount).forEach { rowMachines ->
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp)
-                ) {
-                    rowMachines.forEach { machine ->
-                        MachineChoice(
-                            machine.name,
-                            machine.queue,
-                            machine.status,
-                            { onSelect(machine.machineId) },
-                            Modifier.weight(1f)
-                        )
-                    }
-                    repeat(columnCount - rowMachines.size) {
-                        Spacer(Modifier.weight(1f))
-                    }
+        Spacer(Modifier.height(18.dp))
+        FlowListGroup {
+            machines.forEachIndexed { index, machine ->
+                val queue = machine.queue
+                val status = machine.status
+                val available = status.isOperational && queue.registrationCount < 20
+                val unavailableReason = if (!status.isOperational) {
+                    "机台已停止使用：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}。"
+                } else {
+                    "机台已有 20 份登记，暂不能创建新的登记。"
                 }
+                val waitingPositions = queue.waitingProjection(includeCommonPlayPreview = false).positions.size
+                FlowListRow(
+                    title = machine.name,
+                    description = when {
+                        !available -> unavailableReason
+                        queue.registrationCount == 0 -> "当前没有登记，可以直接开始。"
+                        else -> "$waitingPositions 个等待位置·${queue.registrationCount} 份登记"
+                    },
+                    onClick = { onSelect(machine.machineId) },
+                    leading = {
+                        FlowIconTile(enabled = available) { color ->
+                            Text(machine.machineId.name, color = color, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    },
+                    dividerInset = FlowTileDividerInset.takeIf { index > 0 },
+                    enabled = available,
+                    disabledReason = unavailableReason,
+                    trailing = {
+                        if (!available) {
+                            FlowGreyBadge(if (!status.isOperational) "已停止使用" else "登记已满")
+                        } else {
+                            if (!batch) {
+                                Column(horizontalAlignment = Alignment.End) {
+                                    Text("新登记预计等待", color = TertiaryText, fontSize = QueueTextSize.Caption)
+                                    Text(
+                                        newRegistrationEstimateLabel(machine, newRegistrationWaits),
+                                        color = PrimaryText,
+                                        fontSize = QueueTextSize.Control,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+                            FlowChevron()
+                        }
+                    }
+                )
             }
         }
     }
 }
 
+/** One of the two recommended ways to register, as a large card. */
 @Composable
-private fun MachineChoice(
-    name: String,
-    queue: MachineQueue,
-    status: MachineStatus,
+private fun RegistrationMethodCard(
+    title: String,
+    description: String,
+    actionLabel: String,
+    icon: ImageVector,
+    primary: Boolean,
+    enabled: Boolean,
+    unavailableLabel: String,
+    disabledReason: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val available = status.isOperational && queue.registrationCount < 20
-    val unavailableReason = if (!status.isOperational) {
-        "机台已停止使用：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}。"
-    } else {
-        "机台已有 20 份登记，暂时不能新增。"
-    }
     val context = LocalContext.current
+    val shape = RoundedCornerShape(CardRadius)
     Column(
-        modifier.height(154.dp).clip(RoundedCornerShape(CardRadius)).background(CardBackground)
-            .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(CardRadius))
-            .clickable {
-                if (available) onClick()
-                else showDisabledActionReason(context, name, unavailableReason)
-            }.padding(20.dp)
+        modifier.heightIn(min = 176.dp).clip(shape)
+            .background(
+                when {
+                    !enabled -> PageBackground
+                    primary -> SelectedRowBackground
+                    else -> CardBackground
+                }
+            )
+            .border(
+                if (primary && enabled) 2.dp else 1.dp,
+                when {
+                    !enabled -> Separator.copy(alpha = .72f)
+                    primary -> SystemBlue
+                    else -> Separator
+                },
+                shape
+            )
+            .clickable { if (enabled) onClick() else showDisabledActionReason(context, title, disabledReason) }
+            .padding(18.dp)
     ) {
-        Text(name, color = if (available) PrimaryText else TertiaryText, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(8.dp))
+        Box(
+            Modifier.size(48.dp).clip(RoundedCornerShape(14.dp))
+                .background(
+                    when {
+                        !enabled -> NeutralBadgeBackground
+                        primary -> SystemBlue
+                        else -> SoftBlue
+                    }
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = when {
+                    !enabled -> TertiaryText
+                    primary -> Color.White
+                    else -> SystemBlue
+                },
+                modifier = Modifier.size(28.dp)
+            )
+        }
+        Spacer(Modifier.height(14.dp))
         Text(
-            if (!status.isOperational) {
-                "机台已停止使用：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}。"
-            }
-            else if (queue.registrationCount == 0) "目前没有登记，可以直接开始。"
-            else if (available) "现有 ${queue.registrationCount} 份有效登记。"
-            else "已达到 20 人上限，暂时不能新增登记。",
-            color = SecondaryText,
-            fontSize = 13.sp
+            title,
+            color = if (enabled) PrimaryText else TertiaryText,
+            fontSize = 19.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            description,
+            color = if (enabled) SecondaryText else TertiaryText,
+            fontSize = 13.sp,
+            lineHeight = 19.sp
         )
         Spacer(Modifier.weight(1f))
-        Text(
-            when {
-                available -> "选择这台机台  →"
-                !status.isOperational -> "机台已停止使用"
-                else -> "登记人数已满"
-            },
-            color = if (available) SystemBlue else TertiaryText,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Medium
-        )
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (enabled) {
+                Text(actionLabel, color = SystemBlue, fontSize = QueueTextSize.Body, fontWeight = FontWeight.SemiBold)
+                FlowChevron(tint = SystemBlue, size = 20.dp)
+            } else {
+                Text(unavailableLabel, color = TertiaryText, fontSize = QueueTextSize.Caption)
+            }
+        }
     }
 }
 
@@ -12688,98 +15111,278 @@ private fun CreateRegistrationScreen(
     onIdChange: (String) -> Unit,
     onTemporarySelect: () -> Unit,
     onGenerateId: () -> Unit,
+    onSuggestNicknames: (Int) -> List<String>,
     onPlayerLibrary: () -> Unit,
     mobileRegistrationEnabled: Boolean,
     mobileRegistrationDisabledReason: String,
     mobileRegistrationLoading: Boolean,
     machineLabel: String,
     singlePlayerMachine: Boolean,
+    summary: FlowSummary,
+    pairedQueueOption: PairedMachineQueueJoinOption? = null,
     onMobileRegistration: () -> Unit,
     onBack: () -> Unit,
     onContinue: () -> Unit
 ) {
-    WizardPage(
-        step = if (singlePlayerMachine) "2 / 2" else "2 / 3",
-        title = "创建你的排队登记",
-        subtitle = "选择一种可以确认你身份的方式。登记只用于维护本次排队顺序。",
+    if (temporarySelected) {
+        TemporaryRegistrationNicknamePage(
+            draftId = draftId,
+            idAlreadyRegistered = idAlreadyRegistered,
+            onIdChange = onIdChange,
+            onGenerateId = onGenerateId,
+            onSuggestNicknames = onSuggestNicknames,
+            machineLabel = machineLabel,
+            singlePlayerMachine = singlePlayerMachine,
+            summary = summary,
+            pairedQueueOption = pairedQueueOption,
+            onBack = onBack,
+            onContinue = onContinue
+        )
+        return
+    }
+    StepFlowPage(
+        summary = summary,
+        title = "选择登记方式",
+        subtitle = "选择一种可以确认身份的方式。登记只用于维护本次等待顺序。",
         onBack = onBack
     ) {
         if (singlePlayerMachine) {
-            Text(
-                "$machineLabel 仅能容纳一人游玩，本次登记将直接使用“单人游玩”。玩家资料中的默认游玩偏好不会改变。",
-                color = SecondaryText,
-                fontSize = 12.sp,
-                lineHeight = 18.sp,
-                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
-                    .background(PageBackground)
-                    .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(10.dp))
-                    .padding(horizontal = 13.dp, vertical = 10.dp)
-            )
             Spacer(Modifier.height(14.dp))
-        }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            OptionCard(
-                title = "使用玩家资料库",
-                description = "从本机保存的玩家资料中选择，并沿用常用设置。",
-                selected = false,
-                enabled = true,
-                onClick = onPlayerLibrary,
-                modifier = Modifier.weight(1f)
+            Text(
+                "$machineLabel 仅能容纳一人游玩，本次将使用“单人游玩”。玩家资料中的默认游玩偏好不会改变。",
+                color = SecondaryText,
+                fontSize = QueueTextSize.Caption,
+                lineHeight = 18.sp,
+                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                    .background(CardBackground)
+                    .padding(horizontal = 13.dp, vertical = 11.dp)
             )
-            OptionCard(
-                title = "使用移动设备登记",
-                description = if (mobileRegistrationLoading) {
-                    "正在创建本次登记二维码…"
-                } else {
-                    "扫码后，在移动设备上选择或新建玩家资料。"
-                },
-                selected = false,
+        }
+        Row(
+            Modifier.fillMaxWidth().padding(top = 18.dp).height(IntrinsicSize.Max),
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            RegistrationMethodCard(
+                title = "使用玩家资料库",
+                description = "从本机保存的玩家资料中选择，并沿用其默认游玩偏好。第一次使用时，可以在资料库中创建玩家资料。",
+                actionLabel = "选择资料",
+                icon = PersonRoundIcon,
+                primary = true,
+                enabled = true,
+                unavailableLabel = "",
+                disabledReason = "",
+                onClick = onPlayerLibrary,
+                modifier = Modifier.weight(1f).fillMaxHeight()
+            )
+            RegistrationMethodCard(
+                title = "使用移动设备",
+                description = "扫码后，在移动设备上选择或创建玩家资料，无需在终端上输入。",
+                actionLabel = "显示二维码",
+                icon = SmartphoneRoundIcon,
+                primary = false,
                 enabled = mobileRegistrationEnabled && !mobileRegistrationLoading,
-                badge = if (mobileRegistrationEnabled) null else "需要与服务端同步",
+                unavailableLabel = if (mobileRegistrationLoading) "正在创建二维码" else "需要与服务端同步",
                 disabledReason = if (mobileRegistrationLoading) {
                     "登记二维码正在创建，请稍候。"
                 } else {
                     mobileRegistrationDisabledReason
                 },
                 onClick = onMobileRegistration,
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.weight(1f).fillMaxHeight()
             )
         }
-        Spacer(Modifier.height(16.dp))
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            SmallActionButton(
-                text = "创建临时登记",
+        FlowSectionLabel("也可以")
+        Spacer(Modifier.height(10.dp))
+        FlowListGroup {
+            FlowListRow(
+                title = "创建临时登记",
+                description = "不保存玩家资料，只输入本次排队使用的昵称。",
                 onClick = onTemporarySelect,
-                primary = temporarySelected
-            )
-            Spacer(Modifier.width(12.dp))
-            Text(
-                "不保存玩家资料，只输入本次排队使用的昵称。",
-                color = SecondaryText,
-                fontSize = 11.sp
-            )
-        }
-        if (temporarySelected) {
-            Spacer(Modifier.height(18.dp))
-            Row(verticalAlignment = Alignment.Top) {
-                RegistrationNicknameField(draftId, onIdChange, idAlreadyRegistered, Modifier.weight(1f))
-                Spacer(Modifier.width(12.dp))
-                SecondaryButton("生成随机昵称", onGenerateId, Modifier.padding(top = 8.dp))
-            }
-            Spacer(Modifier.height(12.dp))
-            PrimaryButton(
-                if (singlePlayerMachine) "以单人游玩加入排队" else "继续",
-                onContinue,
-                Modifier.fillMaxWidth(),
-                enabled = draftId.isNotBlank() && !idAlreadyRegistered,
-                disabledReason = if (draftId.isBlank()) {
-                    "请先输入或生成一个玩家昵称。"
-                } else {
-                    "当前队列中已经有相同昵称的登记，请更换昵称。"
-                }
+                trailing = { FlowChevron() }
             )
         }
     }
+}
+
+/** The nickname of a temporary registration, on a page of its own. */
+@Composable
+private fun TemporaryRegistrationNicknamePage(
+    draftId: String,
+    idAlreadyRegistered: Boolean,
+    onIdChange: (String) -> Unit,
+    onGenerateId: () -> Unit,
+    onSuggestNicknames: (Int) -> List<String>,
+    machineLabel: String,
+    singlePlayerMachine: Boolean,
+    summary: FlowSummary,
+    pairedQueueOption: PairedMachineQueueJoinOption?,
+    onBack: () -> Unit,
+    onContinue: () -> Unit
+) {
+    // Checked when the page is left, not while typing (docs/ui-guide.md, 分步填写).
+    var checked by remember { mutableStateOf(false) }
+    val suggestions = remember { onSuggestNicknames(5) }
+    val focusManager = LocalFocusManager.current
+    fun continueIfValid() {
+        checked = true
+        if (draftId.isBlank() || idAlreadyRegistered) return
+        focusManager.clearFocus()
+        onContinue()
+    }
+    val message = when {
+        idAlreadyRegistered -> "这个昵称已有一份有效登记。"
+        checked && draftId.isBlank() -> "请先输入或生成一个玩家昵称。"
+        else -> null
+    }
+    StepFlowPage(
+        summary = summary,
+        title = "填写昵称",
+        subtitle = if (singlePlayerMachine) {
+            "临时登记不保存玩家资料。$machineLabel 仅能容纳一人游玩，本次将使用“单人游玩”。"
+        } else {
+            "临时登记不保存玩家资料，昵称只用于本次排队，应便于现场辨认。"
+        },
+        onBack = onBack
+    ) {
+        Spacer(Modifier.height(18.dp))
+        FlowTextField(
+            value = draftId,
+            onValueChange = onIdChange,
+            placeholder = "例如：Rin",
+            isError = message != null,
+            height = 60.dp,
+            fontSize = 17.sp,
+            onDone = ::continueIfValid,
+            trailing = {
+                Box(
+                    Modifier.height(42.dp).clip(RoundedCornerShape(10.dp)).background(SoftBlue)
+                        .clickable(onClick = onGenerateId)
+                        .padding(horizontal = 14.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("换一个随机昵称", color = SystemBlue, fontSize = QueueTextSize.Body, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        )
+        Text(
+            message ?: "昵称最多 18 个字符，不能与当前队列中的登记重复。",
+            color = if (message != null) Destructive else SecondaryText,
+            fontSize = QueueTextSize.Caption,
+            modifier = Modifier.padding(start = 18.dp, top = 6.dp)
+        )
+        if (suggestions.isNotEmpty()) {
+            Spacer(Modifier.height(18.dp))
+            Text("也可以直接选择一个随机昵称", color = TertiaryText, fontSize = QueueTextSize.Caption)
+            Spacer(Modifier.height(10.dp))
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(QueueSpacing.S),
+                verticalArrangement = Arrangement.spacedBy(QueueSpacing.S)
+            ) {
+                suggestions.forEach { suggestion ->
+                    Box(
+                        Modifier.height(36.dp).clip(RoundedCornerShape(100.dp))
+                            .background(if (suggestion == draftId) SoftBlue else CardBackground)
+                            .border(
+                                1.dp,
+                                if (suggestion == draftId) SystemBlue else Separator,
+                                RoundedCornerShape(100.dp)
+                            )
+                            .clickable { onIdChange(suggestion) }
+                            .padding(horizontal = 14.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            suggestion,
+                            color = if (suggestion == draftId) SystemBlue else PrimaryText,
+                            fontSize = QueueTextSize.Body
+                        )
+                    }
+                }
+            }
+        }
+        // On a machine for one player this is the last step, so the choice is offered here.
+        if (singlePlayerMachine && pairedQueueOption != null) {
+            Spacer(Modifier.height(18.dp))
+            FlowPairedMachineChoice(pairedQueueOption)
+        }
+        FlowActions {
+            FlowPrimaryButton(
+                if (singlePlayerMachine) "以单人游玩加入排队" else "下一步",
+                ::continueIfValid
+            )
+        }
+    }
+}
+
+/**
+ * A one-line text field drawn to the mockup: white, 12 dp corners, a 1 dp grey outline that
+ * turns blue while typing and red on an error, and an optional control inside on the right.
+ */
+@Composable
+private fun FlowTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    placeholder: String,
+    isError: Boolean = false,
+    height: Dp = 44.dp,
+    fontSize: TextUnit = QueueTextSize.Control,
+    keyboardType: KeyboardType = KeyboardType.Text,
+    onDone: (() -> Unit)? = null,
+    leading: (@Composable () -> Unit)? = null,
+    trailing: (@Composable () -> Unit)? = null,
+    enabled: Boolean = true,
+    visualTransformation: VisualTransformation = VisualTransformation.None,
+    modifier: Modifier = Modifier
+) {
+    var focused by remember { mutableStateOf(false) }
+    val shape = RoundedCornerShape(12.dp)
+    BasicTextField(
+        value = value,
+        onValueChange = onValueChange,
+        enabled = enabled,
+        singleLine = true,
+        textStyle = TextStyle(color = if (enabled) PrimaryText else TertiaryText, fontSize = fontSize),
+        cursorBrush = SolidColor(SystemBlue),
+        visualTransformation = visualTransformation,
+        keyboardOptions = KeyboardOptions(
+            keyboardType = keyboardType,
+            imeAction = if (onDone != null) ImeAction.Done else ImeAction.Default
+        ),
+        keyboardActions = KeyboardActions(onDone = { onDone?.invoke() }),
+        modifier = modifier.fillMaxWidth().height(height).onFocusChanged { focused = it.isFocused },
+        decorationBox = { innerTextField ->
+            Row(
+                Modifier.fillMaxSize().clip(shape).background(if (enabled) CardBackground else PageBackground)
+                    .border(
+                        if (focused || isError) 2.dp else 1.dp,
+                        when {
+                            isError -> Destructive
+                            focused -> SystemBlue
+                            !enabled -> Separator
+                            else -> InputBorder
+                        },
+                        shape
+                    )
+                    .padding(start = if (leading != null) 14.dp else 18.dp, end = if (trailing != null) 9.dp else 18.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (leading != null) {
+                    leading()
+                    Spacer(Modifier.width(QueueSpacing.S))
+                }
+                Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                    if (value.isEmpty()) {
+                        Text(placeholder, color = PlaceholderText, fontSize = fontSize, maxLines = 1)
+                    }
+                    innerTextField()
+                }
+                if (trailing != null) {
+                    Spacer(Modifier.width(QueueSpacing.M))
+                    trailing()
+                }
+            }
+        }
+    )
 }
 
 @Composable
@@ -12788,8 +15391,11 @@ private fun RegistrationNicknameField(
     onValueChange: (String) -> Unit,
     alreadyExists: Boolean,
     modifier: Modifier = Modifier,
-    label: String = "你的昵称",
-    placeholder: String = "例如：Rin"
+    label: String = "昵称",
+    placeholder: String = "例如：Rin",
+    /** Shown after an attempt to go on with an empty nickname. */
+    missing: Boolean = false,
+    onDone: (() -> Unit)? = null
 ) {
     OutlinedTextField(
         value = value,
@@ -12797,16 +15403,24 @@ private fun RegistrationNicknameField(
         label = { Text(label) },
         placeholder = { Text(placeholder) },
         singleLine = true,
-        isError = alreadyExists,
+        isError = alreadyExists || missing,
         supportingText = {
-            Text(if (alreadyExists) "这个昵称已有一份有效登记。" else "请使用现场玩家能够认出的昵称。")
+            Text(
+                when {
+                    alreadyExists -> "这个昵称已有一份有效登记。"
+                    missing -> "请先输入或生成一个玩家昵称。"
+                    else -> "请使用现场玩家能够认出的昵称。"
+                }
+            )
         },
+        keyboardOptions = KeyboardOptions(imeAction = if (onDone != null) ImeAction.Done else ImeAction.Default),
+        keyboardActions = KeyboardActions(onDone = { onDone?.invoke() }),
         shape = RoundedCornerShape(ControlRadius),
         colors = OutlinedTextFieldDefaults.colors(
             focusedTextColor = PrimaryText,
             unfocusedTextColor = PrimaryText,
             focusedBorderColor = SystemBlue,
-            unfocusedBorderColor = Color(0xFFA7A7AC),
+            unfocusedBorderColor = InputBorder,
             focusedLabelColor = SystemBlue,
             unfocusedLabelColor = SecondaryText,
             focusedPlaceholderColor = SecondaryText,
@@ -12827,7 +15441,7 @@ private fun PlayerLibraryScreen(
     searchQuery: String,
     sortMode: ProfileSortMode,
     listState: LazyListState,
-    contextLabel: String,
+    summary: FlowSummary,
     title: String,
     subtitle: String,
     onSearchQueryChange: (String) -> Unit,
@@ -12836,96 +15450,86 @@ private fun PlayerLibraryScreen(
     onProfileClick: (PlayerProfile) -> Unit,
     onBack: () -> Unit
 ) {
-    BackHandler(onBack = onBack)
     val displayedProfiles = filterAndSortPlayerProfiles(profiles, searchQuery, sortMode)
-    Column(Modifier.fillMaxSize().imePadding().padding(horizontal = 36.dp, vertical = 24.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            AppBackButton(onBack)
-            Spacer(Modifier.weight(1f))
-            Text(contextLabel, color = TertiaryText, fontSize = 12.sp)
+    val nowMillis = rememberCurrentTimeMillis()
+    StepFlowPage(
+        summary = summary,
+        title = title,
+        subtitle = subtitle,
+        onBack = onBack,
+        scrollable = false
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(top = 18.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            FlowTextField(
+                value = searchQuery,
+                onValueChange = onSearchQueryChange,
+                placeholder = "搜索昵称、QQ 号或玩家编号",
+                leading = {
+                    Icon(Icons.Default.Search, contentDescription = null, tint = TertiaryText, modifier = Modifier.size(20.dp))
+                },
+                modifier = Modifier.weight(1f)
+            )
+            ProfileSortControl(selected = sortMode, onSelect = onSortModeChange)
+            Row(
+                Modifier.height(44.dp).clip(RoundedCornerShape(12.dp)).background(CardBackground)
+                    .border(1.dp, SystemBlue.copy(alpha = .28f), RoundedCornerShape(12.dp))
+                    .clickable(onClick = onNewProfile)
+                    .padding(start = QueueSpacing.M, end = QueueSpacing.L),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.Add, contentDescription = null, tint = SystemBlue, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(QueueSpacing.XS))
+                Text("创建玩家资料", color = SystemBlue, fontSize = QueueTextSize.Body, fontWeight = FontWeight.SemiBold)
+            }
         }
         Spacer(Modifier.height(14.dp))
-        Column(
-            Modifier.fillMaxSize()
-                .widthIn(max = terminalContentMaxWidth(980.dp))
-                .align(Alignment.CenterHorizontally)
-        ) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(title, color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
-                    Spacer(Modifier.height(4.dp))
-                    Text(subtitle, color = SecondaryText, fontSize = 13.sp)
+        if (displayedProfiles.isEmpty()) {
+            Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        if (profiles.isEmpty()) "还没有玩家资料" else "没有符合搜索条件的玩家",
+                        color = PrimaryText,
+                        fontSize = QueueTextSize.CardTitle,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        if (profiles.isEmpty()) {
+                            "创建后，可以更快地加入排队。"
+                        } else {
+                            "请尝试其他昵称、QQ 号或玩家编号。"
+                        },
+                        color = SecondaryText,
+                        fontSize = QueueTextSize.Caption
+                    )
                 }
-                Spacer(Modifier.width(20.dp))
-                PrimaryButton("新建玩家资料", onNewProfile, Modifier.width(174.dp))
             }
-            Spacer(Modifier.height(18.dp))
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = onSearchQueryChange,
-                    label = { Text("搜索玩家") },
-                    placeholder = { Text("输入昵称、QQ 号或玩家编号") },
-                    singleLine = true,
-                    shape = RoundedCornerShape(ControlRadius),
-                    colors = playerProfileTextFieldColors(),
-                    modifier = Modifier.weight(1f)
-                )
-                Spacer(Modifier.width(14.dp))
-                ProfileSortControl(
-                    selected = sortMode,
-                    onSelect = onSortModeChange,
-                    modifier = Modifier.width(250.dp)
-                )
-            }
-            Spacer(Modifier.height(14.dp))
-            if (displayedProfiles.isEmpty()) {
-                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            if (profiles.isEmpty()) "还没有玩家资料" else "没有符合搜索条件的玩家",
-                            color = PrimaryText,
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Medium
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            if (profiles.isEmpty()) {
-                                "新建后，之后可以更快地加入排队。"
-                            } else {
-                                "请尝试其他昵称、QQ 号或玩家编号。"
-                            },
-                            color = SecondaryText,
-                            fontSize = 12.sp
-                        )
-                    }
-                }
-            } else {
-                BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
-                    val columnCount = when {
-                        maxWidth < 560.dp -> 1
-                        maxWidth < 840.dp -> 2
-                        else -> 4
-                    }
-                    val profileRows = displayedProfiles.chunked(columnCount)
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier.fillMaxSize(),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        itemsIndexed(profileRows, key = { _, row -> row.joinToString("|") { it.id } }) { _, row ->
-                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                row.forEach { profile ->
-                                    PlayerProfileCard(
-                                        profile = profile,
-                                        onClick = { onProfileClick(profile) },
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                }
-                                repeat(columnCount - row.size) {
-                                    Spacer(Modifier.weight(1f))
-                                }
-                            }
+        } else {
+            val profileRows = displayedProfiles.chunked(3)
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                itemsIndexed(profileRows, key = { _, row -> row.joinToString("|") { it.id } }) { _, row ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        row.forEach { profile ->
+                            PlayerProfileCard(
+                                profile = profile,
+                                needsCompletion = profile.needsCompletionBeforeUse(),
+                                recentlyUsed = profile.lastUsedAtMillis?.let {
+                                    nowMillis - it in 0..RECENTLY_USED_PROFILE_MILLIS
+                                } == true,
+                                onClick = { onProfileClick(profile) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        repeat(3 - row.size) {
+                            Spacer(Modifier.weight(1f))
                         }
                     }
                 }
@@ -12934,14 +15538,16 @@ private fun PlayerLibraryScreen(
     }
 }
 
+/** A profile used within this time is marked 最近使用 in the library. */
+private const val RECENTLY_USED_PROFILE_MILLIS = 7L * 24L * 60L * 60L * 1_000L
+
 @Composable
 private fun ProfileSortControl(
     selected: ProfileSortMode,
-    onSelect: (ProfileSortMode) -> Unit,
-    modifier: Modifier = Modifier
+    onSelect: (ProfileSortMode) -> Unit
 ) {
     Row(
-        modifier.height(48.dp).clip(RoundedCornerShape(ControlRadius))
+        Modifier.height(44.dp).clip(RoundedCornerShape(12.dp))
             .background(DisabledBackground).padding(3.dp)
     ) {
         listOf(
@@ -12949,15 +15555,16 @@ private fun ProfileSortControl(
             ProfileSortMode.ALPHABETICAL to "首字母排序"
         ).forEach { (mode, label) ->
             Box(
-                Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(8.dp))
+                Modifier.fillMaxHeight().clip(RoundedCornerShape(10.dp))
                     .background(if (selected == mode) CardBackground else Color.Transparent)
-                    .clickable(enabled = selected != mode) { onSelect(mode) },
+                    .clickable(enabled = selected != mode) { onSelect(mode) }
+                    .padding(horizontal = 14.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     label,
                     color = if (selected == mode) PrimaryText else SecondaryText,
-                    fontSize = 12.sp,
+                    fontSize = 15.sp,
                     fontWeight = if (selected == mode) FontWeight.SemiBold else FontWeight.Normal
                 )
             }
@@ -12968,72 +15575,75 @@ private fun ProfileSortControl(
 @Composable
 private fun PlayerProfileCard(
     profile: PlayerProfile,
+    needsCompletion: Boolean,
+    recentlyUsed: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val shape = RoundedCornerShape(14.dp)
     Row(
-        modifier.height(104.dp).clip(RoundedCornerShape(ControlRadius)).background(CardBackground)
-            .border(1.dp, Separator.copy(alpha = .78f), RoundedCornerShape(ControlRadius))
+        modifier.height(72.dp).clip(shape).background(CardBackground)
+            .border(1.dp, Separator, shape)
             .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 12.dp),
+            .padding(horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Box(Modifier.size(52.dp), contentAlignment = Alignment.Center) {
-            PlayerAvatar(profile, 50.dp)
-        }
-        Spacer(Modifier.width(12.dp))
-        Column(
-            Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Row(
-                Modifier.fillMaxWidth().height(22.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+        PlayerAvatar(profile, 44.dp)
+        Spacer(Modifier.width(QueueSpacing.M))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     profile.nickname,
                     color = PrimaryText,
-                    fontSize = 14.sp,
+                    fontSize = 16.sp,
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f, fill = false)
                 )
-                Spacer(Modifier.width(6.dp))
-                PlayerGenderMark(profile.gender, hideUndisclosed = false)
+                if (profile.gender != PlayerGender.UNDISCLOSED) {
+                    Spacer(Modifier.width(6.dp))
+                    PlayerGenderMark(profile.gender, hideUndisclosed = true, fontSize = 14.sp)
+                }
+                if (recentlyUsed) {
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        "最近使用",
+                        color = SuccessText,
+                        fontSize = QueueTextSize.Label,
+                        fontWeight = FontWeight.SemiBold,
+                        lineHeight = 15.sp,
+                        maxLines = 1,
+                        modifier = Modifier.clip(RoundedCornerShape(100.dp)).background(SuccessBackground)
+                            .padding(horizontal = 7.dp, vertical = 1.dp)
+                    )
+                }
             }
+            Spacer(Modifier.height(3.dp))
             Text(
-                if (profile.hasValidContact && profile.hasCompleteRequiredDetails) {
-                    profilePreferenceLabel(profile.defaultPreference)
-                } else {
+                if (needsCompletion) {
                     "需要补全玩家资料"
+                } else {
+                    "${profilePreferenceLabel(profile.defaultPreference)}·编号 ${profile.publicPlayerId ?: "—"}"
                 },
-                color = if (
-                    profile.hasValidContact && profile.hasCompleteRequiredDetails
-                ) SecondaryText else Color(0xFF9A5B00),
-                fontSize = 11.sp,
-                lineHeight = 16.sp,
+                color = if (needsCompletion) WarningText else SecondaryText,
+                fontSize = QueueTextSize.Caption,
                 maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.fillMaxWidth()
+                overflow = TextOverflow.Ellipsis
             )
-            Text(
-                profile.publicPlayerId?.let { publicPlayerId -> "玩家编号 $publicPlayerId" }
-                ?: "玩家编号 —",
-                color = TertiaryText,
-                fontSize = 10.sp,
-                lineHeight = 14.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-        Box(Modifier.size(width = 20.dp, height = 42.dp), contentAlignment = Alignment.Center) {
-            Text("›", color = TertiaryText, fontSize = 18.sp)
         }
     }
 }
 
+/** The pages of creating or editing a player profile, one question per page. */
+private enum class ProfileSetupStep { IDENTITY, CONTACT, PREFERENCE, NOTIFICATIONS, SUMMARY }
+
+/**
+ * Creates or edits a player profile step by step (docs/ui-guide.md, 分步填写). Creating walks
+ * through every page and ends on a summary; editing opens the summary. The summary pane on the
+ * left shows every answer with 修改; once the summary has been reached, a page opened with 修改
+ * returns to it. The draft lives with the caller, so leaving a page keeps what was typed.
+ */
 @Composable
 private fun PlayerProfileEditorScreen(
     nickname: String,
@@ -13058,417 +15668,439 @@ private fun PlayerProfileEditorScreen(
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
-    val requestBack = {
-        if (saving) {
-            showDisabledActionReason(context, "返回", "玩家资料正在保存，请稍候。")
-        } else {
-            onBack()
-        }
+    val focusManager = LocalFocusManager.current
+    // Without a server there is no website and no QQ Bot, so no display scope and no notifications.
+    val connectedBuild = BuildConfig.CLOUD_SYNC_AVAILABLE
+    val steps = remember(connectedBuild) {
+        ProfileSetupStep.entries.filter { connectedBuild || it != ProfileSetupStep.NOTIFICATIONS }
     }
-    var nicknameFieldValue by remember {
-        mutableStateOf(
-            TextFieldValue(
-                text = nickname,
-                selection = if (editingExisting) {
-                    TextRange(0, nickname.length)
-                } else {
-                    TextRange(nickname.length)
-                }
-            )
-        )
+    var step by remember {
+        mutableStateOf(if (editingExisting) ProfileSetupStep.SUMMARY else ProfileSetupStep.IDENTITY)
     }
-    LaunchedEffect(nickname) {
-        if (nicknameFieldValue.text != nickname) {
-            nicknameFieldValue = TextFieldValue(
-                text = nickname,
-                selection = TextRange(nickname.length)
-            )
-        }
-    }
+    // True while a page was opened from the summary: its button and 返回 lead back there.
+    var reviewing by remember { mutableStateOf(editingExisting) }
+    // The furthest page reached; the summary pane shows the answers of the pages up to it.
+    var furthest by remember { mutableIntStateOf(if (editingExisting) steps.lastIndex else 0) }
+    var identityChecked by remember { mutableStateOf(false) }
+    var contactChecked by remember { mutableStateOf(false) }
     val normalizedQqNumber = normalizeOptionalContact(qqNumber)
     val qqSyntaxValid = normalizedQqNumber != null && isValidQqNumber(normalizedQqNumber)
     val contactValid = qqSyntaxValid && !qqAlreadyExists
-    val contactMessage = when {
-        !qqEditable -> "这份资料已绑定网页账户，QQ 只能在网页玩家资料中修改。"
+    val webBoundContactNote = "这份资料已绑定网页账户，QQ 只能在网页玩家资料中修改。"
+    val contactProblem = when {
         normalizedQqNumber == null -> "请输入 QQ 号。"
         !qqSyntaxValid -> "QQ 号应为 5 至 12 位数字。"
         qqAlreadyExists -> "这个 QQ 号已经用于另一份玩家资料。"
-        else -> "QQ 号用于现场联系，并可用于接收排队提醒。"
+        else -> null
     }
-    WizardPage(
-        step = if (editingExisting) "编辑资料" else "新建资料",
-        title = if (editingExisting) "编辑玩家资料" else "新建玩家资料",
-        subtitle = if (editingExisting) {
-            "修改会保存到玩家资料库；已经创建的登记不会因此改变游玩偏好。请填写一个可用的 QQ 号。"
+    val nicknameProblem = when {
+        nickname.isBlank() -> "请填写玩家昵称。"
+        nicknameAlreadyExists -> "当前已有相同昵称的玩家资料或登记，请更换昵称。"
+        else -> null
+    }
+    val stepIndex = steps.indexOf(step)
+
+    fun goTo(target: ProfileSetupStep) {
+        focusManager.clearFocus()
+        step = target
+        furthest = maxOf(furthest, steps.indexOf(target))
+    }
+
+    // The contents of a page are checked when it is left, not while they are typed.
+    fun goForward() {
+        when (step) {
+            ProfileSetupStep.IDENTITY -> {
+                identityChecked = true
+                if (nicknameProblem != null) return
+            }
+            ProfileSetupStep.CONTACT -> {
+                contactChecked = true
+                if (!contactValid) return
+            }
+            else -> Unit
+        }
+        goTo(if (reviewing) ProfileSetupStep.SUMMARY else steps[stepIndex + 1])
+    }
+
+    fun goBack() {
+        when {
+            saving -> showDisabledActionReason(context, "返回", "玩家资料正在保存，请稍候。")
+            step == ProfileSetupStep.SUMMARY && editingExisting -> onBack()
+            step == ProfileSetupStep.SUMMARY -> {
+                reviewing = false
+                goTo(steps[stepIndex - 1])
+            }
+            reviewing -> goTo(ProfileSetupStep.SUMMARY)
+            stepIndex == 0 -> onBack()
+            else -> goTo(steps[stepIndex - 1])
+        }
+    }
+
+    fun edit(target: ProfileSetupStep) {
+        if (saving) {
+            showDisabledActionReason(context, "修改", "玩家资料正在保存，请稍候。")
+            return
+        }
+        reviewing = furthest == steps.lastIndex
+        goTo(target)
+    }
+
+    val summary = FlowSummary(
+        title = if (editingExisting) "编辑玩家资料" else "创建玩家资料",
+        steps = steps.mapIndexed { index, page ->
+            val state = when {
+                page == step -> FlowStepState.CURRENT
+                page == ProfileSetupStep.SUMMARY -> FlowStepState.PENDING
+                index <= furthest -> FlowStepState.DONE
+                else -> FlowStepState.PENDING
+            }
+            val value = when (page) {
+                ProfileSetupStep.IDENTITY -> nickname.trim().takeIf { it.isNotEmpty() }
+                    ?.let { "$it·${playerGenderLabel(gender)}" }
+                ProfileSetupStep.CONTACT -> normalizedQqNumber
+                ProfileSetupStep.PREFERENCE -> profilePreferenceLabel(defaultPreference)
+                ProfileSetupStep.NOTIFICATIONS -> if (notificationPreferences.enabled) "已开启" else "已关闭"
+                ProfileSetupStep.SUMMARY -> null
+            }
+            FlowStep(
+                label = when (page) {
+                    ProfileSetupStep.IDENTITY -> "昵称和性别"
+                    ProfileSetupStep.CONTACT -> "QQ 号"
+                    ProfileSetupStep.PREFERENCE -> "默认游玩偏好"
+                    ProfileSetupStep.NOTIFICATIONS -> "排队通知"
+                    ProfileSetupStep.SUMMARY -> if (editingExisting) "确认保存" else "确认创建"
+                },
+                // A page shows its answer once it has been passed, not while it is first filled in.
+                value = value.takeIf { state == FlowStepState.DONE || index < furthest },
+                state = state,
+                placeholder = when (page) {
+                    ProfileSetupStep.IDENTITY, ProfileSetupStep.CONTACT -> "请填写"
+                    ProfileSetupStep.NOTIFICATIONS -> "请设置"
+                    ProfileSetupStep.SUMMARY -> "请核对"
+                    ProfileSetupStep.PREFERENCE -> "请选择"
+                },
+                onEdit = { edit(page) }.takeIf { page != ProfileSetupStep.SUMMARY }
+            )
+        }
+    )
+    val title = when (step) {
+        ProfileSetupStep.IDENTITY -> "填写昵称和性别"
+        ProfileSetupStep.CONTACT -> "填写 QQ 号"
+        ProfileSetupStep.PREFERENCE -> "选择默认游玩偏好"
+        ProfileSetupStep.NOTIFICATIONS -> "设置排队通知"
+        ProfileSetupStep.SUMMARY -> "确认玩家资料"
+    }
+    val subtitle = when (step) {
+        ProfileSetupStep.IDENTITY ->
+            "昵称应便于现场辨认。性别以符号显示在登记详情中；选择“不愿透露”时不显示符号。"
+        ProfileSetupStep.CONTACT -> if (connectedBuild) {
+            "QQ 号会与玩家资料绑定，用于 QQ Bot 识别玩家和发送排队通知，也会显示在登记菜单中，供现场联系。"
         } else {
-            "这些资料会保存在玩家资料库中，加入排队时再进行确认。请填写一个可用的 QQ 号。"
-        },
-        onBack = requestBack
-    ) {
-        Row(
-            Modifier.fillMaxWidth().height(IntrinsicSize.Max),
-            horizontalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            Column(
-                Modifier.weight(.9f).fillMaxHeight().clip(RoundedCornerShape(CardRadius))
-                    .background(CardBackground)
-                    .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(CardRadius))
-                    .padding(16.dp)
-            ) {
-                Text("玩家身份", color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            "QQ 号会与玩家资料绑定，并显示在登记菜单中，供现场联系。本地版只在本机保存 QQ 号，不会连接 QQ Bot。"
+        }
+        ProfileSetupStep.PREFERENCE -> if (editingExisting) {
+            "使用这份资料创建登记时，默认采用这里的选择。已经创建的登记不会因此改变游玩偏好。"
+        } else {
+            "使用这份资料创建登记时，默认采用这里的选择。"
+        }
+        ProfileSetupStep.NOTIFICATIONS -> if (botQqNumber != null) {
+            "排队通知由 QQ Bot 以私信发送。需要添加 QQ Bot（$botQqNumber）为好友，才能接收主动私信通知。"
+        } else {
+            "排队通知由 QQ Bot 以私信发送。需要添加现场 QQ Bot 为好友，才能接收主动私信通知；QQ Bot 的 QQ 号会在与服务端同步后显示。"
+        }
+        ProfileSetupStep.SUMMARY -> if (editingExisting) {
+            "点击左侧各项的“修改”进行更改。已经创建的登记不会因此改变游玩偏好。"
+        } else {
+            "请核对以下内容。创建后仍可在玩家资料库中编辑。"
+        }
+    }
+    StepFlowPage(summary = summary, title = title, subtitle = subtitle, onBack = ::goBack) {
+        when (step) {
+            ProfileSetupStep.IDENTITY -> {
+                val nicknameMessage = when {
+                    nicknameAlreadyExists -> "这个昵称已经存在于玩家资料库或当前队列中。"
+                    identityChecked && nickname.isBlank() -> "请填写玩家昵称。"
+                    else -> null
+                }
+                Spacer(Modifier.height(2.dp))
+                FlowSectionLabel("玩家昵称")
                 Spacer(Modifier.height(10.dp))
-                OutlinedTextField(
-                    value = nicknameFieldValue,
-                    onValueChange = { value ->
-                        nicknameFieldValue = value
-                        onNicknameChange(value.text)
-                    },
-                    label = { Text("玩家昵称") },
-                    placeholder = { Text("输入现场容易辨认的昵称") },
-                    singleLine = true,
-                    isError = nicknameAlreadyExists,
-                    supportingText = {
-                        Text(
-                            if (nicknameAlreadyExists) "这个昵称已经存在于玩家资料库或当前排队中。"
-                            else "昵称会显示在排队登记中。"
-                        )
-                    },
-                    shape = RoundedCornerShape(ControlRadius),
-                    colors = playerProfileTextFieldColors(),
-                    modifier = Modifier.fillMaxWidth()
+                FlowTextField(
+                    value = nickname,
+                    onValueChange = onNicknameChange,
+                    placeholder = "输入现场容易辨认的昵称",
+                    isError = nicknameMessage != null,
+                    height = 60.dp,
+                    fontSize = 17.sp,
+                    onDone = ::goForward
                 )
+                FlowFieldHelp(nicknameMessage ?: "昵称会显示在排队登记中，最多 18 个字符。", nicknameMessage != null)
+                FlowSectionLabel("性别")
                 Spacer(Modifier.height(10.dp))
-                Text("性别", color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(4.dp))
-                Text("选择“—”时，登记详情中不会显示性别符号。", color = SecondaryText, fontSize = 11.sp)
-                Spacer(Modifier.height(9.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    PlayerGender.entries.forEach { option ->
-                        GenderChoice(
-                            gender = option,
-                            selected = gender == option,
-                            onClick = { onGenderChange(option) },
-                            modifier = Modifier.weight(1f)
+                FlowRadioCells(PlayerGender.entries, gender, onGenderChange) { option ->
+                    Text(
+                        playerGenderLabel(option),
+                        color = PrimaryText,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        lineHeight = 22.sp
+                    )
+                    if (option != PlayerGender.UNDISCLOSED) {
+                        Spacer(Modifier.width(QueueSpacing.S))
+                        // The symbols sit low in the font; one dp up centres them on the label.
+                        Box(Modifier.offset(y = (-1).dp)) {
+                            PlayerGenderMark(option, hideUndisclosed = true, fontSize = 20.sp)
+                        }
+                    }
+                }
+            }
+
+            ProfileSetupStep.CONTACT -> {
+                val contactMessage = when {
+                    !qqEditable -> webBoundContactNote
+                    qqAlreadyExists -> contactProblem
+                    contactChecked -> contactProblem
+                    else -> null
+                }
+                Spacer(Modifier.height(2.dp))
+                FlowSectionLabel("QQ 号")
+                Spacer(Modifier.height(10.dp))
+                FlowTextField(
+                    value = qqNumber,
+                    onValueChange = onQqNumberChange,
+                    placeholder = "输入 QQ 号",
+                    isError = qqEditable && contactMessage != null,
+                    height = 60.dp,
+                    fontSize = 17.sp,
+                    keyboardType = KeyboardType.Number,
+                    onDone = ::goForward,
+                    enabled = qqEditable
+                )
+                FlowFieldHelp(contactMessage ?: "QQ 号为 5 至 12 位数字。", qqEditable && contactMessage != null)
+                if (connectedBuild) {
+                    FlowSectionLabel("QQ 显示范围")
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "终端登记详情始终可以查看 QQ；网站只会按照这里的选择显示。",
+                        color = SecondaryText,
+                        fontSize = 12.sp,
+                        lineHeight = 18.sp
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    FlowListGroup {
+                        FlowListRow(
+                            title = "仅终端显示",
+                            description = "网站登记详情不会显示 QQ。",
+                            onClick = { onQqVisibilityChange(QqVisibility.TERMINAL_ONLY) },
+                            leading = { RadioDot(qqVisibility == QqVisibility.TERMINAL_ONLY) },
+                            selected = qqVisibility == QqVisibility.TERMINAL_ONLY
+                        )
+                        FlowListRow(
+                            title = "允许网站显示",
+                            description = "网站登记详情可以显示 QQ，便于现场联系。",
+                            onClick = { onQqVisibilityChange(QqVisibility.PUBLIC_WEBSITE) },
+                            leading = { RadioDot(qqVisibility == QqVisibility.PUBLIC_WEBSITE) },
+                            dividerInset = FlowTextDividerInset,
+                            selected = qqVisibility == QqVisibility.PUBLIC_WEBSITE
                         )
                     }
                 }
             }
-            Column(
-                Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(CardRadius))
-                    .background(CardBackground)
-                    .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(CardRadius))
-                    .padding(16.dp)
-            ) {
-                Text("QQ 联系方式", color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    if (BuildConfig.CLOUD_SYNC_AVAILABLE) {
-                        "QQ 号会与玩家资料绑定，用于 QQ Bot 识别玩家和发送相关提醒。是否允许网站显示，可以在下方单独设置。"
-                    } else {
-                        "QQ 号会与玩家资料绑定，并仅保存在本机；本地版不会连接 QQ Bot。"
-                    },
-                    color = SecondaryText,
-                    fontSize = 11.sp,
-                    lineHeight = 16.sp
-                )
-                Spacer(Modifier.height(9.dp))
-                OutlinedTextField(
-                    value = qqNumber,
-                    onValueChange = onQqNumberChange,
-                    label = { Text("QQ 号") },
-                    placeholder = { Text("5 至 12 位数字") },
-                    singleLine = true,
-                    enabled = qqEditable,
-                    isError = qqEditable && qqNumber.isNotBlank() && !contactValid,
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = KeyboardType.Number
-                    ),
-                    shape = RoundedCornerShape(ControlRadius),
-                    colors = playerProfileTextFieldColors(),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    contactMessage,
-                    color = if (contactValid || !qqEditable) SecondaryText else Destructive,
-                    fontSize = 10.sp,
-                    lineHeight = 14.sp
-                )
-            }
-            Column(
-                Modifier.weight(1.1f).fillMaxHeight().clip(RoundedCornerShape(CardRadius))
-                    .background(CardBackground)
-                    .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(CardRadius))
-                    .padding(16.dp)
-            ) {
-                Text("默认游玩偏好", color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(8.dp))
-                Column(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(ControlRadius))
-                        .background(PageBackground)
-                ) {
-                    ProfilePreferenceSelectionRow(
+
+            ProfileSetupStep.PREFERENCE -> {
+                Spacer(Modifier.height(18.dp))
+                FlowListGroup {
+                    FlowListRow(
                         title = "单人游玩",
-                        description = "每次使用这份资料时，默认独自占用一个等待位置。",
-                        selected = defaultPreference == ProfilePlayPreference.SOLO,
-                        onClick = { onDefaultPreferenceChange(ProfilePlayPreference.SOLO) }
+                        description = "创建的登记将独自占用一个等待位置。",
+                        onClick = { onDefaultPreferenceChange(ProfilePlayPreference.SOLO) },
+                        leading = { RadioDot(defaultPreference == ProfilePlayPreference.SOLO) },
+                        selected = defaultPreference == ProfilePlayPreference.SOLO
                     )
-                    HorizontalDivider(color = Separator.copy(alpha = .72f))
-                    ProfilePreferenceSelectionRow(
+                    FlowListRow(
                         title = "允许他人加入",
-                        description = "默认接受系统分配的共同游玩，以缩短排队等待。",
-                        selected = defaultPreference == ProfilePlayPreference.OPEN_TO_JOIN,
-                        onClick = { onDefaultPreferenceChange(ProfilePlayPreference.OPEN_TO_JOIN) }
+                        description = "创建的登记接受系统分配的共同游玩，以缩短等待时间。",
+                        onClick = { onDefaultPreferenceChange(ProfilePlayPreference.OPEN_TO_JOIN) },
+                        leading = { RadioDot(defaultPreference == ProfilePlayPreference.OPEN_TO_JOIN) },
+                        dividerInset = FlowTextDividerInset,
+                        selected = defaultPreference == ProfilePlayPreference.OPEN_TO_JOIN
                     )
-                    HorizontalDivider(color = Separator.copy(alpha = .72f))
-                    ProfilePreferenceSelectionRow(
+                    FlowListRow(
                         title = "每次询问",
-                        description = "每次使用这份资料加入排队时，再选择本次偏好。",
-                        selected = defaultPreference == ProfilePlayPreference.ASK_EVERY_TIME,
-                        onClick = { onDefaultPreferenceChange(ProfilePlayPreference.ASK_EVERY_TIME) }
+                        description = "每次创建登记时，再选择本次游玩偏好。",
+                        onClick = { onDefaultPreferenceChange(ProfilePlayPreference.ASK_EVERY_TIME) },
+                        leading = { RadioDot(defaultPreference == ProfilePlayPreference.ASK_EVERY_TIME) },
+                        dividerInset = FlowTextDividerInset,
+                        selected = defaultPreference == ProfilePlayPreference.ASK_EVERY_TIME
                     )
+                }
+            }
+
+            ProfileSetupStep.NOTIFICATIONS -> {
+                Spacer(Modifier.height(18.dp))
+                ProfileNotificationSettings(notificationPreferences, onNotificationPreferencesChange)
+            }
+
+            ProfileSetupStep.SUMMARY -> {
+                Spacer(Modifier.height(18.dp))
+                FlowListGroup {
+                    FlowDetailRow(
+                        "昵称",
+                        nickname.trim().ifEmpty { "未填写" },
+                        first = true,
+                        valueColor = if (nickname.isBlank()) TertiaryText else PrimaryText
+                    )
+                    FlowDetailRow("性别") {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(playerGenderLabel(gender), color = PrimaryText, fontSize = QueueTextSize.Control, lineHeight = 21.sp)
+                            if (gender != PlayerGender.UNDISCLOSED) {
+                                Spacer(Modifier.width(6.dp))
+                                PlayerGenderMark(gender, hideUndisclosed = true, fontSize = QueueTextSize.Control)
+                            }
+                        }
+                    }
+                    FlowDetailRow(
+                        "QQ 号",
+                        normalizedQqNumber ?: "未填写",
+                        valueColor = if (normalizedQqNumber == null) TertiaryText else PrimaryText
+                    )
+                    if (connectedBuild) FlowDetailRow("QQ 显示范围", qqVisibilityLabel(qqVisibility))
+                    FlowDetailRow("默认游玩偏好", profilePreferenceLabel(defaultPreference))
+                    if (connectedBuild) FlowDetailRow("排队通知", queueNotificationSummary(notificationPreferences))
+                }
+                val problem = nicknameProblem ?: contactProblem?.let { if (qqEditable) it else "$webBoundContactNote$it" }
+                if (!saving && problem != null) FlowNote(problem, Destructive)
+            }
+        }
+        FlowActions {
+            when (step) {
+                ProfileSetupStep.SUMMARY -> FlowPrimaryButton(
+                    when {
+                        saving -> "正在保存…"
+                        editingExisting -> "保存玩家资料"
+                        else -> "完成创建"
+                    },
+                    onSave,
+                    enabled = !saving && nicknameProblem == null && contactValid,
+                    disabledReason = when {
+                        saving -> "玩家资料正在保存，请稍候。"
+                        nicknameProblem != null -> nicknameProblem
+                        !qqEditable -> contactProblem ?: webBoundContactNote
+                        else -> contactProblem
+                    }
+                )
+                else -> {
+                    if (step == ProfileSetupStep.NOTIFICATIONS) {
+                        FlowSecondaryButton(
+                            "恢复推荐设置",
+                            { onNotificationPreferencesChange(QueueNotificationPreferences()) },
+                            enabled = notificationPreferences != QueueNotificationPreferences(),
+                            disabledReason = "当前已是推荐设置。"
+                        )
+                        Spacer(Modifier.width(FlowActionGap))
+                    }
+                    FlowPrimaryButton(if (reviewing) "完成修改" else "下一步", ::goForward)
                 }
             }
         }
-        Spacer(Modifier.height(14.dp))
-        Column(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius))
-                .background(CardBackground)
-                .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(CardRadius))
-        ) {
-            Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
-                Text(
-                    "QQ 显示范围",
-                    color = PrimaryText,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "终端登记详情始终可以查看 QQ；网站只会按照这里的选择显示。",
-                    color = SecondaryText,
-                    fontSize = 11.sp,
-                    lineHeight = 16.sp
-                )
+    }
+}
+
+/** The line under a [FlowTextField]: a hint, or the problem in red. */
+@Composable
+private fun FlowFieldHelp(text: String, isError: Boolean) {
+    Text(
+        text,
+        color = if (isError) Destructive else SecondaryText,
+        fontSize = QueueTextSize.Caption,
+        lineHeight = 16.sp,
+        modifier = Modifier.padding(start = 18.dp, top = 6.dp)
+    )
+}
+
+/** The master switch, then the five kinds of queue notification, one per row. */
+@Composable
+private fun ProfileNotificationSettings(
+    notificationPreferences: QueueNotificationPreferences,
+    onNotificationPreferencesChange: (QueueNotificationPreferences) -> Unit
+) {
+    FlowListGroup {
+        ProfileNotificationToggle(
+            title = "接收排队通知",
+            description = "关闭后，QQ Bot 不会向这名玩家发送下列通知。",
+            checked = notificationPreferences.enabled,
+            onCheckedChange = { enabled ->
+                onNotificationPreferencesChange(notificationPreferences.copy(enabled = enabled))
             }
-            HorizontalDivider(color = Separator.copy(alpha = .72f))
-            Row(Modifier.fillMaxWidth()) {
-                ProfilePrivacyChoice(
-                    title = "仅终端显示",
-                    description = "网站队列详情不会公开 QQ。",
-                    selected = qqVisibility == QqVisibility.TERMINAL_ONLY,
-                    onClick = { onQqVisibilityChange(QqVisibility.TERMINAL_ONLY) },
-                    modifier = Modifier.weight(1f)
-                )
-                Box(Modifier.width(1.dp).height(66.dp).background(Separator.copy(alpha = .72f)))
-                ProfilePrivacyChoice(
-                    title = "允许网站显示",
-                    description = "网站登记详情可以显示 QQ，便于现场联系。",
-                    selected = qqVisibility == QqVisibility.PUBLIC_WEBSITE,
-                    onClick = { onQqVisibilityChange(QqVisibility.PUBLIC_WEBSITE) },
-                    modifier = Modifier.weight(1f)
-                )
-            }
-        }
-        Spacer(Modifier.height(14.dp))
-        Column(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius))
-                .background(CardBackground)
-                .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(CardRadius))
-        ) {
-            ProfileNotificationToggle(
-                title = "排队通知",
-                description = if (botQqNumber != null) {
-                    "需要添加 QQ Bot（$botQqNumber）为好友，才能接收主动私信通知。"
-                } else {
-                    "需要添加现场 QQ Bot 为好友，才能接收主动私信通知。Bot QQ 会在同步后显示。"
-                },
-                checked = notificationPreferences.enabled,
-                onCheckedChange = { enabled ->
-                    onNotificationPreferencesChange(
-                        notificationPreferences.copy(enabled = enabled)
-                    )
-                }
-            )
-            HorizontalDivider(color = Separator.copy(alpha = .72f))
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
-                Column(Modifier.weight(1f)) {
-                    ProfileNotificationToggle(
-                        title = "队列状态变化",
-                        description = "加入、退出、切换机台、顺序和本次偏好变化。",
-                        checked = notificationPreferences.queueChanges,
-                        enabled = notificationPreferences.enabled,
-                        onCheckedChange = { checked ->
-                            onNotificationPreferencesChange(
-                                notificationPreferences.copy(queueChanges = checked)
-                            )
-                        }
-                    )
-                    HorizontalDivider(color = Separator.copy(alpha = .58f))
-                    ProfileNotificationToggle(
-                        title = "线上登记与签到",
-                        description = "线上登记创建、签到及未签到移除结果。",
-                        checked = notificationPreferences.onlineCheckIn,
-                        enabled = notificationPreferences.enabled,
-                        onCheckedChange = { checked ->
-                            onNotificationPreferencesChange(
-                                notificationPreferences.copy(onlineCheckIn = checked)
-                            )
-                        }
-                    )
-                    HorizontalDivider(color = Separator.copy(alpha = .58f))
-                    ProfileNotificationToggle(
-                        title = "暂缓一次、暂时离开和未到场",
-                        description = "相关个人状态及系统处理结果。",
-                        checked = notificationPreferences.absence,
-                        enabled = notificationPreferences.enabled,
-                        onCheckedChange = { checked ->
-                            onNotificationPreferencesChange(
-                                notificationPreferences.copy(absence = checked)
-                            )
-                        }
-                    )
-                }
-                Box(Modifier.width(1.dp).height(216.dp).background(Separator.copy(alpha = .72f)))
-                Column(Modifier.weight(1f)) {
-                    ProfileNotificationToggle(
-                        title = "游玩位置变化",
-                        description = "进入、离开游玩位置及正常轮换。",
-                        checked = notificationPreferences.playingPosition,
-                        enabled = notificationPreferences.enabled,
-                        onCheckedChange = { checked ->
-                            onNotificationPreferencesChange(
-                                notificationPreferences.copy(playingPosition = checked)
-                            )
-                        }
-                    )
-                    HorizontalDivider(color = Separator.copy(alpha = .58f))
-                    ProfileNotificationToggle(
-                        title = "机台及营业状态",
-                        description = "所在机台停止、恢复和登记营业状态变化。",
-                        checked = notificationPreferences.machineStatus,
-                        enabled = notificationPreferences.enabled,
-                        onCheckedChange = { checked ->
-                            onNotificationPreferencesChange(
-                                notificationPreferences.copy(machineStatus = checked)
-                            )
-                        }
-                    )
-                }
-            }
-        }
-        Spacer(Modifier.height(18.dp))
-        PrimaryButton(
-            when {
-                saving -> "正在保存…"
-                editingExisting -> "保存玩家资料"
-                else -> "完成新建"
-            },
-            onSave,
-            Modifier.fillMaxWidth(),
-            enabled = !saving && nickname.isNotBlank() && !nicknameAlreadyExists && contactValid,
-            disabledReason = when {
-                saving -> "玩家资料正在保存，请稍候。"
-                nickname.isBlank() -> "请填写玩家昵称。"
-                nicknameAlreadyExists -> "当前已有相同昵称的玩家资料或登记，请更换昵称。"
-                else -> contactMessage
-            }
+        )
+    }
+    Spacer(Modifier.height(QueueSpacing.M))
+    val enabled = notificationPreferences.enabled
+    FlowListGroup {
+        ProfileNotificationToggle(
+            title = "队列状态变化",
+            description = "加入、退出排队、转至其他机台、等待顺序和本次游玩偏好变化。",
+            checked = notificationPreferences.queueChanges,
+            enabled = enabled,
+            onCheckedChange = { onNotificationPreferencesChange(notificationPreferences.copy(queueChanges = it)) }
+        )
+        ProfileNotificationToggle(
+            title = "线上登记与签到",
+            description = "线上登记创建、签到及未签到自动移除的结果。",
+            checked = notificationPreferences.onlineCheckIn,
+            enabled = enabled,
+            divider = true,
+            onCheckedChange = { onNotificationPreferencesChange(notificationPreferences.copy(onlineCheckIn = it)) }
+        )
+        ProfileNotificationToggle(
+            title = "暂缓一次、暂时离开和未到场",
+            description = "相关个人状态及系统处理结果。",
+            checked = notificationPreferences.absence,
+            enabled = enabled,
+            divider = true,
+            onCheckedChange = { onNotificationPreferencesChange(notificationPreferences.copy(absence = it)) }
+        )
+        ProfileNotificationToggle(
+            title = "游玩位置变化",
+            description = "进入、离开游玩位置及正常轮换。",
+            checked = notificationPreferences.playingPosition,
+            enabled = enabled,
+            divider = true,
+            onCheckedChange = { onNotificationPreferencesChange(notificationPreferences.copy(playingPosition = it)) }
+        )
+        ProfileNotificationToggle(
+            title = "机台及营业状态",
+            description = "所在机台停止使用、恢复正常使用，以及登记排队开启和关闭。",
+            checked = notificationPreferences.machineStatus,
+            enabled = enabled,
+            divider = true,
+            onCheckedChange = { onNotificationPreferencesChange(notificationPreferences.copy(machineStatus = it)) }
         )
     }
 }
 
-@Composable
-private fun GenderChoice(
-    gender: PlayerGender,
-    selected: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val backgroundColor by animateColorAsState(
-        if (selected) SoftBlue else PageBackground,
-        tween(180),
-        label = "性别选项背景"
-    )
-    val borderColor by animateColorAsState(
-        if (selected) SystemBlue else Separator.copy(alpha = .78f),
-        tween(180),
-        label = "性别选项边框"
-    )
-    val borderWidth by animateDpAsState(
-        if (selected) 2.dp else 1.dp,
-        tween(180),
-        label = "性别选项边框宽度"
-    )
-    Box(
-        modifier.height(60.dp).clip(RoundedCornerShape(ControlRadius))
-            .background(backgroundColor)
-            .border(
-                borderWidth,
-                borderColor,
-                RoundedCornerShape(ControlRadius)
-            )
-            .clickable(enabled = !selected, onClick = onClick),
-        contentAlignment = Alignment.Center
-    ) {
-        PlayerGenderMark(gender, hideUndisclosed = false, fontSize = 25.sp)
-    }
+private fun playerGenderLabel(gender: PlayerGender): String = when (gender) {
+    PlayerGender.MALE -> "男"
+    PlayerGender.FEMALE -> "女"
+    PlayerGender.UNDISCLOSED -> "不愿透露"
 }
 
-@Composable
-private fun ProfilePreferenceSelectionRow(
-    title: String,
-    description: String,
-    selected: Boolean,
-    onClick: () -> Unit
-) {
-    val backgroundColor by animateColorAsState(
-        if (selected) SoftBlue.copy(alpha = .62f) else Color.Transparent,
-        tween(180),
-        label = "默认偏好选项背景"
-    )
-    Row(
-        Modifier.fillMaxWidth().heightIn(min = 62.dp).clickable(enabled = !selected, onClick = onClick)
-            .background(backgroundColor)
-            .padding(horizontal = 14.dp, vertical = 9.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(title, color = PrimaryText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-            Spacer(Modifier.height(2.dp))
-            Text(description, color = SecondaryText, fontSize = 10.sp, lineHeight = 15.sp)
-        }
-        Spacer(Modifier.width(12.dp))
-        Box(Modifier.size(22.dp), contentAlignment = Alignment.Center) {
-            if (selected) StraightCheckMark(Modifier.size(14.dp), color = SystemBlue)
-        }
-    }
+private fun qqVisibilityLabel(visibility: QqVisibility): String = when (visibility) {
+    QqVisibility.TERMINAL_ONLY -> "仅终端显示"
+    QqVisibility.PUBLIC_WEBSITE -> "允许网站显示"
 }
 
-@Composable
-private fun ProfilePrivacyChoice(
-    title: String,
-    description: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Row(
-        modifier.heightIn(min = 66.dp)
-            .background(if (selected) SoftBlue.copy(alpha = .62f) else Color.Transparent)
-            .clickable(enabled = !selected, onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(title, color = PrimaryText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-            Spacer(Modifier.height(2.dp))
-            Text(description, color = SecondaryText, fontSize = 10.sp, lineHeight = 15.sp)
-        }
-        Spacer(Modifier.width(12.dp))
-        Box(Modifier.size(22.dp), contentAlignment = Alignment.Center) {
-            if (selected) StraightCheckMark(Modifier.size(14.dp), color = SystemBlue)
-        }
-    }
+/** The notification line on the profile summary, in the order of the switches. */
+internal fun queueNotificationSummary(preferences: QueueNotificationPreferences): String {
+    if (!preferences.enabled) return "已关闭"
+    val kinds = listOfNotNull(
+        "队列状态变化".takeIf { preferences.queueChanges },
+        "线上登记与签到".takeIf { preferences.onlineCheckIn },
+        "暂缓一次、暂时离开和未到场".takeIf { preferences.absence },
+        "游玩位置变化".takeIf { preferences.playingPosition },
+        "机台及营业状态".takeIf { preferences.machineStatus }
+    )
+    return if (kinds.isEmpty()) "已开启，未选择任何通知内容" else "已开启：${kinds.joinToString("；")}"
 }
 
 @Composable
@@ -13477,59 +16109,71 @@ private fun ProfileNotificationToggle(
     description: String,
     checked: Boolean,
     enabled: Boolean = true,
+    /** A hairline above, starting under the text, for every row but the first of a column. */
+    divider: Boolean = false,
     onCheckedChange: (Boolean) -> Unit
 ) {
     val context = LocalContext.current
-    Row(
-        Modifier.fillMaxWidth().heightIn(min = 72.dp)
-            .toggleable(
-                value = checked,
-                role = Role.Switch,
-                onValueChange = {
-                    if (enabled) onCheckedChange(it)
-                    else showDisabledActionReason(
-                        context,
-                        title,
-                        "请先开启排队通知总开关。"
-                    )
-                }
-            )
-            .padding(horizontal = 16.dp, vertical = 11.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(
-                title,
-                color = if (enabled) PrimaryText else TertiaryText,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium
-            )
-            Spacer(Modifier.height(2.dp))
-            Text(
-                description,
-                color = if (enabled) SecondaryText else TertiaryText,
-                fontSize = 10.sp,
-                lineHeight = 15.sp
+    Box(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 68.dp)
+                .toggleable(
+                    value = checked,
+                    role = Role.Switch,
+                    onValueChange = {
+                        if (enabled) onCheckedChange(it)
+                        else showDisabledActionReason(
+                            context,
+                            title,
+                            "请先开启“接收排队通知”。"
+                        )
+                    }
+                )
+                .padding(horizontal = QueueSpacing.L, vertical = QueueSpacing.M),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    title,
+                    color = if (enabled) PrimaryText else TertiaryText,
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(Modifier.height(QueueSpacing.XS))
+                Text(
+                    description,
+                    color = if (enabled) SecondaryText else TertiaryText,
+                    fontSize = 12.sp,
+                    lineHeight = 19.sp
+                )
+            }
+            Spacer(Modifier.width(14.dp))
+            Switch(
+                checked = checked,
+                onCheckedChange = null,
+                enabled = enabled,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = Color.White,
+                    checkedTrackColor = SystemBlue,
+                    uncheckedThumbColor = TertiaryText,
+                    uncheckedTrackColor = Separator
+                )
             )
         }
-        Spacer(Modifier.width(14.dp))
-        Switch(
-            checked = checked,
-            onCheckedChange = null,
-            enabled = enabled,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = Color.White,
-                checkedTrackColor = SystemBlue,
-                uncheckedThumbColor = TertiaryText,
-                uncheckedTrackColor = Separator
+        if (divider) {
+            HorizontalDivider(
+                Modifier.align(Alignment.TopStart).padding(start = FlowTextDividerInset),
+                color = Separator.copy(alpha = .6f)
             )
-        )
+        }
     }
 }
 
 @Composable
 private fun PlayerProfileDetailScreen(
     profile: PlayerProfile?,
+    summary: FlowSummary,
+    pairedQueueOption: PairedMachineQueueJoinOption? = null,
     selectedPreference: PlayPreference?,
     rememberPreference: Boolean,
     alreadyRegistered: Boolean,
@@ -13547,30 +16191,30 @@ private fun PlayerProfileDetailScreen(
     onBack: () -> Unit
 ) {
     if (profile == null) {
-        WizardPage(
-            step = "玩家资料",
+        FlowUnavailablePage(
+            summary = summary,
             title = "找不到这份玩家资料",
             subtitle = "资料可能已经发生变化，请返回资料库后重新选择。",
             onBack = onBack
-        ) {
-            SecondaryButton("返回玩家资料库", onBack, Modifier.fillMaxWidth())
-        }
+        )
         return
     }
-    if (!profile.hasValidContact || !profile.hasCompleteRequiredDetails) {
+    if (profile.needsCompletionBeforeUse()) {
         IncompletePlayerProfileScreen(
             profile = profile,
+            summary = summary,
             continuation = "加入排队",
             onEditProfile = onEditProfile,
             onBack = onBack
         )
         return
     }
+    val context = LocalContext.current
     val asksEveryTime = !singlePlayerMachine &&
         profile.defaultPreference == ProfilePlayPreference.ASK_EVERY_TIME
-    WizardPage(
-        step = "确认资料",
-        title = "加入排队",
+    StepFlowPage(
+        summary = summary,
+        title = "确认加入排队",
         subtitle = if (singlePlayerMachine) {
             "请确认玩家资料。完成后会以单人游玩加入 $machineLabel。"
         } else {
@@ -13578,161 +16222,86 @@ private fun PlayerProfileDetailScreen(
         },
         onBack = onBack
     ) {
-        Row(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
-                .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp)).padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(Modifier.size(68.dp), contentAlignment = Alignment.Center) {
-                PlayerAvatar(profile, 64.dp)
-            }
-            Spacer(Modifier.width(16.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Row(
-                    Modifier.fillMaxWidth().height(24.dp),
-                    verticalAlignment = Alignment.CenterVertically
+        FlowProfileCard(profile, flowProfileDetails(profile)) {
+            FlowProfileEditButton(profile, onEditProfile)
+            if (!profile.webAccountBound) {
+                val bindingEnabled = webAccountBindingEnabled && !webAccountBindingLoading
+                val bindingLabel = if (webAccountBindingLoading) "正在创建绑定页面" else "绑定网页账户"
+                Box(
+                    Modifier.height(40.dp).clip(RoundedCornerShape(10.dp))
+                        .clickable {
+                            if (bindingEnabled) onBindWebAccount()
+                            else showDisabledActionReason(
+                                context,
+                                bindingLabel,
+                                if (webAccountBindingLoading) {
+                                    "正在向服务端创建一次性绑定页面。"
+                                } else {
+                                    webAccountBindingDisabledReason
+                                }
+                            )
+                        }
+                        .padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        profile.nickname,
-                        color = PrimaryText,
-                        fontSize = 21.sp,
-                        lineHeight = 24.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    PlayerGenderMark(profile.gender, hideUndisclosed = false, fontSize = 20.sp)
-                }
-                Text(
-                    "默认偏好：${profilePreferenceLabel(profile.defaultPreference)}",
-                    color = SecondaryText,
-                    fontSize = 12.sp,
-                    lineHeight = 16.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                profileContactSummary(profile).takeIf { it.isNotBlank() }?.let { contactSummary ->
-                    Text(
-                        contactSummary,
-                        color = SecondaryText,
-                        fontSize = 11.sp,
-                        lineHeight = 15.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                profile.publicPlayerId?.let { publicPlayerId ->
-                    Text(
-                        "玩家编号：$publicPlayerId",
-                        color = TertiaryText,
-                        fontSize = 11.sp,
-                        lineHeight = 14.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        bindingLabel,
+                        color = if (bindingEnabled) SystemBlue else TertiaryText,
+                        fontSize = QueueTextSize.Body,
+                        fontWeight = FontWeight.SemiBold
                     )
                 }
             }
         }
-        Spacer(Modifier.height(14.dp))
         if (singlePlayerMachine) {
-            Text(
-                "$machineLabel 仅能容纳一人游玩，本次将使用“单人游玩”。这不会修改玩家资料中的默认游玩偏好。",
-                color = SecondaryText,
-                fontSize = 12.sp,
-                lineHeight = 18.sp
-            )
+            FlowNote("$machineLabel 仅能容纳一人游玩，本次将使用“单人游玩”。玩家资料中的默认游玩偏好不会改变。")
         } else if (asksEveryTime) {
-            Text("选择本次游玩偏好", color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(8.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                ProfileJoinPreferenceChoice(
-                    title = "单人游玩",
-                    selected = selectedPreference == PlayPreference.SOLO,
-                    onClick = { onPreferenceChange(PlayPreference.SOLO) },
-                    modifier = Modifier.weight(1f)
-                )
-                ProfileJoinPreferenceChoice(
-                    title = "允许他人加入（推荐）",
-                    selected = selectedPreference == PlayPreference.OPEN_TO_JOIN,
-                    onClick = { onPreferenceChange(PlayPreference.OPEN_TO_JOIN) },
-                    modifier = Modifier.weight(1f)
-                )
-            }
-            Spacer(Modifier.height(7.dp))
-            Text("接受系统分配的共同游玩通常可以缩短排队时间。", color = SecondaryText, fontSize = 11.sp)
+            Spacer(Modifier.height(QueueSpacing.XS))
+            FlowSectionLabel("本次游玩偏好")
             Spacer(Modifier.height(10.dp))
-            FriendConsentConfirmation(
+            PlayPreferenceChoiceGroup(selected = selectedPreference, onSelect = onPreferenceChange)
+            Spacer(Modifier.height(14.dp))
+            FlowCheckRow(
                 checked = rememberPreference,
                 text = "将本次选择保存为默认偏好，以后不再询问。",
                 onToggle = { onRememberPreferenceChange(!rememberPreference) }
             )
         } else {
-            Text(
-                "本次将使用“${profilePreferenceLabel(profile.defaultPreference)}”。",
-                color = SecondaryText,
-                fontSize = 12.sp
-            )
+            FlowNote("本次将使用“${profilePreferenceLabel(profile.defaultPreference)}”。")
+        }
+        // The tick box belongs to the play preference of this one registration.
+        if (pairedQueueOption != null) {
+            Spacer(Modifier.height(QueueSpacing.M))
+            FlowPairedMachineChoice(pairedQueueOption)
         }
         if (alreadyRegistered || !machineAvailable) {
-            Spacer(Modifier.height(12.dp))
-            Text(
+            FlowNote(
                 if (alreadyRegistered) "这名玩家已经有一份有效登记，不能重复加入。"
-                else "$machineLabel 目前无法接收新的登记。",
-                color = Destructive,
-                fontSize = 12.sp
+                else "$machineLabel 当前不能接收新的登记。",
+                Destructive
             )
         }
-        Spacer(Modifier.height(16.dp))
-        PrimaryButton(
-            "完成并加入排队",
-            onComplete,
-            Modifier.fillMaxWidth(),
-            enabled = !alreadyRegistered && machineAvailable &&
-                (!asksEveryTime || selectedPreference != null),
-            disabledReason = when {
-                alreadyRegistered -> "这名玩家已经有一份有效登记，不能重复加入。"
-                !machineAvailable -> "$machineLabel 目前无法接收新的登记。"
-                else -> "请先选择本次游玩偏好。"
-            }
-        )
-        Spacer(Modifier.height(10.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            PlayerProfileEditButton(
-                profile = profile,
-                onEditProfile = onEditProfile,
-                modifier = Modifier.weight(1f)
-            )
-            if (!profile.webAccountBound) {
-                SecondaryButton(
-                    if (webAccountBindingLoading) "正在创建绑定页面" else "绑定网页账户",
-                    onBindWebAccount,
-                    Modifier.weight(1f),
-                    enabled = webAccountBindingEnabled && !webAccountBindingLoading,
-                    disabledReason = if (webAccountBindingLoading) {
-                        "正在向服务端创建一次性绑定页面。"
-                    } else {
-                        webAccountBindingDisabledReason
-                    }
-                )
-            }
-        }
-        Spacer(Modifier.height(7.dp))
-        Text(
-            if (profile.webAccountBound) {
-                if (profile.canEditOnTerminal) {
-                    "这份资料已绑定网页账户，并允许现场终端编辑资料；QQ 和密码仍需由玩家登录网页后管理。"
-                } else {
-                    "这份资料已绑定网页账户，且未允许现场终端编辑。玩家可以登录网页重新开放终端编辑权限。"
+        FlowActions {
+            FlowPrimaryButton(
+                "完成并加入排队",
+                onComplete,
+                enabled = !alreadyRegistered && machineAvailable &&
+                    (!asksEveryTime || selectedPreference != null),
+                disabledReason = when {
+                    alreadyRegistered -> "这名玩家已经有一份有效登记，不能重复加入。"
+                    !machineAvailable -> "$machineLabel 当前不能接收新的登记。"
+                    else -> "请先选择本次游玩偏好。"
                 }
-            } else {
-                "绑定后可在网页管理个人资料。绑定页面只对这份资料有效，且会在短时间后失效。"
-            },
-            color = TertiaryText,
-            fontSize = 10.sp,
-            lineHeight = 15.sp
-        )
+            )
+        }
+    }
+}
+
+/** A step that can no longer go on because what it was about has changed. */
+@Composable
+private fun FlowUnavailablePage(summary: FlowSummary, title: String, subtitle: String, onBack: () -> Unit) {
+    StepFlowPage(summary = summary, title = title, subtitle = subtitle, onBack = onBack) {
+        FlowActions { FlowPrimaryButton("返回玩家资料库", onBack) }
     }
 }
 
@@ -13741,6 +16310,7 @@ private fun FriendPairPlayerProfileDetailScreen(
     profile: PlayerProfile?,
     registration: Registration?,
     currentPartner: Registration?,
+    summary: FlowSummary,
     alreadyRegistered: Boolean,
     machineAvailable: Boolean,
     machineLabel: String,
@@ -13749,19 +16319,18 @@ private fun FriendPairPlayerProfileDetailScreen(
     onBack: () -> Unit
 ) {
     if (profile == null || registration == null) {
-        WizardPage(
-            step = "与朋友共同游玩",
+        FlowUnavailablePage(
+            summary = summary,
             title = "无法继续创建登记",
             subtitle = "玩家资料或队列状态可能已经发生变化，请返回后重新选择。",
             onBack = onBack
-        ) {
-            SecondaryButton("返回玩家资料库", onBack, Modifier.fillMaxWidth())
-        }
+        )
         return
     }
-    if (!profile.hasValidContact || !profile.hasCompleteRequiredDetails) {
+    if (profile.needsCompletionBeforeUse()) {
         IncompletePlayerProfileScreen(
             profile = profile,
+            summary = summary,
             continuation = "创建朋友登记并组成固定组合",
             onEditProfile = onEditProfile,
             onBack = onBack
@@ -13769,143 +16338,64 @@ private fun FriendPairPlayerProfileDetailScreen(
         return
     }
     var consentConfirmed by remember(profile.id, registration.key) { mutableStateOf(false) }
-    WizardPage(
-        step = "确认资料",
+    StepFlowPage(
+        summary = summary,
         title = "与朋友组成固定组合",
-        subtitle = "请确认朋友的玩家资料。完成后，两份登记会在 $machineLabel 的登记顺序末端组成固定组合。",
+        subtitle = "请确认朋友的玩家资料。完成后，两份登记会在 $machineLabel 的队尾组成固定组合。",
         onBack = onBack
     ) {
-        Row(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
-                .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp)).padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(Modifier.size(68.dp), contentAlignment = Alignment.Center) {
-                PlayerAvatar(profile, 64.dp)
-            }
-            Spacer(Modifier.width(16.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Row(
-                    Modifier.fillMaxWidth().height(24.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        profile.nickname,
-                        color = PrimaryText,
-                        fontSize = 21.sp,
-                        lineHeight = 24.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    PlayerGenderMark(profile.gender, hideUndisclosed = false, fontSize = 20.sp)
-                }
-                Text(
-                    "默认偏好：${profilePreferenceLabel(profile.defaultPreference)}",
-                    color = SecondaryText,
-                    fontSize = 12.sp,
-                    lineHeight = 16.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                profileContactSummary(profile).takeIf { it.isNotBlank() }?.let { contactSummary ->
-                    Text(
-                        contactSummary,
-                        color = SecondaryText,
-                        fontSize = 11.sp,
-                        lineHeight = 15.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                profile.publicPlayerId?.let { publicPlayerId ->
-                    Text(
-                        "玩家编号：$publicPlayerId",
-                        color = TertiaryText,
-                        fontSize = 11.sp,
-                        lineHeight = 14.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
+        FlowProfileCard(profile, flowProfileDetails(profile)) {
+            FlowProfileEditButton(profile, onEditProfile)
         }
-        Spacer(Modifier.height(13.dp))
-        Column(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(PageBackground)
-                .padding(horizontal = 15.dp, vertical = 12.dp)
-        ) {
-            MetadataRow("现有登记", registration.displayId)
-            MetadataRow("朋友的登记", profile.nickname)
-            MetadataRow("本次安排", "固定组合")
+        Spacer(Modifier.height(QueueSpacing.M))
+        FlowListGroup {
+            FlowDetailRow("现有登记", registration.displayId, first = true)
+            FlowDetailRow("朋友的登记", profile.nickname)
+            FlowDetailRow("本次安排", "固定组合")
         }
-        Spacer(Modifier.height(11.dp))
-        Text(
-            "此次会使用固定组合安排共同游玩，不会修改朋友玩家资料中的默认游玩偏好。为避免延后其他玩家，两份登记都会移动到当前机台的登记顺序末端。",
-            color = SecondaryText,
-            fontSize = 12.sp,
-            lineHeight = 18.sp
+        FlowNote(
+            "本次将使用固定组合安排共同游玩，不会修改朋友玩家资料中的默认游玩偏好。为避免延后其他玩家，两份登记都会移至 $machineLabel 的队尾。"
         )
         fixedPairFormationAbsenceNotice(listOf(registration))?.let { notice ->
-            Spacer(Modifier.height(9.dp))
-            Text(
-                notice,
-                color = Color(0xFF9A5B00),
-                fontSize = 12.sp,
-                lineHeight = 18.sp
-            )
+            FlowNote(notice, WarningText)
         }
         if (currentPartner != null) {
-            Spacer(Modifier.height(9.dp))
-            Text(
+            FlowNote(
                 buildString {
                     append("继续后，“${registration.displayId}”与“${currentPartner.displayId}”的原固定组合会解除；“${currentPartner.displayId}”会恢复为允许他人加入。")
                     remainingPartnerAbsenceNotice(currentPartner)?.let { append(it) }
                 },
-                color = Color(0xFF9A5B00),
-                fontSize = 12.sp,
-                lineHeight = 18.sp
+                WarningText
             )
         }
         if (alreadyRegistered || !machineAvailable) {
-            Spacer(Modifier.height(10.dp))
-            Text(
+            FlowNote(
                 if (alreadyRegistered) {
                     "这名玩家已经有一份有效登记，不能重复创建。"
                 } else {
                     "$machineLabel 当前不能接收新的登记，固定组合尚未建立。"
                 },
-                color = Destructive,
-                fontSize = 12.sp,
-                lineHeight = 18.sp
+                Destructive
             )
         }
-        Spacer(Modifier.height(12.dp))
-        FriendConsentConfirmation(
+        Spacer(Modifier.height(14.dp))
+        FlowCheckRow(
             checked = consentConfirmed,
             text = "双方已经明确同意使用这份玩家资料创建登记并组成固定组合。",
             onToggle = { consentConfirmed = !consentConfirmed }
         )
-        Spacer(Modifier.height(16.dp))
-        PrimaryButton(
-            "创建并组成固定组合",
-            onComplete,
-            Modifier.fillMaxWidth(),
-            enabled = !alreadyRegistered && machineAvailable && consentConfirmed,
-            disabledReason = when {
-                alreadyRegistered -> "这名玩家已经有一份有效登记，不能重复创建。"
-                !machineAvailable -> "$machineLabel 当前不能接收新的登记。"
-                else -> "请先确认两位玩家都同意组成固定组合。"
-            }
-        )
-        Spacer(Modifier.height(10.dp))
-        PlayerProfileEditButton(
-            profile = profile,
-            onEditProfile = onEditProfile,
-            modifier = Modifier.fillMaxWidth()
-        )
+        FlowActions {
+            FlowPrimaryButton(
+                "创建并组成固定组合",
+                onComplete,
+                enabled = !alreadyRegistered && machineAvailable && consentConfirmed,
+                disabledReason = when {
+                    alreadyRegistered -> "这名玩家已经有一份有效登记，不能重复创建。"
+                    !machineAvailable -> "$machineLabel 当前不能接收新的登记。"
+                    else -> "请先确认两位玩家都同意组成固定组合。"
+                }
+            )
+        }
     }
 }
 
@@ -13913,6 +16403,7 @@ private fun FriendPairPlayerProfileDetailScreen(
 private fun ClaimPlayerProfileDetailScreen(
     profile: PlayerProfile?,
     registration: Registration?,
+    summary: FlowSummary,
     alreadyRegistered: Boolean,
     machineAvailable: Boolean,
     onEditProfile: () -> Unit,
@@ -13920,19 +16411,18 @@ private fun ClaimPlayerProfileDetailScreen(
     onBack: () -> Unit
 ) {
     if (profile == null || registration == null) {
-        WizardPage(
-            step = "认领登记",
+        FlowUnavailablePage(
+            summary = summary,
             title = "无法继续认领",
             subtitle = "玩家资料或临时登记可能已经发生变化，请返回后重新选择。",
             onBack = onBack
-        ) {
-            SecondaryButton("返回玩家资料库", onBack, Modifier.fillMaxWidth())
-        }
+        )
         return
     }
-    if (!profile.hasValidContact || !profile.hasCompleteRequiredDetails) {
+    if (profile.needsCompletionBeforeUse()) {
         IncompletePlayerProfileScreen(
             profile = profile,
+            summary = summary,
             continuation = "认领登记",
             onEditProfile = onEditProfile,
             onBack = onBack
@@ -13942,210 +16432,88 @@ private fun ClaimPlayerProfileDetailScreen(
     val profilePreference = profile.defaultPreference.toPlayPreferenceOrNull()
     val preferenceMismatch = profilePreference != null &&
         profilePreference != registration.preference
-    WizardPage(
-        step = "确认认领",
+    StepFlowPage(
+        summary = summary,
         title = "使用玩家资料认领登记",
-        subtitle = "认领后，登记昵称会更新为“${profile.nickname}”；当前位置和排队先后顺序不会改变。",
+        subtitle = "认领后，登记昵称会更新为“${profile.nickname}”；当前位置和等待顺序不会改变。",
         onBack = onBack
     ) {
-        Row(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
-                .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp)).padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(Modifier.size(64.dp), contentAlignment = Alignment.Center) {
-                PlayerAvatar(profile, 60.dp)
-            }
-            Spacer(Modifier.width(15.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Row(
-                    Modifier.fillMaxWidth().height(24.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        profile.nickname,
-                        color = PrimaryText,
-                        fontSize = 20.sp,
-                        lineHeight = 24.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    PlayerGenderMark(profile.gender, hideUndisclosed = false, fontSize = 19.sp)
-                }
-                Text(
-                    "资料默认偏好：${profilePreferenceLabel(profile.defaultPreference)}",
-                    color = SecondaryText,
-                    fontSize = 12.sp,
-                    lineHeight = 16.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                profileContactSummary(profile).takeIf { it.isNotBlank() }?.let { contactSummary ->
-                    Text(
-                        contactSummary,
-                        color = SecondaryText,
-                        fontSize = 11.sp,
-                        lineHeight = 15.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                profile.publicPlayerId?.let { publicPlayerId ->
-                    Text(
-                        "玩家编号：$publicPlayerId",
-                        color = TertiaryText,
-                        fontSize = 11.sp,
-                        lineHeight = 14.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
+        FlowProfileCard(profile, flowProfileDetails(profile, preferenceCaption = "资料默认游玩偏好")) {
+            FlowProfileEditButton(profile, onEditProfile)
         }
-        Spacer(Modifier.height(13.dp))
-        Column(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(PageBackground)
-                .padding(horizontal = 15.dp, vertical = 12.dp)
-        ) {
-            MetadataRow("当前登记", registration.displayId)
-            MetadataRow("认领后昵称", profile.nickname)
-            MetadataRow("本次游玩偏好", playPreferenceLabel(registration))
+        Spacer(Modifier.height(QueueSpacing.M))
+        FlowListGroup {
+            FlowDetailRow("当前登记", registration.displayId, first = true)
+            FlowDetailRow("认领后昵称", profile.nickname)
+            FlowDetailRow("本次游玩偏好", playPreferenceLabel(registration))
         }
-        Spacer(Modifier.height(11.dp))
-        Text(
+        FlowNote(
             when {
                 profile.defaultPreference == ProfilePlayPreference.ASK_EVERY_TIME ->
                     "这份资料设置为每次询问。认领后，本次将保留当前登记的游玩偏好。"
                 preferenceMismatch ->
-                    "资料默认偏好与当前登记不同。继续后，需要选择本次登记使用哪一项。"
-                else -> "资料默认偏好与当前登记一致。"
+                    "资料默认游玩偏好与当前登记不同。继续后，需要选择本次登记使用哪一项。"
+                else -> "资料默认游玩偏好与当前登记一致。"
             },
-            color = if (preferenceMismatch) Color(0xFF9A5B00) else SecondaryText,
-            fontSize = 12.sp,
-            lineHeight = 18.sp
+            if (preferenceMismatch) WarningText else SecondaryText
         )
         if (alreadyRegistered || !machineAvailable) {
-            Spacer(Modifier.height(10.dp))
-            Text(
+            FlowNote(
                 if (alreadyRegistered) "这份玩家资料已经关联到另一份有效登记，不能重复使用。"
-                else "当前机台已停止使用，暂时不能认领登记。",
-                color = Destructive,
-                fontSize = 12.sp
+                else "当前机台已停止使用，暂不能认领登记。",
+                Destructive
             )
         }
-        Spacer(Modifier.height(16.dp))
-        PrimaryButton(
-            "使用这份资料认领登记",
-            onComplete,
-            Modifier.fillMaxWidth(),
-            enabled = !alreadyRegistered && machineAvailable,
-            disabledReason = if (alreadyRegistered) {
-                "这份玩家资料已经关联到另一份有效登记。"
-            } else {
-                "当前机台已停止使用，暂时不能认领登记。"
-            }
-        )
-        Spacer(Modifier.height(10.dp))
-        PlayerProfileEditButton(
-            profile = profile,
-            onEditProfile = onEditProfile,
-            modifier = Modifier.fillMaxWidth()
-        )
+        FlowActions {
+            FlowPrimaryButton(
+                "使用这份资料认领登记",
+                onComplete,
+                enabled = !alreadyRegistered && machineAvailable,
+                disabledReason = if (alreadyRegistered) {
+                    "这份玩家资料已经关联到另一份有效登记。"
+                } else {
+                    "当前机台已停止使用，暂不能认领登记。"
+                }
+            )
+        }
     }
 }
 
 @Composable
 private fun IncompletePlayerProfileScreen(
     profile: PlayerProfile,
+    summary: FlowSummary,
     continuation: String,
     onEditProfile: () -> Unit,
     onBack: () -> Unit
 ) {
-    WizardPage(
-        step = "资料待补充",
+    StepFlowPage(
+        summary = summary,
         title = "需要补全玩家资料",
-        subtitle = "“${profile.nickname}”尚未确认新版资料设置。请先补全并保存，再继续$continuation。",
+        subtitle = "“${profile.nickname}”的玩家资料还需要补全。请先补全并保存，再继续${continuation}。",
         onBack = onBack
     ) {
-        Row(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(CardBackground)
-                .border(1.dp, Separator.copy(alpha = .82f), RoundedCornerShape(12.dp))
-                .padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(Modifier.size(62.dp), contentAlignment = Alignment.Center) {
-                PlayerAvatar(profile, 58.dp)
-            }
-            Spacer(Modifier.width(15.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(
-                    profile.nickname,
-                    color = PrimaryText,
-                    fontSize = 20.sp,
-                    lineHeight = 24.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                profile.publicPlayerId?.let { publicPlayerId ->
-                    Text(
-                        "玩家编号：$publicPlayerId",
-                        color = TertiaryText,
-                        fontSize = 11.sp,
-                        lineHeight = 14.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                Text(
-                    if (!profile.hasValidContact) {
-                        "需要填写有效的 QQ 号并确认通知设置。"
-                    } else {
-                        "需要确认 QQ 显示范围和排队通知设置。"
-                    },
-                    color = Destructive,
-                    fontSize = 12.sp,
-                    lineHeight = 18.sp
-                )
-            }
-        }
-        Spacer(Modifier.height(16.dp))
-        PrimaryButton(
-            "前往补全玩家资料",
-            onEditProfile,
-            Modifier.fillMaxWidth(),
-            enabled = profile.canEditOnTerminal,
-            disabledReason = terminalProfileEditingDisabledReason
+        FlowProfileCard(
+            profile,
+            if (!profile.hasValidContact) "需要填写有效的 QQ 号并确认通知设置。"
+            else "需要确认 QQ 显示范围和排队通知设置。",
+            detailsColor = Destructive
         )
-        Spacer(Modifier.height(9.dp))
-        SecondaryButton("返回玩家资料库", onBack, Modifier.fillMaxWidth())
+        FlowActions {
+            FlowSecondaryButton("返回玩家资料库", onBack)
+            Spacer(Modifier.width(FlowActionGap))
+            FlowPrimaryButton(
+                "前往补全玩家资料",
+                onEditProfile,
+                enabled = profile.canEditOnTerminal,
+                disabledReason = terminalProfileEditingDisabledReason
+            )
+        }
     }
 }
 
 private const val terminalProfileEditingDisabledReason =
     "这份资料已绑定网页账户，且未允许现场终端编辑。请由玩家登录网页重新开放终端编辑权限。"
-
-@Composable
-private fun PlayerProfileEditButton(
-    profile: PlayerProfile,
-    onEditProfile: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    SecondaryButton(
-        text = "编辑玩家资料",
-        onClick = onEditProfile,
-        modifier = modifier,
-        enabled = profile.canEditOnTerminal,
-        disabledReason = terminalProfileEditingDisabledReason,
-        leadingIcon = Icons.Default.Edit
-    )
-}
-
-private fun profileContactSummary(profile: PlayerProfile): String =
-    profile.normalizedQqNumber()?.let { "QQ：$it" }.orEmpty()
 
 @Composable
 private fun ClaimPreferenceMismatchDialog(
@@ -14162,16 +16530,16 @@ private fun ClaimPreferenceMismatchDialog(
         Text("选择本次游玩偏好", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
         Text(
-            "“$profileNickname”的资料默认偏好为“${playPreferenceLabel(profilePreference)}”，当前临时登记为“$currentPreferenceLabel”。请选择认领后本次登记使用的偏好。这个选择不会修改玩家资料中的默认偏好。",
+            "“${profileNickname}”的资料默认游玩偏好为“${playPreferenceLabel(profilePreference)}”，这份临时登记的本次游玩偏好为“${currentPreferenceLabel}”。请选择认领后使用的本次游玩偏好；这项选择不会修改玩家资料中的默认游玩偏好。",
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         if (fixedPartnerDisplayId != null) {
             Spacer(Modifier.height(10.dp))
             Text(
                 buildString {
-                    append("使用资料默认偏好会解除与“$fixedPartnerDisplayId”的固定组合；对方会保留在原位置，并恢复为允许他人加入。")
+                    append("使用资料默认游玩偏好会解除与“$fixedPartnerDisplayId”的固定组合；对方会保留在原位置，并恢复为允许他人加入。")
                     fixedPartnerAbsenceNotice?.let { append(it) }
                 },
                 color = Destructive,
@@ -14181,42 +16549,22 @@ private fun ClaimPreferenceMismatchDialog(
         }
         Spacer(Modifier.height(16.dp))
         ActionRow(
-            title = "保留当前登记偏好",
+            title = "保留当前游玩偏好",
             description = "继续使用“$currentPreferenceLabel”，队列组合保持不变。",
             onClick = onKeepCurrent
         )
         Spacer(Modifier.height(9.dp))
         ActionRow(
-            title = "使用资料默认偏好",
+            title = "使用资料默认游玩偏好",
             description = if (fixedPartnerDisplayId != null) {
-                "解除固定组合，本次改为“${playPreferenceLabel(profilePreference)}”；等待位置会重新划分。"
+                "解除固定组合，本次将使用“${playPreferenceLabel(profilePreference)}”；等待位置会重新划分。"
             } else {
-                "本次改为“${playPreferenceLabel(profilePreference)}”，等待位置可能重新划分。"
+                "本次将使用“${playPreferenceLabel(profilePreference)}”；等待位置可能重新划分。"
             },
             onClick = onUseProfileDefault
         )
         Spacer(Modifier.height(13.dp))
         CancelAction(onDismiss)
-    }
-}
-
-@Composable
-private fun ProfileJoinPreferenceChoice(
-    title: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Row(
-        modifier.height(56.dp).clip(RoundedCornerShape(12.dp))
-            .background(if (selected) SoftBlue else CardBackground)
-            .border(if (selected) 2.dp else 1.dp, if (selected) SystemBlue else Separator, RoundedCornerShape(12.dp))
-            .clickable(enabled = !selected, onClick = onClick).padding(horizontal = 16.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(title, color = PrimaryText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-        Spacer(Modifier.weight(1f))
-        if (selected) StraightCheckMark(Modifier.size(14.dp), color = SystemBlue)
     }
 }
 
@@ -14236,7 +16584,7 @@ private fun PlayerAvatar(profile: PlayerProfile, size: Dp) {
     }
     Box(Modifier.size(size).clip(CircleShape).background(color), contentAlignment = Alignment.Center) {
         if (avatar == null) {
-            Text(initial, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+            Text(initial, color = Color.White, fontSize = (size.value * .4f).sp, fontWeight = FontWeight.SemiBold)
         } else {
             Image(
                 bitmap = avatar!!,
@@ -14281,7 +16629,7 @@ private fun playerProfileTextFieldColors() = OutlinedTextFieldDefaults.colors(
     focusedTextColor = PrimaryText,
     unfocusedTextColor = PrimaryText,
     focusedBorderColor = SystemBlue,
-    unfocusedBorderColor = Color(0xFFA7A7AC),
+    unfocusedBorderColor = InputBorder,
     focusedLabelColor = SystemBlue,
     unfocusedLabelColor = SecondaryText,
     focusedPlaceholderColor = SecondaryText,
@@ -14295,55 +16643,72 @@ private fun playerProfileTextFieldColors() = OutlinedTextFieldDefaults.colors(
 
 @Composable
 private fun PreferenceScreen(
+    pairedQueueOption: PairedMachineQueueJoinOption? = null,
     selected: PlayPreference?,
+    summary: FlowSummary,
     onSelect: (PlayPreference) -> Unit,
     onBack: () -> Unit,
     onComplete: () -> Unit,
     onFriendPair: () -> Unit
 ) {
-    WizardPage(
-        step = "3 / 3",
-        title = "选择你的游玩偏好",
-        subtitle = "你的选择会显示在登记中，并用于安排每一轮的游玩组合。",
+    StepFlowPage(
+        summary = summary,
+        title = "选择本次游玩偏好",
+        subtitle = "这项选择会显示在登记中，并用于安排每一轮的游玩组合。",
         onBack = onBack
     ) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            OptionCard(
-                "单人游玩",
-                "这份登记始终单独占用一个等待位置。",
-                selected == PlayPreference.SOLO,
-                true,
-                { onSelect(PlayPreference.SOLO) },
-                Modifier.weight(1f)
-            )
-            OptionCard(
-                "允许他人加入（推荐）",
-                "系统会按顺序与其他开放登记组成共同游玩；接受系统分配通常可以缩短等待时间，每轮最多两人。",
-                selected == PlayPreference.OPEN_TO_JOIN,
-                true,
-                { onSelect(PlayPreference.OPEN_TO_JOIN) },
-                Modifier.weight(1f)
-            )
-        }
-        Spacer(Modifier.height(16.dp))
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            SmallActionButton("与朋友共同游玩", onFriendPair)
-            Spacer(Modifier.width(12.dp))
-            Text(
-                "选择一份现有登记，或为朋友创建登记，并形成固定的共同游玩组合。",
-                color = SecondaryText,
-                fontSize = 11.sp
-            )
-        }
-        Spacer(Modifier.height(14.dp))
-        Text("组合不会改变原有的先后顺序，也不会延后其他登记应当取得的游玩机会。", color = SecondaryText, fontSize = 12.sp)
         Spacer(Modifier.height(18.dp))
-        PrimaryButton(
-            "完成并加入排队",
-            onComplete,
-            Modifier.fillMaxWidth(),
-            enabled = selected != null,
-            disabledReason = "请先选择本次游玩偏好。"
+        PlayPreferenceChoiceGroup(selected = selected, onSelect = onSelect)
+        // The tick box belongs to the play preference of this one registration.
+        if (pairedQueueOption != null) {
+            Spacer(Modifier.height(QueueSpacing.M))
+            FlowPairedMachineChoice(pairedQueueOption)
+        }
+        FlowSectionLabel("也可以")
+        Spacer(Modifier.height(10.dp))
+        FlowListGroup {
+            FlowListRow(
+                title = "与朋友共同游玩",
+                description = "与朋友组成固定组合，不会延后其他登记应当取得的游玩机会。",
+                onClick = onFriendPair,
+                leading = {
+                    FlowIconTile { color ->
+                        Icon(PeopleRoundIcon, contentDescription = null, tint = color, modifier = Modifier.size(24.dp))
+                    }
+                },
+                trailing = { FlowChevron() }
+            )
+        }
+        FlowActions {
+            FlowPrimaryButton(
+                "完成并加入排队",
+                onComplete,
+                enabled = selected != null,
+                disabledReason = "请先选择本次游玩偏好。"
+            )
+        }
+    }
+}
+
+/** 单人游玩 and 允许他人加入 as single-choice rows with a radio dot. */
+@Composable
+private fun PlayPreferenceChoiceGroup(selected: PlayPreference?, onSelect: (PlayPreference) -> Unit) {
+    FlowListGroup {
+        FlowListRow(
+            title = "单人游玩",
+            description = "这份登记将独自占用一个等待位置。",
+            onClick = { onSelect(PlayPreference.SOLO) },
+            leading = { RadioDot(selected == PlayPreference.SOLO) },
+            selected = selected == PlayPreference.SOLO
+        )
+        FlowListRow(
+            title = "允许他人加入",
+            description = "与其他允许他人加入的登记组成共同游玩，通常可以缩短等待时间；每轮最多两人。",
+            onClick = { onSelect(PlayPreference.OPEN_TO_JOIN) },
+            leading = { RadioDot(selected == PlayPreference.OPEN_TO_JOIN) },
+            dividerInset = FlowTextDividerInset,
+            selected = selected == PlayPreference.OPEN_TO_JOIN,
+            titleBadge = "推荐"
         )
     }
 }
@@ -14352,59 +16717,70 @@ private fun PreferenceScreen(
 private fun BatchAmountScreen(
     amount: String,
     maximum: Int,
-    onAmountChange: (String) -> Unit,
+    summary: FlowSummary,
     onDecrease: () -> Unit,
     onIncrease: () -> Unit,
     onBack: () -> Unit,
     onComplete: () -> Unit
 ) {
     val amountValue = amount.toIntOrNull()
-    WizardPage(
-        step = "2 / 2",
+    StepFlowPage(
+        summary = summary,
         title = "创建临时登记",
-        subtitle = "输入需要录入的玩家数量。所有登记将默认允许他人加入，并按创建先后排列在登记顺序末端。",
+        subtitle = "这些登记将使用“允许他人加入”，并按创建先后排列在队尾。",
         onBack = onBack
     ) {
-        Row(verticalAlignment = Alignment.Top) {
-            StepperButton("−", onDecrease, enabled = (amountValue ?: 1) > 1)
-            Spacer(Modifier.width(12.dp))
-            OutlinedTextField(
-                value = amount,
-                onValueChange = onAmountChange,
-                label = { Text("登记数量") },
-                supportingText = { Text("本机台还可以创建 $maximum 份登记；每台最多 20 人。") },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                singleLine = true,
-                shape = RoundedCornerShape(ControlRadius),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedTextColor = PrimaryText,
-                    unfocusedTextColor = PrimaryText,
-                    focusedBorderColor = SystemBlue,
-                    unfocusedBorderColor = Color(0xFFA7A7AC),
-                    focusedLabelColor = SystemBlue,
-                    unfocusedLabelColor = SecondaryText,
-                    focusedSupportingTextColor = SecondaryText,
-                    unfocusedSupportingTextColor = SecondaryText,
-                    focusedContainerColor = CardBackground,
-                    unfocusedContainerColor = CardBackground,
-                    cursorColor = SystemBlue
-                ),
-                modifier = Modifier.weight(1f)
-            )
-            Spacer(Modifier.width(12.dp))
-            StepperButton("＋", onIncrease, enabled = (amountValue ?: 0) < maximum)
-        }
-        Spacer(Modifier.height(16.dp))
-        PrimaryButton(
-            "创建 ${amountValue ?: 0} 份登记",
-            onComplete,
-            Modifier.fillMaxWidth(),
-            enabled = amountValue != null && amountValue in 1..maximum,
-            disabledReason = when {
-                amountValue == null -> "请输入有效的登记数量。"
-                amountValue < 1 -> "至少需要创建 1 份登记。"
-                else -> "当前机台最多还可以创建 $maximum 份登记。"
+        val shape = RoundedCornerShape(CardRadius)
+        Row(
+            Modifier.fillMaxWidth().padding(top = 18.dp).height(80.dp).clip(shape)
+                .background(CardBackground).border(1.dp, Separator, shape)
+                .padding(horizontal = 18.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("登记数量", color = PrimaryText, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(QueueSpacing.XS))
+                Text("当前机台还可以创建 $maximum 份登记。", color = SecondaryText, fontSize = 13.sp, lineHeight = 19.sp)
             }
+            StepperButton(increase = false, onDecrease, enabled = (amountValue ?: 1) > 1)
+            Text(
+                "${amountValue ?: 0}",
+                color = PrimaryText,
+                fontSize = 28.sp,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.width(72.dp)
+            )
+            StepperButton(increase = true, onIncrease, enabled = (amountValue ?: 0) < maximum)
+        }
+        FlowActions {
+            FlowPrimaryButton(
+                "创建 ${amountValue ?: 0} 份登记",
+                onComplete,
+                enabled = amountValue != null && amountValue in 1..maximum,
+                disabledReason = when {
+                    amountValue == null -> "请输入有效的登记数量。"
+                    amountValue < 1 -> "至少需要创建 1 份登记。"
+                    else -> "当前机台最多还可以创建 $maximum 份登记。"
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun StepperButton(increase: Boolean, onClick: () -> Unit, enabled: Boolean) {
+    Box(
+        Modifier.size(44.dp).clip(RoundedCornerShape(12.dp))
+            .background(if (enabled) SoftBlue else DisabledBackground)
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            imageVector = if (increase) Icons.Default.Add else MinusIcon,
+            contentDescription = if (increase) "增加" else "减少",
+            tint = if (enabled) SystemBlue else TertiaryText,
+            modifier = Modifier.size(22.dp)
         )
     }
 }
@@ -14412,157 +16788,45 @@ private fun BatchAmountScreen(
 @Composable
 private fun ClaimRegistrationScreen(
     displayId: String,
+    summary: FlowSummary,
     onPlayerLibrary: () -> Unit,
     onBack: () -> Unit
 ) {
-    WizardPage(
-        step = "认领登记",
-        title = "认领这份排队登记",
-        subtitle = "将“$displayId”与玩家资料关联。登记顺序不会改变；如果资料默认游玩偏好与当前登记不同，系统会先询问本次使用哪一项。",
+    StepFlowPage(
+        summary = summary,
+        title = "选择认领方式",
+        subtitle = "将“$displayId”与玩家资料关联。如果资料默认游玩偏好与当前登记不同，系统会先询问本次使用哪一项。",
         onBack = onBack
     ) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            OptionCard(
-                "创建临时登记",
-                "这已经是一份临时登记，不能再次创建。",
-                false,
-                false,
-                {},
-                Modifier.weight(1f),
-                badge = "不可选择"
-            )
-            OptionCard(
-                "使用玩家资料库",
-                "选择本机保存的玩家资料来认领这份登记。",
-                false,
-                true,
-                onPlayerLibrary,
-                Modifier.weight(1f)
-            )
-            OptionCard(
-                "使用移动设备",
-                "移动设备暂不支持认领已有登记。",
-                false,
-                false,
-                {},
-                Modifier.weight(1f),
-                badge = "暂不可用"
-            )
-        }
-    }
-}
-
-@Composable
-private fun WizardPage(
-    step: String,
-    title: String,
-    subtitle: String,
-    onBack: () -> Unit,
-    content: @Composable () -> Unit
-) {
-    BackHandler(onBack = onBack)
-    val nowMillis = rememberCurrentTimeMillis()
-    Column(Modifier.fillMaxSize().imePadding().padding(horizontal = 36.dp, vertical = 24.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            AppBackButton(onBack)
-            Spacer(Modifier.weight(1f))
-            Text(
-                SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(nowMillis)),
-                color = PrimaryText,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium
-            )
-            Spacer(Modifier.width(16.dp))
-            Text(step, color = TertiaryText, fontSize = 12.sp)
-        }
-        Box(
-            Modifier.fillMaxSize()
-                .widthIn(max = terminalContentMaxWidth(820.dp))
-                .align(Alignment.CenterHorizontally)
+        Row(
+            Modifier.fillMaxWidth().padding(top = 18.dp).height(IntrinsicSize.Max),
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            Column(
-                Modifier.fillMaxWidth().align(Alignment.Center)
-                    .verticalScroll(rememberScrollState()).padding(vertical = 20.dp)
-            ) {
-                Text(title, color = PrimaryText, fontSize = 30.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(7.dp))
-                Text(subtitle, color = SecondaryText, fontSize = 14.sp, lineHeight = 20.sp)
-                Spacer(Modifier.height(24.dp))
-                content()
-            }
-        }
-    }
-}
-
-@Composable
-private fun OptionCard(
-    title: String,
-    description: String,
-    selected: Boolean,
-    enabled: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    badge: String? = null,
-    disabledReason: String? = null
-) {
-    val context = LocalContext.current
-    val targetBorderColor = when {
-        !enabled -> Separator.copy(alpha = .6f)
-        selected -> SystemBlue
-        else -> Separator
-    }
-    val backgroundColor by animateColorAsState(
-        when {
-            !enabled -> PageBackground
-            selected -> SoftBlue
-            else -> CardBackground
-        },
-        tween(180),
-        label = "$title 选项背景"
-    )
-    val borderColor by animateColorAsState(
-        targetBorderColor,
-        tween(180),
-        label = "$title 选项边框"
-    )
-    val borderWidth by animateDpAsState(
-        if (selected) 2.dp else 1.dp,
-        tween(180),
-        label = "$title 选项边框宽度"
-    )
-    Column(
-        modifier.height(136.dp).clip(RoundedCornerShape(CardRadius))
-            .background(backgroundColor)
-            .border(borderWidth, borderColor, RoundedCornerShape(CardRadius))
-            .clickable {
-                if (enabled) onClick()
-                else showDisabledActionReason(context, title, disabledReason ?: description)
-            }.padding(18.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                title,
-                color = if (enabled) PrimaryText else TertiaryText,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.SemiBold
+            RegistrationMethodCard(
+                title = "使用玩家资料库",
+                description = "选择本机保存的玩家资料来认领这份登记。还没有资料时，可以在资料库中创建。",
+                actionLabel = "选择资料",
+                icon = PersonRoundIcon,
+                primary = true,
+                enabled = true,
+                unavailableLabel = "",
+                disabledReason = "",
+                onClick = onPlayerLibrary,
+                modifier = Modifier.weight(1f).fillMaxHeight()
             )
-            Spacer(Modifier.weight(1f))
-            if (badge != null) {
-                Text(
-                    badge,
-                    color = TertiaryText,
-                    fontSize = 10.sp,
-                    modifier = Modifier.clip(RoundedCornerShape(100.dp)).background(PageBackground)
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                )
-            } else if (selected) {
-                Box(Modifier.size(18.dp).clip(CircleShape).background(SystemBlue), contentAlignment = Alignment.Center) {
-                    StraightCheckMark(Modifier.size(11.dp))
-                }
-            }
+            RegistrationMethodCard(
+                title = "使用移动设备",
+                description = "扫码后，在移动设备上选择或创建玩家资料。",
+                actionLabel = "",
+                icon = SmartphoneRoundIcon,
+                primary = false,
+                enabled = false,
+                unavailableLabel = "暂不支持认领已有登记",
+                disabledReason = "移动设备暂不支持认领已有登记。",
+                onClick = {},
+                modifier = Modifier.weight(1f).fillMaxHeight()
+            )
         }
-        Spacer(Modifier.height(10.dp))
-        Text(description, color = if (enabled) SecondaryText else TertiaryText, fontSize = 12.sp, lineHeight = 18.sp)
     }
 }
 
@@ -14611,49 +16875,47 @@ private fun FriendPairFlowDialog(
                 Spacer(Modifier.height(8.dp))
                 Text(
                     if (isWaiting) {
-                        "请选择朋友已有的登记，或为朋友创建一份新的临时登记。固定组合只会通过让组合中的前位玩家后移来实现，不会延后其他玩家。"
+                        "请选择朋友已有的登记，或为朋友创建登记。组成固定组合时，两份登记中较靠前的一份会后移，不会延后其他玩家。"
                     } else {
-                        "这份登记正在${playingPositionName(machineId)}。请在本轮结束并重新进入等待顺序后，再设置固定组合。"
+                        "这份登记处于${playingPositionName(machineId)}。请在本轮结束、这份登记回到等待顺序后，再组成固定组合。"
                     },
                     color = SecondaryText,
-                    fontSize = 13.sp,
+                    fontSize = 14.sp,
                     lineHeight = 20.sp
                 )
                 Spacer(Modifier.height(17.dp))
-                MenuActionButton(
-                    MenuAction(
-                        "选择现有登记",
-                        if (!machineOperational) {
-                            "当前机台已停止使用，恢复正常使用后才能组成固定组合。"
-                        } else if (candidates.isNotEmpty()) {
-                            "从当前机台的等待登记中选择朋友，并检查顺序变化。"
-                        } else {
-                            "当前没有可用于组成固定组合的其他等待登记。"
-                        },
-                        { step = FriendPairStep.SELECT_EXISTING },
-                        enabled = machineOperational && candidates.isNotEmpty()
-                    ),
-                    Modifier.widthIn(max = 340.dp).fillMaxWidth().align(Alignment.CenterHorizontally)
-                )
-                Spacer(Modifier.height(9.dp))
-                MenuActionButton(
-                    MenuAction(
-                        "为朋友创建登记",
-                        when {
-                            !isWaiting -> "${playingPositionName(machineId)} 中的登记暂时不能创建固定组合。"
-                            !machineOperational -> "当前机台已停止使用，暂时不能创建朋友登记。"
-                            !allowCreateFriend -> "当前不接收新的排队登记。"
-                            queue.registrationCount >= 20 -> "当前机台已达到 20 人上限，无法继续创建登记。"
-                            else -> "使用玩家资料或创建临时登记，并在登记顺序末端组成固定组合。"
-                        },
-                        {
-                            friendConsentConfirmed = false
-                            step = FriendPairStep.CREATE_FRIEND
-                        },
-                        enabled = allowCreateFriend && machineOperational && isWaiting &&
-                            queue.registrationCount < 20
-                    ),
-                    Modifier.widthIn(max = 340.dp).fillMaxWidth().align(Alignment.CenterHorizontally)
+                // The two ways side by side, as entries are paired in the registration menu.
+                CompactActionGrid(
+                    listOf(
+                        MenuAction(
+                            "选择现有登记",
+                            if (!machineOperational) {
+                                "当前机台已停止使用，恢复正常使用后才能组成固定组合。"
+                            } else if (candidates.isNotEmpty()) {
+                                "从当前机台的等待登记中选择朋友，并检查顺序变化。"
+                            } else {
+                                "当前没有可用于组成固定组合的其他等待登记。"
+                            },
+                            { step = FriendPairStep.SELECT_EXISTING },
+                            enabled = machineOperational && candidates.isNotEmpty()
+                        ),
+                        MenuAction(
+                            "为朋友创建登记",
+                            when {
+                                !isWaiting -> "处于${playingPositionName(machineId)}的登记不能组成固定组合。"
+                                !machineOperational -> "当前机台已停止使用，暂不能创建朋友登记。"
+                                !allowCreateFriend -> "当前不接收新的排队登记。"
+                                queue.registrationCount >= 20 -> "当前机台已有 20 份登记，不能继续创建登记。"
+                                else -> "使用玩家资料或创建临时登记，并在队尾组成固定组合。"
+                            },
+                            {
+                                friendConsentConfirmed = false
+                                step = FriendPairStep.CREATE_FRIEND
+                            },
+                            enabled = allowCreateFriend && machineOperational && isWaiting &&
+                                queue.registrationCount < 20
+                        )
+                    )
                 )
             }
 
@@ -14663,7 +16925,7 @@ private fun FriendPairFlowDialog(
                 Text(
                     "系统会以较靠后的登记为基准安排固定组合，并先检查是否有其他玩家因此延后。",
                     color = SecondaryText,
-                    fontSize = 13.sp,
+                    fontSize = 14.sp,
                     lineHeight = 20.sp
                 )
                 Spacer(Modifier.height(14.dp))
@@ -14685,7 +16947,8 @@ private fun FriendPairFlowDialog(
                                     friendConsentConfirmed = false
                                     step = FriendPairStep.CONFIRM_EXISTING
                                 },
-                                enabled = machineOperational
+                                enabled = machineOperational,
+                                explained = true
                             ),
                             Modifier.fillMaxWidth()
                         )
@@ -14718,31 +16981,31 @@ private fun FriendPairFlowDialog(
                     plan == null -> Text(
                         "无法确认这两份登记当前所在的等待顺序，请返回后重新选择。",
                         color = Destructive,
-                        fontSize = 13.sp,
+                        fontSize = 14.sp,
                         lineHeight = 20.sp
                     )
                     !planIsCurrent -> Text(
-                        "等待顺序或登记状态已经改变。为避免覆盖新的队列状态，请返回后重新选择朋友。",
+                        "等待顺序或登记状态已经发生变化，请返回后重新选择朋友。",
                         color = Destructive,
-                        fontSize = 13.sp,
+                        fontSize = 14.sp,
                         lineHeight = 20.sp
                     )
                     delayedOthers.isNotEmpty() -> Text(
-                        "如果直接组成固定组合，${delayedOthers.joinToString("、") { "“${it.displayId}”" }} 将会延后游玩。系统不会应用这项调整。",
+                        "如果直接组成固定组合，${delayedOthers.joinToString("、") { "“${it.displayId}”" }}会延后游玩，因此不能组成固定组合。",
                         color = Destructive,
-                        fontSize = 13.sp,
+                        fontSize = 14.sp,
                         lineHeight = 20.sp
                     )
                     movedBack.isEmpty() -> Text(
-                        "“${plan.firstRegistration.displayId}”和“${plan.secondRegistration.displayId}”可以共同游玩。建立固定组合不会使其他玩家延后，也不需要改变你们当前取得游玩机会的轮次。",
+                        "“${plan.firstRegistration.displayId}”和“${plan.secondRegistration.displayId}”可以直接组成固定组合。这不会延后其他玩家，两份登记的游玩轮次也不会改变。",
                         color = SecondaryText,
-                        fontSize = 13.sp,
+                        fontSize = 14.sp,
                         lineHeight = 20.sp
                     )
                     else -> Text(
-                        "为避免延后其他玩家，${movedBack.joinToString("、") { "“${it.displayId}”" }} 需要放弃当前较靠前的位置，并向后移动到位置 ${machineId.name}${plan.pairPositionIndex + 1}。其他玩家的游玩机会只会保持或提前。",
+                        "为避免延后其他玩家，${movedBack.joinToString("、") { "“${it.displayId}”" }}会后移至位置 ${machineId.name}${plan.pairPositionIndex + 1}。其他玩家的游玩机会只会保持不变或提前。",
                         color = SecondaryText,
-                        fontSize = 13.sp,
+                        fontSize = 14.sp,
                         lineHeight = 20.sp
                     )
                 }
@@ -14753,7 +17016,7 @@ private fun FriendPairFlowDialog(
                         Spacer(Modifier.height(10.dp))
                         Text(
                             notice,
-                            color = Color(0xFF9A5B00),
+                            color = WarningText,
                             fontSize = 12.sp,
                             lineHeight = 18.sp
                         )
@@ -14767,7 +17030,7 @@ private fun FriendPairFlowDialog(
                         Spacer(Modifier.height(10.dp))
                         Text(
                             buildString {
-                                append("确认后，与“${currentPartner.displayId}”的原固定组合会解除；该登记会恢复为允许他人加入。")
+                                append("确认后，与“${currentPartner.displayId}”的原固定组合会解除；“${currentPartner.displayId}”会恢复为允许他人加入。")
                                 remainingPartnerAbsenceNotice(currentPartner)?.let { append(it) }
                             },
                             color = SecondaryText,
@@ -14777,7 +17040,7 @@ private fun FriendPairFlowDialog(
                     }
                     Spacer(Modifier.height(12.dp))
                     Text(
-                        "固定组合建立后，系统不会再为这两份登记自动匹配其他玩家。为保持原有游玩轮次，其他选择允许他人加入的登记可能重新组合；只要其游玩轮次没有变晚，就不视为延后。",
+                        "固定组合建立后，系统不会再为这两份登记安排其他玩家共同游玩。为保持原有游玩轮次，其他允许他人加入的登记可能重新组合；游玩轮次没有推迟的登记不视为延后。",
                         color = PrimaryText,
                         fontSize = 12.sp,
                         lineHeight = 18.sp,
@@ -14811,16 +17074,16 @@ private fun FriendPairFlowDialog(
                 Text("为朋友创建登记", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "可以使用朋友的玩家资料创建登记，也可以创建一份临时登记。你们两份登记将一起移动到当前机台的登记顺序末端，并形成固定组合；其他玩家不会因此延后。",
+                    "可以使用朋友的玩家资料创建登记，也可以创建一份临时登记。两份登记会在当前机台的队尾组成固定组合；其他玩家不会因此延后。",
                     color = SecondaryText,
-                    fontSize = 13.sp,
+                    fontSize = 14.sp,
                     lineHeight = 20.sp
                 )
                 fixedPairFormationAbsenceNotice(listOf(registration))?.let { notice ->
                     Spacer(Modifier.height(9.dp))
                     Text(
                         notice,
-                        color = Color(0xFF9A5B00),
+                        color = WarningText,
                         fontSize = 12.sp,
                         lineHeight = 18.sp
                     )
@@ -14829,7 +17092,7 @@ private fun FriendPairFlowDialog(
                     Spacer(Modifier.height(9.dp))
                     Text(
                         buildString {
-                            append("这也会解除当前与“${currentPartner.displayId}”的固定组合；该登记会恢复为允许他人加入。")
+                            append("确认后，与“${currentPartner.displayId}”的原固定组合也会解除；“${currentPartner.displayId}”会恢复为允许他人加入。")
                             remainingPartnerAbsenceNotice(currentPartner)?.let { append(it) }
                         },
                         color = SecondaryText,
@@ -14888,7 +17151,7 @@ private fun FriendPairFlowDialog(
                 Spacer(Modifier.height(11.dp))
                 FriendConsentConfirmation(
                     checked = friendConsentConfirmed,
-                    text = "朋友本人已经明确同意由我代为创建登记并组成固定组合。",
+                    text = "朋友本人已经明确同意代其创建登记并组成固定组合。",
                     onToggle = { friendConsentConfirmed = !friendConsentConfirmed }
                 )
                 Spacer(Modifier.height(14.dp))
@@ -14904,10 +17167,10 @@ private fun FriendPairFlowDialog(
                         friendConsentConfirmed,
                     disabledReason = when {
                         friendIdDraft.isBlank() -> "请先填写朋友的登记昵称。"
-                        !machineOperational -> "当前机台已停止使用，暂时不能创建朋友登记。"
+                        !machineOperational -> "当前机台已停止使用，暂不能创建朋友登记。"
                         !allowCreateFriend -> "当前不接收新的排队登记。"
                         friendIdAlreadyExists -> "当前队列中已经有相同昵称的登记。"
-                        queue.registrationCount >= 20 -> "当前机台已有 20 份登记，不能继续新增。"
+                        queue.registrationCount >= 20 -> "当前机台已有 20 份登记，不能继续创建登记。"
                         else -> "请先确认两位玩家都同意组成固定组合。"
                     }
                 )
@@ -14926,28 +17189,52 @@ private fun FriendPairFlowDialog(
 private fun FriendConsentConfirmation(
     checked: Boolean,
     text: String,
-    onToggle: () -> Unit
+    onToggle: () -> Unit,
+    fontSize: TextUnit = 12.sp,
+    lineHeight: TextUnit = 18.sp
 ) {
     Row(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(PageBackground)
             .clickable(onClick = onToggle).padding(horizontal = 13.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Box(
-            Modifier.size(20.dp).clip(RoundedCornerShape(6.dp))
-                .background(if (checked) SystemBlue else Color.Transparent)
-                .border(
-                    1.dp,
-                    if (checked) SystemBlue else Separator,
-                    RoundedCornerShape(6.dp)
-                ),
-            contentAlignment = Alignment.Center
-        ) {
-            if (checked) StraightCheckMark(Modifier.size(12.dp))
-        }
+        TickBox(checked)
         Spacer(Modifier.width(10.dp))
-        Text(text, color = PrimaryText, fontSize = 12.sp, lineHeight = 18.sp)
+        Text(text, color = PrimaryText, fontSize = fontSize, lineHeight = lineHeight)
     }
+}
+
+/** A tick box for one of several independent choices (docs/ui-guide.md). */
+@Composable
+private fun TickBox(checked: Boolean, enabled: Boolean = true) {
+    Box(
+        Modifier.size(20.dp).clip(RoundedCornerShape(6.dp))
+            .background(
+                when {
+                    !enabled -> PageBackground
+                    checked -> SystemBlue
+                    else -> CardBackground
+                }
+            )
+            .border(
+                1.dp,
+                when {
+                    !enabled -> Separator.copy(alpha = .6f)
+                    checked -> SystemBlue
+                    else -> Separator
+                },
+                RoundedCornerShape(6.dp)
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        if (checked) StraightCheckMark(Modifier.size(12.dp), color = if (enabled) Color.White else TertiaryText)
+    }
+}
+
+/** The tick box of a step page, at the size of the mockup (14 sp). */
+@Composable
+private fun FlowCheckRow(checked: Boolean, text: String, onToggle: () -> Unit) {
+    FriendConsentConfirmation(checked, text, onToggle, fontSize = QueueTextSize.Body, lineHeight = 20.sp)
 }
 
 @Composable
@@ -14955,6 +17242,8 @@ private fun RegistrationActions(
     registration: Registration,
     playerProfileGender: PlayerGender?,
     playerProfileQqNumber: String?,
+    /** The linked player profile; with a custom avatar the heading is centred around it. */
+    playerProfile: PlayerProfile? = null,
     fixedPartnerDisplayId: String?,
     playingPartnerDisplayId: String?,
     waitingPartnerDisplayId: String?,
@@ -14967,7 +17256,8 @@ private fun RegistrationActions(
     allowTemporaryLeave: Boolean,
     allowsSharedPlay: Boolean,
     machineOperational: Boolean,
-    transferMachineName: String,
+    /** The only machine a transfer can go to, or null when there are several to choose from. */
+    transferMachineName: String?,
     transferUnavailableReason: String?,
     canEditPlayerProfile: Boolean,
     mode: RegistrationActionMode,
@@ -14977,9 +17267,16 @@ private fun RegistrationActions(
     onDismiss: () -> Unit,
     onMoveIntoPlaying: () -> Unit,
     onReturnToWaitingFront: () -> Unit,
-    onPauseOrLeave: () -> Unit,
+    onPauseOrLeave: (QueueAbsenceChoice?) -> Unit,
     onCancelDeferOneRound: () -> Unit,
+    onCancelSkipOneTurn: () -> Unit,
     onCancelTemporaryLeave: () -> Unit,
+    /**
+     * The registration, or its fixed partner, is a checked-in online registration that has not
+     * played: it cannot be postponed on site (see Registration.mustBeRemovedWhenAbsent).
+     */
+    onlineRegistrationNotPlayed: Boolean = false,
+    pairedQueueOption: PairedMachineQueueJoinOption? = null,
     onChangePreference: () -> Unit,
     onPreferenceSelected: (PlayPreference) -> Unit,
     onFriendPair: () -> Unit,
@@ -14993,67 +17290,110 @@ private fun RegistrationActions(
     onExit: () -> Unit
 ) {
     val context = LocalContext.current
-    val stoppedActionReason = "当前机台已停止使用，恢复正常使用后才能操作这份登记。"
-    ModalSurface(onDismiss, width = 560.dp) {
+    // On a stopped machine a registration can still leave the queue or move to another machine.
+    val stoppedActionReason = "当前机台已停止使用，恢复正常使用前只能退出排队或转至其他机台。"
+    ModalSurface(onDismiss, width = if (mode == RegistrationActionMode.PREFERENCE) 680.dp else 560.dp) {
         when (mode) {
             RegistrationActionMode.PREFERENCE -> {
+                // The same rows as the step that chooses the play preference when joining
+                // (preference-mockup.html): radio rows, the tick row, then 与朋友共同游玩 apart.
+                val isFixedPair = registration.fixedPartnerKey != null
                 Text("更改游玩偏好", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(6.dp))
+                Spacer(Modifier.height(8.dp))
                 Text(
                     if (registration.playerProfileId != null) {
-                        "新的选择只用于本次排队，并会立即用于重新划分等待位置；玩家资料中的默认偏好不会改变。"
+                        "新的选择只用于本次排队，并会立即用于重新划分等待位置；玩家资料中的默认游玩偏好不会改变。"
                     } else {
                         "新的选择会立即用于重新划分等待位置。"
                     },
                     color = SecondaryText,
-                    fontSize = 12.sp,
-                    lineHeight = 18.sp
+                    fontSize = QueueTextSize.Body,
+                    lineHeight = 20.sp
                 )
                 if (fixedPartnerDisplayId != null) {
-                    Spacer(Modifier.height(9.dp))
+                    Spacer(Modifier.height(8.dp))
                     Text(
                         buildString {
-                            append("当前与“$fixedPartnerDisplayId”组成固定组合。改为单人游玩或允许他人加入时，双方的固定组合会同时解除。")
+                            append("改为单人游玩或允许他人加入时，双方的固定组合会同时解除。")
                             fixedPairAbsenceRetentionNotice(registration)?.let { append(it) }
                         },
                         color = SecondaryText,
-                        fontSize = 12.sp,
-                        lineHeight = 18.sp
+                        fontSize = QueueTextSize.Body,
+                        lineHeight = 20.sp
                     )
                 }
-                Spacer(Modifier.height(18.dp))
-                val isFixedPair = registration.fixedPartnerKey != null
-                Column(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
-                        .background(PageBackground)
-                        .border(1.dp, Separator.copy(alpha = .78f), RoundedCornerShape(14.dp))
-                ) {
-                    PreferenceSelectionRow(
-                        title = "单人游玩",
-                        description = "这份登记将独自占用一个等待位置。",
-                        selected = !isFixedPair && registration.preference == PlayPreference.SOLO,
-                        enabled = machineOperational,
-                        disabledReason = stoppedActionReason,
-                        onClick = { onPreferenceSelected(PlayPreference.SOLO) }
+                if (allowsSharedPlay) {
+                    Spacer(Modifier.height(18.dp))
+                    FlowListGroup {
+                        val solo = !isFixedPair && registration.preference == PlayPreference.SOLO
+                        val open = !isFixedPair && registration.preference == PlayPreference.OPEN_TO_JOIN
+                        FlowListRow(
+                            title = "单人游玩",
+                            description = "这份登记将独自占用一个等待位置。",
+                            onClick = { onPreferenceSelected(PlayPreference.SOLO) },
+                            leading = { RadioDot(solo) },
+                            selected = solo,
+                            enabled = machineOperational,
+                            disabledReason = stoppedActionReason
+                        )
+                        FlowListRow(
+                            title = "允许他人加入",
+                            description = "与其他允许他人加入的登记组成共同游玩，通常可以缩短等待时间；每轮最多两人。",
+                            onClick = { onPreferenceSelected(PlayPreference.OPEN_TO_JOIN) },
+                            leading = { RadioDot(open) },
+                            dividerInset = FlowTextDividerInset,
+                            selected = open,
+                            enabled = machineOperational,
+                            disabledReason = stoppedActionReason
+                        )
+                    }
+                } else {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "当前机台仅能容纳一人游玩，这份登记使用“单人游玩”。",
+                        color = SecondaryText,
+                        fontSize = QueueTextSize.Body,
+                        lineHeight = 20.sp
                     )
-                    HorizontalDivider(color = Separator.copy(alpha = .72f))
-                    PreferenceSelectionRow(
-                        title = "允许他人加入",
-                        description = "这份登记可以与相邻的开放登记组成共同游玩位置。",
-                        selected = !isFixedPair && registration.preference == PlayPreference.OPEN_TO_JOIN,
-                        enabled = machineOperational,
-                        disabledReason = stoppedActionReason,
-                        onClick = { onPreferenceSelected(PlayPreference.OPEN_TO_JOIN) }
+                }
+                // The tick box belongs to the play preference of this one registration.
+                if (pairedQueueOption != null) {
+                    Spacer(Modifier.height(QueueSpacing.M))
+                    FlowPairedMachineChoice(
+                        pairedQueueOption.copy(
+                            disabledReason = pairedQueueOption.disabledReason
+                                ?: stoppedActionReason.takeIf { !machineOperational }
+                        )
                     )
-                    HorizontalDivider(color = Separator.copy(alpha = .72f))
-                    PreferenceSelectionRow(
-                        title = "与朋友共同游玩",
-                        description = "与指定玩家形成固定组合，并在不延后其他玩家的前提下调整顺序。",
-                        selected = isFixedPair,
-                        enabled = machineOperational,
-                        disabledReason = stoppedActionReason,
-                        onClick = onFriendPair
-                    )
+                }
+                if (allowsSharedPlay) {
+                    FlowSectionLabel("也可以")
+                    Spacer(Modifier.height(10.dp))
+                    FlowListGroup {
+                        FlowListRow(
+                            title = "与朋友共同游玩",
+                            description = if (isFixedPair && fixedPartnerDisplayId != null) {
+                                "当前与“$fixedPartnerDisplayId”组成固定组合。"
+                            } else {
+                                "与朋友组成固定组合，不会延后其他登记应当取得的游玩机会。"
+                            },
+                            onClick = onFriendPair,
+                            leading = {
+                                FlowIconTile(enabled = machineOperational) { color ->
+                                    Icon(
+                                        PeopleRoundIcon,
+                                        contentDescription = null,
+                                        tint = color,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                }
+                            },
+                            selected = isFixedPair,
+                            enabled = machineOperational,
+                            disabledReason = stoppedActionReason,
+                            trailing = { FlowChevron() }
+                        )
+                    }
                 }
             }
 
@@ -15062,7 +17402,7 @@ private fun RegistrationActions(
                 Spacer(Modifier.height(6.dp))
                 Text(
                     if (registration.playerProfileId != null) {
-                        "这里只修改本次登记显示的昵称，不会修改玩家资料。昵称应当能够让现场玩家确认对应的人。"
+                        "只修改这份登记显示的昵称，不会修改玩家资料。昵称应当能够让现场玩家确认这份登记对应的人。"
                     } else {
                         "昵称应当能够让现场玩家确认这份登记对应的人。"
                     },
@@ -15090,32 +17430,30 @@ private fun RegistrationActions(
             }
 
             RegistrationActionMode.ACTIONS -> {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        registration.displayId,
-                        color = PrimaryText,
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 2,
-                        overflow = TextOverflow.Clip,
-                        lineHeight = 28.sp,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    if (!registration.requiresOnSiteCheckIn) {
+                // A profile with its own avatar shows it on top, and the heading is centred under
+                // it; a temporary registration or a profile without one keeps the left-aligned
+                // heading (docs/ui-guide.md).
+                val avatarProfile = playerProfile?.takeIf { it.avatarReference != null }
+                val centredHeading = avatarProfile != null
+                val headingAlign = if (centredHeading) TextAlign.Center else TextAlign.Start
+                // A registration made from a player profile has two names that the pencil could
+                // mean; it asks which one (the registration's, or the profile).
+                val renameButton: @Composable () -> Unit = {
+                    var renameChoiceOpen by remember { mutableStateOf(false) }
+                    Box {
                         IconButton(
                             onClick = {
-                                if (machineOperational) {
-                                    onRename()
-                                } else {
-                                    showDisabledActionReason(
+                                when {
+                                    !machineOperational -> showDisabledActionReason(
                                         context,
                                         "修改登记昵称",
                                         stoppedActionReason
                                     )
+                                    canEditPlayerProfile -> renameChoiceOpen = true
+                                    else -> onRename()
                                 }
                             },
-                            modifier = Modifier.size(48.dp)
+                            modifier = Modifier.size(MinTouchTarget)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Edit,
@@ -15124,12 +17462,73 @@ private fun RegistrationActions(
                                 modifier = Modifier.size(18.dp)
                             )
                         }
+                        DropdownMenu(
+                            expanded = renameChoiceOpen,
+                            onDismissRequest = { renameChoiceOpen = false },
+                            containerColor = CardBackground
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("修改这份登记的昵称", color = PrimaryText, fontSize = QueueTextSize.Body) },
+                                onClick = {
+                                    renameChoiceOpen = false
+                                    onRename()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("编辑玩家资料", color = PrimaryText, fontSize = QueueTextSize.Body) },
+                                onClick = {
+                                    renameChoiceOpen = false
+                                    onEditPlayerProfile()
+                                }
+                            )
+                        }
+                    }
+                }
+                val nameText: @Composable (Modifier) -> Unit = { modifier ->
+                    Text(
+                        registration.displayId,
+                        color = PrimaryText,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Clip,
+                        lineHeight = 28.sp,
+                        textAlign = headingAlign,
+                        modifier = modifier
+                    )
+                }
+                if (avatarProfile != null) {
+                    // Avatar and name in the middle; the pencil keeps to the top right corner of
+                    // the heading instead of sitting in the middle of it.
+                    Box(Modifier.fillMaxWidth()) {
+                        Column(
+                            Modifier.fillMaxWidth().padding(horizontal = MinTouchTarget),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            PlayerAvatar(avatarProfile, 64.dp)
+                            Spacer(Modifier.height(QueueSpacing.S))
+                            nameText(Modifier.fillMaxWidth())
+                        }
+                        if (!registration.requiresOnSiteCheckIn) {
+                            Box(Modifier.align(Alignment.TopEnd)) { renameButton() }
+                        }
+                    }
+                } else {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        nameText(Modifier.weight(1f))
+                        Spacer(Modifier.width(8.dp))
+                        if (!registration.requiresOnSiteCheckIn) renameButton()
                     }
                 }
                 Spacer(Modifier.height(6.dp))
                 FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(7.dp),
-                    verticalArrangement = Arrangement.spacedBy(7.dp)
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(
+                        7.dp,
+                        if (centredHeading) Alignment.CenterHorizontally else Alignment.Start
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(7.dp),
+                    itemVerticalAlignment = Alignment.CenterVertically
                 ) {
                     if (registration.requiresOnSiteCheckIn) {
                         DetailPill(
@@ -15146,19 +17545,30 @@ private fun RegistrationActions(
                         )
                     }
                     DetailPill(
-                        fixedPartnerDisplayId?.let { "与 $it 共同游玩" }
-                            ?: playingPartnerDisplayId?.let { "正在与 $it 共同游玩" }
-                            ?: waitingPartnerDisplayId?.let { "将与 $it 共同游玩" }
+                        fixedPartnerDisplayId?.let { "与“$it”共同游玩" }
+                            ?: playingPartnerDisplayId?.let { "正在与“${it}”共同游玩" }
+                            ?: waitingPartnerDisplayId?.let { "将与“${it}”共同游玩" }
                             ?: commonPlayPreviewDisplayId?.let { "预计与“$it”共同游玩" }
                             ?: playPreferenceLabel(registration)
                     )
-                    DetailPill(
-                        when {
-                            registration.isTemporary -> "临时登记"
-                            registration.playerProfileId != null -> "玩家资料"
-                            else -> "已认领登记"
-                        }
-                    )
+                    // The action that belongs to the kind of registration sits inside its tag.
+                    when {
+                        registration.isTemporary -> ActionPill(
+                            label = "临时登记",
+                            action = "认领",
+                            enabled = machineOperational,
+                            disabledReason = stoppedActionReason,
+                            onClick = onClaim
+                        )
+                        registration.playerProfileId != null && canEditPlayerProfile -> ActionPill(
+                            label = "玩家资料",
+                            action = "编辑",
+                            onClick = onEditPlayerProfile
+                        )
+                        else -> DetailPill(
+                            if (registration.playerProfileId != null) "玩家资料" else "已认领登记"
+                        )
+                    }
                     if (registration.playerProfileId != null) {
                         playerProfileGender?.takeIf { it != PlayerGender.UNDISCLOSED }?.let { gender ->
                             DetailPill(
@@ -15167,42 +17577,71 @@ private fun RegistrationActions(
                             )
                         }
                     }
+                    // The QQ number shares the line with the tags, which keeps the menu short.
+                    normalizeOptionalContact(playerProfileQqNumber)
+                        ?.takeIf { registration.playerProfileId != null }
+                        ?.let { qqNumber -> DetailPill("QQ：$qqNumber") }
                 }
-                val qqNumber = normalizeOptionalContact(playerProfileQqNumber)
-                if (registration.playerProfileId != null && qqNumber != null) {
-                    Spacer(Modifier.height(7.dp))
-                    DetailPill("QQ：$qqNumber")
+                // Visible at a glance while the tick box is on, with the way to cancel it.
+                if (pairedQueueOption?.checked == true) {
+                    Spacer(Modifier.height(9.dp))
+                    val status = pairedMachineArrangementStatusText(
+                        pairedMachineName = pairedQueueOption.pairedMachineLabel,
+                        waitsForNextRound = registration.skipsPairedMachineThisRound,
+                        announcement = pairedQueueOption.announcement,
+                        previewPosition = pairedQueueOption.previewPosition
+                    )
+                    Text(
+                        // The sentence about a coming move stands out from the rest of the line.
+                        buildAnnotatedString {
+                            append(status.before)
+                            status.highlighted?.let { announced ->
+                                withStyle(
+                                    SpanStyle(
+                                        color = PairedArrangementNoticeColor,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                ) { append(announced) }
+                            }
+                            append(status.after)
+                        },
+                        color = SecondaryText,
+                        fontSize = 12.sp,
+                        lineHeight = 18.sp,
+                        textAlign = headingAlign,
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
-                Spacer(Modifier.height(14.dp))
-                MetadataRow("创建时间", formatRegistrationTime(registration.createdAtMillis))
-                MetadataRow(
-                    "上次游玩",
-                    registration.lastPlayedAtMillis?.let(::formatRegistrationTime) ?: "尚未游玩"
-                )
-                if (registration.requiresOnSiteCheckIn) {
-                    MetadataRow(
-                        "签到时限",
-                        if (registration.hasRestartedOnSiteCheckInWindow) {
-                            "机台恢复正常使用后重新获得的 30 分钟内"
-                        } else {
-                            "创建线上登记后 30 分钟内"
+                Spacer(Modifier.height(QueueSpacing.M))
+                // One line of facts keeps the menu short enough for a 720p screen; the check-in
+                // time limit is explained in the box below for a registration that still needs it.
+                Text(
+                    listOfNotNull(
+                        // formatRegistrationTime gives 刚刚, “5 分钟前” or a clock time.
+                        "${formatRegistrationTime(registration.createdAtMillis)}创建",
+                        registration.lastPlayedAtMillis?.let { "${formatRegistrationTime(it)}游玩过" }
+                            ?: "尚未游玩",
+                        "线上登记，已签到".takeIf {
+                            registration.wasOnlineRegistration && !registration.requiresOnSiteCheckIn
+                        },
+                        registration.noShowCount.takeIf { it > 0 }?.let { count ->
+                            "未到场 $count 次，上次为" +
+                                if (registration.lastNoShowActionWasDefer) "暂缓一次" else "移至队尾"
                         }
-                    )
-                }
-                if (registration.noShowCount > 0) {
-                    MetadataRow("未到场记录", "${registration.noShowCount} 次")
-                    MetadataRow(
-                        "上次未到场处理",
-                        if (registration.lastNoShowActionWasDefer) "暂缓一次" else "移至队尾"
-                    )
-                }
-                Spacer(Modifier.height(16.dp))
+                    ).joinToString("·"),
+                    color = SecondaryText,
+                    fontSize = QueueTextSize.Caption,
+                    lineHeight = 17.sp,
+                    textAlign = headingAlign,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(QueueSpacing.L))
                 if (registration.requiresOnSiteCheckIn) {
                     Text(
                         if (registration.hasRestartedOnSiteCheckInWindow) {
-                            "机台恢复正常使用后，这份登记已重新获得 30 分钟签到时限。请在本次时限内完成现场签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。"
+                            "机台恢复正常使用后，这份登记已重新获得 30 分钟签到时限。请在本次时限内完成现场签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动移除。"
                         } else {
-                            "请在创建线上登记后的 30 分钟内完成现场签到。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动退出排队。"
+                            "请在创建线上登记后的 30 分钟内完成现场签到。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动移除。"
                         },
                         color = OnlineRegistrationStatusColor,
                         fontSize = 11.sp,
@@ -15212,10 +17651,9 @@ private fun RegistrationActions(
                             .padding(horizontal = 13.dp, vertical = 10.dp)
                     )
                     Spacer(Modifier.height(14.dp))
-                    MenuSectionHeader("到场与退出")
                     Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(9.dp)
+                        Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+                        horizontalArrangement = Arrangement.spacedBy(QueueSpacing.S)
                     ) {
                         MenuActionButton(
                             MenuAction(
@@ -15223,9 +17661,9 @@ private fun RegistrationActions(
                                 if (!machineOperational) {
                                     stoppedActionReason
                                 } else if (registration.hasRestartedOnSiteCheckInWindow) {
-                                    "完成签到后，这份登记会保持当前顺序，并开始参与后续游玩位置分配。请在机台恢复正常使用后重新获得的 30 分钟内操作。"
+                                    "完成签到后，这份登记会保持当前顺序，并开始正常轮候。请在机台恢复正常使用后重新获得的 30 分钟内操作。"
                                 } else {
-                                    "完成签到后，这份登记会保持当前顺序，并开始参与后续游玩位置分配。请在创建登记后的 30 分钟内操作。"
+                                    "完成签到后，这份登记会保持当前顺序，并开始正常轮候。请在创建登记后的 30 分钟内操作。"
                                 },
                                 onCheckIn,
                                 enabled = machineOperational,
@@ -15233,213 +17671,149 @@ private fun RegistrationActions(
                                 accentColor = OnlineRegistrationStatusColor,
                                 accentBackgroundColor = OnlineRegistrationStatusBackground
                             ),
-                            Modifier.weight(1f)
+                            Modifier.weight(1f).fillMaxHeight()
                         )
                         MenuActionButton(
                             MenuAction(
                                 "退出排队",
-                                if (machineOperational) {
-                                    "移除这份线上登记；继续游玩时需要重新加入排队。"
-                                } else {
-                                    stoppedActionReason
-                                },
+                                "这份线上登记将退出排队；继续游玩时需要重新加入排队。",
                                 onExit,
-                                destructive = true,
-                                enabled = machineOperational
+                                destructive = true
                             ),
-                            Modifier.weight(1f)
+                            Modifier.weight(1f).fillMaxHeight()
                         )
                     }
                 } else {
-                val queueActions = buildList {
-                    if (canMoveIntoPlaying) {
-                        add(
-                            MenuAction(
-                                "应处于游玩位置",
-                                if (machineOperational) {
-                                    "现场实际为共同游玩时，将这份登记移入$playingPositionLabel，并同步修正相关游玩偏好。"
-                                } else {
-                                    stoppedActionReason
-                                },
-                                onMoveIntoPlaying,
-                                enabled = machineOperational,
-                                accented = true
-                            )
-                        )
-                    }
-                    when (registration.absenceStatus) {
-                        QueueAbsenceStatus.DEFER_ONE_ROUND -> add(
-                            MenuAction(
-                                "取消暂缓一次",
-                                if (machineOperational) {
-                                    "恢复下一次游玩机会；登记保持当前顺序。"
-                                } else {
-                                    stoppedActionReason
-                                },
-                                onCancelDeferOneRound,
-                                enabled = machineOperational,
-                                accented = false
-                            )
-                        )
-                        QueueAbsenceStatus.TEMPORARILY_AWAY -> add(
-                            MenuAction(
-                                "取消暂时离开",
-                                if (machineOperational) {
-                                    "恢复正常轮候，并将已轮空次数清零。"
-                                } else {
-                                    stoppedActionReason
-                                },
-                                onCancelTemporaryLeave,
-                                enabled = machineOperational,
-                                accented = false
-                            )
-                        )
-                        QueueAbsenceStatus.NONE -> add(
-                            MenuAction(
-                                "暂缓一次或暂时离开",
-                                if (!machineOperational) {
-                                    stoppedActionReason
-                                } else if (allowDeferOneRound || allowTemporaryLeave) {
-                                    "选择只跳过下一次进入游玩位置的机会，或在返回前持续轮空。"
-                                } else {
-                                    "系统规则不允许。"
-                                },
-                                onPauseOrLeave,
-                                enabled = machineOperational &&
-                                    (allowDeferOneRound || allowTemporaryLeave),
-                                accented = false
-                            )
-                        )
-                    }
-                    add(
+                // The player's own actions come first, in small groups by purpose; they need no
+                // heading saying whose they are. Corrections of the record follow, and what other
+                // players do for this player sits apart at the bottom (docs/ui-guide.md, 菜单的分组).
+                val absenceActions = when (registration.absenceStatus) {
+                    QueueAbsenceStatus.DEFER_ONE_ROUND -> listOf(
                         MenuAction(
-                            "转至 $transferMachineName",
-                            if (!machineOperational) {
-                                stoppedActionReason
-                            } else if (isPlayingPosition) {
-                                "处于游玩位置的登记不能切换机台。"
-                            } else if (transferUnavailableReason == null) {
-                                "离开当前机台，并在 $transferMachineName 的登记顺序末端重新排队。"
-                            } else {
-                                transferUnavailableReason
-                            },
-                            onTransfer,
-                            enabled = machineOperational && !isPlayingPosition &&
-                                transferUnavailableReason == null,
-                            accented = false
+                            "取消暂缓一次",
+                            if (machineOperational) "" else stoppedActionReason,
+                            onCancelDeferOneRound,
+                            enabled = machineOperational
                         )
                     )
-                }
-                val registrationActions = buildList {
-                    if (allowsSharedPlay) {
-                        add(
-                            MenuAction(
-                                "更改游玩偏好",
-                                if (!machineOperational) {
-                                    stoppedActionReason
-                                } else if (registration.playerProfileId != null) {
-                                    "只调整本次排队的偏好，不会修改玩家资料中的默认偏好。"
-                                } else {
-                                    "调整为单人游玩、允许他人加入或与朋友共同游玩。"
-                                },
-                                onChangePreference,
-                                enabled = machineOperational
-                            )
-                        )
-                    }
-                    if (registration.isTemporary) {
-                        add(
-                            MenuAction(
-                                "认领登记",
-                                if (machineOperational) {
-                                    "通过登录将这份临时登记关联到你的身份。"
-                                } else {
-                                    stoppedActionReason
-                                },
-                                onClaim,
-                                enabled = machineOperational
-                            )
-                        )
-                    }
-                    if (canEditPlayerProfile) {
-                        add(
-                            MenuAction(
-                                "编辑玩家资料",
-                                "修改昵称、性别、QQ 号或资料库默认偏好；不会改变本次登记的游玩偏好。",
-                                onEditPlayerProfile
-                            )
-                        )
-                    }
-                }
-
-                MenuSectionHeader("排队安排")
-                CompactActionGrid(queueActions)
-                if (isPlayingPosition) {
-                    Spacer(Modifier.height(9.dp))
-                    MenuActionButton(
+                    QueueAbsenceStatus.SKIP_ONE_TURN -> listOf(
                         MenuAction(
-                            "撤回至等待顺序前端",
+                            "取消轮空一次",
+                            if (machineOperational) "" else stoppedActionReason,
+                            onCancelSkipOneTurn,
+                            enabled = machineOperational
+                        )
+                    )
+                    QueueAbsenceStatus.TEMPORARILY_AWAY -> listOf(
+                        MenuAction(
+                            "取消暂时离开",
+                            if (machineOperational) "" else stoppedActionReason,
+                            onCancelTemporaryLeave,
+                            enabled = machineOperational
+                        )
+                    )
+                    // One entry for all three; the choice between 暂缓一次, 轮空一次 and 暂时离开
+                    // follows, with what each does. 轮空一次 has no venue setting, so the entry is
+                    // always there. It does not apply in the playing position, where it is left
+                    // out (docs/ui-guide.md, 菜单的分组).
+                    QueueAbsenceStatus.NONE -> listOfNotNull(
+                        MenuAction(
+                            "延后这份登记",
                             when {
                                 !machineOperational -> stoppedActionReason
-                                fixedPartnerDisplayId != null ->
-                                    "只撤回这份登记；确认后会解除固定组合，另一份登记继续留在$playingPositionLabel。"
-                                playingPartnerDisplayId != null ->
-                                    "只撤回这份登记；另一份登记会继续留在$playingPositionLabel，双方游玩偏好保持不变。"
-                                else ->
-                                    "将这份登记撤回等待顺序前端；$playingPositionLabel 会保持空缺。"
+                                onlineRegistrationNotPlayed -> ONLINE_REGISTRATION_POSTPONE_REASON
+                                else -> ""
                             },
-                            onReturnToWaitingFront,
-                            enabled = machineOperational
-                        ),
-                        Modifier.fillMaxWidth()
+                            { onPauseOrLeave(null) },
+                            enabled = machineOperational && !onlineRegistrationNotPlayed
+                        ).takeUnless { isPlayingPosition }
                     )
                 }
+                val playWayActions = listOfNotNull(
+                    MenuAction(
+                        "更改游玩偏好",
+                        if (machineOperational) "" else stoppedActionReason,
+                        onChangePreference,
+                        enabled = machineOperational
+                    ).takeIf { allowsSharedPlay || pairedQueueOption != null },
+                    MenuAction(
+                        transferMachineName?.let { "转至 $it" } ?: "转至其他机台",
+                        transferUnavailableReason.orEmpty(),
+                        onTransfer,
+                        enabled = transferUnavailableReason == null
+                    ).takeUnless { isPlayingPosition }
+                )
+                // 认领 and 编辑 sit beside the registration's tag in the heading.
+                val registrationActions = listOf(MenuAction("退出排队", "", onExit, destructive = true))
+                val correctionActions = listOfNotNull(
+                    MenuAction(
+                        "补入当前游玩位置",
+                        if (machineOperational) "" else stoppedActionReason,
+                        onMoveIntoPlaying,
+                        destructive = true,
+                        enabled = machineOperational
+                    ).takeIf { canMoveIntoPlaying },
+                    MenuAction(
+                        "撤回至等待顺序",
+                        if (machineOperational) "" else stoppedActionReason,
+                        onReturnToWaitingFront,
+                        destructive = true,
+                        enabled = machineOperational
+                    ).takeIf { isPlayingPosition }
+                )
 
-                Spacer(Modifier.height(16.dp))
-                MenuSectionHeader("登记与玩家")
-                CompactActionGrid(registrationActions, accented = false)
-
-                Spacer(Modifier.height(16.dp))
-                MenuSectionHeader("到场与退出")
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                    MenuActionButton(
+                MenuSectionHeader("游玩方式")
+                CompactActionGrid(playWayActions)
+                Spacer(Modifier.height(QueueSpacing.L))
+                MenuSectionHeader("这份登记")
+                CompactActionGrid(absenceActions + registrationActions)
+                if (correctionActions.isNotEmpty()) {
+                    SeparateMenuSection(
+                        "与现场不一致时",
+                        "只在屏幕上的记录与现场实际不一致时使用。",
+                        correctionActions,
+                        singleActionDescription = when {
+                            isPlayingPosition && fixedPartnerDisplayId != null ->
+                                "只撤回这份登记；确认后会解除固定组合，另一份登记继续留在$playingPositionLabel。"
+                            isPlayingPosition && playingPartnerDisplayId != null ->
+                                "只撤回这份登记；另一份登记会继续留在$playingPositionLabel，双方游玩偏好保持不变。"
+                            isPlayingPosition ->
+                                "将这份登记撤回等待顺序，$playingPositionLabel 会保持空缺。"
+                            else ->
+                                "现场实际为共同游玩时，将这份登记移入$playingPositionLabel，并同步修正相关游玩偏好。"
+                        }
+                    )
+                }
+                SeparateMenuSection(
+                    "由现场玩家报告",
+                    "这名玩家不在现场时，由在场的其他玩家报告。",
+                    listOf(
                         MenuAction(
-                            "未到场",
+                            "这名玩家未到场",
                             when {
                                 !machineOperational -> stoppedActionReason
                                 registration.absenceStatus != QueueAbsenceStatus.NONE ->
                                     unavailableNoShowExplanation(listOf(registration))
-                                !canReportNoShow ->
-                                    "现在还未轮到这名玩家游玩，不能记录为未到场。"
-                                isPlayingPosition ->
-                                    "将这次进入$playingPositionLabel 记录为未到场，并选择后续处理方式。"
-                                else -> "记录本次未到场，并选择如何处理这份登记。"
+                                !canReportNoShow -> "现在还未轮到这名玩家游玩，不能记录为未到场。"
+                                else -> ""
                             },
                             onNoShow,
                             destructive = true,
                             enabled = machineOperational && canReportNoShow
-                        ),
-                        Modifier.weight(1f)
+                        )
+                    ),
+                    singleActionDescription = noShowPanelDescription(
+                        group = false,
+                        notYetTheirTurn = machineOperational &&
+                            registration.absenceStatus == QueueAbsenceStatus.NONE &&
+                            !canReportNoShow,
+                        alreadyPlaying = isPlayingPosition
                     )
-                    MenuActionButton(
-                        MenuAction(
-                            "退出排队",
-                            if (machineOperational) {
-                                "移除这份登记；继续游玩时需要重新排队。"
-                            } else {
-                                stoppedActionReason
-                            },
-                            onExit,
-                            destructive = true,
-                            enabled = machineOperational
-                        ),
-                        Modifier.weight(1f)
-                    )
-                }
+                )
                 }
             }
         }
-        Spacer(Modifier.height(13.dp))
+        Spacer(Modifier.height(if (mode == RegistrationActionMode.PREFERENCE) 18.dp else 13.dp))
         CancelAction(onDismiss)
     }
 }
@@ -15458,20 +17832,20 @@ private fun MoveIntoPlayingConfirmation(
         if (joiningPlayer.preference == PlayPreference.SOLO) add("“${joiningPlayer.displayId}”")
     }
     ModalSurface(onDismiss, width = 470.dp) {
-        Text("调整为共同游玩？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+        Text("补入当前游玩位置？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
         Text(
             "是否调整为“${currentPlayer.displayId}”和“${joiningPlayer.displayId}”共同游玩？确认后，“${joiningPlayer.displayId}”会从首个等待位置移入$playingPositionLabel。",
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         if (preferenceChanges.isNotEmpty()) {
             Spacer(Modifier.height(10.dp))
             Text(
-                "为了使本次登记与本轮共同游玩一致，${preferenceChanges.joinToString("和")}的游玩偏好将改为允许他人加入。",
+                "为与本轮共同游玩一致，${preferenceChanges.joinToString("和")}的游玩偏好将改为允许他人加入。",
                 color = SecondaryText,
-                fontSize = 13.sp,
+                fontSize = 14.sp,
                 lineHeight = 20.sp
             )
         }
@@ -15480,7 +17854,7 @@ private fun MoveIntoPlayingConfirmation(
             Text(
                 "“${joiningPlayer.displayId}”当前与“$fixedPartnerDisplayId”组成固定组合。此操作会解除该组合；“$fixedPartnerDisplayId”会保留在等待顺序中，并改为允许他人加入。",
                 color = SecondaryText,
-                fontSize = 13.sp,
+                fontSize = 14.sp,
                 lineHeight = 20.sp
             )
         }
@@ -15491,46 +17865,45 @@ private fun MoveIntoPlayingConfirmation(
     }
 }
 
+/**
+ * A tag that carries its own action in blue (临时登记 · 认领, 玩家资料 · 编辑). The whole tag is the
+ * tappable area, at least 48 high (docs/ui-guide.md), while it looks no bigger than other tags.
+ */
 @Composable
-private fun PreferenceSelectionRow(
-    title: String,
-    description: String,
-    selected: Boolean,
+private fun ActionPill(
+    label: String,
+    action: String,
     enabled: Boolean = true,
     disabledReason: String? = null,
     onClick: () -> Unit
 ) {
     val context = LocalContext.current
-    Row(
-        Modifier.fillMaxWidth().heightIn(min = 70.dp)
-            .clickable {
-                when {
-                    !enabled -> showDisabledActionReason(context, title, disabledReason)
-                    !selected -> onClick()
-                    else -> Unit
-                }
-            }
-            .padding(horizontal = 16.dp, vertical = 11.dp),
-        verticalAlignment = Alignment.CenterVertically
+    Box(
+        Modifier.heightIn(min = MinTouchTarget)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null
+            ) {
+                if (enabled) onClick() else showDisabledActionReason(context, action, disabledReason)
+            },
+        contentAlignment = Alignment.Center
     ) {
-        Column(Modifier.weight(1f)) {
+        Row(
+            Modifier.clip(RoundedCornerShape(100.dp))
+                .background(PageBackground)
+                .padding(horizontal = 11.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(label, color = SecondaryText, fontSize = QueueTextSize.Label)
+            Spacer(Modifier.width(6.dp))
+            Box(Modifier.width(1.dp).height(10.dp).background(Separator))
+            Spacer(Modifier.width(6.dp))
             Text(
-                title,
-                color = if (enabled) PrimaryText else TertiaryText,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium
+                action,
+                color = if (enabled) SystemBlue else TertiaryText,
+                fontSize = QueueTextSize.Label,
+                fontWeight = FontWeight.SemiBold
             )
-            Spacer(Modifier.height(3.dp))
-            Text(
-                if (enabled) description else disabledReason.orEmpty(),
-                color = if (enabled) SecondaryText else TertiaryText,
-                fontSize = 10.sp,
-                lineHeight = 15.sp
-            )
-        }
-        Spacer(Modifier.width(16.dp))
-        Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) {
-            if (selected) StraightCheckMark(Modifier.size(15.dp), color = SystemBlue)
         }
     }
 }
@@ -15544,19 +17917,59 @@ private fun DetailPill(
     Text(
         text,
         color = color,
-        fontSize = 10.sp,
+        fontSize = 11.sp,
         modifier = Modifier.clip(RoundedCornerShape(100.dp)).background(backgroundColor)
             .padding(horizontal = 9.dp, vertical = 5.dp)
     )
 }
 
-@Composable
-private fun MetadataRow(label: String, value: String) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
-        Text(label, color = TertiaryText, fontSize = 11.sp)
-        Spacer(Modifier.weight(1f))
-        Text(value, color = SecondaryText, fontSize = 11.sp)
+/**
+ * The group that 结束本轮并开始下一轮 lets into the playing position, drawn as the home screen
+ * draws it. [positionName] is set when the group is exactly one waiting position of the home
+ * screen; otherwise (for example a registration arranged from the other machine) it is null.
+ * [keepsCurrentPlayers]: nobody else can enter, so the players of this round go to the end of
+ * the waiting order and come straight back; the playing position does not change.
+ */
+private data class RoundEndNextGroup(
+    val label: String,
+    val positionName: String?,
+    val registrations: List<Registration>,
+    val keepsCurrentPlayers: Boolean = false,
+    val othersWaiting: Boolean = false
+)
+
+private fun roundEndNextGroup(
+    machineId: MachineId,
+    queue: MachineQueue,
+    preview: NextPlayingPositionPreview?
+): RoundEndNextGroup? {
+    val next = preview?.nextRegistrations.orEmpty()
+    if (next.isEmpty()) return null
+    val nextKeys = next.map { it.key }.toSet()
+    if (nextKeys == queue.playing.map { it.key }.toSet()) {
+        return RoundEndNextGroup(
+            label = "",
+            positionName = null,
+            registrations = next,
+            keepsCurrentPlayers = true,
+            othersWaiting = queue.waiting.isNotEmpty()
+        )
     }
+    val positions = queue.waitingProjection(includeCommonPlayPreview = false).positions
+    val index = positions.indexOfFirst { position ->
+        position.registrations.map { it.key }.toSet() == nextKeys
+    }
+    if (index < 0) return RoundEndNextGroup(label = "下一组", positionName = null, registrations = next)
+    val registrations = positions[index].registrations
+    val fixedPair = registrations.size == 2 &&
+        registrations[0].fixedPartnerKey == registrations[1].key &&
+        registrations[1].fixedPartnerKey == registrations[0].key
+    val positionName = "位置 ${machineId.name}${index + 1}"
+    return RoundEndNextGroup(
+        label = positionName + if (fixedPair) "·固定组合" else "",
+        positionName = positionName,
+        registrations = registrations
+    )
 }
 
 @Composable
@@ -15565,6 +17978,7 @@ private fun RoundEndConfirmation(
     playingPositionLabel: String,
     playingRegistrationNames: String,
     nextPlayingNotice: String?,
+    nextGroup: RoundEndNextGroup?,
     closingGracePeriod: Boolean,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
@@ -15575,7 +17989,7 @@ private fun RoundEndConfirmation(
 ) {
     var confirmEndOnly by remember { mutableStateOf(false) }
     var confirmRemoveRegistrations by remember { mutableStateOf(false) }
-    ModalSurface(onDismiss, width = 480.dp) {
+    ModalSurface(onDismiss, width = 540.dp) {
         if (confirmRemoveRegistrations) {
                 Text(
                     "移除本轮玩家的登记并开始下一轮？",
@@ -15586,7 +18000,7 @@ private fun RoundEndConfirmation(
                 Spacer(Modifier.height(8.dp))
                 Text(
                     buildString {
-                        append("$playingRegistrationNames 的登记会从$machineName 队列中移除，不会回到队尾。")
+                        append("$playingRegistrationNames 的登记会从 $machineName 队列中移除，不会回到队尾。")
                         if (removalNextPlayingNames != null) {
                             append("随后，$removalNextPlayingNames 将进入$playingPositionLabel 并开始下一轮。")
                         } else {
@@ -15595,7 +18009,7 @@ private fun RoundEndConfirmation(
                         append("被移除的玩家之后仍要游玩时，需要重新加入排队。")
                     },
                     color = SecondaryText,
-                    fontSize = 13.sp,
+                    fontSize = 14.sp,
                     lineHeight = 20.sp
                 )
                 if (removalNextPlayingNotice != null) {
@@ -15622,9 +18036,9 @@ private fun RoundEndConfirmation(
                 Text("仅结束本轮？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "$machineName 当前玩家的登记会回到队尾，但第一个等待位置不会自动进入$playingPositionLabel。完成后，$playingPositionLabel 会保持空缺，需要手动开始下一轮。",
+                    "确认后，$machineName 本轮玩家的登记会回到队尾，$playingPositionLabel 会保持空缺，需要手动开始下一轮。",
                     color = SecondaryText,
-                    fontSize = 13.sp,
+                    fontSize = 14.sp,
                     lineHeight = 20.sp
                 )
                 Spacer(Modifier.height(18.dp))
@@ -15635,24 +18049,37 @@ private fun RoundEndConfirmation(
                 Text("结束本轮游玩", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    if (closingGracePeriod) {
-                        "闭店收尾期间，请确认如何结束当前玩家的排队登记。"
-                    } else {
-                        "本轮玩家的登记会回到队尾。请选择是否立即开始下一轮。"
+                    when {
+                        closingGracePeriod -> "闭店收尾期间，请确认如何结束当前玩家的排队登记。"
+                        nextGroup == null ->
+                            "本轮玩家的登记会回到队尾。当前没有可以进入游玩位置的登记，" +
+                                "结束本轮后，$playingPositionLabel 会保持空缺。"
+                        nextGroup.keepsCurrentPlayers ->
+                            (if (nextGroup.othersWaiting) "当前没有可以进入游玩位置的其他登记。" else "当前没有其他登记在等待。") +
+                                "如果结束本轮并开始下一轮，游玩位置中的玩家将保持不变，并重新开始计时。" +
+                                "如果需要空出游玩位置，请选择“仅结束本轮”。"
+                        nextGroup.positionName != null ->
+                            "本轮玩家的登记会回到队尾。如果结束本轮并开始下一轮，" +
+                                "将立即由${nextGroup.positionName} 的玩家进入游玩位置，后续等待位置将依次前移。" +
+                                "如果不希望其立即进入游玩位置，请选择“仅结束本轮”。"
+                        else ->
+                            "本轮玩家的登记会回到队尾。如果结束本轮并开始下一轮，" +
+                                "下方的玩家将立即进入游玩位置。" +
+                                "如果不希望其立即进入游玩位置，请选择“仅结束本轮”。"
                     },
                     color = SecondaryText,
-                    fontSize = 13.sp,
+                    fontSize = 14.sp,
                     lineHeight = 20.sp
                 )
                 if (closingGracePeriod) {
                     Spacer(Modifier.height(11.dp))
                     Text(
                         "闭店收尾期间，需要让现有队列逐步结束，因此只能移除本轮玩家的登记并开始下一轮。其他处理方式暂时不可用。",
-                        color = Color(0xFF9A5B00),
+                        color = WarningText,
                         fontSize = 12.sp,
                         lineHeight = 19.sp,
                         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                            .background(Color(0xFFFFF4E5))
+                            .background(WarningBackground)
                             .padding(horizontal = 13.dp, vertical = 11.dp)
                     )
                 }
@@ -15668,9 +18095,29 @@ private fun RoundEndConfirmation(
                             .padding(horizontal = 13.dp, vertical = 11.dp)
                     )
                 }
+                if (!closingGracePeriod && nextGroup != null && !nextGroup.keepsCurrentPlayers) {
+                    Spacer(Modifier.height(14.dp))
+                    // The same drawing as the home screen; here it only shows, it does not open menus.
+                    CompositionLocalProvider(
+                        LocalGlobalDragOverlayController provides remember { GlobalDragOverlayController() }
+                    ) {
+                        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                            QueuePosition(
+                                label = nextGroup.label,
+                                registrations = nextGroup.registrations,
+                                isPlaying = false,
+                                overtimeWarning = false,
+                                interactive = false,
+                                onRegistrationClick = {},
+                                onRegistrationLongPress = {},
+                                onPositionClick = {}
+                            )
+                        }
+                    }
+                }
                 Spacer(Modifier.height(18.dp))
                 if (closingGracePeriod) {
-                    DestructiveButton(
+                    DangerSecondaryButton(
                         "移除本轮玩家的登记并开始下一轮",
                         { confirmRemoveRegistrations = true },
                         Modifier.fillMaxWidth()
@@ -15682,17 +18129,19 @@ private fun RoundEndConfirmation(
                         Modifier.fillMaxWidth()
                     )
                     Spacer(Modifier.height(9.dp))
-                    DestructiveButton(
-                        "移除本轮玩家的登记并开始下一轮",
-                        { confirmRemoveRegistrations = true },
-                        Modifier.fillMaxWidth()
-                    )
-                    Spacer(Modifier.height(9.dp))
-                    SecondaryButton(
-                        "仅结束本轮",
-                        { confirmEndOnly = true },
-                        Modifier.fillMaxWidth()
-                    )
+                    // The longer label gets the wider share so that both stay on one line.
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                        DangerSecondaryButton(
+                            "移除本轮玩家的登记并开始下一轮",
+                            { confirmRemoveRegistrations = true },
+                            Modifier.weight(1.5f)
+                        )
+                        SecondaryButton(
+                            "仅结束本轮",
+                            { confirmEndOnly = true },
+                            Modifier.weight(1f)
+                        )
+                    }
                 }
                 Spacer(Modifier.height(12.dp))
                 CancelAction(onDismiss)
@@ -15715,21 +18164,21 @@ private fun JoinClosingWarningDialog(
     val requestedMachine = request.requestedMachineId
     val description = if (requestedMachine != null) {
         val estimate = estimatedWaitMinutes[requestedMachine]
-        val estimateText = estimate?.let { "约 $it 分钟后" } ?: "按照当前队列估算"
+        val estimateText = estimate?.let { "约 $it 分钟后才能游玩，" } ?: "游玩时间"
         val alternativeMachines = request.joinableMachineIds
             .filterNot { it in request.lateMachineIds }
             .joinToString("、") { machineNames.getValue(it) }
         val alternativeText = alternativeMachines.takeIf { it.isNotEmpty() }?.let {
-            "也可以取消并改选$it；按照当前队列估算，它更可能在闭店前轮到。"
+            "也可以取消并改选${it}；按照当前队列估算，改选后更可能在闭店前游玩。"
         }.orEmpty()
-        "加入${machineNames.getValue(requestedMachine)}后，${estimateText}才能游玩，可能晚于 $closingTime。" +
+        "加入 ${machineNames.getValue(requestedMachine)} 后，${estimateText}可能晚于 ${closingTime}。" +
             alternativeText +
             "现场进度仍可能变化，是否继续创建登记？"
     } else {
         val lateMachineNames = request.lateMachineIds.joinToString("、") {
             machineNames.getValue(it)
         }
-        "$lateMachineNames 当前的预计等待时间都会超过 $closingTime。这份登记可能无法在闭店前游玩，是否仍要继续选择机台？"
+        "按照当前队列估算，这份登记在 $lateMachineNames 都可能要到 $closingTime 闭店之后才能游玩。是否仍要继续选择机台？"
     }
     ModalSurface(onDismiss, width = 480.dp) {
         Text(
@@ -15739,7 +18188,7 @@ private fun JoinClosingWarningDialog(
             fontWeight = FontWeight.SemiBold
         )
         Spacer(Modifier.height(8.dp))
-        Text(description, color = SecondaryText, fontSize = 13.sp, lineHeight = 20.sp)
+        Text(description, color = SecondaryText, fontSize = 14.sp, lineHeight = 20.sp)
         Spacer(Modifier.height(18.dp))
         PrimaryButton("仍然继续", onConfirm, Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
@@ -15760,7 +18209,7 @@ private fun EnterPlayingConfirmation(
         Text(
             notice,
             color = AbsenceStatusColor,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp,
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
                 .background(AbsenceStatusBackground)
@@ -15779,6 +18228,8 @@ private fun MachineTransferDestinationChooser(
     destinations: List<MachineDisplayState>,
     registrations: List<Registration>,
     sourceUnavailableReason: String?,
+    /** The machine that forms an active pair with the source machine, if any. */
+    pairedMachineId: MachineId? = null,
     onDismiss: () -> Unit,
     onSelect: (MachineId) -> Unit
 ) {
@@ -15786,7 +18237,7 @@ private fun MachineTransferDestinationChooser(
         Text("选择目标机台", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(6.dp))
         Text(
-            "选择要从 $sourceMachineName 转入的机台。确认目标后，还需要再次确认位置变化。",
+            "请选择要从 $sourceMachineName 转至的机台。选择后，还需要再次确认位置变化。",
             color = SecondaryText,
             fontSize = 12.sp,
             lineHeight = 18.sp
@@ -15803,12 +18254,13 @@ private fun MachineTransferDestinationChooser(
                         status = destination.status,
                         queue = destination.queue,
                         incomingRegistrations = registrations,
-                        machineCapacity = destination.configuration.capacity
+                        machineCapacity = destination.configuration.capacity,
+                        destinationIsPairedMachine = destination.machineId == pairedMachineId
                     )
                 ActionRow(
                     title = destination.name,
                     description = unavailableReason
-                        ?: "转入后会加入这台机台的登记顺序末端。",
+                        ?: "转入后会加入这台机台的队尾。",
                     enabled = unavailableReason == null,
                     onClick = { onSelect(destination.machineId) }
                 )
@@ -15828,6 +18280,7 @@ private fun MachineTransferConfirmation(
     leavingPlayingPosition: Boolean,
     transferUnavailableReason: String?,
     destinationCapacity: Int,
+    pairedArrangementNotice: String? = null,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
 ) {
@@ -15847,19 +18300,19 @@ private fun MachineTransferConfirmation(
         Spacer(Modifier.height(8.dp))
         Text(
             if (isGroup) {
-                "这会将 $registrationNames 从 $sourceMachineName 移出，并把整组登记加入 $destinationMachineName 的登记顺序末端。"
+                "确认后，${registrationNames}会从 $sourceMachineName 移出，并整组加入 $destinationMachineName 的队尾。"
             } else {
-                "这会将 ${registrationNames.ifBlank { "这份登记" }} 从 $sourceMachineName 移出，并加入 $destinationMachineName 的登记顺序末端。"
+                "确认后，${registrationNames.ifBlank { "这份登记" }}会从 $sourceMachineName 移出，并加入 $destinationMachineName 的队尾。"
             },
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         Spacer(Modifier.height(10.dp))
         Text(
-            "原机台上的当前位置和排队顺序不会保留。即使之后再次转回 $sourceMachineName，也只能加入转回时的队尾，无法恢复到现在的位置。转入后，等待位置会按照 $destinationMachineName 的现有顺序和游玩偏好重新划分。",
+            "原机台上的当前位置不会保留。即使之后再次转回 $sourceMachineName，也只能加入转回时的队尾。转入后，等待位置会按照 $destinationMachineName 的等待顺序和游玩偏好重新划分。",
             color = Destructive,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp,
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
                 .background(Destructive.copy(alpha = .07f))
@@ -15873,9 +18326,9 @@ private fun MachineTransferConfirmation(
             Spacer(Modifier.height(10.dp))
             Text(
                 if (isGroup) {
-                    "这组登记目前处于$sourcePlayingPositionLabel，确认后会立即退出该位置，原机台不会自动补入下一组登记。"
+                    "这组登记当前处于${sourcePlayingPositionLabel}，确认后会立即离开游玩位置，原机台不会自动补入下一组登记。"
                 } else {
-                    "这份登记目前处于$sourcePlayingPositionLabel，确认后会立即退出该位置；如果$sourcePlayingPositionLabel 因此空缺，原机台不会自动补入下一组登记。"
+                    "这份登记当前处于${sourcePlayingPositionLabel}，确认后会立即离开游玩位置；如果$sourcePlayingPositionLabel 因此空缺，原机台不会自动补入下一组登记。"
                 },
                 color = SecondaryText,
                 fontSize = 12.sp,
@@ -15885,7 +18338,7 @@ private fun MachineTransferConfirmation(
         if (breaksFixedPair) {
             Spacer(Modifier.height(10.dp))
             Text(
-                "这份登记属于固定组合。只转移其中一份会同时解除双方的固定组合；转入目标机台和留在原机台的两份登记都会恢复为允许他人加入。",
+                "这份登记属于固定组合。只将其中一份转至 $destinationMachineName 会解除固定组合；转入的登记和留在原机台的登记都会恢复为允许他人加入。",
                 color = SecondaryText,
                 fontSize = 12.sp,
                 lineHeight = 18.sp
@@ -15895,10 +18348,19 @@ private fun MachineTransferConfirmation(
             Spacer(Modifier.height(10.dp))
             Text(
                 if (isGroup) {
-                    "$destinationMachineName 仅能容纳一人游玩。转入后，这些登记会分别使用“单人游玩”；玩家资料中的默认游玩偏好不会改变。之后转回支持共同游玩的机台时，这些登记仍会保持“单人游玩”；如需更改，请手动修改本次游玩偏好。"
+                    "$destinationMachineName 仅能容纳一人游玩。转入后，这些登记会分别使用“单人游玩”；玩家资料中的默认游玩偏好不会改变。之后转回支持共同游玩的机台时，这些登记仍会保持“单人游玩”；需要时，请手动更改本次游玩偏好。"
                 } else {
-                    "$destinationMachineName 仅能容纳一人游玩。转入后，这份登记会使用“单人游玩”；玩家资料中的默认游玩偏好不会改变。之后转回支持共同游玩的机台时，这份登记仍会保持“单人游玩”；如需更改，请手动修改本次游玩偏好。"
+                    "$destinationMachineName 仅能容纳一人游玩。转入后，这份登记会使用“单人游玩”；玩家资料中的默认游玩偏好不会改变。之后转回支持共同游玩的机台时，这份登记仍会保持“单人游玩”；需要时，请手动更改本次游玩偏好。"
                 },
+                color = SecondaryText,
+                fontSize = 12.sp,
+                lineHeight = 18.sp
+            )
+        }
+        if (pairedArrangementNotice != null && transferUnavailableReason == null) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                pairedArrangementNotice,
                 color = SecondaryText,
                 fontSize = 12.sp,
                 lineHeight = 18.sp
@@ -15937,11 +18399,14 @@ private fun MachineTransferConfirmation(
 
 @Composable
 private fun PositionActions(
+    /** The wait estimates of all machines (docs/releases/wait-estimate-2026-11.md). */
+    waitEstimates: WaitEstimator.Result = WaitEstimator.EMPTY,
     selection: PositionSelection,
     queue: MachineQueue,
     machineConfiguration: MachineConfiguration,
     machineOperational: Boolean,
-    transferMachineName: String,
+    /** The only machine a transfer can go to, or null when there are several to choose from. */
+    transferMachineName: String?,
     transferUnavailableReason: String?,
     onDismiss: () -> Unit,
     onRegistrationClick: (Int) -> Unit,
@@ -15957,7 +18422,8 @@ private fun PositionActions(
     val registrations = queue.allRegistrations.filter { it.key in selection.registrationKeys }
     val playingPositionLabel = playingPositionName(selection.machineId)
     val nowMillis = rememberCurrentTimeMillis()
-    val stoppedActionReason = "当前机台已停止使用，恢复正常使用后才能调整这个位置。"
+    // On a stopped machine registrations can still be removed or moved to another machine.
+    val stoppedActionReason = "当前机台已停止使用，恢复正常使用前只能移除登记或转至其他机台。"
     val isFixedPair = registrations.size == 2 &&
         registrations[0].fixedPartnerKey == registrations[1].key &&
         registrations[1].fixedPartnerKey == registrations[0].key
@@ -15991,7 +18457,7 @@ private fun PositionActions(
         when {
             selection.isPlayingPosition && registrations.isNotEmpty() -> add(
                 MenuAction(
-                    "本轮结束",
+                    "结束本轮",
                     if (machineOperational) {
                         "结束当前游玩，并选择登记与下一轮的处理方式。"
                     } else {
@@ -16017,7 +18483,7 @@ private fun PositionActions(
         if (showsRoundEndShortcut) {
             add(
                 MenuAction(
-                    "本轮结束",
+                    "结束本轮",
                     if (machineOperational) {
                         "结束$playingPositionLabel 中的本轮游玩，并选择本轮登记与下一轮的处理方式。此位置中的登记不会被视为本轮玩家。"
                     } else {
@@ -16028,44 +18494,45 @@ private fun PositionActions(
                 )
             )
         }
-        if (canAdvanceToPlaying) {
-            add(
-                MenuAction(
-                    "应处于游玩位置",
-                    if (machineOperational) {
-                        "现场已经推进到此位置，而此前只是连续忘记结束轮次时，按实际进度补记并调整整个队列。"
-                    } else {
-                        stoppedActionReason
-                    },
-                    onAdvanceToPlaying,
-                    enabled = machineOperational
-                )
-            )
-        }
     }
+    val correctionActions = listOfNotNull(
+        MenuAction(
+            "推进至此位置",
+            if (machineOperational) "" else stoppedActionReason,
+            onAdvanceToPlaying,
+            destructive = true,
+            enabled = machineOperational
+        ).takeIf { canAdvanceToPlaying },
+        MenuAction(
+            "撤回至等待顺序",
+            if (machineOperational) "" else stoppedActionReason,
+            onReturnToWaitingFront,
+            destructive = true,
+            enabled = machineOperational
+        ).takeIf { selection.isPlayingPosition && registrations.isNotEmpty() }
+    )
     val queueArrangementActions = buildList {
         if (registrations.isNotEmpty() && isPhysicalWaitingPosition && !hasPendingCheckIn) {
             add(
                 MenuAction(
-                    "转至 $transferMachineName",
-                    if (!machineOperational) {
-                        stoppedActionReason
-                    } else if (transferUnavailableReason == null) {
-                        "将此位置中的登记移至 $transferMachineName 的登记顺序末端。"
+                    transferMachineName?.let { "转至 $it" } ?: "转至其他机台",
+                    if (transferUnavailableReason == null) {
+                        transferMachineName?.let { "将此位置中的登记移至 $it 的队尾。" }
+                            ?: "将此位置中的登记移至所选机台的队尾。"
                     } else {
                         transferUnavailableReason
                     },
                     onTransfer,
-                    enabled = machineOperational && transferUnavailableReason == null
+                    enabled = transferUnavailableReason == null
                 )
             )
         }
         if (isFixedPair && isPhysicalWaitingPosition && !hasPendingCheckIn) {
             add(
                 MenuAction(
-                    "释放组合",
+                    "解除固定组合",
                     if (machineOperational) {
-                        "解除两份登记的固定共同游玩关系，并将双方的游玩偏好都改为允许他人加入。"
+                        "解除两份登记的固定组合，双方的游玩偏好都会改为允许他人加入。"
                     } else {
                         stoppedActionReason
                     },
@@ -16074,6 +18541,15 @@ private fun PositionActions(
                 )
             )
         }
+    }
+    val shownWait = remember(waitEstimates, queue, selection.registrationKeys) {
+        shownPositionWait(
+            waitEstimates,
+            queue.waitingProjection().positions.map { position ->
+                position.registrations.mapTo(mutableSetOf()) { it.key }
+            },
+            selection.registrationKeys.toSet()
+        )
     }
     ModalSurface(onDismiss, width = 560.dp) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -16084,12 +18560,8 @@ private fun PositionActions(
                     if (machineOperational) {
                         positionWaitEstimateLabel(
                             registrations,
-                            estimatedMinutesUntilPlaying(
-                                queue,
-                                selection.registrationKeys.toSet(),
-                                nowMillis,
-                                machineConfiguration
-                            )
+                            shownWait?.minutes,
+                            shownWait?.uncertain == true
                         )
                     } else {
                         "机台恢复使用后重新估算"
@@ -16099,10 +18571,14 @@ private fun PositionActions(
                 )
             }
         }
+        if (machineOperational && !selection.isPlayingPosition && shownWait?.uncertain == true) {
+            Spacer(Modifier.height(6.dp))
+            Text(UNCERTAIN_WAIT_NOTE, color = SecondaryText, fontSize = 12.sp, lineHeight = 18.sp)
+        }
         Spacer(Modifier.height(6.dp))
         Text(
             when {
-                registrations.isEmpty() -> "这个位置目前没有登记。"
+                registrations.isEmpty() -> "这个位置当前没有登记。"
                 !selection.isPlayingPosition && !isPhysicalWaitingPosition ->
                     "这是按当前轮换结果合并显示的预计位置。登记仍保留真实等待顺序；请点开单份登记进行操作。"
                 registrations.size == 1 -> "这个位置包含 1 份登记。"
@@ -16112,12 +18588,33 @@ private fun PositionActions(
             fontSize = 12.sp,
             lineHeight = 18.sp
         )
+        val playedMinutes = queue.playingStartedAtMillis?.let { (nowMillis - it).coerceAtLeast(0L) / 60_000L }
+        if (
+            selection.isPlayingPosition && machineOperational && registrations.isNotEmpty() &&
+            playedMinutes != null && playedMinutes > 20
+        ) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "本轮已超过 20 分钟，请确认机台是否仍在正常游玩。",
+                color = WarningText,
+                fontSize = 12.sp,
+                lineHeight = 19.sp,
+                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                    .background(WarningBackground).padding(horizontal = 13.dp, vertical = 11.dp)
+            )
+        }
         if (registrations.isNotEmpty()) {
             Spacer(Modifier.height(16.dp))
-            SectionLabel("此位置中的登记")
-            Spacer(Modifier.height(7.dp))
-            HorizontalDivider(color = Separator.copy(alpha = .72f))
-            Spacer(Modifier.height(10.dp))
+            // Removing goes with the registrations it removes; whoever does it is asked next.
+            val canRemove = !hasPendingCheckIn &&
+                (selection.isPlayingPosition || isPhysicalWaitingPosition)
+            MenuSectionHeader(
+                "此位置中的登记",
+                actionText = (if (registrations.size > 1) "移除这组登记" else "移除登记")
+                    .takeIf { canRemove },
+                actionDestructive = true,
+                onAction = onRemove
+            )
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 registrations.forEachIndexed { index, registration ->
                     val absenceStatus = registrationAbsenceStatusLabel(
@@ -16157,12 +18654,12 @@ private fun PositionActions(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(Modifier.weight(1f)) {
-                            Text("登记 ${index + 1}", color = TertiaryText, fontSize = 9.sp, fontWeight = FontWeight.Medium)
+                            Text("登记 ${index + 1}", color = TertiaryText, fontSize = 11.sp, fontWeight = FontWeight.Medium)
                             Spacer(Modifier.height(3.dp))
                             Text(
                                 registration.displayId,
                                 color = PrimaryText,
-                                fontSize = 13.sp,
+                                fontSize = 15.sp,
                                 fontWeight = FontWeight.Medium,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
@@ -16175,7 +18672,7 @@ private fun PositionActions(
                                     showNoShowStatus -> NoShowStatusColor
                                     else -> SecondaryText
                                 },
-                                fontSize = 10.sp,
+                                fontSize = 11.sp,
                                 fontWeight = if (pendingCheckIn || absenceStatus != null || showNoShowStatus) {
                                     FontWeight.Medium
                                 } else {
@@ -16185,7 +18682,7 @@ private fun PositionActions(
                             )
                         }
                         Spacer(Modifier.width(10.dp))
-                        Text("›", color = TertiaryText, fontSize = 19.sp)
+                        Text("›", color = TertiaryText, fontSize = 15.sp)
                     }
                 }
             }
@@ -16194,39 +18691,42 @@ private fun PositionActions(
             Spacer(Modifier.height(16.dp))
             MenuSectionHeader("游玩进度")
             CompactActionGrid(playActions)
-            if (selection.isPlayingPosition && registrations.isNotEmpty()) {
-                Spacer(Modifier.height(9.dp))
-                MenuActionButton(
-                    MenuAction(
-                        "撤回至等待顺序前端",
-                        if (machineOperational) {
-                            "$playingPositionLabel 与现场不一致时，将整组按原顺序撤回等待顺序前端，再调整登记顺序或游玩偏好。$playingPositionLabel 会保持空缺。"
-                        } else {
-                            stoppedActionReason
-                        },
-                        onReturnToWaitingFront,
-                        enabled = machineOperational
-                    ),
-                    Modifier.fillMaxWidth()
-                )
-            }
         }
         if (queueArrangementActions.isNotEmpty()) {
-            Spacer(Modifier.height(16.dp))
-            MenuSectionHeader("队列安排")
-            CompactActionGrid(queueArrangementActions, accented = false)
+            Spacer(Modifier.height(QueueSpacing.L))
+            MenuSectionHeader("游玩方式")
+            CompactActionGrid(queueArrangementActions)
+        }
+        if (correctionActions.isNotEmpty()) {
+            SeparateMenuSection(
+                "与现场不一致时",
+                "只在屏幕上的记录与现场实际不一致时使用。",
+                correctionActions,
+                singleActionDescription = when {
+                    canAdvanceToPlaying ->
+                        "现场已经轮到此位置、此前未及时结束轮次时，按实际进度补记轮次并调整整个队列。"
+                    registrations.size > 1 ->
+                        "将整组按原顺序撤回等待顺序，$playingPositionLabel 会保持空缺。"
+                    else ->
+                        "将这份登记撤回等待顺序，$playingPositionLabel 会保持空缺。"
+                }
+            )
         }
         if (
             registrations.isNotEmpty() &&
             !hasPendingCheckIn &&
             (selection.isPlayingPosition || isPhysicalWaitingPosition)
         ) {
-            Spacer(Modifier.height(16.dp))
-            MenuSectionHeader("到场与登记")
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                MenuActionButton(
+            SeparateMenuSection(
+                "由现场玩家报告",
+                if (registrations.size > 1) {
+                    "这组玩家不在现场时，由在场的其他玩家报告。"
+                } else {
+                    "这名玩家不在现场时，由在场的其他玩家报告。"
+                },
+                listOf(
                     MenuAction(
-                        if (registrations.size > 1) "这组玩家未到场" else "未到场",
+                        if (registrations.size > 1) "这组玩家未到场" else "这名玩家未到场",
                         when {
                             !machineOperational -> stoppedActionReason
                             registrations.any {
@@ -16236,37 +18736,21 @@ private fun PositionActions(
                                 "现在还未轮到这个位置中的玩家游玩，不能记录为未到场。"
                             !canReportNoShow ->
                                 "现在还未轮到这名玩家游玩，不能记录为未到场。"
-                            selection.isPlayingPosition && registrations.size > 1 ->
-                                "将整组本次进入$playingPositionLabel 记录为未到场，并选择后续处理方式。"
-                            selection.isPlayingPosition ->
-                                "将这次进入$playingPositionLabel 记录为未到场，并选择后续处理方式。"
-                            registrations.size > 1 ->
-                                "记录整组玩家未到场，并选择如何处理这组登记。"
-                            else -> "记录本次未到场，并选择如何处理这份登记。"
+                            else -> ""
                         },
                         onNoShow,
                         destructive = true,
                         enabled = machineOperational && canReportNoShow
-                    ),
-                    Modifier.weight(1f)
+                    )
+                ),
+                singleActionDescription = noShowPanelDescription(
+                    group = registrations.size > 1,
+                    notYetTheirTurn = machineOperational &&
+                        registrations.none { it.absenceStatus != QueueAbsenceStatus.NONE } &&
+                        !canReportNoShow,
+                    alreadyPlaying = selection.isPlayingPosition
                 )
-                MenuActionButton(
-                    MenuAction(
-                        if (registrations.size > 1) "移除这组登记" else "移除登记",
-                        if (!machineOperational) {
-                            stoppedActionReason
-                        } else if (registrations.size > 1) {
-                            "同时移除此位置中的全部登记。"
-                        } else {
-                            "移除这份登记；继续游玩时需要重新排队。"
-                        },
-                        onRemove,
-                        destructive = true,
-                        enabled = machineOperational
-                    ),
-                    Modifier.weight(1f)
-                )
-            }
+            )
         }
         Spacer(Modifier.height(12.dp))
         CancelAction(onDismiss)
@@ -16276,30 +18760,35 @@ private fun PositionActions(
 @Composable
 private fun ReturnPlayingToWaitingConfirmation(
     playingPositionLabel: String,
+    pairedQueueNotice: String? = null,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
 ) {
     ModalSurface(onDismiss, width = 470.dp) {
         Text(
-            "撤回至等待顺序前端？",
+            "撤回至等待顺序？",
             color = PrimaryText,
             fontSize = 22.sp,
             fontWeight = FontWeight.SemiBold
         )
         Spacer(Modifier.height(8.dp))
         Text(
-            "此操作用于纠正登记误进入$playingPositionLabel 的情况，并不表示玩家已经完成游玩。确认后，此位置中的全部登记会按原有顺序回到等待顺序前端；$playingPositionLabel 保持空缺，系统不会自动开始下一轮。",
+            "此操作用于纠正登记误进入$playingPositionLabel 的情况，并不表示玩家已经完成游玩。确认后，此位置中的全部登记会按原有顺序回到队首；$playingPositionLabel 保持空缺，系统不会自动开始下一轮。",
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         Spacer(Modifier.height(10.dp))
         Text(
-            "$playingPositionLabel 中的登记不会因其他登记修改游玩偏好而自动变化。撤回后再调整等待顺序或游玩偏好，可以使电子队列与现场实际玩家一致。",
+            "$playingPositionLabel 中的登记不会因其他登记更改游玩偏好而自动变化。撤回后再调整等待顺序或游玩偏好，可以使电子队列与现场实际玩家一致。",
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
+        if (pairedQueueNotice != null) {
+            Spacer(Modifier.height(10.dp))
+            Text(pairedQueueNotice, color = PrimaryText, fontSize = 14.sp, lineHeight = 20.sp)
+        }
         Spacer(Modifier.height(18.dp))
         PrimaryButton("确认撤回", onConfirm, Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
@@ -16313,6 +18802,7 @@ private fun ReturnPlayingRegistrationConfirmation(
     remainingPlayer: Registration?,
     isFixedPair: Boolean,
     playingPositionLabel: String,
+    pairedQueueNotice: String? = null,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
 ) {
@@ -16322,16 +18812,20 @@ private fun ReturnPlayingRegistrationConfirmation(
         Text(
             when {
                 remainingPlayer == null ->
-                    "确认后，“${registration.displayId}”会回到等待顺序前端，$playingPositionLabel 保持空缺，系统不会自动开始下一轮。它的游玩偏好仍为“${playPreferenceLabel(registration)}”。"
+                    "确认后，“${registration.displayId}”会回到队首，$playingPositionLabel 保持空缺，系统不会自动开始下一轮。这份登记的游玩偏好不会改变。"
                 isFixedPair ->
-                    "“${registration.displayId}”和“${remainingPlayer.displayId}”当前为固定组合。确认后，固定组合会解除，两份登记都会变为“允许他人加入”。“${registration.displayId}”会回到等待顺序前端，“${remainingPlayer.displayId}”会单独留在$playingPositionLabel 继续本轮。"
+                    "“${registration.displayId}”和“${remainingPlayer.displayId}”当前为固定组合。确认后，固定组合会解除，两份登记都会恢复为允许他人加入。“${registration.displayId}”会回到队首，“${remainingPlayer.displayId}”会单独留在$playingPositionLabel 继续本轮。"
                 else ->
-                    "确认后，“${registration.displayId}”会回到等待顺序前端，“${remainingPlayer.displayId}”会单独留在$playingPositionLabel 继续本轮。两份登记的游玩偏好都会保持“允许他人加入”，不会改为“单人游玩”。"
+                    "确认后，“${registration.displayId}”会回到队首，“${remainingPlayer.displayId}”会单独留在$playingPositionLabel 继续本轮。两份登记的游玩偏好都会保持“允许他人加入”，不会改为“单人游玩”。"
             },
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
+        if (pairedQueueNotice != null) {
+            Spacer(Modifier.height(10.dp))
+            Text(pairedQueueNotice, color = PrimaryText, fontSize = 14.sp, lineHeight = 20.sp)
+        }
         Spacer(Modifier.height(18.dp))
         PrimaryButton("确认撤回这份登记", onConfirm, Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
@@ -16353,7 +18847,7 @@ private fun AdvanceToPlayingConfirmation(
 ) {
     val names = registrations.joinToString("和") { "“${it.displayId}”" }
     ModalSurface(onDismiss, width = 500.dp) {
-        Text("调整为$playingPositionLabel？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+        Text("推进至此位置？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
         Text(
             if (registrations.isNotEmpty()) {
@@ -16362,7 +18856,7 @@ private fun AdvanceToPlayingConfirmation(
                 "此位置的登记已经发生变化，无法继续执行调整。"
             },
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         if (registrations.isNotEmpty()) {
@@ -16373,7 +18867,7 @@ private fun AdvanceToPlayingConfirmation(
                 fontSize = 12.sp,
                 lineHeight = 19.sp,
                 modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                    .background(Color(0xFFFFF4E5)).padding(horizontal = 13.dp, vertical = 11.dp)
+                    .background(WarningBackground).padding(horizontal = 13.dp, vertical = 11.dp)
             )
             if (availabilityNotice != null) {
                 Spacer(Modifier.height(10.dp))
@@ -16389,7 +18883,7 @@ private fun AdvanceToPlayingConfirmation(
             }
             Spacer(Modifier.height(10.dp))
             Text(
-                "已完成游玩的登记会按实际游玩顺序回到等待顺序末端，$names 会进入$playingPositionLabel。此操作会同时改变多个等待位置，请只在现场顺序确实已经推进到这里时使用。",
+                "已完成游玩的登记会按实际游玩顺序回到队尾，$names 会进入$playingPositionLabel。此操作会同时改变多个等待位置，请只在现场顺序确实已经推进到这里时使用。",
                 color = SecondaryText,
                 fontSize = 12.sp,
                 lineHeight = 19.sp
@@ -16416,17 +18910,17 @@ private fun ReleaseFixedPairConfirmation(
 ) {
     val names = registrations.joinToString("和") { "“${it.displayId}”" }
     ModalSurface(onDismiss, width = 450.dp) {
-        Text("释放固定组合？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+        Text("解除固定组合？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
         Text(
             if (registrations.size == 2) {
                 buildString {
-                    append("$names 将不再固定共同游玩。两份登记的游玩偏好都会改为允许他人加入，系统会按照登记顺序重新组成等待位置。")
+                    append("确认后，${names}的固定组合会解除。两份登记的游玩偏好都会改为允许他人加入，系统会按照等待顺序重新组成等待位置。")
                     registrations.firstOrNull()?.let(::fixedPairAbsenceRetentionNotice)
                         ?.let { append(it) }
                 }
             } else {
-                "这个固定组合已经发生变化，无法继续执行释放操作。"
+                "这个固定组合已经发生变化，无法解除。"
             },
             color = SecondaryText,
             fontSize = 12.sp,
@@ -16434,7 +18928,7 @@ private fun ReleaseFixedPairConfirmation(
         )
         Spacer(Modifier.height(18.dp))
         PrimaryButton(
-            "确认释放组合",
+            "确认解除固定组合",
             onConfirm,
             Modifier.fillMaxWidth(),
             enabled = registrations.size == 2,
@@ -16445,13 +18939,56 @@ private fun ReleaseFixedPairConfirmation(
     }
 }
 
+/**
+ * The no-show confirmation of registrations that the system had arranged to this machine. They
+ * go back to the machine they came from, so there is nothing to choose.
+ */
+@Composable
+private fun PairedArrivalNoShowDialog(
+    detail: String,
+    leavesPlayingPositionEmpty: Boolean,
+    advanceNotice: String?,
+    confirmLabel: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    ModalSurface(onDismiss, width = 540.dp) {
+        Text(
+            PAIRED_MACHINE_ARRIVAL_NO_SHOW_TITLE,
+            color = PrimaryText,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(detail, color = SecondaryText, fontSize = 14.sp, lineHeight = 20.sp)
+        if (leavesPlayingPositionEmpty) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "如果游玩位置因此无人游玩，将保持空缺，需要手动让下一组进入游玩位置。",
+                color = SecondaryText,
+                fontSize = 12.sp,
+                lineHeight = 18.sp
+            )
+        }
+        AutomaticAdvanceNotice(advanceNotice)
+        Spacer(Modifier.height(18.dp))
+        PrimaryButton(confirmLabel, onConfirm, Modifier.fillMaxWidth())
+        Spacer(Modifier.height(8.dp))
+        CancelAction(onDismiss)
+    }
+}
+
 @Composable
 private fun NoShowDialog(
     registration: Registration,
+    /** See Registration.mustBeRemovedWhenAbsent: only removal is offered. */
+    removalOnly: Boolean = false,
     fromPlayingPosition: Boolean,
     playingPositionLabel: String,
     waitingFrontPositionLabel: String,
     allowDeferOneRound: Boolean,
+    /** 暂缓一次 was used and has not been followed by a round of play: deferring is grey. */
+    deferUsed: Boolean = false,
     deferAdvanceNotice: String?,
     moveAdvanceNotice: String?,
     removeAdvanceNotice: String?,
@@ -16464,7 +19001,8 @@ private fun NoShowDialog(
     var selectedResolution by remember(registration.key, occurrence) {
         mutableStateOf<NoShowResolution?>(null)
     }
-    ModalSurface(onDismiss, width = 540.dp) {
+    // The choice is three cards side by side, like 延后这份登记; the confirmation is narrower.
+    ModalSurface(onDismiss, width = if (selectedResolution == null) 900.dp else 540.dp) {
         AnimatedContent(targetState = selectedResolution, label = "未到场处理确认") { resolution ->
             if (resolution == null) {
                 Column(Modifier.fillMaxWidth()) {
@@ -16486,49 +19024,32 @@ private fun NoShowDialog(
                         Spacer(Modifier.height(10.dp))
                     }
                     Text(
-                        if (occurrence == 1) {
-                            "请根据玩家是否仍会回来，选择保留原位、移至队尾或退出排队。"
+                        if (removalOnly) {
+                            "这份线上登记已完成签到，尚未游玩。$ONLINE_REGISTRATION_NO_SHOW_REMOVAL_ONLY"
+                        } else if (deferUsed) {
+                            "这份登记已暂缓过一次，游玩一轮之前不能再次暂缓。请根据玩家是否仍会回来，选择移至队尾或移除登记。"
+                        } else if (occurrence == 1) {
+                            "请根据玩家是否仍会回来，选择暂缓一次、移至队尾或移除登记。"
                         } else if (!allowDeferOneRound) {
                             "这是再次未到场。系统规则不允许暂缓一次，请选择移至队尾或移除登记。"
                         } else {
                             "这是再次未到场。确认玩家仍会回来时可以暂缓一次或移至队尾，否则建议移除登记。"
                         },
                         color = SecondaryText,
-                        fontSize = 13.sp,
+                        fontSize = 14.sp,
                         lineHeight = 20.sp
                     )
-                    Spacer(Modifier.height(17.dp))
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        NoShowChoice(
-                            "暂缓一次",
-                            if (allowDeferOneRound) {
-                                if (fromPlayingPosition) {
-                                    "回到$waitingFrontPositionLabel，跳过本次机会后自动解除。"
-                                } else {
-                                    "$waitingFrontPositionLabel 保持不变；跳过本次机会后自动解除。"
-                                }
-                            } else {
-                                "系统规则不允许。"
-                            },
-                            onClick = { selectedResolution = NoShowResolution.DEFER_ONE_ROUND },
-                            visuallyDisabled = !allowDeferOneRound,
-                            modifier = Modifier.weight(1f)
-                        )
-                        NoShowChoice(
-                            "移至队尾",
-                            "将这份登记移动到当前队尾。",
-                            onClick = { selectedResolution = NoShowResolution.MOVE_TO_TAIL },
-                            modifier = Modifier.weight(1f)
-                        )
-                        NoShowChoice(
-                            "移除登记",
-                            "从当前排队中移除这份登记。",
-                            destructive = true,
-                            onClick = { selectedResolution = NoShowResolution.REMOVE },
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                    Spacer(Modifier.height(12.dp))
+                    Spacer(Modifier.height(QueueSpacing.L))
+                    NoShowResolutionCards(
+                        group = false,
+                        removalOnly = removalOnly,
+                        deferUsed = deferUsed,
+                        allowDeferOneRound = allowDeferOneRound,
+                        fromPlayingPosition = fromPlayingPosition,
+                        playingPositionLabel = playingPositionLabel,
+                        onSelect = { selectedResolution = it }
+                    )
+                    Spacer(Modifier.height(QueueSpacing.M))
                     CancelAction(onDismiss)
                 }
             } else {
@@ -16561,11 +19082,16 @@ private fun NoShowDialog(
 
 @Composable
 private fun GroupNoShowDialog(
+    arrangedArrivalNotice: String? = null,
     registrations: List<Registration>,
+    /** See Registration.mustBeRemovedWhenAbsent: only removal is offered. */
+    removalOnly: Boolean = false,
     fromPlayingPosition: Boolean,
     playingPositionLabel: String,
     waitingFrontPositionLabel: String,
     allowDeferOneRound: Boolean,
+    /** 暂缓一次 was used and has not been followed by a round of play: deferring is grey. */
+    deferUsed: Boolean = false,
     deferAdvanceNotice: String?,
     moveAdvanceNotice: String?,
     removeAdvanceNotice: String?,
@@ -16575,10 +19101,13 @@ private fun GroupNoShowDialog(
     onRemove: () -> Unit
 ) {
     val anyPreviousNoShow = registrations.any { it.noShowCount > 0 }
+    val isFixedPair = registrations.size == 2 &&
+        registrations[0].fixedPartnerKey == registrations[1].key &&
+        registrations[1].fixedPartnerKey == registrations[0].key
     var selectedResolution by remember(registrations.map { it.key }, anyPreviousNoShow) {
         mutableStateOf<NoShowResolution?>(null)
     }
-    ModalSurface(onDismiss, width = 550.dp) {
+    ModalSurface(onDismiss, width = if (selectedResolution == null) 900.dp else 550.dp) {
         AnimatedContent(targetState = selectedResolution, label = "整组未到场处理确认") { resolution ->
             if (resolution == null) {
                 Column(Modifier.fillMaxWidth()) {
@@ -16600,7 +19129,19 @@ private fun GroupNoShowDialog(
                         Spacer(Modifier.height(10.dp))
                     }
                     Text(
-                        if (!anyPreviousNoShow) {
+                        if (removalOnly) {
+                            // The other registration of the group need not go with it: point to
+                            // handling the two one by one. A fixed pair is always handled as a
+                            // group, so it has to be released first.
+                            "组内有已完成签到、尚未游玩的线上登记。$ONLINE_REGISTRATION_NO_SHOW_REMOVAL_ONLY" +
+                                if (isFixedPair) {
+                                    "需要保留另一份登记时，请先解除固定组合，再分别对两份登记记录未到场。"
+                                } else {
+                                    "需要保留另一份登记时，请分别对两份登记记录未到场。"
+                                }
+                        } else if (deferUsed) {
+                            "组内有登记已暂缓过一次，游玩一轮之前不能再次暂缓。请根据玩家是否仍会回来，选择整组移至队尾或移除整组登记。"
+                        } else if (!anyPreviousNoShow) {
                             "以下操作会同时作用于组内全部登记。请根据玩家是否仍会回来选择处理方式。"
                         } else if (!allowDeferOneRound) {
                             "组内已有登记曾被记录为未到场。系统规则不允许暂缓一次，请选择整组移至队尾或移除整组登记。"
@@ -16608,41 +19149,29 @@ private fun GroupNoShowDialog(
                             "组内已有登记曾被记录为未到场。确认仍会回来时可以暂缓一次或移至队尾，否则建议移除整组登记。"
                         },
                         color = SecondaryText,
-                        fontSize = 13.sp,
+                        fontSize = 14.sp,
                         lineHeight = 20.sp
                     )
-                    Spacer(Modifier.height(17.dp))
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        NoShowChoice(
-                            "暂缓一次",
-                            if (allowDeferOneRound) {
-                                if (fromPlayingPosition) {
-                                    "整组回到$waitingFrontPositionLabel，跳过本次机会后自动解除。"
-                                } else {
-                                    "$waitingFrontPositionLabel 保持不变；整组跳过本次机会后自动解除。"
-                                }
-                            } else {
-                                "系统规则不允许。"
-                            },
-                            onClick = { selectedResolution = NoShowResolution.DEFER_GROUP_ONE_ROUND },
-                            visuallyDisabled = !allowDeferOneRound,
-                            modifier = Modifier.weight(1f)
-                        )
-                        NoShowChoice(
-                            "整组移至队尾",
-                            "将这组登记移动到当前队尾。",
-                            onClick = { selectedResolution = NoShowResolution.MOVE_TO_TAIL },
-                            modifier = Modifier.weight(1f)
-                        )
-                        NoShowChoice(
-                            "移除整组",
-                            "从当前排队中移除这组登记。",
-                            destructive = true,
-                            onClick = { selectedResolution = NoShowResolution.REMOVE },
-                            modifier = Modifier.weight(1f)
+                    if (arrangedArrivalNotice != null) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            arrangedArrivalNotice,
+                            color = SecondaryText,
+                            fontSize = 14.sp,
+                            lineHeight = 20.sp
                         )
                     }
-                    Spacer(Modifier.height(12.dp))
+                    Spacer(Modifier.height(QueueSpacing.L))
+                    NoShowResolutionCards(
+                        group = true,
+                        removalOnly = removalOnly,
+                        deferUsed = deferUsed,
+                        allowDeferOneRound = allowDeferOneRound,
+                        fromPlayingPosition = fromPlayingPosition,
+                        playingPositionLabel = playingPositionLabel,
+                        onSelect = { selectedResolution = it }
+                    )
+                    Spacer(Modifier.height(QueueSpacing.M))
                     CancelAction(onDismiss)
                 }
             } else {
@@ -16673,6 +19202,91 @@ private fun GroupNoShowDialog(
     }
 }
 
+/**
+ * The three ways to settle a no-show, as cards side by side like the choice under 延后这份登记:
+ * each says when it fits, what happens now and what follows. A card that does not apply is grey
+ * and shows why in place of its summary.
+ */
+@Composable
+private fun NoShowResolutionCards(
+    group: Boolean,
+    removalOnly: Boolean,
+    deferUsed: Boolean,
+    allowDeferOneRound: Boolean,
+    fromPlayingPosition: Boolean,
+    playingPositionLabel: String,
+    onSelect: (NoShowResolution) -> Unit
+) {
+    val players = if (group) "这组玩家" else "玩家"
+    val registrations = if (group) "这组登记" else "这份登记"
+    val whole = if (group) "整组" else ""
+    Row(
+        Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+        horizontalArrangement = Arrangement.spacedBy(QueueSpacing.M)
+    ) {
+        AbsenceChoiceCard(
+            title = "暂缓一次",
+            summary = "${whole}跳过本次机会，位置不变",
+            facts = listOf(
+                "适用" to "${players}暂时不在，但很快就会回来。",
+                "处理后" to if (fromPlayingPosition) {
+                    "${whole}离开$playingPositionLabel 并回到队首，跳过本次机会。"
+                } else {
+                    "${whole}跳过本次机会，${registrations}保持当前顺序；本轮由其余在场的登记重新组合。"
+                },
+                "之后" to "跳过一次后自动解除。游玩一轮之前，${registrations}不能再次暂缓。"
+            ),
+            enabled = !removalOnly && !deferUsed && allowDeferOneRound,
+            disabledReason = when {
+                removalOnly -> ONLINE_REGISTRATION_NO_SHOW_CHOICE_UNAVAILABLE
+                deferUsed -> if (group) {
+                    "组内有登记已暂缓过一次，游玩一轮之后才能再次暂缓。"
+                } else {
+                    DEFER_ONE_ROUND_USED_REASON
+                }
+                else -> "系统规则不允许暂缓一次。"
+            },
+            onClick = {
+                onSelect(
+                    if (group) NoShowResolution.DEFER_GROUP_ONE_ROUND else NoShowResolution.DEFER_ONE_ROUND
+                )
+            },
+            modifier = Modifier.weight(1f).fillMaxHeight()
+        )
+        AbsenceChoiceCard(
+            title = if (group) "整组移至队尾" else "移至队尾",
+            summary = "保留登记，${whole}移至队尾",
+            facts = listOf(
+                "适用" to "${players}会回来，但需要一些时间。",
+                "处理后" to if (fromPlayingPosition) {
+                    "${whole}离开$playingPositionLabel 并移至当前队尾。"
+                } else {
+                    "${registrations}移至当前队尾。"
+                },
+                "之后" to "按正常轮换再次轮到，不需要再操作。"
+            ),
+            enabled = !removalOnly,
+            disabledReason = ONLINE_REGISTRATION_NO_SHOW_CHOICE_UNAVAILABLE,
+            onClick = { onSelect(NoShowResolution.MOVE_TO_TAIL) },
+            modifier = Modifier.weight(1f).fillMaxHeight()
+        )
+        AbsenceChoiceCard(
+            title = if (group) "移除整组" else "移除登记",
+            summary = "${whole}退出本次排队",
+            facts = listOf(
+                "适用" to "${players}不会回来，或无法确认是否回来。",
+                "处理后" to "从队列中移除${registrations}。",
+                "之后" to "继续游玩时需要重新加入排队。"
+            ),
+            enabled = true,
+            disabledReason = "",
+            destructive = true,
+            onClick = { onSelect(NoShowResolution.REMOVE) },
+            modifier = Modifier.weight(1f).fillMaxHeight()
+        )
+    }
+}
+
 @Composable
 private fun NoShowResolutionConfirmation(
     subject: String,
@@ -16700,20 +19314,20 @@ private fun NoShowResolutionConfirmation(
         Text(
             when {
                 fromPlayingPosition && isDefer ->
-                    "$subject 会离开${playingPositionLabel}并回到$waitingFrontPositionLabel。未到场记录会增加一次；暂缓状态会在工作人员下一次安排游玩位置时处理，不会立即把玩家重新选入本轮。"
+                    "${subject}会离开$playingPositionLabel 并回到$waitingFrontPositionLabel。未到场记录会增加一次；暂缓状态会在下一次安排游玩位置时处理，玩家不会立即重新进入本轮。"
                 fromPlayingPosition && resolution == NoShowResolution.MOVE_TO_TAIL ->
-                    "$subject 会离开${playingPositionLabel}并移至等待顺序末端。未到场记录会增加一次；如果游玩位置因此无人游玩，将保持空缺，等待工作人员安排下一组。"
+                    "${subject}会离开${playingPositionLabel}并移至队尾。未到场记录会增加一次；如果游玩位置因此无人游玩，将保持空缺，需要手动让下一组进入游玩位置。"
                 fromPlayingPosition ->
-                    "$subject 会离开${playingPositionLabel}并退出本次排队。未到场记录不会保留在已移除的登记中；如果游玩位置因此无人游玩，将保持空缺。"
+                    "${subject}会离开${playingPositionLabel}，登记会从队列中移除。如果游玩位置因此无人游玩，将保持空缺。"
                 isDefer ->
-                    "$subject 的未到场记录会增加一次，本次机会会被跳过；登记保持真实顺序，并在跳过后自动解除暂缓。"
+                    "${subject}的未到场记录会增加一次，本次机会会被跳过；登记保持真实顺序，并在跳过后自动解除暂缓。"
                 resolution == NoShowResolution.MOVE_TO_TAIL ->
-                    "$subject 的未到场记录会增加一次，并移至等待顺序末端。本次自动安排会明确跳过相关登记，下次正常轮换时再参与。"
+                    "${subject}的未到场记录会增加一次，登记会移至队尾，之后按正常轮换参与游玩。"
                 else ->
-                    "$subject 会记录本次未到场并退出排队。"
+                    "${subject}的本次未到场会被记录，登记会从队列中移除。"
             },
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         AutomaticAdvanceNotice(advanceNotice)
@@ -16730,7 +19344,7 @@ private fun NoShowResolutionConfirmation(
             )
         }
         Spacer(Modifier.height(8.dp))
-        CancelAction("返回选择", onBack)
+        CancelAction("返回", onBack)
     }
 }
 
@@ -16745,21 +19359,37 @@ private fun QueueAbsenceDialog(
     allowTemporaryLeave: Boolean,
     deferAdvanceNotice: String?,
     temporarilyLeaveAdvanceNotice: String?,
+    skipAdvanceNotice: String? = null,
+    /** 暂缓一次 was used and the registration has not played since; it is grey. */
+    deferOneRoundUsed: Boolean = false,
+    /** Turns missed during an earlier leave or skip that still count; see Registration. */
+    retainedSkippedTurns: Int = 0,
+    /** Set when the registration menu offered the methods as separate entries. */
+    initialChoice: QueueAbsenceChoice? = null,
     onDismiss: () -> Unit,
     onDeferOneRound: () -> Unit,
+    onSkipOneTurn: () -> Unit = {},
     onTemporarilyLeave: () -> Unit
 ) {
-    var choice by remember(displayId, fixedPartnerDisplayId) {
-        mutableStateOf<QueueAbsenceChoice?>(null)
+    val deferAvailable = allowDeferOneRound && !deferOneRoundUsed
+    val deferUnavailableReason = if (allowDeferOneRound) {
+        DEFER_ONE_ROUND_USED_REASON
+    } else {
+        "系统规则不允许暂缓一次。"
     }
+    var choice by remember(displayId, fixedPartnerDisplayId) {
+        mutableStateOf(initialChoice)
+    }
+    val leaveConfirmation: () -> Unit = { if (initialChoice == null) choice = null else onDismiss() }
+    val leaveConfirmationLabel = if (initialChoice == null) "返回" else "取消"
     val subject = fixedPartnerDisplayId?.let { "“$displayId”和“$it”" } ?: "“$displayId”"
-    ModalSurface(onDismiss, width = 500.dp) {
-        AnimatedContent(targetState = choice, label = "暂缓一次或暂时离开选项") { selectedChoice ->
+    ModalSurface(onDismiss, width = if (choice == null) 900.dp else 500.dp) {
+        AnimatedContent(targetState = choice, label = "延后登记的方式") { selectedChoice ->
             Column(Modifier.fillMaxWidth()) {
                 when (selectedChoice) {
                     null -> {
                         Text(
-                            "暂缓一次或暂时离开",
+                            if (fixedPartnerDisplayId == null) "延后这份登记" else "延后这组登记",
                             color = PrimaryText,
                             fontSize = 22.sp,
                             fontWeight = FontWeight.SemiBold
@@ -16767,45 +19397,62 @@ private fun QueueAbsenceDialog(
                         Spacer(Modifier.height(8.dp))
                         Text(
                             if (fixedPartnerDisplayId == null) {
-                                "请选择这份登记暂时无法游玩时的处理方式。"
+                                "暂时不能游玩时，选择一种方式。三种方式的区别如下。"
                             } else {
-                                "$subject 是固定组合，以下操作会同时作用于两份登记。"
+                                "${subject}是固定组合，所选方式会同时作用于两份登记。"
                             },
                             color = SecondaryText,
-                            fontSize = 13.sp,
+                            fontSize = QueueTextSize.Body,
                             lineHeight = 20.sp
                         )
-                        Spacer(Modifier.height(17.dp))
-                        MenuActionButton(
-                            MenuAction(
-                                "暂缓一次",
-                                if (allowDeferOneRound) {
-                                    "只跳过下一次游玩机会；本轮按其余在场登记重新组合，之后自动解除。"
-                                } else {
-                                    "系统规则不允许。"
-                                },
-                                { choice = QueueAbsenceChoice.DEFER_ONE_ROUND },
-                                enabled = allowDeferOneRound
-                            ),
-                            Modifier.fillMaxWidth(),
-                            accented = false
-                        )
-                        Spacer(Modifier.height(9.dp))
-                        MenuActionButton(
-                            MenuAction(
-                                "暂时离开",
-                                if (allowTemporaryLeave) {
-                                    "暂时离开期间不参与游玩组合；每次轮到时移至队尾，返回后需要手动解除。"
-                                } else {
-                                    "系统规则不允许。"
-                                },
-                                { choice = QueueAbsenceChoice.TEMPORARILY_AWAY },
-                                enabled = allowTemporaryLeave
-                            ),
-                            Modifier.fillMaxWidth(),
-                            accented = false
-                        )
-                        Spacer(Modifier.height(10.dp))
+                        Spacer(Modifier.height(QueueSpacing.L))
+                        // The two side by side, each saying when it fits, what happens when the
+                        // registration is reached, and how it ends.
+                        Row(
+                            Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+                            horizontalArrangement = Arrangement.spacedBy(QueueSpacing.M)
+                        ) {
+                            AbsenceChoiceCard(
+                                title = "暂缓一次",
+                                summary = "跳过一次，位置不变",
+                                facts = listOf(
+                                    "适用" to "仍在现场，只是这一次轮到时还没有准备好。",
+                                    "轮到时" to "跳过这一次进入游玩位置的机会，登记保持当前顺序；本轮由其余在场的登记重新组合。",
+                                    "结束" to "跳过一次后自动解除，不需要再操作。"
+                                ),
+                                enabled = deferAvailable,
+                                disabledReason = deferUnavailableReason,
+                                onClick = { choice = QueueAbsenceChoice.DEFER_ONE_ROUND },
+                                modifier = Modifier.weight(1f).fillMaxHeight()
+                            )
+                            AbsenceChoiceCard(
+                                title = "轮空一次",
+                                summary = "轮到时移至队尾",
+                                facts = listOf(
+                                    "适用" to "需要晚些再游玩，在重新排一次队的时间内可以回来。",
+                                    "轮到时" to "下一次轮到时移至队尾，计一次轮空；本轮由其余在场的登记重新组合。",
+                                    "结束" to "移至队尾后自动解除，不需要再操作；轮空次数与暂时离开合并计算。"
+                                ),
+                                enabled = true,
+                                disabledReason = "",
+                                onClick = { choice = QueueAbsenceChoice.SKIP_ONE_TURN },
+                                modifier = Modifier.weight(1f).fillMaxHeight()
+                            )
+                            AbsenceChoiceCard(
+                                title = "暂时离开",
+                                summary = "离开期间轮空，返回后取消",
+                                facts = listOf(
+                                    "适用" to "需要离开现场一段时间。",
+                                    "轮到时" to "每次轮到都移至队尾，计一次轮空；离开期间不参与游玩组合。",
+                                    "结束" to "返回后手动取消暂时离开；第 4 次轮到时，登记会被自动移除。"
+                                ),
+                                enabled = allowTemporaryLeave,
+                                disabledReason = "系统规则不允许暂时离开。",
+                                onClick = { choice = QueueAbsenceChoice.TEMPORARILY_AWAY },
+                                modifier = Modifier.weight(1f).fillMaxHeight()
+                            )
+                        }
+                        Spacer(Modifier.height(QueueSpacing.M))
                         CancelAction(onDismiss)
                     }
 
@@ -16820,23 +19467,23 @@ private fun QueueAbsenceDialog(
                         Text(
                             when {
                                 isPlayingPosition && fixedPartnerDisplayId != null ->
-                                    "$subject 会一起离开$playingPositionLabel 并回到等待顺序前端。这次游玩机会会被跳过，两份登记保持原有顺序，随后自动解除暂缓。"
+                                    "${subject}会一起离开$playingPositionLabel 并回到队首。这次游玩机会会被跳过，两份登记保持原有顺序，随后自动解除暂缓。"
                                 isPlayingPosition && playingPartnerDisplayId != null ->
-                                    "$subject 会离开$playingPositionLabel 并回到等待顺序前端；“$playingPartnerDisplayId”继续本轮游玩。这次机会视为已经跳过，暂缓随即自动解除。"
+                                    "${subject}会离开$playingPositionLabel 并回到队首；“$playingPartnerDisplayId”继续本轮游玩。这次机会视为已经跳过，暂缓随即自动解除。"
                                 isPlayingPosition ->
-                                    "$subject 会离开$playingPositionLabel 并回到等待顺序前端。这次游玩机会会被跳过，登记保持原有顺序，随后自动解除暂缓。"
+                                    "${subject}会离开$playingPositionLabel 并回到队首。这次游玩机会会被跳过，登记保持原有顺序，随后自动解除暂缓。"
                                 fixedPartnerDisplayId != null ->
-                                "下一次轮到$subject 时，整组不会进入游玩位置。两份登记保持当前顺序，并在跳过这次机会后自动解除暂缓。"
+                                "下一次轮到${subject}时，整组不会进入游玩位置。两份登记保持当前顺序，并在跳过这次机会后自动解除暂缓。"
                                 else ->
-                                "下一次轮到$subject 时不会进入游玩位置。这份登记保持当前顺序，并在跳过这次机会后自动解除暂缓。"
+                                "下一次轮到${subject}时不会进入游玩位置。这份登记保持当前顺序，并在跳过这次机会后自动解除暂缓。"
                             },
                             color = SecondaryText,
-                            fontSize = 13.sp,
+                            fontSize = 14.sp,
                             lineHeight = 20.sp
                         )
                         Spacer(Modifier.height(10.dp))
                         Text(
-                            "暂缓的登记本轮不会占用共同游玩位置。系统会忽略它，并按照其余在场登记的单人游玩、允许他人加入或固定组合偏好重新组成下一轮。",
+                            "暂缓的登记在跳过的这一轮不占用共同游玩位置；系统会按照其余在场登记的游玩偏好重新组合。",
                             color = AbsenceStatusColor,
                             fontSize = 12.sp,
                             lineHeight = 19.sp,
@@ -16850,11 +19497,57 @@ private fun QueueAbsenceDialog(
                             "确认暂缓一次",
                             onDeferOneRound,
                             Modifier.fillMaxWidth(),
-                            enabled = allowDeferOneRound,
-                            disabledReason = "系统规则不允许暂缓一次。"
+                            enabled = deferAvailable,
+                            disabledReason = deferUnavailableReason
                         )
                         Spacer(Modifier.height(8.dp))
-                        CancelAction("返回选择") { choice = null }
+                        CancelAction(leaveConfirmationLabel, leaveConfirmation)
+                    }
+
+                    QueueAbsenceChoice.SKIP_ONE_TURN -> {
+                        Text(
+                            if (fixedPartnerDisplayId == null) "确认轮空一次？" else "确认整组轮空一次？",
+                            color = PrimaryText,
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            if (fixedPartnerDisplayId != null) {
+                                "下一次轮到${subject}时，整组不会进入游玩位置，而会一起按一次轮空移至当前队尾；轮空一次随即自动解除。"
+                            } else {
+                                "下一次轮到${subject}时不会进入游玩位置，而会按一次轮空移至当前队尾；轮空一次随即自动解除。"
+                            },
+                            color = SecondaryText,
+                            fontSize = 14.sp,
+                            lineHeight = 20.sp
+                        )
+                        // Few skip three times in a row, so the limit is only stressed once it is
+                        // near: when this skip is the third, and when the next turn removes it.
+                        skipOneTurnLimitNotice(subject, retainedSkippedTurns)?.let { notice ->
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                notice,
+                                color = AbsenceStatusColor,
+                                fontSize = 14.sp,
+                                lineHeight = 20.sp
+                            )
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            "轮空的登记不会占用共同游玩位置，系统会按照其余在场登记的游玩偏好重新组合。轮到之前，可以从登记菜单取消轮空一次。",
+                            color = AbsenceStatusColor,
+                            fontSize = 12.sp,
+                            lineHeight = 19.sp,
+                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                                .background(AbsenceStatusBackground)
+                                .padding(horizontal = 13.dp, vertical = 10.dp)
+                        )
+                        AutomaticAdvanceNotice(skipAdvanceNotice)
+                        Spacer(Modifier.height(18.dp))
+                        PrimaryButton("确认轮空一次", onSkipOneTurn, Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(8.dp))
+                        CancelAction(leaveConfirmationLabel, leaveConfirmation)
                     }
 
                     QueueAbsenceChoice.TEMPORARILY_AWAY -> {
@@ -16867,17 +19560,26 @@ private fun QueueAbsenceDialog(
                         Spacer(Modifier.height(8.dp))
                         Text(
                             if (isPlayingPosition) {
-                                "$subject 会离开$playingPositionLabel，并按一次轮空移至当前等待顺序末端。之后每次轮到时仍会移至队尾，状态不会自动解除。"
+                                "${subject}会离开$playingPositionLabel，并按一次轮空移至当前队尾。之后每次轮到时仍会移至队尾，状态不会自动解除。"
                             } else {
-                                "下一次轮到$subject 时不会进入游玩位置，而会按一次轮空移至当前等待顺序末端；之后每次轮到时仍会移至队尾。"
+                                "下一次轮到${subject}时不会进入游玩位置，而会按一次轮空移至当前队尾；之后每次轮到时仍会移至队尾。"
                             },
                             color = SecondaryText,
-                            fontSize = 13.sp,
+                            fontSize = 14.sp,
                             lineHeight = 20.sp
                         )
+                        if (retainedSkippedTurns > 0) {
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                "${subject}已轮空 $retainedSkippedTurns 次。再次暂时离开后，已轮空次数将继续累计。",
+                                color = AbsenceStatusColor,
+                                fontSize = 14.sp,
+                                lineHeight = 20.sp
+                            )
+                        }
                         Spacer(Modifier.height(10.dp))
                         Text(
-                            "暂时离开的登记不会占用共同游玩位置，系统会按照其余在场登记的游玩偏好重新组合。玩家返回后，需要从登记菜单手动取消暂时离开。连续轮空 3 次后仍未取消，第四次轮到时会自动退出排队。",
+                            "暂时离开的登记不会占用共同游玩位置，系统会按照其余在场登记的游玩偏好重新组合。玩家返回后，需要从登记菜单手动取消暂时离开。累计轮空 3 次后，第 4 次轮到时仍未取消，登记会自动移除；已轮空次数会在游玩一轮后清零。",
                             color = AbsenceStatusColor,
                             fontSize = 12.sp,
                             lineHeight = 19.sp,
@@ -16895,7 +19597,7 @@ private fun QueueAbsenceDialog(
                             disabledReason = "系统规则不允许暂时离开。"
                         )
                         Spacer(Modifier.height(8.dp))
-                        CancelAction("返回选择") { choice = null }
+                        CancelAction(leaveConfirmationLabel, leaveConfirmation)
                     }
                 }
             }
@@ -16918,18 +19620,131 @@ private fun AutomaticAdvanceNotice(notice: String?) {
     )
 }
 
+/**
+ * Removing registrations from a position asks who is doing it: one of the players of the position,
+ * or another player on site. The choice and the confirmation are on one page; the confirmation
+ * stays grey until a box is ticked, and the log keeps who it was.
+ */
+@Composable
+private fun RemoveWithOperatorConfirmation(
+    title: String,
+    message: String,
+    registrations: List<Registration>,
+    confirmText: String,
+    onDismiss: () -> Unit,
+    /** The key of the registration whose player is doing it, or null for another player. */
+    onConfirm: (Int?) -> Unit
+) {
+    val context = LocalContext.current
+    val otherPlayer = Int.MIN_VALUE
+    var operator by remember { mutableStateOf<Int?>(null) }
+    ModalSurface(onDismiss, width = 480.dp) {
+        Text(title, color = PrimaryText, fontSize = QueueTextSize.DialogTitle, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(QueueSpacing.S))
+        Text(message, color = SecondaryText, fontSize = QueueTextSize.Body, lineHeight = 20.sp)
+        Spacer(Modifier.height(QueueSpacing.L))
+        MenuSectionHeader("由谁操作")
+        Text("请选择正在操作的人，日志会记录操作者。", color = SecondaryText, fontSize = QueueTextSize.Caption)
+        Spacer(Modifier.height(QueueSpacing.S))
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(ControlRadius))
+                .border(1.dp, Separator.copy(alpha = .8f), RoundedCornerShape(ControlRadius))
+        ) {
+            val choices = registrations.map { it.key to "“${it.displayId}”" } + (otherPlayer to "现场其他玩家")
+            choices.forEachIndexed { index, (key, label) ->
+                if (index > 0) HorizontalDivider(color = Separator.copy(alpha = .6f))
+                Row(
+                    Modifier.fillMaxWidth().heightIn(min = MinTouchTarget + 4.dp)
+                        .clickable { operator = key }
+                        .padding(horizontal = QueueSpacing.M),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Only one person can be doing it: a radio dot, not a tick box.
+                    RadioDot(selected = operator == key)
+                    Spacer(Modifier.width(QueueSpacing.M))
+                    Text(label, color = PrimaryText, fontSize = QueueTextSize.Body)
+                }
+            }
+        }
+        Spacer(Modifier.height(QueueSpacing.L))
+        val chosen = operator
+        if (chosen != null) {
+            DestructiveButton(
+                confirmText,
+                { onConfirm(chosen.takeIf { it != otherPlayer }) },
+                Modifier.fillMaxWidth()
+            )
+        } else {
+            Box(
+                Modifier.fillMaxWidth().height(52.dp).clip(RoundedCornerShape(ControlRadius))
+                    .background(DisabledBackground)
+                    .clickable { showDisabledActionReason(context, confirmText, "请先选择由谁操作。") },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(confirmText, color = TertiaryText, fontSize = QueueTextSize.Control, fontWeight = FontWeight.SemiBold)
+            }
+        }
+        Spacer(Modifier.height(QueueSpacing.S))
+        CancelAction(onDismiss)
+    }
+}
+
+/**
+ * The mark of a single choice (docs/ui-guide.md): a ring, filled with a dot when chosen. Several
+ * independent choices use the tick box with [StraightCheckMark] instead.
+ */
+@Composable
+private fun RadioDot(selected: Boolean) {
+    Box(
+        Modifier.size(22.dp).clip(CircleShape)
+            .background(CardBackground)
+            .border(if (selected) 2.dp else 1.5.dp, if (selected) SystemBlue else InputBorder, CircleShape),
+        contentAlignment = Alignment.Center
+    ) {
+        if (selected) Box(Modifier.size(10.dp).clip(CircleShape).background(SystemBlue))
+    }
+}
+
+/**
+ * What the 由现场玩家报告 panel says. While it is not yet the player's turn the button is grey,
+ * and the panel says why nobody can act on the registration yet (maintainer, 2026-11-25).
+ */
+internal fun noShowPanelDescription(group: Boolean, notYetTheirTurn: Boolean, alreadyPlaying: Boolean): String {
+    val who = if (group) "这组玩家" else "这名玩家"
+    val what = if (group) "这组登记" else "这份登记"
+    return if (notYetTheirTurn) {
+        "现在还没有轮到$who，即使其不在现场，现场玩家也不能处理$what。"
+    } else {
+        (if (alreadyPlaying) "已经" else "即将") +
+            "轮到的${who}不在现场。现场玩家应将其记录为未到场，并选择如何处理$what。"
+    }
+}
+
 @Composable
 private fun RemoveRegistrationConfirmation(
     title: String,
     message: String,
     confirmText: String,
     onDismiss: () -> Unit,
-    onConfirm: () -> Unit
+    onConfirm: () -> Unit,
+    /** A reminder in its own box under the message (docs/ui-guide.md, 弹窗). */
+    notice: String? = null
 ) {
     ModalSurface(onDismiss, width = 430.dp) {
         Text(title, color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
-        Text(message, color = SecondaryText, fontSize = 13.sp, lineHeight = 20.sp)
+        Text(message, color = SecondaryText, fontSize = 14.sp, lineHeight = 20.sp)
+        if (notice != null) {
+            Spacer(Modifier.height(12.dp))
+            Text(
+                notice,
+                color = WarningText,
+                fontSize = 12.sp,
+                lineHeight = 19.sp,
+                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                    .background(WarningBackground).padding(horizontal = 13.dp, vertical = 11.dp)
+            )
+        }
         Spacer(Modifier.height(18.dp))
         DestructiveButton(confirmText, onConfirm, Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
@@ -16944,7 +19759,7 @@ private fun QueueStateLoadingOverlay() {
         contentAlignment = Alignment.Center
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("正在读取本机数据", color = PrimaryText, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+            Text("正在读取本机数据", color = PrimaryText, fontSize = QueueTextSize.CardTitle, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(6.dp))
             Text("请稍候。", color = SecondaryText, fontSize = 12.sp)
         }
@@ -16968,7 +19783,7 @@ private fun PlayerProfileSavingOverlay() {
                 .padding(horizontal = 24.dp, vertical = 22.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text("正在保存玩家资料", color = PrimaryText, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+            Text("正在保存玩家资料", color = PrimaryText, fontSize = QueueTextSize.CardTitle, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(7.dp))
             Text("保存完成后会继续当前操作。", color = SecondaryText, fontSize = 12.sp)
         }
@@ -16986,9 +19801,9 @@ private fun PlayerProfileCreationLoadingDialog() {
         )
         Spacer(Modifier.height(8.dp))
         Text(
-            "正在向服务端创建一次性页面，请稍候。",
+            "正在生成二维码，请稍候。",
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         Spacer(Modifier.height(18.dp))
@@ -17019,12 +19834,12 @@ private fun PlayerProfileCreationDialog(
         Spacer(Modifier.height(7.dp))
         Text(
             if (expired) {
-                "这张二维码已经失效，请重新生成后再扫码。"
+                "这张二维码已过期，请重新生成后再扫码。"
             } else {
                 "请使用手机扫描二维码，在网页中填写玩家资料并设置密码。完成后会立即绑定网页账户。"
             },
             color = if (expired) Destructive else SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         Spacer(Modifier.height(16.dp))
@@ -17038,7 +19853,7 @@ private fun PlayerProfileCreationDialog(
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                "二维码将在 ${formatClockTime(session.expiresAtMillis)} 失效",
+                "二维码将在 ${formatClockTime(session.expiresAtMillis)} 过期",
                 color = TertiaryText,
                 fontSize = 11.sp,
                 modifier = Modifier.fillMaxWidth(),
@@ -17046,7 +19861,7 @@ private fun PlayerProfileCreationDialog(
             )
             Spacer(Modifier.height(14.dp))
             Text(
-                "手机页面创建的是云端同步的网页玩家资料，并会同时设置登录密码。绑定后，现场终端默认只读；玩家可以在网页设置中重新开放终端编辑权限。",
+                "在手机页面创建的玩家资料会与服务端同步，并同时设置登录密码。绑定后，现场终端默认不能编辑这份资料；玩家可以在网页设置中重新开放终端编辑权限。",
                 color = SecondaryText,
                 fontSize = 12.sp,
                 lineHeight = 19.sp,
@@ -17084,7 +19899,7 @@ private fun PlayerProfileCreationFailureDialog(
             fontWeight = FontWeight.SemiBold
         )
         Spacer(Modifier.height(8.dp))
-        Text(detail, color = SecondaryText, fontSize = 13.sp, lineHeight = 20.sp)
+        Text(detail, color = SecondaryText, fontSize = 14.sp, lineHeight = 20.sp)
         Spacer(Modifier.height(18.dp))
         PrimaryButton(
             "重试",
@@ -17119,12 +19934,12 @@ private fun MobileRegistrationDialog(
         Spacer(Modifier.height(7.dp))
         Text(
             if (expired) {
-                "这张二维码已经失效，请重新生成后再扫码。"
+                "这张二维码已过期，请重新生成后再扫码。"
             } else {
-                "使用手机扫描二维码，在网页中为 $machineName 选择或新建玩家资料。"
+                "使用手机扫描二维码，在网页中为 $machineName 选择或创建玩家资料。"
             },
             color = if (expired) Destructive else SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         Spacer(Modifier.height(16.dp))
@@ -17138,7 +19953,7 @@ private fun MobileRegistrationDialog(
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                "二维码将在 ${formatClockTime(session.expiresAtMillis)} 失效",
+                "二维码将在 ${formatClockTime(session.expiresAtMillis)} 过期",
                 color = TertiaryText,
                 fontSize = 11.sp,
                 modifier = Modifier.fillMaxWidth(),
@@ -17179,7 +19994,7 @@ private fun MobileRegistrationFailureDialog(
             fontWeight = FontWeight.SemiBold
         )
         Spacer(Modifier.height(8.dp))
-        Text(detail, color = SecondaryText, fontSize = 13.sp, lineHeight = 20.sp)
+        Text(detail, color = SecondaryText, fontSize = 14.sp, lineHeight = 20.sp)
         Spacer(Modifier.height(18.dp))
         PrimaryButton(
             "重试",
@@ -17211,12 +20026,12 @@ private fun PlayerAccountBindingDialog(
         Spacer(Modifier.height(7.dp))
         Text(
             if (expired) {
-                "这张二维码已经失效，请重新生成后再扫码。"
+                "这张二维码已过期，请重新生成后再扫码。"
             } else {
                 "请让“${session.profileNickname}”本人使用手机扫码，并在网页中设置账户密码。"
             },
             color = if (expired) Destructive else SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         if (!expired) {
@@ -17228,7 +20043,7 @@ private fun PlayerAccountBindingDialog(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Column {
-                    Text("玩家编号", color = TertiaryText, fontSize = 10.sp)
+                    Text("玩家编号", color = TertiaryText, fontSize = 11.sp)
                     Text(
                         session.publicPlayerId ?: "等待服务端分配",
                         color = PrimaryText,
@@ -17237,7 +20052,7 @@ private fun PlayerAccountBindingDialog(
                     )
                 }
                 Column(horizontalAlignment = Alignment.End) {
-                    Text("QQ", color = TertiaryText, fontSize = 10.sp)
+                    Text("QQ", color = TertiaryText, fontSize = 11.sp)
                     Text(session.qqNumber, color = PrimaryText, fontSize = 14.sp)
                 }
             }
@@ -17251,7 +20066,7 @@ private fun PlayerAccountBindingDialog(
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                "二维码将在 ${formatClockTime(session.expiresAtMillis)} 失效",
+                "二维码将在 ${formatClockTime(session.expiresAtMillis)} 过期",
                 color = TertiaryText,
                 fontSize = 11.sp,
                 modifier = Modifier.fillMaxWidth(),
@@ -17259,7 +20074,7 @@ private fun PlayerAccountBindingDialog(
             )
             Spacer(Modifier.height(12.dp))
             Text(
-                "这次绑定只适用于当前玩家资料。网页不会凭 QQ、昵称或玩家编号直接绑定其他资料。重新生成二维码后，旧二维码会立即失效。",
+                "这次绑定只适用于当前玩家资料。网页不会凭 QQ、昵称或玩家编号直接绑定其他资料。重新生成二维码后，旧二维码不能再使用。",
                 color = SecondaryText,
                 fontSize = 12.sp,
                 lineHeight = 19.sp,
@@ -17293,7 +20108,7 @@ private fun PlayerAccountBindingFailureDialog(
             fontWeight = FontWeight.SemiBold
         )
         Spacer(Modifier.height(8.dp))
-        Text(detail, color = SecondaryText, fontSize = 13.sp, lineHeight = 20.sp)
+        Text(detail, color = SecondaryText, fontSize = 14.sp, lineHeight = 20.sp)
         Spacer(Modifier.height(18.dp))
         PrimaryButton(
             "重试",
@@ -17322,9 +20137,9 @@ private fun InactivityReturnWarningDialog(
         )
         Spacer(Modifier.height(10.dp))
         Text(
-            "由于较长时间没有操作，$remainingSeconds 秒后将返回排队页面。如果有尚未保存的内容，返回后将不会保留。",
+            "由于较长时间没有操作，$remainingSeconds 秒后将返回首页。尚未保存的内容不会保留。",
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         Spacer(Modifier.height(20.dp))
@@ -17351,7 +20166,7 @@ private fun BotFriendQrDialog(qqNumber: String, onDismiss: () -> Unit) {
         Text(
             "排队通知需要由 QQ Bot 主动发送私信。请使用 QQ 扫描二维码并添加好友，否则即使开启通知也可能无法收到。",
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         Spacer(Modifier.height(16.dp))
@@ -17366,7 +20181,7 @@ private fun BotFriendQrDialog(qqNumber: String, onDismiss: () -> Unit) {
         Text(
             "QQ：$qqNumber",
             color = PrimaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             fontWeight = FontWeight.Medium,
             modifier = Modifier.fillMaxWidth(),
             textAlign = TextAlign.Center
@@ -17392,12 +20207,12 @@ private fun IncompleteCheckInProfileDialog(
         Spacer(Modifier.height(8.dp))
         Text(
             if (profile == null) {
-                "这份线上登记关联的玩家资料暂时不可用，因此不能完成签到。请等待资料同步后重试，或联系现场工作人员。"
+                "这份线上登记关联的玩家资料暂时不可用，因此不能完成签到。请等待资料同步后重试，或联系管理员。"
             } else {
-                "“${profile.nickname}”还需要确认 QQ 显示范围和排队通知设置。补全资料期间，本次 30 分钟签到时限以及轮到进入游玩位置时仍未签到即退出排队的规则不会暂停。保存资料后，请再次点击登记并选择“已到场”完成签到。"
+                "“${profile.nickname}”还需要确认 QQ 显示范围和排队通知设置。补全资料期间，签到时限照常计算；超过签到时限，或轮到进入游玩位置时仍未签到，这份登记会自动移除。保存资料后，请再次点击这份登记并选择“已到场”完成签到。"
             },
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         Spacer(Modifier.height(18.dp))
@@ -17458,7 +20273,7 @@ private fun PlayerProfileWriteFailureDialog(detail: String, onDismiss: () -> Uni
     ModalSurface(onDismiss) {
         Text("玩家资料未能保存", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
-        Text(detail, color = SecondaryText, fontSize = 13.sp, lineHeight = 20.sp)
+        Text(detail, color = SecondaryText, fontSize = 14.sp, lineHeight = 20.sp)
         Spacer(Modifier.height(18.dp))
         PrimaryButton("我知道了", onDismiss, Modifier.fillMaxWidth())
     }
@@ -17485,7 +20300,7 @@ private fun QueueRestoreDialog(
                     append("此操作无法撤销。")
                 },
                 color = SecondaryText,
-                fontSize = 13.sp,
+                fontSize = 14.sp,
                 lineHeight = 20.sp
             )
             Spacer(Modifier.height(18.dp))
@@ -17496,15 +20311,15 @@ private fun QueueRestoreDialog(
             Text("继续使用上次的队列？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(7.dp))
             Text(
-                "上次队列保存于 ${formatQueueSnapshotTime(savedState.savedAtMillis)}。继续后会恢复游玩位置、等待顺序、暂缓一次、暂时离开、未到场和机台状态。",
+                "上次队列保存于 ${formatQueueSnapshotTime(savedState.savedAtMillis)}。继续后会恢复游玩位置、等待顺序、暂缓一次、轮空一次、暂时离开、未到场和机台状态。",
                 color = SecondaryText,
-                fontSize = 13.sp,
+                fontSize = 14.sp,
                 lineHeight = 20.sp
             )
             Spacer(Modifier.height(15.dp))
             Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(PageBackground)
-                    .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(10.dp))
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(PageBackground)
+                    .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(12.dp))
             ) {
                 savedState.configuredMachineIds.forEachIndexed { index, machineId ->
                     if (index > 0) HorizontalDivider(color = Separator.copy(alpha = .72f))
@@ -17518,7 +20333,7 @@ private fun QueueRestoreDialog(
             }
             if (!savedState.registrationOpen) {
                 Spacer(Modifier.height(9.dp))
-                Text("上次退出时，登记排队处于关闭状态。", color = Color(0xFF9A5B00), fontSize = 11.sp)
+                Text("上次退出时，登记排队处于关闭状态。", color = WarningText, fontSize = 11.sp)
             }
             if (
                 savedState.machines.values.any {
@@ -17536,7 +20351,7 @@ private fun QueueRestoreDialog(
             Spacer(Modifier.height(18.dp))
             PrimaryButton("继续使用上次队列", onRestore, Modifier.fillMaxWidth())
             Spacer(Modifier.height(9.dp))
-            DestructiveButton(
+            DangerSecondaryButton(
                 "不使用，开始新的队列",
                 {
                     if (savedState.hasMeaningfulState) startNewConfirmationVisible = true
@@ -17558,18 +20373,18 @@ private fun QueueRestoreMachineRow(
         Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(machineName, color = PrimaryText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+        Text(machineName, color = PrimaryText, fontSize = 15.sp, fontWeight = FontWeight.Medium)
         Spacer(Modifier.weight(1f))
         Text(
             buildString {
                 if (queue.registrationCount == 0) {
                     append("没有登记")
                 } else {
-                    append("${queue.waitingProjection(includeCommonPlayPreview = false).positions.size} 个等待位置·${queue.registrationCount} 个登记")
+                    append("${queue.waitingProjection(includeCommonPlayPreview = false).positions.size} 个等待位置·${queue.registrationCount} 份登记")
                 }
                 if (!status.isOperational) append("·已停止使用")
             },
-            color = if (status.isOperational) SecondaryText else Color(0xFF9A5B00),
+            color = if (status.isOperational) SecondaryText else WarningText,
             fontSize = 11.sp,
             textAlign = TextAlign.End
         )
@@ -17592,10 +20407,10 @@ private fun CloseRegistrationConfirmation(
             if (registrationCount > 0) {
                 "当前共有 $registrationCount 份登记。仅建议在现场已经能够自行辨认排队顺序时关闭；确认后将删除所有机台的全部登记，且无法恢复。"
             } else {
-                "当前没有登记。确认后仍会结束当前排队批次；重新开放时将载入最新机台配置和状态，并开始新的空队列。"
+                "当前没有登记。确认后会关闭登记排队；重新开启时将载入最新的机台配置和状态，并开始新的空队列。"
             },
             color = SecondaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         Spacer(Modifier.height(18.dp))
@@ -17615,6 +20430,12 @@ private fun MoreMenu(
     canEditRegistrations: Boolean,
     canReportMachineStop: Boolean,
     machineManagementLocked: Boolean = false,
+    /** Null in the local build, which never syncs. */
+    cloudSyncStatus: QueueCloudSyncStatus?,
+    canBatchCreate: Boolean,
+    batchCreateDisabledReason: String,
+    onBatchCreate: () -> Unit,
+    onOpenSyncStatus: () -> Unit,
     onDismiss: () -> Unit,
     onEditRegistrations: () -> Unit,
     onOpenAuditLog: () -> Unit,
@@ -17623,62 +20444,148 @@ private fun MoreMenu(
     onReportMachineStop: () -> Unit,
     onToggleRegistration: () -> Unit
 ) {
-    ModalSurface(onDismiss, width = 390.dp) {
-        Text("更多", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(16.dp))
+    ModalSurface(onDismiss, width = 560.dp) {
+        Text("更多", color = PrimaryText, fontSize = QueueTextSize.DialogTitle, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(QueueSpacing.L))
+        val battery = rememberTerminalBatteryStatus(rememberCurrentTimeMillis())
+        MenuSectionHeader("终端状态")
+        Row(
+            Modifier.fillMaxWidth().height(IntrinsicSize.Max),
+            horizontalArrangement = Arrangement.spacedBy(QueueSpacing.S)
+        ) {
+            TerminalStatusTile(
+                caption = "电量",
+                value = battery.level?.let { "$it%" } ?: "无法读取",
+                detail = when {
+                    battery.low -> "电量较低且未在充电，请连接电源。"
+                    battery.charging -> "正在充电。"
+                    else -> "未在充电。"
+                },
+                attention = battery.low,
+                modifier = Modifier.weight(1f).fillMaxHeight()
+            )
+            if (cloudSyncStatus != null) {
+                TerminalStatusTile(
+                    caption = "与服务端同步",
+                    value = queueCloudSyncShortLabel(cloudSyncStatus.phase),
+                    detail = when (cloudSyncStatus.phase) {
+                        QueueCloudSyncPhase.WAITING_TO_RETRY -> "上次同步未成功，系统会自动重试。"
+                        QueueCloudSyncPhase.NOT_CONFIGURED -> "已开启同步，但服务器连接不完整。"
+                        else -> cloudSyncStatus.lastSuccessfulAtMillis?.let {
+                            "最近一次成功同步：${SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(it))}。"
+                        } ?: "尚无成功同步的记录。"
+                    },
+                    attention = cloudSyncStatus.needsAttention(),
+                    onClick = onOpenSyncStatus,
+                    modifier = Modifier.weight(1f).fillMaxHeight()
+                )
+            } else {
+                Spacer(Modifier.weight(1f))
+            }
+        }
+        Spacer(Modifier.height(QueueSpacing.L))
         MenuSectionHeader("队列管理")
-        ActionRow(
-            title = "编辑登记",
-            enabled = canEditRegistrations,
-            onClick = onEditRegistrations
-        )
-        Spacer(Modifier.height(7.dp))
-        ActionRow(
-            title = if (registrationOpen) "关闭登记排队" else "重新开放登记排队",
-            description = if (registrationOpen) {
-                "删除所有机台的当前登记，并结束本次排队批次。"
-            } else {
-                "载入最新机台配置和状态，并开始新的空队列。"
-            },
-            destructive = registrationOpen,
-            onClick = onToggleRegistration
+        CompactActionGrid(
+            listOf(
+                MenuAction(
+                    title = "批量创建登记",
+                    description = batchCreateDisabledReason,
+                    onClick = onBatchCreate,
+                    enabled = canBatchCreate
+                ),
+                MenuAction(
+                    title = "编辑登记",
+                    description = "调整所选机台的等待顺序。",
+                    onClick = onEditRegistrations,
+                    enabled = canEditRegistrations
+                ),
+                MenuAction(
+                    title = if (registrationOpen) "关闭登记排队" else "重新开启登记排队",
+                    description = if (registrationOpen) {
+                        "删除所有机台的当前登记；重新开启后会开始新的空队列。"
+                    } else {
+                        "载入最新机台配置和状态，并开始新的空队列。"
+                    },
+                    onClick = onToggleRegistration,
+                    destructive = registrationOpen
+                )
+            )
         )
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(QueueSpacing.L))
         MenuSectionHeader("机台管理")
-        ActionRow(
-            title = "报告机台停止使用",
-            description = if (machineManagementLocked) {
-                "已由管理后台接管，只能从管理后台修改。"
-            } else {
-                "保留所选机台的登记顺序，并暂停该机台的队列操作与计时。"
-            },
-            destructive = true,
-            enabled = canReportMachineStop,
-            onClick = onReportMachineStop
+        CompactActionGrid(
+            listOf(
+                MenuAction(
+                    title = "报告机台停止使用",
+                    description = if (machineManagementLocked) {
+                        "已由管理后台接管，只能从管理后台修改。"
+                    } else {
+                        "保留所选机台的登记顺序，并暂停该机台的队列操作与计时。"
+                    },
+                    onClick = onReportMachineStop,
+                    destructive = true,
+                    enabled = canReportMachineStop
+                )
+            )
         )
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(QueueSpacing.L))
         MenuSectionHeader("记录与应用")
-        ActionRow(
-            title = "操作日志",
-            accented = false,
-            onClick = onOpenAuditLog
-        )
-        Spacer(Modifier.height(7.dp))
-        ActionRow(
-            title = "应用设置",
-            accented = false,
-            onClick = onOpenSettings
-        )
-        Spacer(Modifier.height(7.dp))
-        ActionRow(
-            title = "应用详情",
-            accented = false,
-            onClick = onOpenAppDetails
+        CompactActionGrid(
+            listOf(
+                MenuAction("操作日志", "查看队列变动和设置修改的记录。", onOpenAuditLog),
+                MenuAction("应用设置", "机厅与终端、服务端、营业时间、排队规则和机台。", onOpenSettings),
+                MenuAction("应用详情", "版本、机厅与终端信息和运行规格。", onOpenAppDetails)
+            )
         )
         Spacer(Modifier.height(13.dp))
         CancelAction(onDismiss)
+    }
+}
+
+/** One reading in the 终端状态 section of 更多; orange while it needs someone on site. */
+@Composable
+private fun TerminalStatusTile(
+    caption: String,
+    value: String,
+    detail: String,
+    attention: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null
+) {
+    val shape = RoundedCornerShape(ControlRadius)
+    val accent = if (attention) WarningText else SecondaryText
+    Column(
+        modifier.heightIn(min = 72.dp).clip(shape)
+            .background(if (attention) WarningBackground else PageBackground)
+            .let { if (onClick != null) it.clickable(onClick = onClick) else it }
+            .padding(horizontal = QueueSpacing.M, vertical = 10.dp)
+    ) {
+        // A fixed height, so the tile with an arrow keeps its value level with the one without.
+        Row(Modifier.fillMaxWidth().height(18.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(caption, color = accent, fontSize = QueueTextSize.Caption, lineHeight = 16.sp)
+            Spacer(Modifier.weight(1f))
+            if (onClick != null) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                    contentDescription = null,
+                    tint = if (attention) WarningText else TertiaryText,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+        }
+        // A fixed line height: "100%" and Chinese text otherwise get boxes of different heights
+        // from their fonts and stop lining up across the two tiles.
+        Text(
+            value,
+            color = if (attention) WarningText else PrimaryText,
+            fontSize = QueueTextSize.Control,
+            fontWeight = FontWeight.SemiBold,
+            lineHeight = 22.sp
+        )
+        Spacer(Modifier.height(2.dp))
+        Text(detail, color = accent, fontSize = QueueTextSize.Caption, lineHeight = 17.sp)
     }
 }
 
@@ -17692,7 +20599,7 @@ private fun AppDetailsDialog(
     ModalSurface(onDismiss, width = 500.dp) {
         Text("应用详情", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(5.dp))
-        Text("maimai Q", color = SecondaryText, fontSize = 13.sp)
+        Text("maimai Q", color = SecondaryText, fontSize = 12.sp)
         Spacer(Modifier.height(18.dp))
         AppDetailSectionTitle("版本信息")
         AppDetailLinkRow("版本", BuildConfig.VERSION_NAME, "查看更新记录", onOpenVersionHistory)
@@ -17711,7 +20618,7 @@ private fun AppDetailsDialog(
         AppDetailSectionTitle("运行规格")
         AppDetailRow("排队方式", "各机台分别独立排序")
         HorizontalDivider(color = Separator.copy(alpha = .72f))
-        AppDetailRow("单台上限", "20 个登记")
+        AppDetailRow("单台上限", "20 份登记")
         HorizontalDivider(color = Separator.copy(alpha = .72f))
         AppDetailRow("系统要求", "Android 10 或更高版本")
         Spacer(Modifier.height(15.dp))
@@ -17728,7 +20635,7 @@ private fun AppDetailsDialog(
         Spacer(Modifier.height(13.dp))
         Text(
             if (cloudSyncStatus != null) {
-                "队列、玩家资料和日志始终先保存在本机。开启与服务端同步后，只有玩家选择允许公开时，当前登记的 QQ 才会显示在网页详情中；完整玩家资料、性别、默认偏好和资料内部编号仍通过私有接口保存。"
+                "队列、玩家资料和日志始终先保存在本机。开启与服务端同步后，只有玩家选择允许网站显示时，当前登记的 QQ 才会显示在网站上；完整的玩家资料、性别、默认游玩偏好和资料内部编号不会在网站公开。"
             } else {
                 "这是不连接服务端的纯本地版本。队列、玩家资料和日志只保存在本机，不会上传到服务端。"
             },
@@ -17750,7 +20657,7 @@ private fun TerminalInstallationDetailsDialog(
     val status = when (identity.registrationState) {
         TerminalInstallationRegistrationState.REGISTERED -> "已在服务端注册"
         TerminalInstallationRegistrationState.WAITING_FOR_SERVER ->
-            if (identity.allowsOnlineAccess(queueStatusEndpoint)) "兼容服务端连接" else "等待核对服务端"
+            if (identity.allowsOnlineAccess(queueStatusEndpoint)) "已连接旧版服务端" else "等待核对服务端"
         TerminalInstallationRegistrationState.LOCAL_ONLY -> "仅在本机使用"
         TerminalInstallationRegistrationState.VENUE_MISMATCH -> "机厅身份不一致"
     }
@@ -17783,14 +20690,19 @@ private fun TerminalInstallationDetailsDialog(
                 lineHeight = 18.sp
             )
         }
-        Spacer(Modifier.height(18.dp))
-        SecondaryButton("关闭", onDismiss, Modifier.fillMaxWidth())
+        Spacer(Modifier.height(12.dp))
+        CancelAction("关闭", onDismiss)
     }
 }
 
 @Composable
 private fun VersionHistoryDialog(onDismiss: () -> Unit) {
     val releases = listOf(
+        Triple(
+            "1.0.0",
+            "自动安排登记与界面重新设计",
+            "机厅添加一对机台后，玩家确认登记时可以允许系统在两台机台之间安排登记；另一机台能够更早安排游玩时先显示预览，至少 12 分钟后才自动转至。延后这份登记分为暂缓一次、轮空一次和暂时离开，未到场改用同样的对照卡片。等待时间改用新的估算方法。首页、菜单和各个分步流程重新设计，并按屏幕分辨率等比例放大；终端、网站、QQ Bot 和服务端的文案统一。"
+        ),
         Triple(
             "0.13.6",
             "终端宽屏布局与中点间距",
@@ -18068,18 +20980,18 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
                     Text(
                         version,
                         color = if (index == 0) SystemBlue else PrimaryText,
-                        fontSize = 13.sp,
+                        fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold
                     )
                     Spacer(Modifier.width(10.dp))
-                    Text(title, color = PrimaryText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    Text(title, color = PrimaryText, fontSize = 14.sp, fontWeight = FontWeight.Medium)
                     if (index == 0) {
                         Spacer(Modifier.width(8.dp))
                         Text(
                             "当前版本",
                             color = SystemBlue,
-                            fontSize = 10.sp,
-                            modifier = Modifier.clip(RoundedCornerShape(5.dp))
+                            fontSize = 11.sp,
+                            modifier = Modifier.clip(RoundedCornerShape(6.dp))
                                 .background(SoftBlue)
                                 .padding(horizontal = 7.dp, vertical = 3.dp)
                         )
@@ -18104,16 +21016,16 @@ private fun CloudSyncInfoDialog(
         Text("与服务端同步状态", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(7.dp))
         Text(
-            "开启与服务端同步后，每次变动会先保存在本机，再尝试上传。终端也会接收服务器待执行的资料修改，并按本地规则校验后应用。关闭同步或网络不可用时，不会阻止现场排队。",
+            "开启与服务端同步后，每次变动会先保存在本机，再上传到服务端。终端也会接收服务端提交的玩家资料修改，核对无误后应用。关闭同步或网络不可用时，现场排队不受影响。",
             color = SecondaryText,
             fontSize = 12.sp,
             lineHeight = 18.sp
         )
         Spacer(Modifier.height(14.dp))
         Row(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
                 .background(currentStatusColor.copy(alpha = .09f))
-                .border(1.dp, currentStatusColor.copy(alpha = .18f), RoundedCornerShape(10.dp))
+                .border(1.dp, currentStatusColor.copy(alpha = .18f), RoundedCornerShape(12.dp))
                 .padding(horizontal = 13.dp, vertical = 11.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -18137,9 +21049,9 @@ private fun CloudSyncInfoDialog(
         if (timestamps.isNotEmpty()) {
             Spacer(Modifier.height(12.dp))
             Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
                     .background(PageBackground)
-                    .border(1.dp, Separator.copy(alpha = .65f), RoundedCornerShape(10.dp))
+                    .border(1.dp, Separator.copy(alpha = .65f), RoundedCornerShape(12.dp))
             ) {
                 timestamps.forEachIndexed { index, (label, timestampMillis) ->
                     if (index > 0) HorizontalDivider(color = Separator.copy(alpha = .58f))
@@ -18193,7 +21105,7 @@ private fun CloudSyncInfoDialog(
 
         Spacer(Modifier.height(13.dp))
         Text(
-            "公开网站会显示登记昵称、队列位置、游玩状态、时间估算，以及玩家允许公开的 QQ。完整玩家资料通过需要专用令牌的私有接口同步；性别、默认偏好和资料内部编号不会出现在公开队列或公开日志中。",
+            "网站会显示登记昵称、队列位置、游玩状态、预计等待时间，以及玩家允许网站显示的 QQ。完整的玩家资料不会公开；性别、默认游玩偏好和资料内部编号不会出现在网站的队列或日志中。",
             color = SecondaryText,
             fontSize = 11.sp,
             lineHeight = 17.sp
@@ -18266,7 +21178,7 @@ private fun queueCloudSyncStatusColor(phase: QueueCloudSyncPhase): Color = when 
     QueueCloudSyncPhase.CONFIGURED -> SecondaryText
     QueueCloudSyncPhase.SYNCING -> SystemBlue
     QueueCloudSyncPhase.SYNCED -> Color(0xFF34C759)
-    QueueCloudSyncPhase.WAITING_TO_RETRY -> Color(0xFFFF9500)
+    QueueCloudSyncPhase.WAITING_TO_RETRY -> AttentionDot
 }
 
 @Composable
@@ -18305,7 +21217,7 @@ private fun AppDetailLinkRow(
     onClick: () -> Unit
 ) {
     Row(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable(onClick = onClick)
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable(onClick = onClick)
             .padding(vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -18409,7 +21321,7 @@ private fun StopMachineReasonDialog(
                 Modifier.fillMaxWidth()
             )
             Spacer(Modifier.height(8.dp))
-            CancelAction("返回选择原因") { enteringOtherReason = false }
+            CancelAction("返回") { enteringOtherReason = false }
         } else {
             Text("选择停止使用原因", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(6.dp))
@@ -18500,6 +21412,7 @@ private fun ReorderScreen(
     machineName: String,
     initialQueue: MachineQueue,
     explicitEditMode: Boolean,
+    pairedQueueNotice: String? = null,
     onCancel: () -> Unit,
     onCommit: (List<Registration>) -> Unit
 ) {
@@ -18636,7 +21549,7 @@ private fun ReorderScreen(
                     color = SystemBlue,
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.clip(RoundedCornerShape(9.dp)).clickable {
+                    modifier = Modifier.clip(RoundedCornerShape(12.dp)).clickable {
                         if (hasRegistrationOrderChanged(originalOrder, registrations)) {
                             onCommit(registrations.toList())
                         } else {
@@ -18653,21 +21566,25 @@ private fun ReorderScreen(
                 .align(Alignment.CenterHorizontally)
         ) {
             Text(
-                if (explicitEditMode) "编辑$machineName 的登记" else "调整登记位置",
+                if (explicitEditMode) "编辑 $machineName 的登记" else "调整登记位置",
                 color = PrimaryText,
-                fontSize = 29.sp,
+                fontSize = QueueTextSize.PageTitle,
                 fontWeight = FontWeight.SemiBold
             )
             Spacer(Modifier.height(6.dp))
             Text(
                 if (initialQueue.playing.isNotEmpty()) {
-                    "游玩位置中的登记已锁定；需要调整时，请先将其撤回至等待顺序前端。"
+                    "游玩位置中的登记已锁定；需要调整时，请先将其撤回至等待顺序。"
                 } else {
                     "当前仅显示等待登记；游玩位置不会参与顺序调整。"
                 },
                 color = SecondaryText,
-                fontSize = 13.sp
+                fontSize = 12.sp
             )
+            if (pairedQueueNotice != null) {
+                Spacer(Modifier.height(4.dp))
+                Text(pairedQueueNotice, color = SecondaryText, fontSize = 12.sp)
+            }
             Spacer(Modifier.height(18.dp))
             LazyColumn(
                 state = listState,
@@ -18719,6 +21636,7 @@ private fun ReorderScreen(
             originalQueue = initialQueue,
             proposedOrder = registrations,
             movedKey = movedKey,
+            pairedQueueNotice = pairedQueueNotice,
             onKeepOriginal = {
                 pendingMovedKey = null
                 registrations.clear()
@@ -18733,7 +21651,7 @@ private fun ReorderScreen(
     if (discardConfirmationVisible) {
         RemoveRegistrationConfirmation(
             title = "放弃顺序调整？",
-            message = "返回后，这次尚未完成的登记顺序调整不会保存。",
+            message = "返回后，这次尚未完成的等待顺序调整不会保存。",
             confirmText = "放弃调整",
             onDismiss = { discardConfirmationVisible = false },
             onConfirm = {
@@ -18763,7 +21681,7 @@ private fun ReorderRegistrationRow(
     var rowCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
     val background by animateColorAsState(
         when {
-            locked -> Color(0xFFEDEDF1)
+            locked -> PreviewBackground
             dragging -> SoftBlue
             else -> CardBackground
         },
@@ -18777,14 +21695,14 @@ private fun ReorderRegistrationRow(
             .graphicsLayer {
                 alpha = if (dragging && !isDragOverlay) 0f else 1f
                 shadowElevation = elevation.toPx()
-                shape = RoundedCornerShape(15.dp)
+                shape = RoundedCornerShape(CardRadius)
             }
-            .clip(RoundedCornerShape(15.dp))
+            .clip(RoundedCornerShape(CardRadius))
             .background(background)
             .border(
                 1.dp,
                 if (dragging) SystemBlue.copy(alpha = .35f) else Separator.copy(alpha = .85f),
-                RoundedCornerShape(15.dp)
+                RoundedCornerShape(CardRadius)
             )
             .padding(start = 17.dp, end = 8.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -18800,12 +21718,12 @@ private fun ReorderRegistrationRow(
             Text(
                 playPreferenceLabel(registration),
                 color = if (locked) TertiaryText else SecondaryText,
-                fontSize = 10.sp
+                fontSize = 11.sp
             )
         }
         if (locked) {
             Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
-                Text("锁定", color = TertiaryText, fontSize = 10.sp, fontWeight = FontWeight.Medium)
+                Text("锁定", color = TertiaryText, fontSize = 11.sp, fontWeight = FontWeight.Medium)
             }
         } else {
             val dragHandleModifier = if (isDragOverlay) {
@@ -18869,6 +21787,7 @@ private fun ReorderConfirmation(
     originalQueue: MachineQueue,
     proposedOrder: List<Registration>,
     movedKey: Int,
+    pairedQueueNotice: String? = null,
     onKeepOriginal: () -> Unit,
     onConfirm: () -> Unit
 ) {
@@ -18888,45 +21807,33 @@ private fun ReorderConfirmation(
     }
 
     ModalSurface(onKeepOriginal, width = 470.dp) {
-        Text("确认调整登记顺序？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+        Text("确认调整等待顺序？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
-        Text(impactText, color = if (delayed.isEmpty()) SecondaryText else Destructive, fontSize = 13.sp, lineHeight = 20.sp)
-        Spacer(Modifier.height(16.dp))
-        Row(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(13.dp)).background(PageBackground)
-                .clickable { consentConfirmed = !consentConfirmed }.padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(
-                Modifier.size(20.dp).clip(RoundedCornerShape(6.dp))
-                    .background(if (consentConfirmed) SystemBlue else Color.Transparent)
-                    .border(1.dp, if (consentConfirmed) SystemBlue else Separator, RoundedCornerShape(6.dp)),
-                contentAlignment = Alignment.Center
-            ) {
-                if (consentConfirmed) StraightCheckMark(Modifier.size(12.dp))
-            }
-            Spacer(Modifier.width(10.dp))
-            Text(
-                if (movedForward && delayedOtherPlayers.isNotEmpty()) {
-                    "已经得到所有因这次调整而延后的玩家明确同意。"
-                } else {
-                    "这是被拖动登记的玩家本人操作，或已经得到其明确同意。"
-                },
-                color = PrimaryText,
-                fontSize = 12.sp,
-                lineHeight = 18.sp
-            )
+        Text(impactText, color = if (delayed.isEmpty()) SecondaryText else Destructive, fontSize = 14.sp, lineHeight = 20.sp)
+        if (pairedQueueNotice != null) {
+            Spacer(Modifier.height(10.dp))
+            Text(pairedQueueNotice, color = PrimaryText, fontSize = 14.sp, lineHeight = 20.sp)
         }
+        Spacer(Modifier.height(16.dp))
+        FriendConsentConfirmation(
+            checked = consentConfirmed,
+            text = if (movedForward && delayedOtherPlayers.isNotEmpty()) {
+                "已经得到所有因这次调整而延后的玩家明确同意。"
+            } else {
+                "这是被拖动登记的玩家本人操作，或已经得到其明确同意。"
+            },
+            onToggle = { consentConfirmed = !consentConfirmed }
+        )
         Spacer(Modifier.height(16.dp))
         PrimaryButton("保持原有顺序", onKeepOriginal, Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
         Text(
             "确认调整",
             color = if (consentConfirmed) Destructive else TertiaryText,
-            fontSize = 13.sp,
+            fontSize = 15.sp,
             fontWeight = FontWeight.Medium,
             textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(13.dp))
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
                 .background(PageBackground).clickable(enabled = consentConfirmed, onClick = onConfirm).padding(13.dp)
         )
     }
@@ -18935,6 +21842,7 @@ private fun ReorderConfirmation(
 @Composable
 private fun PositionReorderConfirmation(
     proposal: PositionReorderProposal,
+    pairedQueueNotice: String? = null,
     onKeepOriginal: () -> Unit,
     onConfirm: () -> Unit
 ) {
@@ -18984,7 +21892,7 @@ private fun PositionReorderConfirmation(
         Text(
             "${movedNames}所在的位置将从 $sourceLabel 移至 $destinationLabel，$shiftedRange 将依次${if (movedForward) "后移" else "前移"}。",
             color = PrimaryText,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             lineHeight = 20.sp
         )
         Spacer(Modifier.height(7.dp))
@@ -18998,33 +21906,37 @@ private fun PositionReorderConfirmation(
             fontSize = 12.sp,
             lineHeight = 18.sp
         )
+        if (pairedQueueNotice != null) {
+            Spacer(Modifier.height(10.dp))
+            Text(pairedQueueNotice, color = PrimaryText, fontSize = 14.sp, lineHeight = 20.sp)
+        }
         if (proposal.relationshipChanges.isNotEmpty()) {
             Spacer(Modifier.height(14.dp))
             Column(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                    .background(Color(0xFFFFF4E5)).padding(13.dp)
+                    .background(WarningBackground).padding(13.dp)
             ) {
                 Text(
                     "共同游玩关系将重新分配",
-                    color = Color(0xFF9A5B00),
+                    color = WarningText,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "系统会按照各登记当前的游玩偏好重新组成队列位置，不会修改任何人的游玩偏好。",
-                    color = Color(0xFF9A5B00),
+                    "系统会按照各登记当前的游玩偏好重新组成队列位置，不会更改任何人的游玩偏好。",
+                    color = WarningText,
                     fontSize = 11.sp,
                     lineHeight = 17.sp
                 )
                 Spacer(Modifier.height(5.dp))
                 proposal.relationshipChanges.take(3).forEach { description ->
-                    Text("• $description", color = Color(0xFF7A4800), fontSize = 11.sp, lineHeight = 17.sp)
+                    Text("• $description", color = WarningText, fontSize = 11.sp, lineHeight = 17.sp)
                 }
                 if (proposal.relationshipChanges.size > 3) {
                     Text(
                         "• 另有 ${proposal.relationshipChanges.size - 3} 个位置会随之调整。",
-                        color = Color(0xFF7A4800),
+                        color = WarningText,
                         fontSize = 11.sp,
                         lineHeight = 17.sp
                     )
@@ -19032,41 +21944,25 @@ private fun PositionReorderConfirmation(
             }
         }
         Spacer(Modifier.height(15.dp))
-        Row(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(13.dp)).background(PageBackground)
-                .clickable { consentConfirmed = !consentConfirmed }.padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Box(
-                Modifier.size(20.dp).clip(RoundedCornerShape(6.dp))
-                    .background(if (consentConfirmed) SystemBlue else Color.Transparent)
-                    .border(1.dp, if (consentConfirmed) SystemBlue else Separator, RoundedCornerShape(6.dp)),
-                contentAlignment = Alignment.Center
-            ) {
-                if (consentConfirmed) StraightCheckMark(Modifier.size(12.dp))
-            }
-            Spacer(Modifier.width(10.dp))
-            Text(
-                if (movedForward) {
-                    "已经得到所有因这次调整而延后的玩家明确同意。"
-                } else {
-                    "这是被移动位置中的玩家本人操作，或已经得到其明确同意。"
-                },
-                color = PrimaryText,
-                fontSize = 12.sp,
-                lineHeight = 18.sp
-            )
-        }
+        FriendConsentConfirmation(
+            checked = consentConfirmed,
+            text = if (movedForward) {
+                "已经得到所有因这次调整而延后的玩家明确同意。"
+            } else {
+                "这是被移动位置中的玩家本人操作，或已经得到其明确同意。"
+            },
+            onToggle = { consentConfirmed = !consentConfirmed }
+        )
         Spacer(Modifier.height(16.dp))
         PrimaryButton("保持原有顺序", onKeepOriginal, Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
         Text(
             "确认调整位置",
             color = if (consentConfirmed) Destructive else TertiaryText,
-            fontSize = 13.sp,
+            fontSize = 15.sp,
             fontWeight = FontWeight.Medium,
             textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(13.dp))
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
                 .background(PageBackground).clickable(enabled = consentConfirmed, onClick = onConfirm).padding(13.dp)
         )
     }
@@ -19145,87 +22041,59 @@ private fun showDisabledActionReason(
     Toast.makeText(context, panguSpacing("$title：$reason"), Toast.LENGTH_LONG).show()
 }
 
+/** A full-width menu entry; the same look as [MenuActionButton] (docs/ui-guide.md, 菜单项). */
 @Composable
 private fun ActionRow(
     title: String,
     description: String? = null,
     destructive: Boolean = false,
     enabled: Boolean = true,
-    accented: Boolean = true,
+    @Suppress("UNUSED_PARAMETER") accented: Boolean = true,
     onClick: () -> Unit
 ) {
-    val context = LocalContext.current
-    val shape = RoundedCornerShape(ControlRadius)
-    val visibleDescription = description?.takeIf { it.isNotBlank() }
-    Row(
-        Modifier.fillMaxWidth().heightIn(min = if (visibleDescription == null) 52.dp else 68.dp)
-            .clip(shape)
-            .background(
-                when {
-                    !enabled -> DisabledBackground
-                    destructive -> Destructive.copy(alpha = .075f)
-                    !accented -> PageBackground
-                    else -> SoftBlue
-                }
-            )
-            .border(
-                1.dp,
-                when {
-                    !enabled -> Separator.copy(alpha = .65f)
-                    destructive -> Destructive.copy(alpha = .18f)
-                    !accented -> Separator.copy(alpha = .8f)
-                    else -> SystemBlue.copy(alpha = .12f)
-                },
-                shape
-            )
-            .clickable {
-                if (enabled) onClick() else showDisabledActionReason(
-                    context,
-                    title,
-                    visibleDescription
-                )
-            }.padding(horizontal = 15.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(
-                title,
-                color = when {
-                    !enabled -> TertiaryText
-                    destructive -> Destructive
-                    else -> PrimaryText
-                },
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium
-            )
-            visibleDescription?.let {
-                Spacer(Modifier.height(3.dp))
-                Text(it, color = SecondaryText, fontSize = 10.sp, lineHeight = 14.sp)
-            }
-        }
-        Text("›", color = if (enabled) TertiaryText else Separator, fontSize = 19.sp)
-    }
+    MenuActionButton(
+        MenuAction(
+            title = title,
+            description = description.orEmpty(),
+            onClick = onClick,
+            destructive = destructive,
+            enabled = enabled,
+            explained = true
+        ),
+        Modifier.fillMaxWidth()
+    )
 }
 
+/**
+ * The one look of every menu entry (docs/ui-guide.md, 菜单项): title on the left, an optional line
+ * of explanation, “›” on the right; neutral grey, light red when it removes or ends something.
+ * An entry that resolves the state its registration is in (the check-in of an online
+ * registration) keeps that state's colour. In a row, give each entry
+ * `Modifier.weight(1f).fillMaxHeight()` and the row `height(IntrinsicSize.Min)` so both are as tall.
+ */
 @Composable
 private fun MenuActionButton(
     action: MenuAction,
     modifier: Modifier = Modifier,
     enabled: Boolean = action.enabled,
-    accented: Boolean = true
+    @Suppress("UNUSED_PARAMETER") accented: Boolean = true
 ) {
+    if (!action.explained) {
+        MenuButton(action, modifier, enabled)
+        return
+    }
     val context = LocalContext.current
     val shape = RoundedCornerShape(ControlRadius)
     val visibleDescription = action.description.takeIf { it.isNotBlank() }
+    val stateColor = action.accentColor.takeIf { enabled && !action.destructive }
     Column(
-        modifier.heightIn(min = if (visibleDescription == null) 52.dp else 82.dp).clip(shape)
+        modifier.heightIn(min = MenuItemMinHeight).clip(shape)
             .background(
                 when {
                     !enabled -> DisabledBackground
                     action.destructive -> Destructive.copy(alpha = .075f)
-                    !accented -> PageBackground
-                    action.accentBackgroundColor != null -> action.accentBackgroundColor
-                    else -> SoftBlue
+                    stateColor != null -> action.accentBackgroundColor ?: PageBackground
+                    else -> PageBackground
                 }
             )
             .border(
@@ -19233,9 +22101,8 @@ private fun MenuActionButton(
                 when {
                     !enabled -> Separator.copy(alpha = .65f)
                     action.destructive -> Destructive.copy(alpha = .18f)
-                    !accented -> Separator.copy(alpha = .8f)
-                    action.accentColor != null -> action.accentColor.copy(alpha = .24f)
-                    else -> SystemBlue.copy(alpha = .14f)
+                    stateColor != null -> stateColor.copy(alpha = .24f)
+                    else -> Separator.copy(alpha = .8f)
                 },
                 shape
             )
@@ -19246,7 +22113,7 @@ private fun MenuActionButton(
                     visibleDescription
                 )
             }
-            .padding(horizontal = 14.dp, vertical = 11.dp),
+            .padding(horizontal = 14.dp, vertical = QueueSpacing.M),
         verticalArrangement = Arrangement.Center
     ) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -19255,62 +22122,76 @@ private fun MenuActionButton(
                 color = when {
                     !enabled -> TertiaryText
                     action.destructive -> Destructive
-                    action.accentColor != null -> action.accentColor
+                    stateColor != null -> stateColor
                     else -> PrimaryText
                 },
-                fontSize = 13.sp,
+                fontSize = QueueTextSize.Control,
                 fontWeight = FontWeight.Medium,
-                maxLines = 1
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
             )
-            Spacer(Modifier.weight(1f))
+            Spacer(Modifier.width(QueueSpacing.S))
             Text(
                 "›",
                 color = when {
                     !enabled -> Separator
-                    action.accentColor != null -> action.accentColor.copy(alpha = .72f)
+                    action.destructive -> Destructive.copy(alpha = .6f)
+                    stateColor != null -> stateColor.copy(alpha = .72f)
                     else -> TertiaryText
                 },
-                fontSize = 17.sp
+                fontSize = 15.sp
             )
         }
         visibleDescription?.let { description ->
-            Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.height(QueueSpacing.XS))
             Text(
                 description,
                 color = if (enabled) SecondaryText else TertiaryText,
-                fontSize = 10.sp,
-                lineHeight = 14.sp
+                fontSize = QueueTextSize.Caption,
+                lineHeight = 17.sp
             )
         }
     }
 }
 
+/**
+ * An entry whose title says enough (docs/ui-guide.md): the secondary button, or the danger
+ * secondary button for an entry that removes or ends something. An entry that resolves the state
+ * its registration is in keeps that state's colour. When unavailable it is grey, and tapping it
+ * gives the reason in [MenuAction.description].
+ */
 @Composable
-private fun CompactActionButton(
+private fun MenuButton(
     action: MenuAction,
     modifier: Modifier = Modifier,
-    enabled: Boolean = action.enabled,
-    accented: Boolean = true
+    enabled: Boolean = action.enabled
 ) {
     val context = LocalContext.current
     val shape = RoundedCornerShape(ControlRadius)
+    val stateColor = action.accentColor.takeIf { enabled && !action.destructive }
+    val contentColor = when {
+        !enabled -> TertiaryText
+        action.destructive -> Destructive
+        stateColor != null -> stateColor
+        else -> SystemBlue
+    }
     Box(
-        modifier.height(50.dp).clip(shape)
+        modifier.heightIn(min = 52.dp).clip(shape)
             .background(
                 when {
                     !enabled -> DisabledBackground
-                    action.destructive -> Destructive.copy(alpha = .075f)
-                    !accented -> PageBackground
-                    else -> SoftBlue
+                    stateColor != null -> action.accentBackgroundColor ?: CardBackground
+                    else -> CardBackground
                 }
             )
             .border(
                 1.dp,
                 when {
                     !enabled -> Separator.copy(alpha = .65f)
-                    action.destructive -> Destructive.copy(alpha = .18f)
-                    !accented -> Separator.copy(alpha = .8f)
-                    else -> SystemBlue.copy(alpha = .14f)
+                    action.destructive -> Destructive.copy(alpha = .38f)
+                    stateColor != null -> stateColor.copy(alpha = .38f)
+                    else -> SystemBlue.copy(alpha = .28f)
                 },
                 shape
             )
@@ -19318,22 +22199,17 @@ private fun CompactActionButton(
                 if (enabled) action.onClick() else showDisabledActionReason(
                     context,
                     action.title,
-                    action.description
+                    action.description.takeIf { it.isNotBlank() }
                 )
             }
-            .padding(horizontal = 14.dp),
+            .padding(horizontal = QueueSpacing.L, vertical = QueueSpacing.S),
         contentAlignment = Alignment.Center
     ) {
         Text(
             action.title,
-            color = when {
-                !enabled -> TertiaryText
-                action.destructive -> Destructive
-                !accented -> PrimaryText
-                else -> SystemBlue
-            },
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Medium,
+            color = contentColor,
+            fontSize = QueueTextSize.Control,
+            fontWeight = FontWeight.SemiBold,
             textAlign = TextAlign.Center,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis
@@ -19341,35 +22217,200 @@ private fun CompactActionButton(
     }
 }
 
+/** Kept for the call sites that used the old centred tile; it is now the ordinary menu entry. */
+@Composable
+private fun CompactActionButton(
+    action: MenuAction,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = action.enabled,
+    accented: Boolean = true
+) = MenuActionButton(action, modifier, enabled, accented)
+
+/** Menu entries two to a row; the two entries of a row are as tall as each other. */
 @Composable
 private fun CompactActionGrid(actions: List<MenuAction>, accented: Boolean = true) {
     actions.chunked(2).forEachIndexed { index, rowActions ->
-        if (index > 0) Spacer(Modifier.height(9.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+        if (index > 0) Spacer(Modifier.height(QueueSpacing.S))
+        Row(
+            Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+            horizontalArrangement = Arrangement.spacedBy(QueueSpacing.S)
+        ) {
             rowActions.forEach { action ->
-                CompactActionButton(
+                MenuActionButton(
                     action,
-                    Modifier.weight(1f),
+                    Modifier.weight(1f).fillMaxHeight(),
                     accented = action.accented ?: accented
                 )
             }
+            if (rowActions.size == 1) Spacer(Modifier.weight(1f))
         }
     }
 }
 
+/**
+ * Actions that are not part of ordinary queueing (docs/ui-guide.md, 菜单的分组): what other players
+ * do for a player who is not there, and corrections of the record. They sit apart at the bottom of
+ * the menu, each kind on its own tinted panel with one line saying when it is used.
+ */
 @Composable
-private fun MenuSectionHeader(text: String) {
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text(text, color = SecondaryText, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.width(10.dp))
-        HorizontalDivider(Modifier.weight(1f), color = Separator.copy(alpha = .72f))
+private fun SeparateMenuSection(
+    title: String,
+    description: String,
+    actions: List<MenuAction>,
+    /** With only one action, the line under the title says what that action does instead. */
+    singleActionDescription: String? = null
+) {
+    Spacer(Modifier.height(QueueSpacing.L))
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(CardRadius))
+            .background(PageBackground)
+            .border(1.dp, Separator.copy(alpha = .8f), RoundedCornerShape(CardRadius))
+            .padding(QueueSpacing.M)
+    ) {
+        val heading: @Composable () -> Unit = {
+            Text(
+                title,
+                color = PrimaryText,
+                fontSize = QueueTextSize.Body,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(QueueSpacing.XS))
+            Text(
+                singleActionDescription?.takeIf { actions.size == 1 } ?: description,
+                color = SecondaryText,
+                fontSize = QueueTextSize.Caption,
+                lineHeight = 17.sp
+            )
+        }
+        if (actions.size == 1) {
+            // A single action stands beside its explanation, which keeps the menu short.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) { heading() }
+                Spacer(Modifier.width(QueueSpacing.M))
+                MenuActionButton(actions.single(), Modifier.width(220.dp))
+            }
+        } else {
+            heading()
+            Spacer(Modifier.height(QueueSpacing.M))
+            CompactActionGrid(actions)
+        }
     }
-    Spacer(Modifier.height(10.dp))
 }
 
+/**
+ * One of the two ways to step back from a turn (延后这份登记): a card that says when it fits, what
+ * happens when the registration is reached, and how it ends, so the two can be compared at a glance.
+ */
 @Composable
-private fun SectionLabel(text: String) {
-    Text(text, color = SecondaryText, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+private fun AbsenceChoiceCard(
+    title: String,
+    summary: String,
+    facts: List<Pair<String, String>>,
+    enabled: Boolean,
+    disabledReason: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    /** Removing: the title and summary are red. */
+    destructive: Boolean = false
+) {
+    val context = LocalContext.current
+    val shape = RoundedCornerShape(CardRadius)
+    Column(
+        modifier.clip(shape)
+            .background(if (enabled) CardBackground else DisabledBackground)
+            .border(1.dp, if (enabled) Separator else Separator.copy(alpha = .65f), shape)
+            .clickable {
+                if (enabled) onClick() else showDisabledActionReason(context, title, disabledReason)
+            }
+            .padding(QueueSpacing.L)
+    ) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                title,
+                color = when {
+                    !enabled -> TertiaryText
+                    destructive -> Destructive
+                    else -> PrimaryText
+                },
+                fontSize = QueueTextSize.CardTitle,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
+            Text("›", color = if (enabled) TertiaryText else Separator, fontSize = 15.sp)
+        }
+        Spacer(Modifier.height(QueueSpacing.XS))
+        Text(
+            if (enabled) summary else disabledReason,
+            color = when {
+                !enabled -> TertiaryText
+                destructive -> Destructive
+                else -> AbsenceStatusColor
+            },
+            fontSize = QueueTextSize.Body,
+            fontWeight = FontWeight.Medium
+        )
+        Spacer(Modifier.height(QueueSpacing.M))
+        facts.forEachIndexed { index, (label, text) ->
+            if (index > 0) Spacer(Modifier.height(QueueSpacing.S))
+            Text(label, color = TertiaryText, fontSize = QueueTextSize.Label, fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text,
+                color = if (enabled) SecondaryText else TertiaryText,
+                fontSize = QueueTextSize.Caption,
+                lineHeight = 17.sp
+            )
+        }
+    }
+}
+
+/**
+ * The heading of a group in a menu (docs/ui-guide.md, 小节标题): 12-point semibold grey text and a
+ * line to the right. An action that belongs to the group sits at the end of the line, in the same
+ * size and centred on the same line, blue or red for removing.
+ */
+@Composable
+private fun MenuSectionHeader(
+    text: String,
+    actionText: String? = null,
+    actionDestructive: Boolean = false,
+    /** A greyed action stays in place and explains itself when tapped. */
+    actionDisabledReason: String? = null,
+    onAction: (() -> Unit)? = null
+) {
+    val context = LocalContext.current
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = if (actionText != null) MinTouchTarget else 0.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(text, color = SecondaryText, fontSize = QueueTextSize.Caption, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.width(10.dp))
+        HorizontalDivider(Modifier.weight(1f), color = Separator.copy(alpha = .72f))
+        if (actionText != null && onAction != null) {
+            Spacer(Modifier.width(QueueSpacing.S))
+            Box(
+                Modifier.heightIn(min = MinTouchTarget).clip(RoundedCornerShape(ControlRadius))
+                    .clickable {
+                        if (actionDisabledReason == null) onAction()
+                        else showDisabledActionReason(context, actionText, actionDisabledReason)
+                    }
+                    .padding(horizontal = QueueSpacing.XS),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    actionText,
+                    color = when {
+                        actionDisabledReason != null -> TertiaryText
+                        actionDestructive -> Destructive
+                        else -> SystemBlue
+                    },
+                    fontSize = QueueTextSize.Caption,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+    }
+    Spacer(Modifier.height(if (actionText != null) QueueSpacing.XS else 10.dp))
 }
 
 @Composable
@@ -19391,47 +22432,6 @@ private fun AppBackButton(onClick: () -> Unit, text: String = "返回") {
 }
 
 @Composable
-private fun NoShowChoice(
-    title: String,
-    description: String,
-    modifier: Modifier = Modifier,
-    visuallyDisabled: Boolean = false,
-    destructive: Boolean = false,
-    onClick: () -> Unit
-) {
-    val context = LocalContext.current
-    val shape = RoundedCornerShape(ControlRadius)
-    Column(
-        modifier.heightIn(min = 88.dp).clip(shape)
-            .background(if (visuallyDisabled) DisabledBackground else PageBackground)
-            .border(1.dp, Separator.copy(alpha = .7f), shape)
-            .clickable {
-                if (visuallyDisabled) {
-                    showDisabledActionReason(context, title, description)
-                } else {
-                    onClick()
-                }
-            }
-            .padding(horizontal = 11.dp, vertical = 10.dp),
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(
-            title,
-            color = when {
-                visuallyDisabled -> TertiaryText
-                destructive -> Destructive
-                else -> PrimaryText
-            },
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Medium,
-            maxLines = 1
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(description, color = TertiaryText, fontSize = 9.sp, lineHeight = 13.sp)
-    }
-}
-
-@Composable
 private fun CancelAction(onClick: () -> Unit) {
     CancelAction("取消", onClick)
 }
@@ -19443,7 +22443,7 @@ private fun CancelAction(text: String, onClick: () -> Unit) {
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
-        Text(text, color = SystemBlue, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+        Text(text, color = SystemBlue, fontSize = QueueTextSize.Body, fontWeight = FontWeight.Medium)
     }
 }
 
@@ -19453,11 +22453,13 @@ private fun SmallActionButton(
     onClick: () -> Unit,
     primary: Boolean = false,
     enabled: Boolean = true,
-    disabledReason: String = "当前状态下不能使用这项操作。"
+    disabledReason: String = "当前状态下不能使用这项操作。",
+    /** Drawn left of the text, in the text's colour. */
+    leadingIcon: (@Composable (Color) -> Unit)? = null
 ) {
     val context = LocalContext.current
     Box(
-        Modifier.height(40.dp).clip(RoundedCornerShape(ControlRadius))
+        Modifier.height(52.dp).clip(RoundedCornerShape(ControlRadius))
             .background(if (!enabled) DisabledBackground else if (primary) SystemBlue else SoftBlue)
             .border(
                 1.dp,
@@ -19467,18 +22469,53 @@ private fun SmallActionButton(
             .clickable {
                 if (enabled) onClick() else showDisabledActionReason(context, text, disabledReason)
             }
-            .padding(horizontal = if (primary) 16.dp else 14.dp),
+            .padding(horizontal = 20.dp),
         contentAlignment = Alignment.Center
     ) {
-        Text(
-            text,
-            color = when {
-                !enabled -> TertiaryText
-                primary -> Color.White
-                else -> SystemBlue
-            },
-            fontSize = 12.sp,
-            fontWeight = if (primary) FontWeight.SemiBold else FontWeight.Medium
+        val contentColor = when {
+            !enabled -> TertiaryText
+            primary -> Color.White
+            else -> SystemBlue
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (leadingIcon != null) {
+                leadingIcon(contentColor)
+                Spacer(Modifier.width(6.dp))
+            }
+            Text(
+                text,
+                color = contentColor,
+                fontSize = QueueTextSize.Control,
+                fontWeight = if (primary) FontWeight.SemiBold else FontWeight.Medium
+            )
+        }
+    }
+}
+
+/**
+ * A return-key arrow (↵): 结束本轮 moves the queue on to the next group. Drawn here rather than
+ * taken from an icon set, because the app only bundles the core Material icons.
+ */
+@Composable
+private fun RoundAdvanceIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier.size(16.dp)) {
+        val right = size.width * .84f
+        val top = size.height * .14f
+        val baseline = size.height * .64f
+        val left = size.width * .14f
+        val head = size.width * .22f
+        val path = Path().apply {
+            moveTo(right, top)
+            lineTo(right, baseline)
+            lineTo(left, baseline)
+            moveTo(left + head, baseline - head)
+            lineTo(left, baseline)
+            lineTo(left + head, baseline + head)
+        }
+        drawPath(
+            path,
+            color,
+            style = Stroke(width = 1.9.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
         )
     }
 }
@@ -19506,6 +22543,7 @@ private fun PrimaryButton(
     ) { Text(text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
 }
 
+/** Solid red: only the last confirmation of something that cannot be undone (docs/ui-guide.md). */
 @Composable
 private fun DestructiveButton(text: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
     Button(
@@ -19513,18 +22551,32 @@ private fun DestructiveButton(text: String, onClick: () -> Unit, modifier: Modif
         modifier = modifier.height(52.dp),
         shape = RoundedCornerShape(ControlRadius),
         colors = ButtonDefaults.buttonColors(containerColor = Destructive, contentColor = Color.White)
-    ) { Text(text, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
+    ) { Text(text, fontSize = QueueTextSize.Control, fontWeight = FontWeight.SemiBold) }
 }
 
+/**
+ * White with red text: the way into something destructive that asks once more before it acts,
+ * so the solid red stays for that last step (docs/ui-guide.md).
+ */
 @Composable
-private fun StepperButton(text: String, onClick: () -> Unit, enabled: Boolean) {
+private fun DangerSecondaryButton(text: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
     Box(
-        Modifier.size(56.dp).clip(RoundedCornerShape(14.dp))
-            .background(if (enabled) SoftBlue else DisabledBackground)
-            .clickable(enabled = enabled, onClick = onClick),
+        modifier.height(52.dp).clip(RoundedCornerShape(ControlRadius))
+            .background(CardBackground)
+            .border(1.dp, Destructive.copy(alpha = .38f), RoundedCornerShape(ControlRadius))
+            .clickable(onClick = onClick)
+            .padding(horizontal = QueueSpacing.L),
         contentAlignment = Alignment.Center
     ) {
-        Text(text, color = if (enabled) SystemBlue else TertiaryText, fontSize = 24.sp, fontWeight = FontWeight.Medium)
+        Text(
+            text,
+            color = Destructive,
+            fontSize = QueueTextSize.Control,
+            fontWeight = FontWeight.SemiBold,
+            textAlign = TextAlign.Center,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 
@@ -19564,7 +22616,7 @@ private fun SecondaryButton(
                 Text(
                     text,
                     color = if (enabled) SystemBlue else TertiaryText,
-                    fontSize = 14.sp,
+                    fontSize = QueueTextSize.Control,
                     fontWeight = FontWeight.SemiBold,
                     textAlign = TextAlign.Center,
                     maxLines = 1,
@@ -19575,7 +22627,7 @@ private fun SecondaryButton(
             Text(
                 text,
                 color = if (enabled) SystemBlue else TertiaryText,
-                fontSize = 14.sp,
+                fontSize = QueueTextSize.Control,
                 fontWeight = FontWeight.SemiBold,
                 textAlign = TextAlign.Center
             )
@@ -19618,12 +22670,13 @@ private fun rememberCurrentTimeMillis(): Long {
     return currentTime
 }
 
+/** The width a tile needs for its nickname, within [RegistrationTileMinWidth] and [RegistrationTileMaxWidth]. */
 private fun registrationTileWidth(displayId: String): Dp {
     val visibleId = queueDisplayId(displayId)
     val visibleCharacters = visibleId
         .codePointCount(0, visibleId.length)
         .coerceIn(3, 6)
-    return (66 + visibleCharacters * 8).dp
+    return (40 + visibleCharacters * 17).dp.coerceIn(RegistrationTileMinWidth, RegistrationTileMaxWidth)
 }
 
 private fun inlineReorderRegistrationTileWidth(displayId: String): Dp {
@@ -19832,6 +22885,28 @@ internal fun estimatedMinutesUntilPlaying(
     return null
 }
 
+/**
+ * What a round confirmation adds when the next group includes registrations that queue at both
+ * machines and are about to come over from the other machine of the pair.
+ */
+private fun pairedArrivalNotice(
+    preview: NextPlayingPositionPreview?,
+    ownQueue: MachineQueue,
+    pairedMachineName: String?,
+    machineName: String
+): String? {
+    if (preview == null || pairedMachineName == null) return null
+    val ownKeys = ownQueue.allRegistrations.mapTo(mutableSetOf()) { it.key }
+    val arriving = preview.nextRegistrations.filter { it.key !in ownKeys }
+    if (arriving.isEmpty()) return null
+    val names = arriving.joinToString("、") { "“${it.displayId}”" }
+    return "${names}将自动由 $pairedMachineName 转至 $machineName 并进入游玩位置。"
+}
+
+/** Joins the notices of a confirmation, one per line; null when there is none. */
+private fun joinNotices(vararg notices: String?): String? =
+    notices.filterNotNull().joinToString("\n").takeIf { it.isNotEmpty() }
+
 private fun nextPlayingChangeMessage(preview: NextPlayingPositionPreview?): String? {
     if (preview?.changedByAvailability != true) return null
 
@@ -19885,20 +22960,35 @@ private fun availabilityOutcomeMessage(
             add(
                 "${names(pendingCheckIn)}尚未完成现场签到，" +
                     if (pendingCheckIn.size == 1) {
-                        "这份线上登记将自动移除。"
+                        "这份线上登记会自动移除。"
                     } else {
-                        "这些线上登记将自动移除。"
+                        "这些线上登记会自动移除。"
                     }
             )
         }
         if (deferred.isNotEmpty()) {
             add(
-                "${names(deferred)}已设置为暂缓一次，本次进入游玩位置的机会会被跳过；跳过后自动恢复。真实等待顺序不变，画面位置会按后续轮换重新计算。"
+                "${names(deferred)}将暂缓一次，本次进入游玩位置的机会会被跳过，随后自动解除暂缓。等待顺序不变，队列会显示预计下次游玩的位置。"
+            )
+        }
+        val skipping = unavailableRegistrations.filter {
+            it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN
+        }
+        skipping.filter { it.temporaryAwaySkippedTurns < 3 }.forEach { registration ->
+            add(
+                "“${registration.displayId}”将轮空一次，本次会移至队尾；" +
+                    "轮空次数将变为 ${registration.temporaryAwaySkippedTurns + 1} 次，轮空一次随即自动解除。"
+            )
+        }
+        skipping.filter { it.temporaryAwaySkippedTurns >= 3 }.takeIf { it.isNotEmpty() }?.let { leaving ->
+            add(
+                "${names(leaving)}已轮空 3 次，" +
+                    if (leaving.size == 1) "本次再轮到时会自动移除。" else "本次再轮到时都会自动移除。"
             )
         }
         temporaryAwayWillRemain.forEach { registration ->
             add(
-                "“${registration.displayId}”处于暂时离开状态，本轮会轮空并移至等待顺序末端；" +
+                "“${registration.displayId}”处于暂时离开状态，本轮会轮空并移至队尾；" +
                     "轮空次数将变为 ${registration.temporaryAwaySkippedTurns + 1} 次。"
             )
         }
@@ -19906,15 +22996,15 @@ private fun availabilityOutcomeMessage(
             add(
                 "${names(temporaryAwayWillExit)}暂时离开期间已轮空 3 次，" +
                     if (temporaryAwayWillExit.size == 1) {
-                        "本次再轮到时会自动退出排队。"
+                        "本次再轮到时会自动移除。"
                     } else {
-                        "本次再轮到时都会自动退出排队。"
+                        "本次再轮到时都会自动移除。"
                     }
             )
         }
     }
     val nextRound = when (nextRegistrations.size) {
-        0 -> "目前没有可以进入游玩位置的登记，游玩位置将保持空缺。"
+        0 -> "当前没有可以进入游玩位置的登记，游玩位置将保持空缺。"
         1 -> "实际将由${names(nextRegistrations)}单人游玩。"
         else -> "实际将由${names(nextRegistrations)}共同游玩。"
     }
@@ -19993,25 +23083,61 @@ private fun roundDurationMillis(
     sharedRoundMinutes * 60_000L
 }
 
+/** The value under 新登记预计等待 on a machine card, so it does not repeat 预计. */
 internal fun formatJoinWaitEstimate(minutes: Long?): String = when {
     minutes == null -> "暂时无法估算"
-    minutes <= 0L -> "预计很快可以游玩"
+    minutes <= 0L -> "很快可以游玩"
     else -> "约 $minutes 分钟"
 }
 
-internal fun formatPositionWaitEstimate(minutes: Long?): String = when {
+/**
+ * The wait of a waiting position. [uncertain] marks an estimate that a move between the two
+ * machines of a pair may make wrong; it is then the earliest time and says so.
+ */
+internal fun formatPositionWaitEstimate(minutes: Long?, uncertain: Boolean = false): String = when {
     minutes == null -> "暂时无法估算"
-    minutes <= 0L -> "预计很快可以游玩"
+    minutes <= 0L -> if (uncertain) "可能很快可以游玩" else "预计很快可以游玩"
+    uncertain -> "最快约 $minutes 分钟后可以游玩"
     else -> "约 $minutes 分钟后可以游玩"
+}
+
+/** Shown with an uncertain wait (docs/releases/wait-estimate-2026-11.md). */
+internal const val UNCERTAIN_WAIT_NOTE =
+    "受系统在两台机台之间安排登记的影响，等待时间可能不准确，请以现场实际情况为准。"
+
+/** A waiting position's minutes as shown, and whether they may be wrong. */
+internal data class ShownWait(val minutes: Long, val uncertain: Boolean)
+
+/**
+ * The shown wait of the position holding [keys], on a machine whose waiting positions are
+ * [positions] in their displayed order; see [WaitEstimator.displayMinutesInOrder].
+ */
+internal fun shownPositionWait(
+    estimates: WaitEstimator.Result,
+    positions: List<Set<Int>>,
+    keys: Set<Int>
+): ShownWait? {
+    val positionEstimates = positions.map(estimates::estimate)
+    val minutes = WaitEstimator.displayMinutesInOrder(positionEstimates)
+    val index = positions.indexOfFirst { it == keys }
+        .takeIf { it >= 0 }
+        ?: positions.indexOfFirst { position -> position.any { it in keys } }
+    if (index >= 0) {
+        val shown = minutes[index] ?: return null
+        return ShownWait(shown, positionEstimates[index]?.uncertain == true)
+    }
+    val estimate = estimates.estimate(keys) ?: return null
+    return ShownWait(WaitEstimator.displayMinutes(estimate.waitMillis, estimate.uncertain), estimate.uncertain)
 }
 
 private fun positionWaitEstimateLabel(
     registrations: List<Registration>,
-    minutes: Long?
+    minutes: Long?,
+    uncertain: Boolean
 ): String = when {
     registrations.any { it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY } ->
         "暂时离开，无法估算"
-    else -> formatPositionWaitEstimate(minutes)
+    else -> formatPositionWaitEstimate(minutes, uncertain)
 }
 
 private fun randomChinesePlayerId(): String {
@@ -20116,16 +23242,18 @@ private fun machineTransferUnavailableReason(
     status: MachineStatus,
     queue: MachineQueue,
     incomingRegistrations: List<Registration>,
-    machineCapacity: Int = DEFAULT_MACHINE_CAPACITY
+    machineCapacity: Int = DEFAULT_MACHINE_CAPACITY,
+    /** Whether this machine and the registrations' machine form an active pair. */
+    destinationIsPairedMachine: Boolean = false
 ): String? = when {
-    !status.isOperational -> "$machineName 已停止使用，暂时不能转入。"
-    incomingRegistrations.isEmpty() -> "当前没有可以转移的登记。"
+    !status.isOperational -> "$machineName 已停止使用，暂不能转入。"
+    incomingRegistrations.isEmpty() -> "当前没有可以转至其他机台的登记。"
     incomingRegistrations.any(Registration::requiresOnSiteCheckIn) ->
-        "此位置中有待签到的线上登记，完成现场签到后才能切换机台。"
+        "此位置中有待签到的线上登记，完成现场签到后才能转至其他机台。"
     machineCapacity == 1 && incomingRegistrations.any { it.fixedPartnerKey != null } ->
-        "$machineName 仅能容纳一人游玩，请先释放固定组合再转入。"
+        "$machineName 仅能容纳一人游玩，请先解除固定组合再转入。"
     queue.registrationCount + incomingRegistrations.size > 20 ->
-        "$machineName 剩余容量不足，无法接收这些登记。"
+        "$machineName 的登记将超过 20 份，无法接收这些登记。"
     else -> null
 }
 
@@ -20139,7 +23267,14 @@ private fun registrationAbsenceStatusLabel(
     includeSkippedTurns: Boolean
 ): String? = when (registration.absenceStatus) {
     QueueAbsenceStatus.NONE -> null
-    QueueAbsenceStatus.DEFER_ONE_ROUND -> "暂缓一次"
+    // Set but not yet happened: written with 将 (maintainer, 2026-11-25).
+    QueueAbsenceStatus.DEFER_ONE_ROUND -> "将暂缓一次"
+    QueueAbsenceStatus.SKIP_ONE_TURN -> buildString {
+        append("将轮空一次")
+        if (includeSkippedTurns && registration.temporaryAwaySkippedTurns > 0) {
+            append("·已轮空 ${registration.temporaryAwaySkippedTurns} 次")
+        }
+    }
     QueueAbsenceStatus.TEMPORARILY_AWAY -> buildString {
         append("暂时离开")
         if (includeSkippedTurns && registration.temporaryAwaySkippedTurns > 0) {
@@ -20157,10 +23292,13 @@ private fun fixedPairFormationAbsenceNotice(
     if (temporarilyAway.isNotEmpty()) {
         val skippedTurns = temporarilyAway.maxOf(Registration::temporaryAwaySkippedTurns)
         return "其中至少一份登记当前处于暂时离开状态。固定组合建立后，两份登记都会暂时离开，已轮空次数统一为 $skippedTurns 次；返回后可通过其中任一份登记取消。" +
-            if (skippedTurns >= 3) "下一次轮到时，整组会自动退出排队。" else ""
+            if (skippedTurns >= 3) "下一次轮到时，整组登记会自动移除。" else ""
+    }
+    if (registrations.any { it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN }) {
+        return "其中至少一份登记当前将轮空一次。固定组合建立后，两份登记都将轮空一次；下一次轮到整组时会一起移至队尾，随后同时自动解除。"
     }
     if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
-        return "其中至少一份登记当前已暂缓一次。固定组合建立后，两份登记都会暂缓一次；下一次轮到整组时会跳过，随后同时自动解除。"
+        return "其中至少一份登记当前将暂缓一次。固定组合建立后，两份登记都将暂缓一次；下一次轮到整组时会跳过，随后同时自动解除。"
     }
     return null
 }
@@ -20173,17 +23311,21 @@ private fun fixedPairCreatedStatusDetail(registrations: List<Registration>): Str
         val skippedTurns = temporarilyAway.maxOf(Registration::temporaryAwaySkippedTurns)
         return "两份登记现均为暂时离开，已轮空次数统一为 $skippedTurns 次。"
     }
-    return if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
-        "两份登记现均已暂缓一次。"
-    } else {
-        null
+    return when {
+        registrations.any { it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN } ->
+            "两份登记现均将轮空一次。"
+        registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND } ->
+            "两份登记现均将暂缓一次。"
+        else -> null
     }
 }
 
 private fun fixedPairAbsenceRetentionNotice(registration: Registration): String? =
     when (registration.absenceStatus) {
         QueueAbsenceStatus.DEFER_ONE_ROUND ->
-            "两份登记的“暂缓一次”安排不会因解除组合而取消。"
+            "两份登记的暂缓一次不会因解除固定组合而取消。"
+        QueueAbsenceStatus.SKIP_ONE_TURN ->
+            "两份登记的轮空一次不会因解除固定组合而取消。"
         QueueAbsenceStatus.TEMPORARILY_AWAY ->
             "两份登记当前的暂时离开状态和已轮空 ${registration.temporaryAwaySkippedTurns} 次不会因解除组合而清除。"
         QueueAbsenceStatus.NONE -> null
@@ -20192,9 +23334,11 @@ private fun fixedPairAbsenceRetentionNotice(registration: Registration): String?
 private fun remainingPartnerAbsenceNotice(registration: Registration): String? =
     when (registration.absenceStatus) {
         QueueAbsenceStatus.DEFER_ONE_ROUND ->
-            "对方仍保持暂缓一次，并会在下一次轮到后自动解除。"
+            "另一份登记仍将暂缓一次，并会在下一次轮到后自动解除。"
+        QueueAbsenceStatus.SKIP_ONE_TURN ->
+            "另一份登记仍将轮空一次，并会在下一次轮到时移至队尾。"
         QueueAbsenceStatus.TEMPORARILY_AWAY ->
-            "对方仍保持暂时离开和已轮空 ${registration.temporaryAwaySkippedTurns} 次，返回后需要手动取消。"
+            "另一份登记仍保持暂时离开和已轮空 ${registration.temporaryAwaySkippedTurns} 次，返回后需要手动取消。"
         QueueAbsenceStatus.NONE -> null
     }
 
@@ -20208,14 +23352,22 @@ private fun machineTransferAbsenceNotice(
     if (temporarilyAway.isNotEmpty()) {
         val skippedTurns = temporarilyAway.maxOf(Registration::temporaryAwaySkippedTurns)
         return if (breaksFixedPair) {
-            "两份登记的暂时离开状态和已轮空 $skippedTurns 次都会保留；转入后仍需手动取消，才能参与游玩位置分配。"
+            "两份登记的暂时离开状态和已轮空 $skippedTurns 次都会保留；转入后仍需手动取消。"
         } else {
-            "暂时离开状态和已轮空 $skippedTurns 次会保留；转入后仍需手动取消，才能参与游玩位置分配。"
+            "暂时离开状态和已轮空 $skippedTurns 次会保留；转入后仍需手动取消。"
+        }
+    }
+    if (registrations.any { it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN }) {
+        // Arriving at the tail already does what 轮空一次 would; see MachineQueue.receiveAtWaitingTail.
+        return if (breaksFixedPair) {
+            "转入登记已在队尾，不再轮空；留在原机台的登记仍将轮空一次。"
+        } else {
+            "这些登记转入后已在队尾，不再轮空。"
         }
     }
     if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
         return if (breaksFixedPair) {
-            "转入登记不再暂缓；留在原机台的登记仍会暂缓一次。"
+            "转入登记不再暂缓；留在原机台的登记仍将暂缓一次。"
         } else {
             "这些登记转入后不再暂缓。"
         }
@@ -20231,16 +23383,21 @@ private fun unavailableNoShowExplanation(registrations: List<Registration>): Str
     val hasOneRoundDeferral = registrations.any {
         it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
     }
+    val hasSkip = registrations.any {
+        it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN
+    }
     val subject = if (registrations.size > 1) "这组玩家" else "这名玩家"
     return when {
         hasPendingCheckIn ->
-            "$subject 尚未完成现场签到，不会进入游玩位置，不能标记为未到场。"
-        hasTemporaryLeave && hasOneRoundDeferral ->
-            "$subject 包含暂缓一次或暂时离开的登记，本次不会进入游玩位置，不能标记为未到场。"
+            "${subject}尚未完成现场签到，不会进入游玩位置，不能记录为未到场。"
+        listOf(hasTemporaryLeave, hasOneRoundDeferral, hasSkip).count { it } > 1 ->
+            "这组登记中有暂缓一次、轮空一次或暂时离开的登记，本次不会进入游玩位置，不能记录为未到场。"
         hasTemporaryLeave ->
-            "$subject 处于暂时离开状态，本次不会进入游玩位置，不能标记为未到场。"
+            "${subject}处于暂时离开状态，本次不会进入游玩位置，不能记录为未到场。"
+        hasSkip ->
+            "${subject}将轮空一次，本次会移至队尾，不能记录为未到场。"
         else ->
-            "$subject 已暂缓一次，本次机会会被跳过，不能标记为未到场。"
+            "${subject}将暂缓一次，本次机会会被跳过，不能记录为未到场。"
     }
 }
 
@@ -20273,4 +23430,350 @@ private fun formatRegistrationTime(timeMillis: Long, nowMillis: Long = System.cu
 @Composable
 private fun RegistrationAppPreview() {
     MaimaiQueueTheme(dynamicColor = false) { RegistrationApp() }
+}
+
+internal fun pairedMachineKindLabel(configuration: MachineConfiguration): String {
+    val type = machineGameTypeDisplayName(configuration)
+    val server = when {
+        !configuration.gameType.supportsServerConfiguration -> null
+        configuration.server == MachineServer.HIDDEN -> null
+        configuration.server == MachineServer.OTHER -> configuration.customServer.takeIf { it.isNotBlank() }
+        else -> machineServerLabel(configuration.server)
+    }
+    return if (server == null) type else "$type（$server）"
+}
+
+/**
+ * The venue setting for queueing at both machines of a pair: the switch, the configured pairs,
+ * and a picker for adding one.
+ */
+@Composable
+private fun PairedMachineQueueSettings(
+    settings: QueueRuleSettings,
+    /** While a management app has taken over, the setting can only be changed from there. */
+    locked: Boolean = false,
+    onSettingsChange: (QueueRuleSettings) -> Unit,
+    /**
+     * Opens [AddMachinePairDialogs]. The dialogs are drawn by the settings page itself: this row
+     * sits in a scrolling column, where a full-screen dialog has no height limit and crashes.
+     */
+    onAddPair: () -> Unit
+) {
+    val pairs = settings.configuredMachinePairs
+    val pairedMachines = pairs.flatMapTo(mutableSetOf()) { listOf(it.first, it.second) }
+    val availableMachines = settings.configuredMachineIds.filterNot { it in pairedMachines }
+    fun label(machineId: MachineId): String = machineName(machineId, settings.machineRemark(machineId))
+
+    QueueRuleSettingRow(
+        title = "允许系统在一对机台之间安排登记",
+        description = if (locked) {
+            "已由管理后台接管，只能从管理后台修改。"
+        } else {
+            "开启后，玩家可以允许系统在一对机台之间安排自己的登记。"
+        },
+        checked = settings.pairedMachineQueueEnabled,
+        enabled = !locked,
+        onCheckedChange = { onSettingsChange(settings.copy(pairedMachineQueueEnabled = it)) }
+    )
+    Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 14.dp)) {
+        Text(
+            "一对机台",
+            color = PrimaryText,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium
+        )
+        Spacer(Modifier.height(6.dp))
+        if (pairs.isEmpty()) {
+            Text("尚未添加一对机台。", color = SecondaryText, fontSize = 11.sp, lineHeight = 16.sp)
+        }
+        pairs.forEach { (first, second) ->
+            Row(
+                Modifier.fillMaxWidth().height(40.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "${label(first)} 与 ${label(second)}",
+                    color = PrimaryText,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    modifier = Modifier.weight(1f)
+                )
+                if (!locked) {
+                    Text(
+                        "移除",
+                        color = SystemBlue,
+                        fontSize = 12.sp,
+                        modifier = Modifier.clip(RoundedCornerShape(12.dp)).clickable {
+                            val removed = setOf(
+                                settings.machineStableId(first),
+                                settings.machineStableId(second)
+                            )
+                            onSettingsChange(
+                                settings.copy(
+                                    pairedMachineStableIds =
+                                        settings.pairedMachineStableIds.filterNot {
+                                            it.first in removed || it.second in removed
+                                        }
+                                )
+                            )
+                        }.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        SecondaryButton(
+            text = "添加一对机台",
+            onClick = onAddPair,
+            enabled = !locked && availableMachines.size >= 2,
+            disabledReason = if (locked) {
+                "已由管理后台接管，只能从管理后台修改。"
+            } else {
+                "当前没有两台尚未设为一对的机台。"
+            }
+        )
+    }
+}
+
+/** Choosing two machines to pair, and confirming a pair of different kinds. */
+@Composable
+private fun AddMachinePairDialogs(
+    settings: QueueRuleSettings,
+    onSettingsChange: (QueueRuleSettings) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var addingPair by remember { mutableStateOf(true) }
+    var differingPair by remember { mutableStateOf<Pair<MachineId, MachineId>?>(null) }
+    val pairs = settings.configuredMachinePairs
+    val pairedMachines = pairs.flatMapTo(mutableSetOf()) { listOf(it.first, it.second) }
+    val availableMachines = settings.configuredMachineIds.filterNot { it in pairedMachines }
+    fun label(machineId: MachineId): String = machineName(machineId, settings.machineRemark(machineId))
+    fun addPair(first: MachineId, second: MachineId) {
+        onSettingsChange(
+            settings.copy(
+                pairedMachineQueueEnabled = true,
+                pairedMachineStableIds = settings.pairedMachineStableIds +
+                    (settings.machineStableId(first) to settings.machineStableId(second))
+            )
+        )
+    }
+    LaunchedEffect(addingPair, differingPair) {
+        if (!addingPair && differingPair == null) onDismiss()
+    }
+    if (addingPair) {
+        var selected by remember { mutableStateOf(emptyList<MachineId>()) }
+        val capacitiesDiffer = selected.size == 2 &&
+            settings.machineConfiguration(selected[0]).capacity !=
+            settings.machineConfiguration(selected[1]).capacity
+        ModalSurface({ addingPair = false }, width = 480.dp) {
+            Text("添加一对机台", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "选择两台游玩容量相同的机台。一台机台只能属于一对。",
+                color = SecondaryText,
+                fontSize = 14.sp,
+                lineHeight = 20.sp
+            )
+            Spacer(Modifier.height(12.dp))
+            availableMachines.forEach { machineId ->
+                val isSelected = machineId in selected
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 4.dp).height(48.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(if (isSelected) SoftBlue else CardBackground)
+                        .border(
+                            if (isSelected) 2.dp else 1.dp,
+                            if (isSelected) SystemBlue else Separator,
+                            RoundedCornerShape(12.dp)
+                        )
+                        .clickable {
+                            selected = when {
+                                isSelected -> selected - machineId
+                                selected.size < 2 -> selected + machineId
+                                else -> listOf(selected[1], machineId)
+                            }
+                        }
+                        .padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(label(machineId), color = PrimaryText, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        "${pairedMachineKindLabel(settings.machineConfiguration(machineId))}·" +
+                            "${settings.machineConfiguration(machineId).capacity} 人",
+                        color = SecondaryText,
+                        fontSize = 11.sp
+                    )
+                }
+            }
+            if (capacitiesDiffer) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "两台机台的游玩容量不同，不能设为一对机台。",
+                    color = AbsenceStatusColor,
+                    fontSize = 12.sp,
+                    lineHeight = 18.sp
+                )
+            }
+            Spacer(Modifier.height(16.dp))
+            PrimaryButton(
+                text = "添加",
+                onClick = {
+                    val first = selected[0]
+                    val second = selected[1]
+                    addingPair = false
+                    if (
+                        pairedMachineKindLabel(settings.machineConfiguration(first)) ==
+                        pairedMachineKindLabel(settings.machineConfiguration(second))
+                    ) {
+                        addPair(first, second)
+                    } else {
+                        differingPair = first to second
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = selected.size == 2 && !capacitiesDiffer,
+                disabledReason = if (capacitiesDiffer) {
+                    "两台机台的游玩容量不同，不能设为一对机台。"
+                } else {
+                    "请选择两台机台。"
+                }
+            )
+            Spacer(Modifier.height(8.dp))
+            CancelAction { addingPair = false }
+        }
+    }
+
+    differingPair?.let { (first, second) ->
+        ModalSurface({ differingPair = null }, width = 480.dp) {
+            Text(
+                "将 ${label(first)} 与 ${label(second)} 设为一对机台？",
+                color = PrimaryText,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "两台机台的游戏类型或服务器不同：${label(first)} 为 " +
+                    "${pairedMachineKindLabel(settings.machineConfiguration(first))}，${label(second)} 为 " +
+                    "${pairedMachineKindLabel(settings.machineConfiguration(second))}。确认后，登记可能自动转至另一机台。" +
+                    "请仅在玩家可以在两台机台游玩时继续。",
+                color = SecondaryText,
+                fontSize = 14.sp,
+                lineHeight = 20.sp
+            )
+            Spacer(Modifier.height(18.dp))
+            PrimaryButton(
+                "仍然添加",
+                {
+                    differingPair = null
+                    addPair(first, second)
+                },
+                Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            CancelAction { differingPair = null }
+        }
+    }
+}
+
+/**
+ * The tick box that lets the system arrange a registration between the two machines of a pair:
+ * a white row with the tick box in front, the explanation under the title and the question mark
+ * on the right. It is shown with the play preference of one registration, is never ticked in
+ * advance, and is grey with the reason in place of the explanation when it cannot be changed.
+ */
+@Composable
+private fun FlowPairedMachineChoice(option: PairedMachineQueueJoinOption) {
+    FlowListGroup {
+        FlowListRow(
+            title = pairedMachineArrangementLabel(option.pairedMachineLabel),
+            description = option.disabledReason
+                ?: if (option.startsAfterNextRound) {
+                    PAIRED_MACHINE_ARRANGEMENT_STARTS_LATER_HINT
+                } else {
+                    PAIRED_MACHINE_ARRANGEMENT_HINT
+                },
+            onClick = option.onToggle,
+            leading = { TickBox(option.checked, enabled = option.disabledReason == null) },
+            selected = option.checked,
+            enabled = option.disabledReason == null,
+            disabledReason = option.disabledReason,
+            disabledActionTitle = "更改这项选择",
+            trailing = { PairedMachineHelpButton(option.onShowDetails) }
+        )
+    }
+}
+
+/** The question mark that opens the explanation of the machine pair. */
+@Composable
+private fun PairedMachineHelpButton(onClick: () -> Unit) {
+    Box(
+        Modifier.size(44.dp).clip(CircleShape)
+            .clickable(onClickLabel = "查看说明", onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            Modifier.size(22.dp).clip(CircleShape)
+                .border(1.dp, SystemBlue, CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("?", color = SystemBlue, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, lineHeight = 18.sp)
+        }
+    }
+}
+
+/**
+ * The explanation of the tick box. Opened by the question mark it can be closed at once; when
+ * it opened by itself on first use ([countsDown]) it can only be closed after five seconds.
+ */
+@Composable
+private fun PairedMachineQueueIntroductionDialog(
+    pairedMachineLabel: String,
+    countsDown: Boolean,
+    onDismiss: () -> Unit
+) {
+    var remainingSeconds by remember { mutableStateOf(if (countsDown) 5 else 0) }
+    LaunchedEffect(Unit) {
+        while (remainingSeconds > 0) {
+            delay(1_000L)
+            remainingSeconds--
+        }
+    }
+    ModalSurface({ if (remainingSeconds <= 0) onDismiss() }, width = 520.dp) {
+        Text(
+            PAIRED_MACHINE_ARRANGEMENT_DETAILS_TITLE,
+            color = PrimaryText,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(10.dp))
+        pairedMachineArrangementDetails(pairedMachineLabel).forEach { paragraph ->
+            Text(paragraph.text, color = SecondaryText, fontSize = 14.sp, lineHeight = 20.sp)
+            paragraph.items.forEach { item ->
+                Row(Modifier.fillMaxWidth().padding(start = 6.dp, top = 3.dp)) {
+                    Text("•", color = SecondaryText, fontSize = 14.sp, lineHeight = 20.sp)
+                    Spacer(Modifier.width(7.dp))
+                    Text(item, color = SecondaryText, fontSize = 14.sp, lineHeight = 20.sp)
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+        Spacer(Modifier.height(10.dp))
+        PrimaryButton(
+            text = "我知道了",
+            onClick = onDismiss,
+            modifier = Modifier.fillMaxWidth(),
+            enabled = remainingSeconds <= 0,
+            disabledReason = pairedMachineArrangementCountdown(remainingSeconds)
+        )
+        if (remainingSeconds > 0) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                pairedMachineArrangementCountdown(remainingSeconds),
+                color = TertiaryText,
+                fontSize = 11.sp
+            )
+        }
+    }
 }

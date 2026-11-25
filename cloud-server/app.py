@@ -96,12 +96,15 @@ QUEUE_OPERATIONS = {
     "JOIN_QUEUE",
     "DEFER_ONE_ROUND",
     "CANCEL_DEFER_ONE_ROUND",
+    "SKIP_ONE_TURN",
+    "CANCEL_SKIP_ONE_TURN",
     "TEMPORARILY_LEAVE",
     "CANCEL_TEMPORARY_LEAVE",
     "TRANSFER_MACHINE",
     "CHANGE_PLAY_PREFERENCE",
     "LEAVE_QUEUE",
     "CHECK_IN",
+    "SET_PAIRED_MACHINE_QUEUEING",
 }
 MANAGEMENT_QUEUE_ACTIONS = {
     "ADD_TEMPORARY_REGISTRATION",
@@ -118,6 +121,8 @@ MANAGEMENT_QUEUE_ACTIONS = {
     "ADVANCE_TO_WAITING_POSITION",
     "DEFER_ONE_ROUND",
     "CANCEL_DEFER_ONE_ROUND",
+    "SKIP_ONE_TURN",
+    "CANCEL_SKIP_ONE_TURN",
     "TEMPORARILY_LEAVE",
     "CANCEL_TEMPORARY_LEAVE",
     "CHANGE_PREFERENCE",
@@ -133,6 +138,7 @@ MANAGEMENT_QUEUE_ACTIONS = {
     "REPLACE_WAITING_POSITIONS",
     "REPLACE_REGISTRATION_ORDER",
     "TRANSFER_REGISTRATIONS",
+    "SET_PAIRED_MACHINE_QUEUEING",
 }
 NO_SHOW_RESOLUTIONS = {
     "DEFER_ONE_ROUND",
@@ -145,16 +151,44 @@ RESULT_SOURCE_SERVER_TIMEOUT = "SERVER_TIMEOUT"
 RESULT_SOURCE_SERVER_MIGRATION = "SERVER_MIGRATION"
 RESULT_SOURCE_BOT_DISABLED = "BOT_DISABLED"
 RESULT_SOURCE_SYNC_DISABLED = "SYNC_DISABLED"
-COMMAND_TIMEOUT_DETAIL = "终端未在有效时间内处理这次修改，请重新提交。"
-BOT_DISABLED_DETAIL = "QQ Bot 联动已关闭，这次修改没有执行。"
+COMMAND_TIMEOUT_DETAIL = "终端未在有效时间内处理这次操作，请重新提交。"
+# What COMMAND_TIMEOUT_DETAIL said before; rows written with it are still recognised.
+LEGACY_COMMAND_TIMEOUT_DETAIL = "终端未在有效时间内处理这次修改，请重新提交。"
+PLAYING_POSITION_DEFER_REFUSAL = (
+    "处于游玩位置的登记不能暂缓一次，请先在现场终端撤回至等待顺序。"
+)
+PLAYING_POSITION_TEMPORARY_LEAVE_REFUSAL = (
+    "处于游玩位置的登记不能暂时离开，请先在现场终端撤回至等待顺序。"
+)
+PLAYING_POSITION_SKIP_ONE_TURN_REFUSAL = (
+    "处于游玩位置的登记不能轮空一次，请先在现场终端撤回至等待顺序。"
+)
+PLAYING_POSITION_REFUSALS = {
+    "DEFER_ONE_ROUND": PLAYING_POSITION_DEFER_REFUSAL,
+    "SKIP_ONE_TURN": PLAYING_POSITION_SKIP_ONE_TURN_REFUSAL,
+    "TEMPORARILY_LEAVE": PLAYING_POSITION_TEMPORARY_LEAVE_REFUSAL,
+}
+# 暂缓一次 can be used once until the registration has played a round (maintainer,
+# 2026-11-25). The terminal reports it as defer_one_round_used.
+DEFER_ONE_ROUND_USED_REFUSAL = "这份登记已暂缓过一次，游玩一轮之后才能再次暂缓。"
+# An online registration that has been checked in but has not played a round yet can be
+# postponed only through the management app; the terminal reports it as
+# online_registration_not_played.
+ONLINE_REGISTRATION_NOT_PLAYED_REFUSAL = (
+    "已签到的线上登记在游玩一轮之前不能延后。"
+)
+# What a request confirms about the absence state of a registration; see
+# registration_absence_status.
+ABSENCE_STATUSES = {"NONE", "DEFER_ONE_ROUND", "SKIP_ONE_TURN", "TEMPORARILY_AWAY"}
+BOT_DISABLED_DETAIL = "QQ Bot 联动已关闭，这次操作没有执行。"
 SYNC_DISABLED_DETAIL = "与服务端同步已关闭，这次操作没有执行。"
-MOBILE_SESSION_INVALIDATED_DETAIL = "这次移动设备登记已经失效，请在终端重新打开。"
-TEST_SYNC_ENDED_DETAIL = "测试同步已经结束，这次修改没有执行，请重新提交。"
+MOBILE_SESSION_INVALIDATED_DETAIL = "这次移动设备登记已经失效，请在终端重新打开移动设备登记。"
+TEST_SYNC_ENDED_DETAIL = "测试同步已经结束，这次操作没有执行，请重新提交。"
 TAKEOVER_QUEUE_CONTEXT_CHANGED_DETAIL = (
-    "现场终端已经接管，原队列或机台配置发生变化，这次排队操作没有执行，"
+    "现场终端已经接管，原队列或机台配置发生变化，这次操作没有执行，"
     "请重新查询后再提交。"
 )
-TERMINAL_INSTANCE_CONFLICT_DETAIL = "另一份终端实例正在同步，请关闭重复打开的应用后重试。"
+TERMINAL_INSTANCE_CONFLICT_DETAIL = "另一个终端应用正在同步，请关闭重复打开的应用后重试。"
 APPLIED_JOIN_SYNC_GUARD_SECONDS = 30
 SYNC_MODES = {"test", "takeover"}
 MACHINE_NAMES = {
@@ -268,6 +302,7 @@ REQUIRED_DATABASE_COLUMNS = {
         "terminal_editing_allowed",
         "visited_venues_public",
         "web_profile_revision",
+        "paired_machine_queueing_introduced",
     },
     "player_account": {
         "account_id",
@@ -639,12 +674,12 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         CORS_ORIGIN=configured_cors_origin,
         PUBLIC_SITE_URL=configured_public_site_url.rstrip("/"),
         LATEST_TERMINAL_VERSION=os.getenv(
-            "QUEUE_LATEST_TERMINAL_VERSION", "0.13.6"
+            "QUEUE_LATEST_TERMINAL_VERSION", "1.0.0"
         ),
         LATEST_WEBSITE_VERSION=os.getenv(
-            "QUEUE_LATEST_WEBSITE_VERSION", "0.13.4"
+            "QUEUE_LATEST_WEBSITE_VERSION", "1.0.0"
         ),
-        LATEST_BOT_VERSION=os.getenv("QUEUE_LATEST_BOT_VERSION", "0.3.13"),
+        LATEST_BOT_VERSION=os.getenv("QUEUE_LATEST_BOT_VERSION", "0.4.0"),
         MAX_CONTENT_LENGTH=MAX_AVATAR_REQUEST_BYTES,
         JSON_AS_ASCII=False,
     )
@@ -834,7 +869,7 @@ def initialize_database(database_path: str, *, profile_scope_id: str = "default"
             """
             UPDATE terminal_command
             SET result_source = CASE
-                WHEN status = 'REJECTED' AND result_detail = ? THEN ?
+                WHEN status = 'REJECTED' AND result_detail IN (?, ?) THEN ?
                 WHEN status != 'PENDING' THEN ?
                 ELSE NULL
             END
@@ -842,6 +877,7 @@ def initialize_database(database_path: str, *, profile_scope_id: str = "default"
             """,
             (
                 COMMAND_TIMEOUT_DETAIL,
+                LEGACY_COMMAND_TIMEOUT_DETAIL,
                 RESULT_SOURCE_SERVER_TIMEOUT,
                 RESULT_SOURCE_TERMINAL,
             ),
@@ -922,6 +958,7 @@ def initialize_database(database_path: str, *, profile_scope_id: str = "default"
                 terminal_editing_allowed INTEGER NOT NULL DEFAULT 1,
                 visited_venues_public INTEGER NOT NULL DEFAULT 1,
                 web_profile_revision INTEGER NOT NULL DEFAULT 0,
+                paired_machine_queueing_introduced INTEGER NOT NULL DEFAULT 0,
                 received_at INTEGER NOT NULL,
                 PRIMARY KEY(device_id, profile_id)
             )
@@ -947,6 +984,7 @@ def initialize_database(database_path: str, *, profile_scope_id: str = "default"
             ("visited_venues_public", "INTEGER NOT NULL DEFAULT 1"),
             ("web_profile_revision", "INTEGER NOT NULL DEFAULT 0"),
             ("recent_usage_at", "TEXT NOT NULL DEFAULT '[]'"),
+            ("paired_machine_queueing_introduced", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column_name not in player_profile_columns:
                 connection.execute(
@@ -1365,7 +1403,7 @@ def register_routes(app: Flask) -> None:
         message = (
             "头像文件不能超过 8 MB。"
             if request.path == "/api/player-account/avatar"
-            else "队列数据超过大小限制"
+            else "队列数据超过大小限制。"
         )
         return jsonify({"ok": False, "error": message}), 413
 
@@ -1747,7 +1785,7 @@ def avatar_reference_from_wire(value: Any) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or len(value) > 512:
-        raise ValidationError("avatar_url 无效")
+        raise ValidationError("avatar_url 无效。")
     candidate = value.strip()
     if not candidate:
         return None
@@ -1755,10 +1793,10 @@ def avatar_reference_from_wire(value: Any) -> str | None:
         return candidate
     parsed = urlsplit(candidate)
     if parsed.query or parsed.fragment or parsed.path is None:
-        raise ValidationError("avatar_url 无效")
+        raise ValidationError("avatar_url 无效。")
     match = re.fullmatch(r"/api/player-avatars/([0-9a-f]{64})\.webp", parsed.path)
     if match is None:
-        raise ValidationError("avatar_url 无效")
+        raise ValidationError("avatar_url 无效。")
     return match.group(1)
 
 
@@ -1824,10 +1862,10 @@ def persist_avatar_bytes(avatar_reference: str, content: bytes) -> Path:
 
 def read_player_avatar(avatar_reference: str):
     if PLAYER_AVATAR_REFERENCE_PATTERN.fullmatch(avatar_reference) is None:
-        return jsonify({"ok": False, "error": "头像不存在"}), 404
+        return jsonify({"ok": False, "error": "头像不存在。"}), 404
     path = Path(current_app.config["PLAYER_AVATAR_DIRECTORY"]) / f"{avatar_reference}.webp"
     if not path.is_file():
-        return jsonify({"ok": False, "error": "头像不存在"}), 404
+        return jsonify({"ok": False, "error": "头像不存在。"}), 404
     return send_file(path, mimetype="image/webp", max_age=31536000, conditional=True)
 
 
@@ -2115,6 +2153,7 @@ def current_player_account_session(
                profile.setup_version, profile.profile_revision,
                profile.web_account_bound, profile.terminal_editing_allowed,
                profile.visited_venues_public, profile.web_profile_revision,
+               profile.paired_machine_queueing_introduced,
                profile.profile_updated_at, venue.venue_id, venue.venue_code,
                venue.display_name AS venue_name
         FROM player_account AS account
@@ -2182,6 +2221,9 @@ def serialize_player_account(account: sqlite3.Row) -> dict[str, Any]:
             "terminal_editing_allowed": bool(account["terminal_editing_allowed"]),
             "visited_venues_public": bool(account["visited_venues_public"]),
             "web_profile_revision": account["web_profile_revision"],
+            "paired_machine_queueing_introduced": bool(
+                account["paired_machine_queueing_introduced"]
+            ),
             "updated_at": account["profile_updated_at"],
         },
         "venue": {
@@ -2195,11 +2237,10 @@ def serialize_player_account(account: sqlite3.Row) -> dict[str, Any]:
 def create_player_binding_session():
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
-    try:
-        profile_id = str(UUID(source.get("profile_id", "")))
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "玩家资料编号无效"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
+    profile_id = parse_uuid_text(source.get("profile_id"))
+    if profile_id is None:
+        return jsonify({"ok": False, "error": "玩家资料编号无效。"}), 400
     site_url = current_app.config["PLAYER_ACCOUNT_SITE_URL"] or current_app.config[
         "PUBLIC_SITE_URL"
     ]
@@ -2244,7 +2285,7 @@ def create_player_binding_session():
                 {
                     "ok": False,
                     "code": "TEST_DATA_ACCOUNT_BINDING_UNAVAILABLE",
-                    "error": "当前数据是测试数据，不能绑定长期网页账户。",
+                    "error": "当前数据是测试数据，不能绑定网页账户。",
                 }
             ), 409
         profile = connection.execute(
@@ -2262,7 +2303,7 @@ def create_player_binding_session():
         ).fetchone()
         if profile is None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "没有找到当前玩家资料"}), 404
+            return jsonify({"ok": False, "error": "没有找到当前玩家资料。"}), 404
         if profile["setup_version"] <= 0 or profile["qq_number"] is None:
             connection.rollback()
             return jsonify(
@@ -2381,7 +2422,7 @@ def read_player_binding_row(
 
 def player_binding_state_error(binding: sqlite3.Row | None, now: int):
     if binding is None:
-        return jsonify({"ok": False, "error": "绑定页面无效，请在终端重新打开。"}), 404
+        return jsonify({"ok": False, "error": "绑定页面无效，请回到现场终端重新生成二维码。"}), 404
     if binding["consumed_at"] is not None:
         return jsonify(
             {
@@ -2395,7 +2436,7 @@ def player_binding_state_error(binding: sqlite3.Row | None, now: int):
             {
                 "ok": False,
                 "code": "PLAYER_BINDING_EXPIRED",
-                "error": "绑定页面已经失效，请在现场终端重新生成。",
+                "error": "绑定页面已经失效，请回到现场终端重新生成二维码。",
             }
         ), 410
     if binding["account_id"] is not None:
@@ -2411,7 +2452,7 @@ def player_binding_state_error(binding: sqlite3.Row | None, now: int):
             {
                 "ok": False,
                 "code": "PLAYER_PROFILE_INCOMPLETE",
-                "error": "玩家资料尚未补全，请先回到现场终端完成资料设置。",
+                "error": "玩家资料尚未补全，请先回到现场终端补全玩家资料。",
             }
         ), 409
     return None
@@ -2446,7 +2487,7 @@ def read_player_binding_session(binding_token: str):
 def complete_player_binding_session(binding_token: str):
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     try:
         password = validate_player_account_password(source.get("password"))
     except ValidationError as error:
@@ -2629,7 +2670,7 @@ def serialize_player_profile_creation_session(
 def create_player_profile_creation_session():
     source = request.get_json(silent=True)
     if not isinstance(source, dict) or set(source) != {"request_id"}:
-        return jsonify({"ok": False, "error": "网页玩家资料会话参数不完整"}), 400
+        return jsonify({"ok": False, "error": "网页玩家资料会话参数不完整。"}), 400
     try:
         session_id = read_uuid(source, "request_id")
     except ValidationError as error:
@@ -2674,7 +2715,7 @@ def create_player_profile_creation_session():
                     {
                         "ok": False,
                         "code": "PLAYER_PROFILE_CREATION_INSTANCE_CONFLICT",
-                        "error": "这个请求编号已属于另一份终端运行实例，请重新打开玩家资料创建页面。",
+                        "error": "现场终端应用已经变化，请重新打开玩家资料创建页面。",
                     }
                 ), 409
             connection.commit()
@@ -2692,7 +2733,7 @@ def create_player_profile_creation_session():
         ).fetchone()
         if snapshot_row is None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "现场终端尚未同步排队状态。"}), 404
         if not snapshot_is_online(snapshot_row):
             connection.rollback()
             return jsonify(
@@ -2700,7 +2741,7 @@ def create_player_profile_creation_session():
             ), 503
         if snapshot_row["device_id"] != device_id:
             connection.rollback()
-            return jsonify({"ok": False, "error": "当前终端不是正在同步的终端"}), 409
+            return jsonify({"ok": False, "error": "当前终端不是正在同步的终端。"}), 409
         if not terminal_instance_matches(
             snapshot_row, device_id, instance_id, instance_generation
         ):
@@ -2719,7 +2760,7 @@ def create_player_profile_creation_session():
                 {
                     "ok": False,
                     "code": "TEST_DATA_PROFILE_CREATION_UNAVAILABLE",
-                    "error": "当前数据是测试数据，不能创建长期网页玩家资料。",
+                    "error": "当前数据是测试数据，不能创建网页玩家资料。",
                 }
             ), 409
         if not snapshot.get("website_remote_enabled", False):
@@ -2762,7 +2803,7 @@ def player_profile_creation_state_error(
     session: sqlite3.Row | None, now: int
 ):
     if session is None:
-        return jsonify({"ok": False, "error": "玩家资料创建页面无效，请在终端重新打开。"}), 404
+        return jsonify({"ok": False, "error": "玩家资料创建页面无效，请回到现场终端重新生成二维码。"}), 404
     if session["status"] == "COMPLETED" or session["consumed_at"] is not None:
         return jsonify(
             {
@@ -2776,7 +2817,7 @@ def player_profile_creation_state_error(
             {
                 "ok": False,
                 "code": "PLAYER_PROFILE_CREATION_EXPIRED",
-                "error": "玩家资料创建页面已经失效，请在现场终端重新生成。",
+                "error": "玩家资料创建页面已经失效，请回到现场终端重新生成二维码。",
             }
         ), 410
     return None
@@ -2854,7 +2895,7 @@ def complete_player_profile_creation_session(session_token: str):
                 {
                     "ok": False,
                     "code": "PLAYER_PROFILE_CREATION_STALE",
-                    "error": "现场终端连接已经变化，请回到终端重新生成二维码。",
+                    "error": "现场终端连接已经变化，请回到现场终端重新生成二维码。",
                 }
             ), 409
         if not terminal_instance_matches(
@@ -2898,7 +2939,6 @@ def complete_player_profile_creation_session(session_token: str):
                     "error": "现场机厅已经变化，请回到终端重新生成二维码。",
                 }
             ), 409
-
         duplicate = connection.execute(
             """
             SELECT profile_id, nickname, qq_number
@@ -2916,7 +2956,7 @@ def complete_player_profile_creation_session(session_token: str):
                     {
                         "ok": False,
                         "code": "QQ_ALREADY_USED",
-                        "error": "这个 QQ 已经关联其他玩家资料，请返回终端选择已有资料或更换 QQ。",
+                        "error": "这个 QQ 已经关联其他玩家资料，请更换 QQ，或回到现场终端选择已有资料。",
                     }
                 ), 409
             connection.rollback()
@@ -3055,6 +3095,7 @@ def current_player_account_session_for_id(
                profile.setup_version, profile.profile_revision,
                profile.web_account_bound, profile.terminal_editing_allowed,
                profile.visited_venues_public, profile.web_profile_revision,
+               profile.paired_machine_queueing_introduced,
                profile.profile_updated_at, venue.venue_id, venue.venue_code,
                venue.display_name AS venue_name
         FROM player_account AS account
@@ -3078,7 +3119,7 @@ def lookup_player_account_login():
     """
     source = request.get_json(silent=True)
     if not isinstance(source, dict) or set(source) != {"qq"}:
-        return jsonify({"ok": False, "error": "请求内容必须包含 QQ 号"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须包含 QQ 号。"}), 400
     qq_number = source.get("qq")
     if not isinstance(qq_number, str) or QQ_NUMBER_PATTERN.fullmatch(qq_number.strip()) is None:
         return jsonify(
@@ -3136,7 +3177,7 @@ def lookup_player_account_login():
 def login_player_account():
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     qq_number = str(source.get("qq", "")).strip()
     password = source.get("password")
     if QQ_NUMBER_PATTERN.fullmatch(qq_number) is None or not isinstance(password, str):
@@ -3233,7 +3274,7 @@ def read_current_player_account():
                     {
                         "ok": False,
                         "code": "ACCOUNT_LOGIN_REQUIRED",
-                        "error": "请先登录玩家账户。",
+                        "error": "请先登录网页账户。",
                     }
                 ),
                 401,
@@ -3255,7 +3296,7 @@ def read_current_player_account():
 def update_current_player_account_profile():
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     allowed_fields = {
         "expected_profile_revision",
         "nickname",
@@ -3269,10 +3310,10 @@ def update_current_player_account_profile():
         "current_password",
     }
     if not set(source) <= allowed_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的玩家资料字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的玩家资料字段。"}), 400
     editable_fields = set(source) - {"expected_profile_revision", "current_password"}
     if not editable_fields:
-        return jsonify({"ok": False, "error": "没有需要保存的玩家资料字段"}), 400
+        return jsonify({"ok": False, "error": "没有需要保存的玩家资料字段。"}), 400
     try:
         expected_revision = read_integer(
             source, "expected_profile_revision", minimum=1, maximum=2**63 - 1
@@ -3325,7 +3366,7 @@ def update_current_player_account_profile():
                 {
                     "ok": False,
                     "code": "PLAYER_PROFILE_CHANGED",
-                    "error": "玩家资料已经在其他端更新，请刷新后重试。",
+                    "error": "玩家资料已经更新，请刷新后重试。",
                 }
             ), 409
 
@@ -3526,15 +3567,15 @@ def update_current_player_account_avatar():
         connection.commit()
 
     if set(request.form) != {"expected_profile_revision"}:
-        return jsonify({"ok": False, "error": "头像上传参数不完整"}), 400
+        return jsonify({"ok": False, "error": "头像上传参数不完整。"}), 400
     if set(request.files) != {"avatar"}:
-        return jsonify({"ok": False, "error": "请选择一张头像图片"}), 400
+        return jsonify({"ok": False, "error": "请选择一张头像图片。"}), 400
     try:
         expected_revision = int(request.form["expected_profile_revision"])
     except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "玩家资料版本无效"}), 400
+        return jsonify({"ok": False, "error": "玩家资料版本无效。"}), 400
     if expected_revision < 1 or expected_revision > 2**63 - 1:
-        return jsonify({"ok": False, "error": "玩家资料版本无效"}), 400
+        return jsonify({"ok": False, "error": "玩家资料版本无效。"}), 400
 
     upload = request.files["avatar"]
     raw = upload.stream.read(MAX_AVATAR_UPLOAD_BYTES + 1)
@@ -3611,7 +3652,7 @@ def update_current_player_account_avatar():
 def update_current_player_account_password():
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     current_password = source.get("current_password")
     try:
         new_password = validate_player_account_password(source.get("new_password"))
@@ -3803,17 +3844,39 @@ def read_current_player_account_queue():
                 "position": context["position"],
                 "position_index": context["position_index"],
                 "estimated_wait_minutes": context["estimated_wait_minutes"],
+                "estimated_wait_uncertain": context["estimated_wait_uncertain"],
                 "preference": registration["preference"],
                 "fixed_pair": registration["fixed_pair"],
                 "fixed_pair_id": registration["fixed_pair_id"],
                 "deferred_once": registration["deferred_once"],
+                "skips_one_turn": bool(registration.get("skips_one_turn", False)),
                 "temporarily_away": registration["temporarily_away"],
                 "temporary_away_skipped_turns": registration[
                     "temporary_away_skipped_turns"
                 ],
+                "defer_one_round_used": bool(
+                    registration.get("defer_one_round_used", False)
+                ),
+                "online_registration_not_played": bool(
+                    registration.get("online_registration_not_played", False)
+                ),
                 "online_registration_pending_check_in": registration.get(
                     "online_registration_pending_check_in", False
                 ),
+                "also_queues_at_paired_machine": registration.get(
+                    "also_queues_at_paired_machine", False
+                ),
+                "skips_paired_machine_this_round": bool(
+                    registration.get("skips_paired_machine_this_round", False)
+                ),
+                # A preview at the other machine announces a move, and from when on.
+                "paired_arrangement_announced": bool(
+                    registration.get("paired_arrangement_announced", False)
+                ),
+                "paired_arrangement_not_before": registration.get(
+                    "paired_arrangement_not_before"
+                ),
+                "paired_machine_id": machine.get("paired_machine_id"),
                 "machine_capacity": machine_capacity(machine),
             }
         )
@@ -3841,12 +3904,13 @@ def read_current_player_account_queue():
 def create_player_account_queue_operation_command():
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     allowed_fields = {
         "request_id",
         "operation",
         "target_machine_id",
         "preference",
+        "also_queues_at_paired_machine",
         "expected_queue_id",
         "expected_registration_id",
         "expected_machine_id",
@@ -3861,7 +3925,7 @@ def create_player_account_queue_operation_command():
     }
     if set(source) - allowed_fields:
         return jsonify(
-            {"ok": False, "error": "请求包含不支持的个人排队操作字段"}
+            {"ok": False, "error": "请求包含不支持的个人排队操作字段。"}
         ), 400
     if source.get("operation") == "JOIN_QUEUE":
         return jsonify(
@@ -3949,7 +4013,7 @@ def publish_snapshot():
         ), 400
     device_id = request.headers.get("X-Device-ID", "").strip()
     if not device_id or len(device_id) > 128:
-        return jsonify({"ok": False, "error": "终端编号无效"}), 400
+        return jsonify({"ok": False, "error": "终端编号无效。"}), 400
     try:
         instance_id, instance_generation = read_terminal_instance_identity(device_id)
     except ValidationError as error:
@@ -3957,11 +4021,11 @@ def publish_snapshot():
 
     requested_sync_mode = request.headers.get("X-Queue-Sync-Mode", "").strip().lower()
     if requested_sync_mode and requested_sync_mode not in SYNC_MODES:
-        return jsonify({"ok": False, "error": "同步方式无效"}), 400
+        return jsonify({"ok": False, "error": "同步方式无效。"}), 400
 
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
 
     try:
         payload_schema_version = read_integer(payload, "schema_version", minimum=1)
@@ -4005,9 +4069,8 @@ def publish_snapshot():
             if isinstance(submitted_venue, dict)
             else None
         )
-        try:
-            submitted_venue_id = str(UUID(submitted_venue_id))
-        except (TypeError, ValueError):
+        submitted_venue_id = parse_uuid_text(submitted_venue_id)
+        if submitted_venue_id is None:
             return jsonify(
                 {
                     "ok": False,
@@ -4021,7 +4084,7 @@ def publish_snapshot():
                 {
                     "ok": False,
                     "code": "VENUE_MISMATCH",
-                    "error": "提交的机厅与当前服务端不一致，本次同步没有执行。",
+                    "error": "提交的机厅与当前服务器不一致，本次同步没有执行。",
                 }
             ), 409
 
@@ -4153,7 +4216,7 @@ def publish_snapshot():
                     {
                         "ok": False,
                         "code": "TERMINAL_STILL_ONLINE",
-                        "error": "另一终端仍在线，暂不能开始测试或接管同步",
+                        "error": "另一终端仍在线，暂不能开始测试同步或接管同步。",
                     }
                 ), 409
             if not requested_sync_mode:
@@ -4181,6 +4244,29 @@ def publish_snapshot():
                 "DELETE FROM retired_queue WHERE queue_id = ?",
                 (queue_storage_id,),
             )
+        deleted_profile_ids = {
+            row["profile_id"]
+            for row in connection.execute(
+                """
+                SELECT profile_id FROM deleted_player_profile
+                WHERE profile_scope_id = ?
+                """,
+                (profile_scope_id,),
+            ).fetchall()
+        }
+        # A public QQ was attached to registrations while the snapshot was normalized. A
+        # terminal that still holds a profile this server has deleted must not bring that
+        # profile's QQ back onto the public page.
+        registration_ids_of_deleted_profiles = {
+            contact["registration_id"]
+            for contact in private_contacts
+            if contact["profile_id"] in deleted_profile_ids
+        }
+        if registration_ids_of_deleted_profiles:
+            for machine in normalized["machines"].values():
+                for registration in all_machine_registrations(machine):
+                    if registration["registration_id"] in registration_ids_of_deleted_profiles:
+                        registration["qq_number"] = None
         serialized = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
         previous_queue_contacts = {}
         if (
@@ -4205,12 +4291,12 @@ def publish_snapshot():
 
         if retired is not None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "此队列批次已经结束"}), 409
+            return jsonify({"ok": False, "error": "当前排队批次已经结束，本次同步没有执行。"}), 409
 
         if current is not None and current_queue_storage_id == queue_storage_id:
             if revision < current["revision"]:
                 connection.rollback()
-                return jsonify({"ok": False, "error": "队列版本早于服务器版本"}), 409
+                return jsonify({"ok": False, "error": "服务端已有更新的队列数据，本次同步没有执行。"}), 409
         elif (
             current is not None
             and current["device_id"] == device_id
@@ -4321,16 +4407,6 @@ def publish_snapshot():
                 "DELETE FROM queue_private_contact WHERE queue_id = ?",
                 (current_queue_storage_id,),
             )
-        deleted_profile_ids = {
-            row["profile_id"]
-            for row in connection.execute(
-                """
-                SELECT profile_id FROM deleted_player_profile
-                WHERE profile_scope_id = ?
-                """,
-                (profile_scope_id,),
-            ).fetchall()
-        }
         stored_contacts = {
             row["registration_id"]: row
             for row in connection.execute(
@@ -4341,6 +4417,9 @@ def publish_snapshot():
                 """,
                 (queue_storage_id,),
             ).fetchall()
+            # Deleting a profile removes its contacts; one that is still here for any reason
+            # is not carried forward either.
+            if row["player_id"] not in deleted_profile_ids
         }
         incoming_contacts = {
             contact["registration_id"]: {
@@ -4371,15 +4450,13 @@ def publish_snapshot():
             if registration_id not in current_registration_ids
             or registration_id in current_contact_ids
         }
-        for contact in private_contacts:
-            registration_id = contact["registration_id"]
+        # incoming_contacts no longer holds the contacts of profiles this server has deleted,
+        # so both loops go over it instead of over everything the terminal uploaded.
+        for registration_id, normalized_contact in incoming_contacts.items():
             if registration_id not in current_registration_ids:
-                normalized_contact = incoming_contacts[registration_id]
                 contacts_to_store[normalized_contact["player_id"]] = normalized_contact
-        for contact in private_contacts:
-            registration_id = contact["registration_id"]
+        for registration_id, normalized_contact in incoming_contacts.items():
             if registration_id in current_registration_ids:
-                normalized_contact = incoming_contacts[registration_id]
                 contacts_to_store[normalized_contact["player_id"]] = normalized_contact
         connection.execute(
             "DELETE FROM queue_private_contact WHERE queue_id = ?",
@@ -4860,6 +4937,12 @@ def upsert_player_profiles(
                 """,
                 (received_at, profile_scope_id, profile["profile_id"]),
             )
+            if profile["paired_machine_queueing_introduced"]:
+                # Not tied to the profile's revision: that the player has been shown the
+                # explanation can only ever be added, whichever copy is otherwise newer.
+                mark_paired_machine_queueing_introduced(
+                    connection, profile_scope_id, profile["profile_id"]
+                )
             if (
                 current_public_player_id is None
                 and public_player_id is not None
@@ -5024,8 +5107,9 @@ def upsert_player_profiles(
                  profile_revision, created_at, profile_updated_at,
                  public_player_id, avatar_reference, web_account_bound,
                  terminal_editing_allowed,
-                 visited_venues_public, web_profile_revision, received_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 visited_venues_public, web_profile_revision,
+                 paired_machine_queueing_introduced, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id, profile_id) DO UPDATE SET
                 nickname = excluded.nickname,
                 gender = excluded.gender,
@@ -5058,6 +5142,13 @@ def upsert_player_profiles(
                 terminal_editing_allowed = excluded.terminal_editing_allowed,
                 visited_venues_public = excluded.visited_venues_public,
                 web_profile_revision = excluded.web_profile_revision,
+                -- Once the player has been shown the explanation this stays set: the
+                -- terminal only ever reports it as true, and the server may have noted
+                -- it first when the website or the phone page turned the tick box on.
+                paired_machine_queueing_introduced = MAX(
+                    player_profile.paired_machine_queueing_introduced,
+                    excluded.paired_machine_queueing_introduced
+                ),
                 received_at = excluded.received_at
             """,
             (
@@ -5087,6 +5178,7 @@ def upsert_player_profiles(
                 int(profile["terminal_editing_allowed"]),
                 int(profile["visited_venues_public"]),
                 profile["web_profile_revision"],
+                int(profile["paired_machine_queueing_introduced"]),
                 received_at,
             ),
         )
@@ -5189,7 +5281,7 @@ def read_or_update_venue_settings():
     if request.method == "PUT":
         if not isinstance(source, dict) or set(source) != {"business_hours"}:
             return jsonify(
-                {"ok": False, "error": "请求内容必须只包含 business_hours"}
+                {"ok": False, "error": "请求内容必须只包含 business_hours。"}
             ), 400
         try:
             business_hours = normalize_venue_business_hours(source["business_hours"])
@@ -5282,13 +5374,13 @@ def upsert_registered_terminal(
 def read_or_update_terminal_installation():
     terminal_id = request.headers.get("X-Device-ID", "").strip()
     if not terminal_id or len(terminal_id) > 128:
-        return jsonify({"ok": False, "error": "终端编号无效"}), 400
+        return jsonify({"ok": False, "error": "终端编号无效。"}), 400
     source = request.get_json(silent=True) if request.method == "POST" else None
     if request.method == "POST":
         if not isinstance(source, dict):
-            return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+            return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
         if set(source) - {"venue_name", "terminal_name", "venue_id"}:
-            return jsonify({"ok": False, "error": "请求包含不支持的安装信息字段"}), 400
+            return jsonify({"ok": False, "error": "请求包含不支持的安装信息字段。"}), 400
         venue_name = source.get("venue_name")
         terminal_name = source.get("terminal_name")
         submitted_venue_id = source.get("venue_id")
@@ -5297,18 +5389,17 @@ def read_or_update_terminal_installation():
             or not venue_name.strip()
             or len(venue_name.strip()) > MAX_VENUE_NAME_CHARACTERS
         ):
-            return jsonify({"ok": False, "error": "机厅名称必须为 1 至 40 个字符"}), 400
+            return jsonify({"ok": False, "error": "机厅名称必须为 1 至 40 个字符。"}), 400
         if terminal_name is not None and (
             not isinstance(terminal_name, str)
             or not terminal_name.strip()
             or len(terminal_name.strip()) > MAX_TERMINAL_NAME_CHARACTERS
         ):
-            return jsonify({"ok": False, "error": "终端名称必须为 1 至 24 个字符"}), 400
+            return jsonify({"ok": False, "error": "终端名称必须为 1 至 24 个字符。"}), 400
         if submitted_venue_id is not None:
-            try:
-                submitted_venue_id = str(UUID(submitted_venue_id))
-            except (TypeError, ValueError):
-                return jsonify({"ok": False, "error": "机厅 ID 无效"}), 400
+            submitted_venue_id = parse_uuid_text(submitted_venue_id)
+            if submitted_venue_id is None:
+                return jsonify({"ok": False, "error": "机厅 ID 无效。"}), 400
 
     now = int(time.time())
     with open_database() as connection:
@@ -5413,7 +5504,7 @@ def sync_mode_required_response(
         {
             "ok": False,
             "code": "SYNC_MODE_REQUIRED",
-            "error": "请选择测试同步或接管同步后再继续",
+            "error": "请选择测试同步或接管同步后再继续。",
             "current_registration_count": snapshot_registration_count(current_payload),
             "local_registration_count": snapshot_registration_count(incoming_payload),
             "current_terminal_online": current_online,
@@ -5480,7 +5571,7 @@ def read_snapshot():
         ).fetchone()
         venue = read_active_venue(connection)
     if row is None:
-        return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+        return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
 
     payload = compact_public_middle_dots(json.loads(row["payload"]))
     now = int(time.time())
@@ -5657,23 +5748,23 @@ def read_queue_logs():
         "SYSTEM_AUTOMATIC",
     }
     if operation_source and operation_source not in allowed_sources:
-        return jsonify({"ok": False, "error": "source 来源筛选值无效"}), 400
+        return jsonify({"ok": False, "error": "source 来源筛选值无效。"}), 400
 
     try:
         limit = int(limit_text)
     except ValueError:
-        return jsonify({"ok": False, "error": "limit 数值无效"}), 400
+        return jsonify({"ok": False, "error": "limit 数值无效。"}), 400
     if not 1 <= limit <= MAX_LOG_PAGE_SIZE:
-        return jsonify({"ok": False, "error": "limit 数值无效"}), 400
+        return jsonify({"ok": False, "error": "limit 数值无效。"}), 400
 
     before = None
     if before_text:
         try:
             before = int(before_text)
         except ValueError:
-            return jsonify({"ok": False, "error": "before 数值无效"}), 400
+            return jsonify({"ok": False, "error": "before 数值无效。"}), 400
         if before <= 0:
-            return jsonify({"ok": False, "error": "before 数值无效"}), 400
+            return jsonify({"ok": False, "error": "before 数值无效。"}), 400
 
     with open_database() as connection:
         current = connection.execute(
@@ -5681,13 +5772,13 @@ def read_queue_logs():
         ).fetchone()
         if not queue_id:
             if current is None:
-                return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+                return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
             queue_id = current["queue_id"]
         else:
             try:
                 queue_id = str(UUID(queue_id))
             except ValueError:
-                return jsonify({"ok": False, "error": "queue_id 必须是 UUID"}), 400
+                return jsonify({"ok": False, "error": "queue_id 必须是 UUID。"}), 400
 
         queue_storage_id = (
             snapshot_storage_context(current)[0]
@@ -5754,7 +5845,7 @@ def read_bot_players():
             "FROM queue_snapshot WHERE id = 1"
         ).fetchone()
         if snapshot_row is None:
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         snapshot = json.loads(snapshot_row["payload"])
         queue_storage_id, profile_scope_id = snapshot_storage_context(
             snapshot_row, snapshot
@@ -5809,6 +5900,7 @@ def read_bot_players():
                 "position": context["position"],
                 "position_index": context["position_index"],
                 "estimated_wait_minutes": context["estimated_wait_minutes"],
+                "estimated_wait_uncertain": context["estimated_wait_uncertain"],
                 "co_player_display_ids": [
                     registration["display_id"]
                     for registration in context["position_registrations"]
@@ -5834,10 +5926,19 @@ def read_bot_players():
                 ],
                 "last_played_at": context["registration"]["last_played_at"],
                 "deferred_once": context["registration"]["deferred_once"],
+                "skips_one_turn": bool(
+                    context["registration"].get("skips_one_turn", False)
+                ),
                 "temporarily_away": context["registration"]["temporarily_away"],
                 "temporary_away_skipped_turns": context["registration"][
                     "temporary_away_skipped_turns"
                 ],
+                "defer_one_round_used": bool(
+                    context["registration"].get("defer_one_round_used", False)
+                ),
+                "online_registration_not_played": bool(
+                    context["registration"].get("online_registration_not_played", False)
+                ),
                 "no_show_count": context["registration"]["no_show_count"],
                 "last_no_show_action_was_defer": context["registration"][
                     "last_no_show_action_was_defer"
@@ -5897,9 +5998,9 @@ def read_bot_events():
         after = int(after_text)
         limit = int(limit_text)
     except ValueError:
-        return jsonify({"ok": False, "error": "after 或 limit 数值无效"}), 400
+        return jsonify({"ok": False, "error": "after 或 limit 数值无效。"}), 400
     if after < 0 or not 1 <= limit <= MAX_LOG_PAGE_SIZE:
-        return jsonify({"ok": False, "error": "after 或 limit 数值无效"}), 400
+        return jsonify({"ok": False, "error": "after 或 limit 数值无效。"}), 400
 
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -5910,7 +6011,7 @@ def read_bot_events():
         ).fetchone()
         if snapshot_row is None:
             connection.commit()
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         snapshot = json.loads(snapshot_row["payload"])
         queue_storage_id, _ = snapshot_storage_context(snapshot_row, snapshot)
         recipient_rows = connection.execute(
@@ -6090,7 +6191,7 @@ def read_synced_profiles(*, allow_qq_filter: bool):
     else:
         qq_number = request.args.get("qq", "").strip()
     if qq_number and not allow_qq_filter:
-        return jsonify({"ok": False, "error": "终端资料接口不支持 qq 参数"}), 400
+        return jsonify({"ok": False, "error": "终端资料接口不支持 qq 参数。"}), 400
 
     with open_database() as connection:
         snapshot_row = connection.execute(
@@ -6100,7 +6201,7 @@ def read_synced_profiles(*, allow_qq_filter: bool):
             """
         ).fetchone()
         if snapshot_row is None:
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         profile_scope_id = snapshot_storage_context(snapshot_row)[1]
         rows = connection.execute(
             """
@@ -6112,7 +6213,8 @@ def read_synced_profiles(*, allow_qq_filter: bool):
                    profile_revision, created_at, profile_updated_at,
                    public_player_id, avatar_reference, web_account_bound,
                    terminal_editing_allowed, visited_venues_public,
-                   web_profile_revision, received_at
+                   web_profile_revision, paired_machine_queueing_introduced,
+                   received_at
             FROM player_profile
             WHERE device_id = ?
             ORDER BY nickname, profile_id
@@ -6183,6 +6285,9 @@ def read_synced_profiles(*, allow_qq_filter: bool):
                     "terminal_editing_allowed": bool(row["terminal_editing_allowed"]),
                     "visited_venues_public": bool(row["visited_venues_public"]),
                     "web_profile_revision": row["web_profile_revision"],
+                    "paired_machine_queueing_introduced": bool(
+                        row["paired_machine_queueing_introduced"]
+                    ),
                     "setup_version": row["setup_version"],
                     "profile_revision": row["profile_revision"],
                     "created_at": row["created_at"],
@@ -6203,31 +6308,31 @@ def read_private_qq_filter(allowed_extra_fields: set[str] | None = None):
     if request.method == "GET":
         if "qq" in request.args:
             return None, (
-                jsonify({"ok": False, "error": "按 QQ 查询请使用 POST JSON 请求体"}),
+                jsonify({"ok": False, "error": "按 QQ 查询请使用 POST JSON 请求体。"}),
                 400,
             )
         return "", None
 
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return None, (jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400)
+        return None, (jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400)
     unknown_fields = set(source) - {"qq"} - (allowed_extra_fields or set())
     if unknown_fields:
-        return None, (jsonify({"ok": False, "error": "请求包含不支持的查询字段"}), 400)
+        return None, (jsonify({"ok": False, "error": "请求包含不支持的查询字段。"}), 400)
     qq_number = source.get("qq", "")
     if not isinstance(qq_number, str) or (
         qq_number and QQ_NUMBER_PATTERN.fullmatch(qq_number) is None
     ):
-        return None, (jsonify({"ok": False, "error": "qq 必须是 5 至 12 位数字"}), 400)
+        return None, (jsonify({"ok": False, "error": "qq 必须是 5 至 12 位数字。"}), 400)
     return qq_number, None
 
 
 def read_online_profile():
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     if set(source) != {"qq"}:
-        return jsonify({"ok": False, "error": "请求包含不支持的查询字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的查询字段。"}), 400
     try:
         qq_number = read_qq_number(source, "qq")
     except ValidationError as error:
@@ -6239,22 +6344,22 @@ def read_online_profile():
             "FROM queue_snapshot WHERE id = 1"
         ).fetchone()
         if snapshot_row is None:
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         snapshot = json.loads(snapshot_row["payload"])
         if not snapshot_is_online(snapshot_row):
             return jsonify(
-                {"ok": False, "error": "现场终端暂时离线，暂不能使用线上登记"}
+                {"ok": False, "error": "现场终端暂时离线，暂不能使用线上登记。"}
             ), 503
         if not snapshot.get("website_remote_enabled", False):
             return jsonify(
-                {"ok": False, "error": "现场终端已关闭与服务端同步，暂不能使用线上登记"}
+                {"ok": False, "error": "现场终端已关闭与服务端同步，暂不能使用线上登记。"}
             ), 503
         if snapshot_in_closing_grace(snapshot):
             return jsonify(
-                {"ok": False, "error": "闭店收尾期间不再接收新的排队登记"}
+                {"ok": False, "error": "闭店收尾期间不再接收新的排队登记。"}
             ), 409
         if not online_registration_allowed(snapshot):
-            return jsonify({"ok": False, "error": "现场规则暂不允许线上登记"}), 503
+            return jsonify({"ok": False, "error": "系统规则不允许线上登记。"}), 503
         profile = find_player_profile_by_qq(connection, qq_number)
         if profile is None:
             return jsonify(
@@ -6262,8 +6367,8 @@ def read_online_profile():
                     "ok": False,
                     "code": "PROFILE_NOT_FOUND",
                     "error": (
-                        "这个 QQ 还没有关联玩家资料。请先前往现场终端，"
-                        "在玩家资料库中创建资料并填写 QQ。"
+                        "这个 QQ 尚未关联玩家资料。请先在现场终端的玩家资料库中"
+                        "创建资料并填写 QQ。"
                     ),
                 }
             ), 404
@@ -6313,12 +6418,13 @@ def read_online_profile():
 def create_website_join_command():
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     allowed_fields = {
         "request_id",
         "qq",
         "machine_id",
         "preference",
+        "also_queues_at_paired_machine",
         "expected_queue_id",
         "expected_machine_configuration_revision",
         "expected_machine_stable_id",
@@ -6334,7 +6440,7 @@ def create_website_join_command():
 def create_bot_queue_operation_command():
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     allowed_fields = {
         "request_id",
         "actor_qq",
@@ -6342,6 +6448,7 @@ def create_bot_queue_operation_command():
         "machine_id",
         "target_machine_id",
         "preference",
+        "also_queues_at_paired_machine",
         "expected_queue_id",
         "expected_registration_id",
         "expected_machine_id",
@@ -6389,27 +6496,28 @@ def create_management_terminal_queue_action():
         "desired_waiting_positions",
         "desired_registration_order",
         "no_show_resolution",
+        "also_queues_at_paired_machine",
         "start_next_when_playing_becomes_empty",
         "advance_when_playing_empty",
         "reason",
     }
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     if set(source) - allowed_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的终端队列操作字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的终端队列操作字段。"}), 400
 
     def read_registration_ids(key: str, *, required: bool = False) -> list[str]:
         value = source.get(key)
         if value is None and not required:
             return []
         if not isinstance(value, list) or len(value) > MAX_REGISTRATIONS_PER_MACHINE:
-            raise ValidationError(f"{key} 必须是登记编号数组")
+            raise ValidationError(f"{key} 必须是登记编号数组。")
         result: list[str] = []
         for item in value:
             if not isinstance(item, str) or PUBLIC_ID_PATTERN.fullmatch(item) is None:
-                raise ValidationError(f"{key} 中包含无效登记编号")
+                raise ValidationError(f"{key} 中包含无效登记编号。")
             if item in result:
-                raise ValidationError(f"{key} 中不能有重复登记编号")
+                raise ValidationError(f"{key} 中不能有重复登记编号。")
             result.append(item)
         return result
 
@@ -6418,18 +6526,18 @@ def create_management_terminal_queue_action():
         if value is None and not required:
             return None
         if not isinstance(value, list) or len(value) > MAX_REGISTRATIONS_PER_MACHINE:
-            raise ValidationError(f"{key} 必须是等待位置数组")
+            raise ValidationError(f"{key} 必须是等待位置数组。")
         groups: list[list[str]] = []
         seen: set[str] = set()
         for group in value:
             if not isinstance(group, list) or not 1 <= len(group) <= 2:
-                raise ValidationError(f"{key} 中的每个等待位置必须包含一至两份登记")
+                raise ValidationError(f"{key} 中的每个等待位置必须包含一至两份登记。")
             normalized: list[str] = []
             for item in group:
                 if not isinstance(item, str) or PUBLIC_ID_PATTERN.fullmatch(item) is None:
-                    raise ValidationError(f"{key} 中包含无效登记编号")
+                    raise ValidationError(f"{key} 中包含无效登记编号。")
                 if item in seen:
-                    raise ValidationError(f"{key} 中不能有重复登记编号")
+                    raise ValidationError(f"{key} 中不能有重复登记编号。")
                 seen.add(item)
                 normalized.append(item)
             groups.append(normalized)
@@ -6441,7 +6549,7 @@ def create_management_terminal_queue_action():
         try:
             return str(UUID(read_string(source, key, maximum_length=36)))
         except ValueError as error:
-            raise ValidationError(f"{key} 无效") from error
+            raise ValidationError(f"{key} 无效。") from error
 
     try:
         command_id = read_uuid(source, "request_id")
@@ -6468,7 +6576,7 @@ def create_management_terminal_queue_action():
         action = read_choice(source, "action", MANAGEMENT_QUEUE_ACTIONS)
         machine_id = read_optional_machine_id(source, "machine_id")
         if machine_id is None:
-            raise ValidationError("machine_id 不能为空")
+            raise ValidationError("machine_id 不能为空。")
         machine_stable_id = read_machine_internal_id(
             source, "expected_machine_stable_id"
         )
@@ -6476,7 +6584,7 @@ def create_management_terminal_queue_action():
             "expected_playing_registration_ids", required=True
         )
         if len(expected_playing) > 2:
-            raise ValidationError("游玩位置最多只能包含两份登记")
+            raise ValidationError("游玩位置最多只能包含两份登记。")
         expected_waiting = read_position_groups("expected_waiting_positions", required=True)
         assert expected_waiting is not None
         registration_ids = read_registration_ids("registration_ids")
@@ -6509,6 +6617,11 @@ def create_management_terminal_queue_action():
         no_show_resolution = read_optional_choice(
             source, "no_show_resolution", NO_SHOW_RESOLUTIONS
         )
+        also_queues_at_paired_machine = (
+            read_boolean(source, "also_queues_at_paired_machine")
+            if "also_queues_at_paired_machine" in source
+            else None
+        )
         start_next = (
             read_boolean(source, "start_next_when_playing_becomes_empty")
             if "start_next_when_playing_becomes_empty" in source
@@ -6536,17 +6649,20 @@ def create_management_terminal_queue_action():
             "MOVE_WAITING_REGISTRATION_INTO_CURRENT_ROUND",
             "DEFER_ONE_ROUND",
             "CANCEL_DEFER_ONE_ROUND",
+            "SKIP_ONE_TURN",
+            "CANCEL_SKIP_ONE_TURN",
             "TEMPORARILY_LEAVE",
             "CANCEL_TEMPORARY_LEAVE",
             "CHANGE_PREFERENCE",
             "RENAME_REGISTRATION",
             "CLAIM_WITH_PLAYER_PROFILE",
             "CHECK_IN",
+            "SET_PAIRED_MACHINE_QUEUEING",
         }
         if action in machine_only_actions and registration_ids:
-            raise ValidationError("这项机台操作不接受登记编号")
+            raise ValidationError("这项机台操作不接受登记编号。")
         if action in single_registration_actions and len(registration_ids) != 1:
-            raise ValidationError("这项操作必须指定一份登记")
+            raise ValidationError("这项操作必须指定一份登记。")
         if action in {
             "RETURN_PLAYING_TO_WAITING_FRONT",
             "ADVANCE_TO_WAITING_POSITION",
@@ -6554,49 +6670,54 @@ def create_management_terminal_queue_action():
             "REMOVE_REGISTRATIONS",
             "TRANSFER_REGISTRATIONS",
         } and not registration_ids:
-            raise ValidationError("这项操作必须指定至少一份登记")
+            raise ValidationError("这项操作必须指定至少一份登记。")
         if action in {"CREATE_FIXED_PAIR", "RELEASE_FIXED_PAIR"} and len(registration_ids) != 2:
-            raise ValidationError("这项操作必须指定两份登记")
+            raise ValidationError("这项操作必须指定两份登记。")
         if action == "CREATE_FIXED_PAIR_WITH_REGISTRATION" and (
             len(registration_ids) != 1 or (friend_profile_id is None and not display_id)
         ):
-            raise ValidationError("请指定原登记以及朋友的玩家资料或临时名称")
+            raise ValidationError("请指定原登记以及朋友的玩家资料或临时名称。")
         if action == "ADD_TEMPORARY_REGISTRATION" and (
             registration_ids or not display_id or profile_id is not None
         ):
-            raise ValidationError("新建临时登记需要填写名称且不能指定现有登记")
+            raise ValidationError("创建临时登记需要填写名称且不能指定现有登记。")
         if action == "ADD_PROFILE_REGISTRATION" and (
             registration_ids or profile_id is None
         ):
-            raise ValidationError("新建玩家登记必须选择玩家资料")
+            raise ValidationError("创建玩家登记必须选择玩家资料。")
         if action == "CHANGE_PREFERENCE" and preference is None:
-            raise ValidationError("请选择本次游玩偏好")
+            raise ValidationError("请选择本次游玩偏好。")
         if action == "RENAME_REGISTRATION" and not display_id:
-            raise ValidationError("请输入新的登记名称")
+            raise ValidationError("请输入新的登记名称。")
         if action == "CLAIM_WITH_PLAYER_PROFILE" and profile_id is None:
-            raise ValidationError("请选择要关联的玩家资料")
+            raise ValidationError("请选择要关联的玩家资料。")
         if action == "MARK_NO_SHOW" and no_show_resolution is None:
-            raise ValidationError("请选择未到场处理方式")
+            raise ValidationError("请选择未到场处理方式。")
+        if action == "SET_PAIRED_MACHINE_QUEUEING":
+            if also_queues_at_paired_machine is None:
+                raise ValidationError("请选择是否允许系统在两台机台之间安排登记。")
+        elif action != "ADD_PROFILE_REGISTRATION" and also_queues_at_paired_machine is not None:
+            raise ValidationError("这项操作不接受 also_queues_at_paired_machine。")
         if action == "MOVE_WAITING_POSITION" and (
             source_position_index is None
             or destination_position_index is None
             or source_position_index == destination_position_index
         ):
-            raise ValidationError("请选择不同的原等待位置和目标等待位置")
+            raise ValidationError("请选择不同的原等待位置和目标等待位置。")
         if action == "REPLACE_WAITING_POSITIONS" and desired_waiting is None:
-            raise ValidationError("请提交新的等待位置顺序")
+            raise ValidationError("请提交新的等待位置顺序。")
         if action == "REPLACE_REGISTRATION_ORDER" and desired_registration_order is None:
-            raise ValidationError("请提交新的登记顺序")
+            raise ValidationError("请提交新的登记顺序。")
         if action == "TRANSFER_REGISTRATIONS" and (
             target_machine_id is None
             or target_machine_id == machine_id
             or target_machine_stable_id is None
         ):
-            raise ValidationError("请选择不同的目标机台并提交稳定身份")
+            raise ValidationError("请选择不同的目标机台并提交稳定身份。")
         if action != "TRANSFER_REGISTRATIONS" and (
             target_machine_id is not None or target_machine_stable_id is not None
         ):
-            raise ValidationError("只有转移登记可以指定目标机台")
+            raise ValidationError("只有转至其他机台可以指定目标机台。")
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
 
@@ -6627,6 +6748,9 @@ def create_management_terminal_queue_action():
         "advance_when_playing_empty": advance_when_empty,
         "reason": reason,
     }
+    # Added only when present, so that requests from before the feature keep their identity.
+    if also_queues_at_paired_machine is not None:
+        request_identity["also_queues_at_paired_machine"] = also_queues_at_paired_machine
 
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -6642,7 +6766,7 @@ def create_management_terminal_queue_action():
                 or existing_payload.get("_request") != request_identity
             ):
                 connection.rollback()
-                return jsonify({"ok": False, "error": "request_id 已用于其他命令"}), 409
+                return jsonify({"ok": False, "error": "request_id 已用于其他命令。"}), 409
             connection.commit()
             return jsonify(serialize_command(existing_command)), 200
 
@@ -6654,10 +6778,10 @@ def create_management_terminal_queue_action():
         ).fetchone()
         if snapshot_row is None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         if not snapshot_is_online(snapshot_row):
             connection.rollback()
-            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能操作队列"}), 503
+            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能操作队列。"}), 503
         snapshot = json.loads(snapshot_row["payload"])
         if (
             snapshot_row["queue_id"] != expected_queue_id
@@ -6671,17 +6795,17 @@ def create_management_terminal_queue_action():
         ):
             connection.rollback()
             return jsonify(
-                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列或机台配置已经更新，请刷新后重试"}
+                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列或机台配置已经更新，请刷新后重试。"}
             ), 409
         machine = snapshot.get("machines", {}).get(machine_id)
         if not isinstance(machine, dict):
             connection.rollback()
-            return jsonify({"ok": False, "error": "目标机台不存在"}), 409
+            return jsonify({"ok": False, "error": "目标机台不存在。"}), 409
         current_stable_id = machine.get("stable_id") or default_machine_stable_id(machine_id)
         if current_stable_id != machine_stable_id:
             connection.rollback()
             return jsonify(
-                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "目标机台已经变化，请刷新后重试"}
+                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "目标机台已经变化，请刷新后重试。"}
             ), 409
         current_playing = [
             registration["registration_id"] for registration in machine.get("playing", [])
@@ -6696,7 +6820,7 @@ def create_management_terminal_queue_action():
         if current_playing != expected_playing or current_waiting != expected_waiting:
             connection.rollback()
             return jsonify(
-                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列位置已经变化，请刷新后重试"}
+                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列位置已经变化，请刷新后重试。"}
             ), 409
         current_registration_ids = set(current_playing)
         current_registration_ids.update(
@@ -6704,13 +6828,27 @@ def create_management_terminal_queue_action():
         )
         if any(registration_id not in current_registration_ids for registration_id in registration_ids):
             connection.rollback()
-            return jsonify({"ok": False, "error": "所选登记已经不在目标机台"}), 409
+            return jsonify({"ok": False, "error": "所选登记已经不在目标机台。"}), 409
+        if action in PLAYING_POSITION_REFUSALS and any(
+            registration_id in current_playing for registration_id in registration_ids
+        ):
+            connection.rollback()
+            return jsonify(
+                {"ok": False, "error": PLAYING_POSITION_REFUSALS[action]}
+            ), 409
+        if also_queues_at_paired_machine is not None and machine.get("paired_machine_id") is None:
+            # Only a terminal that knows the feature reports a paired machine, so this also
+            # keeps the command away from terminals that could not execute it.
+            connection.rollback()
+            return jsonify(
+                {"ok": False, "error": "系统规则不允许自动在两台机台之间安排登记。"}
+            ), 409
         if desired_waiting is not None:
             current_groups = sorted(tuple(sorted(position)) for position in current_waiting)
             desired_groups = sorted(tuple(sorted(position)) for position in desired_waiting)
             if current_groups != desired_groups:
                 connection.rollback()
-                return jsonify({"ok": False, "error": "新的顺序必须完整保留每个等待位置"}), 409
+                return jsonify({"ok": False, "error": "新的顺序必须完整保留每个等待位置。"}), 409
         if desired_registration_order is not None:
             current_order = current_playing + [item for position in current_waiting for item in position]
             if (
@@ -6719,19 +6857,19 @@ def create_management_terminal_queue_action():
                 or set(desired_registration_order) != set(current_order)
             ):
                 connection.rollback()
-                return jsonify({"ok": False, "error": "新的登记顺序与当前队列不一致"}), 409
+                return jsonify({"ok": False, "error": "新的登记顺序与当前队列不一致。"}), 409
         if target_machine_id is not None:
             target_machine = snapshot.get("machines", {}).get(target_machine_id)
             if not isinstance(target_machine, dict):
                 connection.rollback()
-                return jsonify({"ok": False, "error": "目标机台不存在"}), 409
+                return jsonify({"ok": False, "error": "目标机台不存在。"}), 409
             current_target_stable_id = target_machine.get("stable_id") or default_machine_stable_id(
                 target_machine_id
             )
             if current_target_stable_id != target_machine_stable_id:
                 connection.rollback()
                 return jsonify(
-                    {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "要转入的机台已经变化，请刷新后重试"}
+                    {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "要转入的机台已经变化，请刷新后重试。"}
                 ), 409
 
         pending = connection.execute(
@@ -6746,7 +6884,7 @@ def create_management_terminal_queue_action():
         ).fetchone()
         if pending is not None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "这台机台已有管理操作正在等待终端处理"}), 409
+            return jsonify({"ok": False, "error": "这台机台已有管理操作正在等待终端处理。"}), 409
 
         queue_storage_id, _ = snapshot_storage_context(snapshot_row, snapshot)
         payload = {
@@ -6780,6 +6918,7 @@ def create_management_terminal_queue_action():
             "desired_waiting_positions": desired_waiting,
             "desired_registration_order": desired_registration_order,
             "no_show_resolution": no_show_resolution,
+            "also_queues_at_paired_machine": also_queues_at_paired_machine,
         }
         payload.update({key: value for key, value in optional_payload.items() if value is not None})
         connection.execute(
@@ -6806,7 +6945,7 @@ def create_management_terminal_queue_action():
 def create_management_queue_operation_command():
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     allowed_fields = {
         "request_id",
         "profile_id",
@@ -6814,6 +6953,7 @@ def create_management_queue_operation_command():
         "machine_id",
         "target_machine_id",
         "preference",
+        "also_queues_at_paired_machine",
         "expected_queue_id",
         "expected_registration_id",
         "expected_machine_id",
@@ -6828,7 +6968,7 @@ def create_management_queue_operation_command():
         "reason",
     }
     if set(source) - allowed_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的管理队列字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的管理队列字段。"}), 400
     try:
         profile_id = None
         if "profile_id" in source and source.get("profile_id") not in (None, ""):
@@ -6839,15 +6979,18 @@ def create_management_queue_operation_command():
             {
                 "DEFER_ONE_ROUND",
                 "CANCEL_DEFER_ONE_ROUND",
+                "SKIP_ONE_TURN",
+                "CANCEL_SKIP_ONE_TURN",
                 "TEMPORARILY_LEAVE",
                 "CANCEL_TEMPORARY_LEAVE",
                 "TRANSFER_MACHINE",
                 "CHANGE_PLAY_PREFERENCE",
                 "LEAVE_QUEUE",
+                "SET_PAIRED_MACHINE_QUEUEING",
             },
         )
     except (ValidationError, ValueError) as error:
-        detail = str(error) if isinstance(error, ValidationError) else "玩家资料编号无效"
+        detail = str(error) if isinstance(error, ValidationError) else "玩家资料编号无效。"
         return jsonify({"ok": False, "error": detail}), 400
     normalized = dict(source)
     normalized["operation"] = operation
@@ -6880,20 +7023,20 @@ def create_management_queue_reorder_command():
         "reason",
     }
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     if set(source) - allowed_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的队列重排字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的队列重排字段。"}), 400
 
     def read_order(key: str) -> list[str]:
         value = source.get(key)
         if not isinstance(value, list) or len(value) > MAX_REGISTRATIONS_PER_MACHINE:
-            raise ValidationError(f"{key} 必须是登记编号数组")
+            raise ValidationError(f"{key} 必须是登记编号数组。")
         result: list[str] = []
         for item in value:
             if not isinstance(item, str) or PUBLIC_ID_PATTERN.fullmatch(item) is None:
-                raise ValidationError(f"{key} 中包含无效登记编号")
+                raise ValidationError(f"{key} 中包含无效登记编号。")
             if item in result:
-                raise ValidationError(f"{key} 中不能有重复登记编号")
+                raise ValidationError(f"{key} 中不能有重复登记编号。")
             result.append(item)
         return result
 
@@ -6902,7 +7045,7 @@ def create_management_queue_reorder_command():
         expected_queue_id = read_uuid(source, "expected_queue_id")
         machine_id = read_optional_machine_id(source, "machine_id")
         if machine_id is None:
-            raise ValidationError("machine_id 不能为空")
+            raise ValidationError("machine_id 不能为空。")
         expected_machine_stable_id = (
             read_machine_internal_id(source, "expected_machine_stable_id")
             if "expected_machine_stable_id" in source
@@ -6917,9 +7060,9 @@ def create_management_queue_reorder_command():
         expected_order = read_order("expected_registration_order")
         desired_order = read_order("registration_order")
         if set(expected_order) != set(desired_order):
-            raise ValidationError("新的登记顺序必须包含当前机台的全部登记")
+            raise ValidationError("新的登记顺序必须包含当前机台的全部登记。")
         reason = read_optional_string(source, "reason", maximum_length=200) or (
-            "管理后台调整队列顺序"
+            "管理后台调整等待顺序"
         )
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
@@ -6950,7 +7093,7 @@ def create_management_queue_reorder_command():
                 or existing_payload.get("_request") != request_identity
             ):
                 connection.rollback()
-                return jsonify({"ok": False, "error": "request_id 已用于其他命令"}), 409
+                return jsonify({"ok": False, "error": "request_id 已用于其他命令。"}), 409
             connection.commit()
             return jsonify(serialize_command(existing_command)), 200
 
@@ -6962,35 +7105,35 @@ def create_management_queue_reorder_command():
         ).fetchone()
         if snapshot_row is None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         if not snapshot_is_online(snapshot_row):
             connection.rollback()
-            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能调整队列"}), 503
+            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能调整队列。"}), 503
         if snapshot_row["queue_id"] != expected_queue_id:
             connection.rollback()
             return jsonify(
-                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列已经更新，请刷新后重试"}
+                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列已经更新，请刷新后重试。"}
             ), 409
         snapshot = json.loads(snapshot_row["payload"])
         current_revision = snapshot.get("machine_configuration_revision", 1)
         if current_revision != expected_revision:
             connection.rollback()
             return jsonify(
-                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场机台配置已经更新，请刷新后重试"}
+                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场机台配置已经更新，请刷新后重试。"}
             ), 409
         machine = snapshot.get("machines", {}).get(machine_id)
         if not isinstance(machine, dict):
             connection.rollback()
-            return jsonify({"ok": False, "error": "目标机台不存在"}), 409
+            return jsonify({"ok": False, "error": "目标机台不存在。"}), 409
         current_stable_id = machine.get("stable_id") or default_machine_stable_id(machine_id)
         if expected_machine_stable_id is not None and expected_machine_stable_id != current_stable_id:
             connection.rollback()
             return jsonify(
-                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "目标机台已经变化，请刷新后重试"}
+                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "目标机台已经变化，请刷新后重试。"}
             ), 409
         if not machine.get("operational", False):
             connection.rollback()
-            return jsonify({"ok": False, "error": "目标机台已停止使用"}), 409
+            return jsonify({"ok": False, "error": "目标机台已停止使用。"}), 409
 
         current_order = [
             registration["registration_id"]
@@ -7004,15 +7147,15 @@ def create_management_queue_reorder_command():
         if current_order != expected_order:
             connection.rollback()
             return jsonify(
-                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "队列顺序已经变化，请刷新后重试"}
+                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列已经更新，请刷新后重试。"}
             ), 409
         playing_count = len(machine.get("playing", []))
         if desired_order[:playing_count] != current_order[:playing_count]:
             connection.rollback()
-            return jsonify({"ok": False, "error": "当前游玩位置不能调整顺序"}), 409
+            return jsonify({"ok": False, "error": "当前游玩位置不能调整顺序。"}), 409
         if desired_order == expected_order:
             connection.rollback()
-            return jsonify({"ok": False, "error": "新的顺序与当前顺序相同"}), 409
+            return jsonify({"ok": False, "error": "新的顺序与当前顺序相同。"}), 409
 
         pending = connection.execute(
             """
@@ -7027,7 +7170,7 @@ def create_management_queue_reorder_command():
         ).fetchone()
         if pending is not None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "这台机台已有队列调整命令正在等待终端处理"}), 409
+            return jsonify({"ok": False, "error": "这台机台已有顺序调整正在等待终端处理。"}), 409
 
         queue_storage_id, _ = snapshot_storage_context(snapshot_row, snapshot)
         payload = {
@@ -7097,9 +7240,9 @@ def create_management_terminal_policy_command():
         "reason",
     }
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     if set(source) - allowed_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的终端策略字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的终端策略字段。"}), 400
     try:
         request_id = read_uuid(source, "request_id")
         expected_queue_id = read_uuid(source, "expected_queue_id")
@@ -7145,7 +7288,7 @@ def create_management_terminal_policy_command():
                 or existing_payload.get("_request") != request_identity
             ):
                 connection.rollback()
-                return jsonify({"ok": False, "error": "request_id 已用于其他命令"}), 409
+                return jsonify({"ok": False, "error": "request_id 已用于其他命令。"}), 409
             connection.commit()
             return jsonify(serialize_command(existing_command)), 200
 
@@ -7154,19 +7297,19 @@ def create_management_terminal_policy_command():
         ).fetchone()
         if snapshot_row is None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         snapshot = json.loads(snapshot_row["payload"])
         if not snapshot_is_online(snapshot_row):
             connection.rollback()
-            return jsonify({"ok": False, "error": "现场终端暂时离线，不能更新终端策略"}), 503
+            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能更新终端敏感策略。"}), 503
         if expected_queue_id != snapshot_row["queue_id"]:
             connection.rollback()
             return jsonify(
-                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列已经更新，请刷新后再提交"}
+                {"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列已经更新，请刷新后重试。"}
             ), 409
         if not snapshot.get("management_policy_supported", False):
             connection.rollback()
-            return jsonify({"ok": False, "error": "当前现场终端不支持管理后台策略接管"}), 409
+            return jsonify({"ok": False, "error": "当前现场终端不支持管理后台接管终端敏感策略。"}), 409
         current_revision = int(snapshot.get("management_policy_revision", 0))
         if expected_revision != current_revision:
             connection.rollback()
@@ -7174,7 +7317,7 @@ def create_management_terminal_policy_command():
                 {
                     "ok": False,
                     "code": "TERMINAL_POLICY_CONTEXT_CHANGED",
-                    "error": "终端敏感策略已经更新，请刷新后再提交",
+                    "error": "终端敏感策略已经更新，请刷新后再提交。",
                 }
             ), 409
         pending = connection.execute(
@@ -7188,7 +7331,7 @@ def create_management_terminal_policy_command():
         ).fetchone()
         if pending is not None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "终端已有策略修改正在等待处理"}), 409
+            return jsonify({"ok": False, "error": "终端敏感策略已有修改正在等待处理。"}), 409
 
         payload = {
             "queue_id": snapshot_row["queue_id"],
@@ -7229,13 +7372,13 @@ def normalize_management_machine_settings(
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]], str]:
     machines_source = source.get("machines")
     if not isinstance(machines_source, dict):
-        raise ValidationError("machines 必须是对象")
+        raise ValidationError("machines 必须是对象。")
     configured_machine_ids = list(MACHINE_NAMES)[: len(machines_source)]
     if (
         not 1 <= len(machines_source) <= MAX_MACHINE_COUNT
         or set(machines_source) != set(configured_machine_ids)
     ):
-        raise ValidationError("机台必须按 A 至 J 的顺序连续配置 1 至 10 台")
+        raise ValidationError("机台必须按 A 至 J 的顺序连续配置 1 至 10 台。")
     groups, default_group_id = normalize_machine_groups(
         source,
         configured_machine_ids=configured_machine_ids,
@@ -7248,18 +7391,18 @@ def normalize_management_machine_settings(
         if not isinstance(item, dict) or set(item) != {
             "stable_id", "group_id", "remark", "configuration"
         }:
-            raise ValidationError(f"机台 {machine_id} 的设置字段不完整")
+            raise ValidationError(f"机台 {machine_id} 的设置字段不完整。")
         stable_id = read_machine_internal_id(item, "stable_id")
         group_id = read_machine_internal_id(item, "group_id")
         if group_id not in valid_group_ids:
-            raise ValidationError(f"机台 {machine_id} 引用了不存在的机台分组")
+            raise ValidationError(f"机台 {machine_id} 引用了不存在的机台分组。")
         remark = read_string(
             item,
             "remark",
             maximum_length=MAX_MACHINE_REMARK_CHARACTERS,
         )
         if not remark.isprintable():
-            raise ValidationError(f"机台 {machine_id} 的备注内容无效")
+            raise ValidationError(f"机台 {machine_id} 的备注内容无效。")
         configuration = normalize_machine_configuration(
             machine_id,
             item,
@@ -7278,9 +7421,9 @@ def normalize_management_machine_settings(
         }
     stable_ids = [machine["stable_id"] for machine in machines.values()]
     if len(stable_ids) != len(set(stable_ids)):
-        raise ValidationError("机台稳定标识不能重复")
+        raise ValidationError("机台稳定标识不能重复。")
     if {machine["group_id"] for machine in machines.values()} != valid_group_ids:
-        raise ValidationError("每个机台分组都必须至少包含一台机台")
+        raise ValidationError("每个机台分组都必须至少包含一台机台。")
     return machines, groups, default_group_id
 
 
@@ -7317,12 +7460,13 @@ def create_management_terminal_settings_command():
         "machine_groups",
         "default_machine_group_id",
         "machines",
+        "paired_machine_queue_settings",
         "reason",
     }
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     if set(source) - allowed_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的终端设置字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的终端设置字段。"}), 400
     try:
         request_id = read_uuid(source, "request_id")
         expected_queue_id = read_uuid(source, "expected_queue_id")
@@ -7344,6 +7488,20 @@ def create_management_terminal_settings_command():
         machines, machine_groups, default_group_id = (
             normalize_management_machine_settings(source)
         )
+        # Optional: a management app older than the feature does not send it, and the terminal
+        # then keeps its own setting. The pairs are checked against the machines as they will
+        # be after this command, which may change machines and capacities at the same time.
+        paired_machine_queue_settings = (
+            normalize_paired_machine_queue_settings(
+                source["paired_machine_queue_settings"],
+                {
+                    machine["stable_id"]: machine["configuration"]["capacity"]
+                    for machine in machines.values()
+                },
+            )
+            if source.get("paired_machine_queue_settings") is not None
+            else None
+        )
         reason = read_optional_string(source, "reason", maximum_length=200) or (
             "管理后台更新终端设置"
         )
@@ -7364,6 +7522,9 @@ def create_management_terminal_settings_command():
         "machines": machines,
         "reason": reason,
     }
+    # Added only when present, so that requests from before the feature keep their identity.
+    if paired_machine_queue_settings is not None:
+        request_identity["paired_machine_queue_settings"] = paired_machine_queue_settings
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         now = int(time.time())
@@ -7378,7 +7539,7 @@ def create_management_terminal_settings_command():
                 or payload.get("_request") != request_identity
             ):
                 connection.rollback()
-                return jsonify({"ok": False, "error": "request_id 已用于其他命令"}), 409
+                return jsonify({"ok": False, "error": "request_id 已用于其他命令。"}), 409
             connection.commit()
             return jsonify(serialize_command(existing)), 200
 
@@ -7387,32 +7548,40 @@ def create_management_terminal_settings_command():
         ).fetchone()
         if snapshot_row is None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         snapshot = json.loads(snapshot_row["payload"])
         if not snapshot_is_online(snapshot_row):
             connection.rollback()
-            return jsonify({"ok": False, "error": "现场终端暂时离线，不能更新设置"}), 503
+            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能更新设置。"}), 503
         if not snapshot.get("management_settings_supported", False):
             connection.rollback()
-            return jsonify({"ok": False, "error": "当前现场终端不支持远程设置"}), 409
+            return jsonify({"ok": False, "error": "当前现场终端不支持远程设置。"}), 409
         if not snapshot.get("management_app_bound", False):
             connection.rollback()
-            return jsonify({"ok": False, "error": "请先绑定并接管现场终端设置"}), 409
+            return jsonify({"ok": False, "error": "请先绑定并接管现场终端设置。"}), 409
+        if (
+            paired_machine_queue_settings is not None
+            and snapshot.get("paired_machine_queue_settings") is None
+        ):
+            connection.rollback()
+            return jsonify(
+                {"ok": False, "error": "当前现场终端不支持远程修改一对机台的设置。"}
+            ), 409
         if expected_queue_id != snapshot_row["queue_id"]:
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列已经更新，请刷新后再提交。"}), 409
         current_settings_revision = int(snapshot.get("management_settings_revision", 0))
         if expected_settings_revision != current_settings_revision:
             connection.rollback()
-            return jsonify({"ok": False, "code": "TERMINAL_SETTINGS_CONTEXT_CHANGED", "error": "终端设置已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "TERMINAL_SETTINGS_CONTEXT_CHANGED", "error": "终端设置已经更新，请刷新后再提交。"}), 409
         current_policy_revision = int(snapshot.get("management_policy_revision", 0))
         if expected_policy_revision != current_policy_revision:
             connection.rollback()
-            return jsonify({"ok": False, "code": "TERMINAL_POLICY_CONTEXT_CHANGED", "error": "终端接管策略已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "TERMINAL_POLICY_CONTEXT_CHANGED", "error": "终端敏感策略已经更新，请刷新后重试。"}), 409
         current_machine_revision = int(snapshot.get("machine_configuration_revision", 1))
         if expected_machine_revision != current_machine_revision:
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场机台配置已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场机台配置已经更新，请刷新后再提交。"}), 409
         current_registration_open = bool(
             snapshot.get(
                 "registration_control_open",
@@ -7421,12 +7590,12 @@ def create_management_terminal_settings_command():
         )
         if expected_registration_open != current_registration_open:
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "登记开放状态已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "登记排队状态已经更新，请刷新后再提交。"}), 409
         current_machines = snapshot.get("machines") or {}
         risk_sensitive = machine_settings_are_risk_sensitive(current_machines, machines)
         if risk_sensitive and current_registration_open:
             connection.rollback()
-            return jsonify({"ok": False, "error": "请先关闭登记排队，再修改机台数量、游玩容量或计划游玩时间"}), 409
+            return jsonify({"ok": False, "error": "请先关闭登记排队，再修改机台数量、游玩容量或计划游玩时间。"}), 409
         current_stable_ids = {
             machine.get("stable_id"): machine
             for machine in current_machines.values()
@@ -7444,14 +7613,14 @@ def create_management_terminal_settings_command():
         ]
         if blocked_removed:
             connection.rollback()
-            return jsonify({"ok": False, "error": "请先清空并恢复要删除的机台，再减少机台数量"}), 409
+            return jsonify({"ok": False, "error": "请先清空并恢复要删除的机台，再减少机台数量。"}), 409
         pending = connection.execute(
             "SELECT 1 FROM terminal_command WHERE device_id = ? AND status = 'PENDING' AND command_type = ? LIMIT 1",
             (snapshot_row["device_id"], TERMINAL_SETTINGS_COMMAND),
         ).fetchone()
         if pending is not None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "终端已有设置修改正在等待处理"}), 409
+            return jsonify({"ok": False, "error": "终端已有设置修改正在等待处理。"}), 409
         payload = {
             **request_identity,
             "next_settings_revision": current_settings_revision + 1,
@@ -7497,9 +7666,9 @@ def create_management_registration_availability_command():
         "reason",
     }
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     if set(source) - allowed_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的登记开关字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的登记开关字段。"}), 400
     try:
         request_id = read_uuid(source, "request_id")
         expected_queue_id = read_uuid(source, "expected_queue_id")
@@ -7528,13 +7697,13 @@ def create_management_registration_availability_command():
         if not isinstance(registration_ids_source, list) or len(registration_ids_source) > (
             MAX_REGISTRATIONS_PER_MACHINE * MAX_MACHINE_COUNT
         ):
-            raise ValidationError("expected_registration_ids 必须是有效的登记编号数组")
+            raise ValidationError("expected_registration_ids 必须是有效的登记编号数组。")
         expected_registration_ids = sorted(
             read_public_id({"registration_id": value}, "registration_id")
             for value in registration_ids_source
         )
         if len(expected_registration_ids) != len(set(expected_registration_ids)):
-            raise ValidationError("expected_registration_ids 不能包含重复编号")
+            raise ValidationError("expected_registration_ids 不能包含重复编号。")
         confirm_clear_queue = read_boolean(source, "confirm_clear_queue")
         reason = read_optional_string(source, "reason", maximum_length=200) or (
             "管理后台开启登记排队" if registration_open else "管理后台关闭登记排队"
@@ -7542,11 +7711,11 @@ def create_management_registration_availability_command():
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
     if expected_registration_open == registration_open:
-        return jsonify({"ok": False, "error": "登记开放状态没有变化"}), 400
+        return jsonify({"ok": False, "error": "登记排队状态没有变化。"}), 400
     if not registration_open and not confirm_clear_queue:
-        return jsonify({"ok": False, "error": "关闭登记前必须确认清空当前全部队列"}), 400
+        return jsonify({"ok": False, "error": "关闭登记前必须确认清空当前全部队列。"}), 400
     if registration_open and confirm_clear_queue:
-        return jsonify({"ok": False, "error": "开启登记不需要清空确认"}), 400
+        return jsonify({"ok": False, "error": "开启登记不需要清空确认。"}), 400
 
     request_identity = {
         "operation_source": "MANAGEMENT_APP",
@@ -7575,7 +7744,7 @@ def create_management_registration_availability_command():
                 or payload.get("_request") != request_identity
             ):
                 connection.rollback()
-                return jsonify({"ok": False, "error": "request_id 已用于其他命令"}), 409
+                return jsonify({"ok": False, "error": "request_id 已用于其他命令。"}), 409
             connection.commit()
             return jsonify(serialize_command(existing)), 200
         snapshot_row = connection.execute(
@@ -7583,30 +7752,30 @@ def create_management_registration_availability_command():
         ).fetchone()
         if snapshot_row is None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         snapshot = json.loads(snapshot_row["payload"])
         if not snapshot_is_online(snapshot_row):
             connection.rollback()
-            return jsonify({"ok": False, "error": "现场终端暂时离线，不能切换登记状态"}), 503
+            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能开启或关闭登记排队。"}), 503
         if not snapshot.get("management_settings_supported", False):
             connection.rollback()
-            return jsonify({"ok": False, "error": "当前现场终端不支持远程登记开关"}), 409
+            return jsonify({"ok": False, "error": "当前现场终端不支持远程登记开关。"}), 409
         if not snapshot.get("management_app_bound", False):
             connection.rollback()
-            return jsonify({"ok": False, "error": "请先绑定并接管现场终端设置"}), 409
+            return jsonify({"ok": False, "error": "请先绑定并接管现场终端设置。"}), 409
         if expected_queue_id != snapshot_row["queue_id"] or expected_queue_revision != snapshot_row["revision"]:
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列已经更新，请刷新后再提交。"}), 409
         if expected_machine_revision != int(snapshot.get("machine_configuration_revision", 1)):
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场机台配置已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场机台配置已经更新，请刷新后再提交。"}), 409
         if (
             expected_policy_revision is not None
             and expected_policy_revision
             != int(snapshot.get("management_policy_revision", 0))
         ):
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "终端接管策略已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "终端接管策略已经更新，请刷新后再提交。"}), 409
         if expected_registration_open != bool(
             snapshot.get(
                 "registration_control_open",
@@ -7614,20 +7783,20 @@ def create_management_registration_availability_command():
             )
         ):
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "登记开放状态已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "登记排队状态已经更新，请刷新后再提交。"}), 409
         if expected_registration_ids != snapshot_registration_ids(snapshot):
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "当前队列登记已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "当前队列登记已经更新，请刷新后再提交。"}), 409
         if registration_open and expected_registration_ids:
             connection.rollback()
-            return jsonify({"ok": False, "error": "关闭状态下仍有队列登记，请先在现场确认并清空"}), 409
+            return jsonify({"ok": False, "error": "关闭状态下仍有队列登记，请先在现场确认并清空。"}), 409
         pending = connection.execute(
             "SELECT 1 FROM terminal_command WHERE device_id = ? AND status = 'PENDING' AND command_type = ? LIMIT 1",
             (snapshot_row["device_id"], REGISTRATION_AVAILABILITY_COMMAND),
         ).fetchone()
         if pending is not None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "登记开关命令正在等待终端处理"}), 409
+            return jsonify({"ok": False, "error": "已有开启或关闭登记排队的操作正在等待终端处理。"}), 409
         payload = {**request_identity, "_request": request_identity}
         connection.execute(
             "INSERT INTO terminal_command (command_id, device_id, command_type, payload, status, created_at) VALUES (?, ?, ?, ?, 'PENDING', ?)",
@@ -7662,9 +7831,9 @@ def create_management_machine_status_command():
         "reason",
     }
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     if set(source) - allowed_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的机台状态字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的机台状态字段。"}), 400
     try:
         request_id = read_uuid(source, "request_id")
         expected_queue_id = read_uuid(source, "expected_queue_id")
@@ -7698,17 +7867,17 @@ def create_management_machine_status_command():
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
     if machine_id is None:
-        return jsonify({"ok": False, "error": "machine_id 不能为空"}), 400
+        return jsonify({"ok": False, "error": "machine_id 不能为空。"}), 400
     if expected_operational == operational:
-        return jsonify({"ok": False, "error": "机台状态没有变化"}), 400
+        return jsonify({"ok": False, "error": "机台状态没有变化。"}), 400
     if operational and (stop_reason is not None or stop_reason_detail is not None):
-        return jsonify({"ok": False, "error": "恢复机台时不能填写停止原因"}), 400
+        return jsonify({"ok": False, "error": "恢复机台时不能填写停止原因。"}), 400
     if not operational and stop_reason is None:
-        return jsonify({"ok": False, "error": "停止机台时必须选择原因"}), 400
+        return jsonify({"ok": False, "error": "停止机台时必须选择原因。"}), 400
     if stop_reason != "OTHER" and stop_reason_detail is not None:
-        return jsonify({"ok": False, "error": "只有其他原因可以填写补充说明"}), 400
+        return jsonify({"ok": False, "error": "只有选择其他原因时可以填写补充说明。"}), 400
     if stop_reason == "OTHER" and stop_reason_detail is None:
-        return jsonify({"ok": False, "error": "请选择其他原因时填写补充说明"}), 400
+        return jsonify({"ok": False, "error": "选择其他原因时，请填写补充说明。"}), 400
     request_identity = {
         "operation_source": "MANAGEMENT_APP",
         "queue_id": expected_queue_id,
@@ -7736,7 +7905,7 @@ def create_management_machine_status_command():
                 or payload.get("_request") != request_identity
             ):
                 connection.rollback()
-                return jsonify({"ok": False, "error": "request_id 已用于其他命令"}), 409
+                return jsonify({"ok": False, "error": "request_id 已用于其他命令。"}), 409
             connection.commit()
             return jsonify(serialize_command(existing)), 200
         snapshot_row = connection.execute(
@@ -7744,44 +7913,44 @@ def create_management_machine_status_command():
         ).fetchone()
         if snapshot_row is None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         snapshot = json.loads(snapshot_row["payload"])
         if not snapshot_is_online(snapshot_row):
             connection.rollback()
-            return jsonify({"ok": False, "error": "现场终端暂时离线，不能修改机台状态"}), 503
+            return jsonify({"ok": False, "error": "现场终端暂时离线，不能修改机台状态。"}), 503
         if not snapshot.get("management_settings_supported", False):
             connection.rollback()
-            return jsonify({"ok": False, "error": "当前现场终端不支持远程机台控制"}), 409
+            return jsonify({"ok": False, "error": "当前现场终端不支持远程机台控制。"}), 409
         if not snapshot.get("management_app_bound", False):
             connection.rollback()
-            return jsonify({"ok": False, "error": "请先绑定并接管现场终端设置"}), 409
+            return jsonify({"ok": False, "error": "请先绑定并接管现场终端设置。"}), 409
         if expected_queue_id != snapshot_row["queue_id"]:
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场队列已经更新，请刷新后再提交。"}), 409
         if expected_machine_revision != int(snapshot.get("machine_configuration_revision", 1)):
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场机台配置已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "现场机台配置已经更新，请刷新后再提交。"}), 409
         if (
             expected_policy_revision is not None
             and expected_policy_revision
             != int(snapshot.get("management_policy_revision", 0))
         ):
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "终端接管策略已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "终端接管策略已经更新，请刷新后再提交。"}), 409
         machine = (snapshot.get("machines") or {}).get(machine_id)
         if not isinstance(machine, dict) or machine.get("stable_id") != machine_stable_id:
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "目标机台已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "目标机台已经更新，请刷新后再提交。"}), 409
         if bool(machine.get("operational", False)) != expected_operational:
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "机台状态已经更新，请刷新后再提交"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "机台状态已经更新，请刷新后再提交。"}), 409
         pending = connection.execute(
             "SELECT 1 FROM terminal_command WHERE device_id = ? AND status = 'PENDING' AND command_type = ? AND json_extract(payload, '$.machine_id') = ? LIMIT 1",
             (snapshot_row["device_id"], MACHINE_STATUS_COMMAND, machine_id),
         ).fetchone()
         if pending is not None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "这台机台已有状态命令正在等待处理"}), 409
+            return jsonify({"ok": False, "error": "这台机台已有状态修改正在等待终端处理。"}), 409
         payload = {**request_identity, "_request": request_identity}
         connection.execute(
             "INSERT INTO terminal_command (command_id, device_id, command_type, payload, status, created_at) VALUES (?, ?, ?, ?, 'PENDING', ?)",
@@ -7809,7 +7978,7 @@ def read_management_overview():
             """
         ).fetchone()
         if snapshot_row is None:
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         snapshot = json.loads(snapshot_row["payload"])
         venue = read_active_venue(connection)
         queue_storage_id, profile_scope_id = snapshot_storage_context(
@@ -7872,12 +8041,31 @@ def read_management_overview():
                 "online_check_in_started_at"
             ),
             "deferred_once": bool(registration.get("deferred_once", False)),
+            "skips_one_turn": bool(registration.get("skips_one_turn", False)),
             "temporarily_away": bool(registration.get("temporarily_away", False)),
             "temporary_away_skipped_turns": registration.get(
                 "temporary_away_skipped_turns", 0
             ),
+            "defer_one_round_used": bool(
+                registration.get("defer_one_round_used", False)
+            ),
+            "online_registration_not_played": bool(
+                registration.get("online_registration_not_played", False)
+            ),
             "fixed_pair": bool(registration.get("fixed_pair", False)),
             "fixed_pair_id": registration.get("fixed_pair_id"),
+            "also_queues_at_paired_machine": bool(
+                registration.get("also_queues_at_paired_machine", False)
+            ),
+            "skips_paired_machine_this_round": bool(
+                registration.get("skips_paired_machine_this_round", False)
+            ),
+            "paired_arrangement_announced": bool(
+                registration.get("paired_arrangement_announced", False)
+            ),
+            "paired_arrangement_not_before": registration.get(
+                "paired_arrangement_not_before"
+            ),
             "profile_nickname": profile["nickname"] if profile is not None else None,
         }
 
@@ -7894,6 +8082,10 @@ def read_management_overview():
                     "index": waiting_position["index"],
                     "estimated_wait_minutes": waiting_position.get(
                         "estimated_wait_minutes"
+                    ),
+                    "estimated_wait_uncertain": bool(
+                        waiting_position.get("estimated_wait_uncertain", False)
+                        and waiting_position.get("estimated_wait_minutes") is not None
                     ),
                     "common_play_preview": waiting_position.get("common_play_preview"),
                     "registrations": [
@@ -7922,6 +8114,7 @@ def read_management_overview():
                 "waiting_positions": waiting_positions,
                 "configuration": machine.get("configuration")
                 or default_machine_configuration(machine),
+                "paired_machine_id": machine.get("paired_machine_id"),
             }
         )
 
@@ -8008,6 +8201,10 @@ def read_management_overview():
                     "default_machine_group_id": snapshot.get(
                         "default_machine_group_id", DEFAULT_MACHINE_GROUP_ID
                     ),
+                    # Null when the terminal does not offer this setting to the management app.
+                    "paired_machine_queue_settings": snapshot.get(
+                        "paired_machine_queue_settings"
+                    ),
                 },
                 "machines": machines,
             },
@@ -8032,6 +8229,10 @@ def read_management_overview():
                 "COMMON_PLAY_PREVIEW_EDIT": bool(
                     snapshot.get("management_settings_supported", False)
                 ),
+                "PAIRED_MACHINE_QUEUE_EDIT": bool(
+                    snapshot.get("management_settings_supported", False)
+                    and snapshot.get("paired_machine_queue_settings") is not None
+                ),
             },
         }
     )
@@ -8040,7 +8241,7 @@ def read_management_overview():
 def create_management_queue_command():
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     allowed_fields = {
         "request_id",
         "operation",
@@ -8053,7 +8254,7 @@ def create_management_queue_command():
         "reason",
     }
     if set(source) - allowed_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的管理命令字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的管理命令字段。"}), 400
     try:
         command_id = read_uuid(source, "request_id")
         operation = read_choice(source, "operation", {"CHECK_IN"})
@@ -8074,10 +8275,10 @@ def create_management_queue_command():
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
     if expected_machine_id is None:
-        return jsonify({"ok": False, "error": "expected_machine_id 不能为空"}), 400
+        return jsonify({"ok": False, "error": "expected_machine_id 不能为空。"}), 400
     if not expected_pending_check_in:
         return jsonify(
-            {"ok": False, "error": "立即签到只能用于待签到的线上登记"}
+            {"ok": False, "error": "立即签到只能用于待签到的线上登记。"}
         ), 400
 
     request_identity = {
@@ -8107,7 +8308,7 @@ def create_management_queue_command():
                 existing_command["command_type"] != QUEUE_OPERATION_COMMAND
                 or existing_payload.get("_request") != request_identity
             ):
-                return jsonify({"ok": False, "error": "request_id 已用于其他命令"}), 409
+                return jsonify({"ok": False, "error": "request_id 已用于其他命令。"}), 409
             connection.commit()
             return jsonify(serialize_command(existing_command)), 200
 
@@ -8118,10 +8319,10 @@ def create_management_queue_command():
             """
         ).fetchone()
         if snapshot_row is None:
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         snapshot = json.loads(snapshot_row["payload"])
         if not snapshot_is_online(snapshot_row):
-            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能立即签到"}), 503
+            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能立即签到。"}), 503
         if expected_queue_id != snapshot_row["queue_id"]:
             return jsonify(
                 {
@@ -8141,20 +8342,20 @@ def create_management_queue_command():
             ), 409
         machine = snapshot.get("machines", {}).get(expected_machine_id)
         if not isinstance(machine, dict):
-            return jsonify({"ok": False, "error": "目标机台不存在"}), 409
+            return jsonify({"ok": False, "error": "目标机台不存在。"}), 409
         if not machine.get("operational", False):
-            return jsonify({"ok": False, "error": "目标机台已停止使用"}), 409
+            return jsonify({"ok": False, "error": "目标机台已停止使用。"}), 409
         contexts = index_snapshot_registrations(snapshot)
         context = contexts.get(registration_id)
         if context is None:
-            return jsonify({"ok": False, "error": "目标登记已经不在当前队列中"}), 409
+            return jsonify({"ok": False, "error": "目标登记已经不在当前队列中。"}), 409
         registration = context["registration"]
         if context["machine_id"] != expected_machine_id or context["position"] != "WAITING":
             return jsonify(
                 {"ok": False, "error": "登记所在机台或位置已经变化，请刷新后重试。"}
             ), 409
         if not registration.get("online_registration_pending_check_in", False):
-            return jsonify({"ok": False, "error": "这份登记已经完成现场签到"}), 409
+            return jsonify({"ok": False, "error": "这份登记已经完成现场签到。"}), 409
 
         queue_storage_id, profile_scope_id = snapshot_storage_context(
             snapshot_row, snapshot
@@ -8171,13 +8372,13 @@ def create_management_queue_command():
             (profile_scope_id, queue_storage_id, registration_id),
         ).fetchone()
         if contact is None:
-            return jsonify({"ok": False, "error": "这份登记没有关联玩家资料"}), 409
+            return jsonify({"ok": False, "error": "这份登记没有关联玩家资料。"}), 409
         profile = connection.execute(
             "SELECT * FROM player_profile WHERE device_id = ? AND profile_id = ?",
             (profile_scope_id, contact["player_id"]),
         ).fetchone()
         if profile is None or not profile["qq_number"]:
-            return jsonify({"ok": False, "error": "玩家资料尚未完成 QQ 关联"}), 409
+            return jsonify({"ok": False, "error": "玩家资料尚未完成 QQ 关联。"}), 409
 
         pending = connection.execute(
             """
@@ -8190,15 +8391,9 @@ def create_management_queue_command():
             (snapshot_row["device_id"], QUEUE_OPERATION_COMMAND, registration_id),
         ).fetchone()
         if pending is not None:
-            return jsonify({"ok": False, "error": "这份登记已有命令正在等待终端处理"}), 409
+            return jsonify({"ok": False, "error": "这份登记已有一项操作正在等待终端处理。"}), 409
 
-        absence_status = (
-            "DEFER_ONE_ROUND"
-            if registration.get("deferred_once", False)
-            else "TEMPORARILY_AWAY"
-            if registration.get("temporarily_away", False)
-            else "NONE"
-        )
+        absence_status = registration_absence_status(registration)
         payload = {
             "_queue_storage_id": queue_storage_id,
             "queue_id": snapshot_row["queue_id"],
@@ -8247,7 +8442,7 @@ def read_management_command(command_id: str):
     try:
         command_id = str(UUID(command_id))
     except ValueError:
-        return jsonify({"ok": False, "error": "命令编号无效"}), 400
+        return jsonify({"ok": False, "error": "命令编号无效。"}), 400
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         expire_pending_commands(connection, int(time.time()))
@@ -8256,10 +8451,10 @@ def read_management_command(command_id: str):
         ).fetchone()
         connection.commit()
     if row is None:
-        return jsonify({"ok": False, "error": "没有找到这条命令"}), 404
+        return jsonify({"ok": False, "error": "没有找到这条命令。"}), 404
     payload = json.loads(row["payload"])
     if payload.get("operation_source") != "MANAGEMENT_APP":
-        return jsonify({"ok": False, "error": "没有找到这条管理命令"}), 404
+        return jsonify({"ok": False, "error": "没有找到这条管理命令。"}), 404
     return jsonify(serialize_command(row))
 
 
@@ -8316,7 +8511,7 @@ def player_join_syncing_response():
         {
             "ok": False,
             "code": "PLAYER_OPERATION_SYNCING",
-            "error": "上一份登记已由终端保存，正在同步最新队列，请稍后刷新。",
+            "error": "上一次提交的登记已由现场终端保存，正在同步最新队列，请稍后查看。",
         }
     ), 409
 
@@ -8338,6 +8533,18 @@ def create_queue_operation_command(
         machine_id = read_optional_machine_id(source, "machine_id")
         target_machine_id = read_optional_machine_id(source, "target_machine_id")
         preference = read_optional_choice(source, "preference", PREFERENCES)
+        # None means the request does not mention it, which is what every client older than
+        # the feature sends.
+        also_queues_at_paired_machine = (
+            read_boolean(source, "also_queues_at_paired_machine")
+            if "also_queues_at_paired_machine" in source
+            else None
+        )
+        if operation == "SET_PAIRED_MACHINE_QUEUEING":
+            if also_queues_at_paired_machine is None:
+                raise ValidationError("请选择是否允许系统在两台机台之间安排登记。")
+        elif operation != "JOIN_QUEUE" and also_queues_at_paired_machine is not None:
+            raise ValidationError("这项操作不接受 also_queues_at_paired_machine。")
         expected_field_names = {
             "expected_queue_id",
             "expected_registration_id",
@@ -8372,9 +8579,9 @@ def create_queue_operation_command(
             supplied_join_fields = expected_join_field_names.intersection(source)
             registration_detail_fields = expected_field_names - {"expected_queue_id"}
             if registration_detail_fields.intersection(source):
-                raise ValidationError("加入排队不接受登记确认状态")
+                raise ValidationError("加入排队不接受登记确认状态。")
             if supplied_join_fields and supplied_join_fields != expected_join_field_names:
-                raise ValidationError("加入排队确认字段不完整")
+                raise ValidationError("加入排队确认字段不完整。")
             if supplied_join_fields:
                 expected_join_context = {
                     "queue_id": read_uuid(source, "expected_queue_id"),
@@ -8387,27 +8594,27 @@ def create_queue_operation_command(
                     "machine_stable_id": expected_machine_stable_id,
                 }
             elif expected_machine_stable_id is not None:
-                raise ValidationError("加入排队确认字段不完整")
+                raise ValidationError("加入排队确认字段不完整。")
             if expected_target_machine_stable_id is not None:
-                raise ValidationError("加入排队不接受目标机台确认字段")
+                raise ValidationError("加入排队不接受目标机台确认字段。")
         else:
             supplied_expected_fields = expected_field_names.intersection(source)
             if (
                 supplied_expected_fields
                 and supplied_expected_fields != expected_field_names
             ):
-                raise ValidationError("确认状态字段不完整")
+                raise ValidationError("确认状态字段不完整。")
             if (
                 expected_configuration_revision_field in source
                 and supplied_expected_fields != expected_field_names
             ):
-                raise ValidationError("确认状态字段不完整")
+                raise ValidationError("确认状态字段不完整。")
             if (
                 (expected_machine_stable_id is not None or
                  expected_target_machine_stable_id is not None)
                 and supplied_expected_fields != expected_field_names
             ):
-                raise ValidationError("确认状态字段不完整")
+                raise ValidationError("确认状态字段不完整。")
         if operation != "JOIN_QUEUE" and supplied_expected_fields:
             expected_context = {
                 "queue_id": read_uuid(source, "expected_queue_id"),
@@ -8420,7 +8627,7 @@ def create_queue_operation_command(
                 "absence_status": read_choice(
                     source,
                     "expected_absence_status",
-                    {"NONE", "DEFER_ONE_ROUND", "TEMPORARILY_AWAY"},
+                    ABSENCE_STATUSES,
                 ),
                 "temporary_away_skipped_turns": read_integer(
                     source,
@@ -8441,12 +8648,12 @@ def create_queue_operation_command(
                 "target_machine_stable_id": expected_target_machine_stable_id,
             }
             if expected_context["machine_id"] is None:
-                raise ValidationError("expected_machine_id 不能为空")
+                raise ValidationError("expected_machine_id 不能为空。")
             if (
                 expected_target_machine_stable_id is not None
                 and operation != "TRANSFER_MACHINE"
             ):
-                raise ValidationError("只有切换机台可以提交目标机台确认字段")
+                raise ValidationError("只有转至其他机台可以提交目标机台确认字段。")
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
 
@@ -8462,6 +8669,10 @@ def create_queue_operation_command(
     }
     if actor_profile_id is not None:
         request_identity["actor_profile_id"] = actor_profile_id
+    # Added only when present, so that a repeated request from before the feature still
+    # matches the identity stored with its command.
+    if also_queues_at_paired_machine is not None:
+        request_identity["also_queues_at_paired_machine"] = also_queues_at_paired_machine
 
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -8479,14 +8690,14 @@ def create_queue_operation_command(
                 existing_command["command_type"] != QUEUE_OPERATION_COMMAND
                 or existing_payload.get("_request") != request_identity
             ):
-                return jsonify({"ok": False, "error": "request_id 已用于其他命令"}), 409
+                return jsonify({"ok": False, "error": "request_id 已用于其他命令。"}), 409
             return jsonify(serialize_command(existing_command)), 200
 
         snapshot_row = connection.execute(
             "SELECT queue_id, device_id, payload, received_at FROM queue_snapshot WHERE id = 1"
         ).fetchone()
         if snapshot_row is None:
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         snapshot = json.loads(snapshot_row["payload"])
         queue_storage_id, _ = snapshot_storage_context(snapshot_row, snapshot)
         if expected_join_context is not None and (
@@ -8553,7 +8764,7 @@ def create_queue_operation_command(
                     "ok": False,
                     "code": "PROFILE_NOT_FOUND",
                     "error": (
-                        "当前 QQ 尚未关联玩家资料。请先在现场终端的玩家资料库中"
+                        "这个 QQ 尚未关联玩家资料。请先在现场终端的玩家资料库中"
                         "创建资料并填写 QQ。"
                     ),
                 }
@@ -8625,6 +8836,7 @@ def create_queue_operation_command(
             machine_id=machine_id,
             target_machine_id=target_machine_id,
             preference=preference,
+            also_queues_at_paired_machine=also_queues_at_paired_machine,
             expected_context=expected_context,
             registration_contexts=registration_contexts,
             request_identity=request_identity,
@@ -8670,8 +8882,23 @@ def create_queue_operation_command(
                 ),
             ).fetchone()
         if pending is not None:
-            return jsonify({"ok": False, "error": "你已有一项操作正在等待终端处理"}), 409
+            return jsonify({"ok": False, "error": "已有一项操作正在等待终端处理。"}), 409
 
+        if (
+            operation_source == "WEBSITE_REMOTE"
+            and actor_profile_id is not None
+            and also_queues_at_paired_machine is True
+            and operation in {"JOIN_QUEUE", "SET_PAIRED_MACHINE_QUEUEING"}
+        ):
+            # The website showed the explanation before the player could send this, and the
+            # request comes from the signed-in account of this profile. An online join that
+            # names a QQ number needs no sign-in and anybody can send it, so it records
+            # nothing here; see complete_terminal_command.
+            mark_paired_machine_queueing_introduced(
+                connection,
+                snapshot_storage_context(snapshot_row, snapshot)[1],
+                profile["profile_id"],
+            )
         connection.execute(
             """
             INSERT INTO terminal_command
@@ -8707,6 +8934,7 @@ def build_queue_operation_payload(
     expected_context: dict[str, Any] | None,
     registration_contexts: list[dict[str, Any]],
     request_identity: dict[str, Any],
+    also_queues_at_paired_machine: bool | None = None,
 ):
     payload = {
         "queue_id": queue_id,
@@ -8723,38 +8951,38 @@ def build_queue_operation_payload(
 
     if operation == "JOIN_QUEUE":
         if expected_context is not None:
-            return None, ("加入排队不接受登记确认状态", 400)
+            return None, ("加入排队不接受登记确认状态。", 400)
         if snapshot_in_closing_grace(snapshot):
-            return None, ("闭店收尾期间不再接收新的排队登记", 409)
+            return None, ("闭店收尾期间不再接收新的排队登记。", 409)
         if not online_registration_allowed(snapshot):
-            return None, ("现场规则暂不允许线上登记", 409)
+            return None, ("系统规则不允许线上登记。", 409)
         if registration_contexts:
-            return None, ("你已经有一份正在排队的登记，不能重复加入", 409)
+            return None, ("已经有一份正在排队的登记，不能重复加入。", 409)
         if not snapshot.get("registration_open", True):
-            return None, ("现场当前没有使用登记排队，暂不能线上加入排队", 409)
+            return None, ("现场当前未使用登记排队，暂不能线上加入排队。", 409)
         machine = snapshot.get("machines", {}).get(machine_id or "")
         if machine is None:
-            return None, ("请选择有效的排队机台", 400)
+            return None, ("请选择有效的排队机台。", 400)
         payload["machine_stable_id"] = machine.get(
             "stable_id"
         ) or default_machine_stable_id(machine_id or "")
         if not machine.get("operational", False):
-            return None, (f"{machine['name']}已停止使用，暂不能加入", 409)
+            return None, (f"{machine['name']} 已停止使用，暂不能加入。", 409)
         if machine.get("registration_count", 0) >= MAX_REGISTRATIONS_PER_MACHINE:
-            return None, (f"{machine['name']}的登记已满，请选择其他机台", 409)
+            return None, (f"{machine['name']} 的登记已满，请选择其他机台。", 409)
         if machine_capacity(machine) == 1:
             resolved_preference = "SOLO"
         else:
             if profile is None:
-                return None, ("线上加入排队必须关联玩家资料", 409)
+                return None, ("线上加入排队必须关联玩家资料。", 409)
             default_preference = profile["default_preference"]
             if default_preference == "ASK_EVERY_TIME":
                 if preference not in PREFERENCES:
-                    return None, ("请选择本次游玩偏好", 400)
+                    return None, ("请选择本次游玩偏好。", 400)
                 resolved_preference = preference
             else:
                 if preference is not None and preference != default_preference:
-                    return None, ("这份玩家资料使用固定的默认游玩偏好", 409)
+                    return None, ("这份玩家资料使用固定的默认游玩偏好。", 409)
                 resolved_preference = default_preference
         payload.update(
             {
@@ -8762,30 +8990,30 @@ def build_queue_operation_payload(
                 "preference": resolved_preference,
             }
         )
+        if also_queues_at_paired_machine is not None:
+            # The tick box on the page decides for this registration alone; a profile
+            # carries no setting for it.
+            if machine.get("paired_machine_id") is None:
+                return None, (f"{machine['name']} 不属于一对机台，不能自动在两台机台之间安排登记。", 409)
+            payload["also_queues_at_paired_machine"] = also_queues_at_paired_machine
         return payload, None
 
     if len(registration_contexts) != 1:
-        return None, ("当前没有可以执行此操作的排队登记", 409)
+        return None, ("当前没有可以执行此操作的排队登记。", 409)
     context = registration_contexts[0]
     registration = context["registration"]
     if expected_context is not None:
-        current_absence_status = (
-            "DEFER_ONE_ROUND"
-            if registration.get("deferred_once", False)
-            else "TEMPORARILY_AWAY"
-            if registration.get("temporarily_away", False)
-            else "NONE"
-        )
+        current_absence_status = registration_absence_status(registration)
         if (
             expected_context["queue_id"] != queue_id
             or expected_context["registration_id"] != registration.get("registration_id")
         ):
-            return None, ("确认期间排队批次或登记已经变化，请重新查询后再操作", 409)
+            return None, ("确认期间现场队列或登记已经变化，请重新查询后再操作。", 409)
         if (
             expected_context["machine_id"] != context["machine_id"]
             or expected_context["position"] != context["position"]
         ):
-            return None, ("确认期间登记所在机台或位置已经变化，请重新查询后再操作", 409)
+            return None, ("确认期间登记所在机台或位置已经变化，请重新查询后再操作。", 409)
         if (
             expected_context["fixed_pair_id"]
             != registration.get("fixed_pair_id")
@@ -8795,10 +9023,20 @@ def build_queue_operation_payload(
             or expected_context["pending_check_in"]
             != registration.get("online_registration_pending_check_in", False)
         ):
-            return None, ("确认期间登记状态已经变化，请重新查询后再操作", 409)
+            return None, ("确认期间登记状态已经变化，请重新查询后再操作。", 409)
     source_machine = snapshot.get("machines", {}).get(context["machine_id"])
-    if source_machine is None or not source_machine.get("operational", False):
-        return None, ("登记所在机台已停止使用，恢复正常使用后才能操作", 409)
+    if source_machine is None:
+        return None, ("确认期间登记所在机台已经变化，请重新查询后再操作。", 409)
+    # Nobody is held at a machine that cannot be played on: leaving the queue and moving to
+    # another machine stay possible while it is stopped. Everything else waits.
+    if not source_machine.get("operational", False) and operation not in {
+        "LEAVE_QUEUE",
+        "TRANSFER_MACHINE",
+    }:
+        return None, (
+            f"{source_machine['name']} 已停止使用，恢复正常使用前只能退出排队或转至其他机台。",
+            409,
+        )
     source_machine_stable_id = source_machine.get(
         "stable_id"
     ) or default_machine_stable_id(context["machine_id"])
@@ -8807,33 +9045,50 @@ def build_queue_operation_payload(
         and expected_context["machine_stable_id"] is not None
         and expected_context["machine_stable_id"] != source_machine_stable_id
     ):
-        return None, ("确认期间登记所在机台已经变化，请重新查询后再操作", 409)
+        return None, ("确认期间登记所在机台已经变化，请重新查询后再操作。", 409)
     payload["machine_stable_id"] = source_machine_stable_id
     pending_check_in = registration.get("online_registration_pending_check_in", False)
     if pending_check_in and operation != "LEAVE_QUEUE":
-        return None, ("线上登记完成现场签到后，才能进行这项操作", 409)
+        return None, ("线上登记完成现场签到后，才能进行这项操作。", 409)
 
     queue_rules = snapshot.get("queue_rules") or normalize_public_queue_rules(None)
-    if operation == "DEFER_ONE_ROUND":
-        if not queue_rules["allow_defer_one_round"]:
-            return None, ("系统规则不允许暂缓一次", 409)
-    elif operation == "TEMPORARILY_LEAVE":
-        if not queue_rules["allow_temporary_leave"]:
-            return None, ("系统规则不允许暂时离开", 409)
-    elif operation in {"CANCEL_DEFER_ONE_ROUND", "CANCEL_TEMPORARY_LEAVE"}:
+    if operation in PLAYING_POSITION_REFUSALS:
+        if operation == "DEFER_ONE_ROUND" and not queue_rules["allow_defer_one_round"]:
+            return None, ("系统规则不允许暂缓一次。", 409)
+        if operation == "TEMPORARILY_LEAVE" and not queue_rules["allow_temporary_leave"]:
+            return None, ("系统规则不允许暂时离开。", 409)
+        # Deferring, skipping a turn and leaving temporarily are for registrations that
+        # wait; the terminal refuses them for the playing position, where they would put
+        # the player first in line for the next round.
+        if context["position"] == "PLAYING":
+            return None, (PLAYING_POSITION_REFUSALS[operation], 409)
+        # Only the management app may postpone these. The terminal checks both again; this
+        # gives the player the reason before the command is queued.
+        if operation_source != "MANAGEMENT_APP":
+            if registration.get("online_registration_not_played", False):
+                return None, (ONLINE_REGISTRATION_NOT_PLAYED_REFUSAL, 409)
+            if operation == "DEFER_ONE_ROUND" and registration.get(
+                "defer_one_round_used", False
+            ):
+                return None, (DEFER_ONE_ROUND_USED_REFUSAL, 409)
+    elif operation in {
+        "CANCEL_DEFER_ONE_ROUND",
+        "CANCEL_SKIP_ONE_TURN",
+        "CANCEL_TEMPORARY_LEAVE",
+    }:
         # The public snapshot may lag behind the terminal by one publish cycle.
         # The terminal owns the current absence state and performs the final check.
         pass
     elif operation == "TRANSFER_MACHINE":
         if context["position"] == "PLAYING":
-            return None, ("处于游玩位置的登记暂不能切换机台", 409)
+            return None, ("处于游玩位置的登记不能转至其他机台。", 409)
         target_machine = snapshot.get("machines", {}).get(target_machine_id or "")
         if target_machine is None or target_machine_id == context["machine_id"]:
-            return None, ("请选择其他可用机台", 400)
+            return None, ("请选择其他可用机台。", 400)
         if not target_machine.get("operational", False):
-            return None, (f"{target_machine['name']}已停止使用，暂不能转入", 409)
+            return None, (f"{target_machine['name']} 已停止使用，暂不能转入。", 409)
         if target_machine.get("registration_count", 0) >= MAX_REGISTRATIONS_PER_MACHINE:
-            return None, (f"{target_machine['name']}的登记已满，暂不能转入", 409)
+            return None, (f"{target_machine['name']} 的登记已满，暂不能转入。", 409)
         target_machine_stable_id = target_machine.get(
             "stable_id"
         ) or default_machine_stable_id(target_machine_id or "")
@@ -8843,19 +9098,27 @@ def build_queue_operation_payload(
             and expected_context["target_machine_stable_id"]
             != target_machine_stable_id
         ):
-            return None, ("确认期间要转入的机台已经变化，请重新选择", 409)
+            return None, ("确认期间要转入的机台已经变化，请重新选择。", 409)
         if machine_capacity(target_machine) == 1 and registration.get("fixed_pair"):
-            return None, (f"{target_machine['name']}仅能容纳一人游玩，请先释放固定组合", 409)
+            return None, (f"{target_machine['name']} 仅能容纳一人游玩，请先解除固定组合。", 409)
         payload["target_machine_id"] = target_machine_id
         payload["target_machine_stable_id"] = target_machine_stable_id
     elif operation == "CHANGE_PLAY_PREFERENCE":
         if machine_capacity(source_machine) == 1:
-            return None, (f"{source_machine['name']}仅能容纳一人游玩，不能修改游玩偏好", 409)
+            return None, (f"{source_machine['name']} 仅能容纳一人游玩，不能更改游玩偏好。", 409)
         if preference not in PREFERENCES:
-            return None, ("请选择本次游玩偏好", 400)
+            return None, ("请选择本次游玩偏好。", 400)
         payload["preference"] = preference
+    elif operation == "SET_PAIRED_MACHINE_QUEUEING":
+        # Only a terminal that knows the feature reports a paired machine, so this also keeps
+        # the command away from terminals that could not execute it.
+        if source_machine.get("paired_machine_id") is None:
+            return None, ("系统规则不允许自动在两台机台之间安排登记。", 409)
+        if also_queues_at_paired_machine and registration.get("fixed_pair"):
+            return None, ("固定组合只能在当前机台游玩。", 409)
+        payload["also_queues_at_paired_machine"] = bool(also_queues_at_paired_machine)
     elif operation != "LEAVE_QUEUE":
-        return None, ("不支持这项排队操作", 400)
+        return None, ("不支持这项排队操作。", 400)
 
     payload.update(
         {
@@ -8863,13 +9126,7 @@ def build_queue_operation_payload(
             "machine_id": context["machine_id"],
             "expected_position": context["position"],
             "expected_fixed_pair_id": registration.get("fixed_pair_id"),
-            "expected_absence_status": (
-                "DEFER_ONE_ROUND"
-                if registration.get("deferred_once", False)
-                else "TEMPORARILY_AWAY"
-                if registration.get("temporarily_away", False)
-                else "NONE"
-            ),
+            "expected_absence_status": registration_absence_status(registration),
             "expected_temporary_away_skipped_turns": registration.get(
                 "temporary_away_skipped_turns", 0
             ),
@@ -8879,11 +9136,90 @@ def build_queue_operation_payload(
     return payload, None
 
 
+def registration_absence_status(registration: dict[str, Any]) -> str:
+    """The absence state of a registration as requests confirm it (ABSENCE_STATUSES)."""
+    if registration.get("deferred_once", False):
+        return "DEFER_ONE_ROUND"
+    if registration.get("skips_one_turn", False):
+        return "SKIP_ONE_TURN"
+    if registration.get("temporarily_away", False):
+        return "TEMPORARILY_AWAY"
+    return "NONE"
+
+
+def mark_paired_machine_queueing_introduced(
+    connection: sqlite3.Connection, profile_scope_id: str, profile_id: str
+) -> None:
+    """Notes that the player of this profile has been shown the explanation.
+
+    The website and the phone page show it the first time the tick box is turned on for a
+    profile. Where the request can only come from the player, that is from a signed-in
+    account or from a phone that scanned the code on the terminal, the server records it
+    when it accepts the request, so that the pages do not show it again before the terminal
+    has reported the same. An online join that only names a QQ number can be sent by
+    anybody; it is recorded once the terminal reports that it carried the request out.
+    Requests of the Bot and of the management app show nothing and therefore record
+    nothing. Once set it stays set.
+    """
+    connection.execute(
+        """
+        UPDATE player_profile
+        SET paired_machine_queueing_introduced = 1
+        WHERE device_id = ? AND profile_id = ?
+          AND paired_machine_queueing_introduced = 0
+        """,
+        (profile_scope_id, profile_id),
+    )
+
+
+def record_explanation_shown_for_applied_command(
+    connection: sqlite3.Connection, command: sqlite3.Row
+) -> None:
+    """Records the explanation for a website request the terminal has carried out.
+
+    See mark_paired_machine_queueing_introduced. A request the terminal refuses, or never
+    answers, leaves the profile as it was.
+    """
+    payload = json.loads(command["payload"])
+    profile_id = payload.get("profile_id")
+    if (
+        payload.get("operation_source") != "WEBSITE_REMOTE"
+        or payload.get("also_queues_at_paired_machine") is not True
+        or payload.get("operation") not in {"JOIN_QUEUE", "SET_PAIRED_MACHINE_QUEUEING"}
+        or not isinstance(profile_id, str)
+    ):
+        return
+    # The command was made for the data set of the snapshot it was checked against: the
+    # test data of a terminal keep their own profiles.
+    queue_storage_id = payload.get("_queue_storage_id")
+    device_id = command["device_id"]
+    profile_scope_id = current_app.config["PROFILE_SCOPE_ID"]
+    if isinstance(queue_storage_id, str) and queue_storage_id.startswith(f"test:{device_id}:"):
+        profile_scope_id = f"{profile_scope_id}:test:{device_id}"
+    mark_paired_machine_queueing_introduced(connection, profile_scope_id, profile_id)
+
+
+def paired_machine_queueing_available(snapshot: Any) -> bool:
+    """
+    Whether the venue currently has a pair of machines between which the system may arrange
+    registrations. The phone page offers the tick box for that only where this is true.
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    machines = snapshot.get("machines")
+    if not isinstance(machines, dict):
+        return False
+    return any(
+        isinstance(machine, dict) and machine.get("paired_machine_id") is not None
+        for machine in machines.values()
+    )
+
+
 def read_website_command(command_id: str):
     try:
         command_id = str(UUID(command_id))
     except ValueError:
-        return jsonify({"ok": False, "error": "命令编号无效"}), 400
+        return jsonify({"ok": False, "error": "命令编号无效。"}), 400
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         expire_pending_commands(connection, int(time.time()))
@@ -8892,10 +9228,10 @@ def read_website_command(command_id: str):
         ).fetchone()
         connection.commit()
     if row is None:
-        return jsonify({"ok": False, "error": "没有找到这条命令"}), 404
+        return jsonify({"ok": False, "error": "没有找到这条命令。"}), 404
     payload = json.loads(row["payload"])
     if payload.get("operation_source") != "WEBSITE_REMOTE":
-        return jsonify({"ok": False, "error": "没有找到这条命令"}), 404
+        return jsonify({"ok": False, "error": "没有找到这条命令。"}), 404
     request_identity = payload.get("_request")
     account_profile_id = (
         request_identity.get("actor_profile_id")
@@ -8908,7 +9244,7 @@ def read_website_command(command_id: str):
         with open_database() as connection:
             current = current_player_account_session(connection)
         if current is None or current[1]["profile_id"] != account_profile_id:
-            return jsonify({"ok": False, "error": "没有找到这条命令"}), 404
+            return jsonify({"ok": False, "error": "没有找到这条命令。"}), 404
     command = serialize_command(row)
     command.pop("payload", None)
     return jsonify(command)
@@ -8942,7 +9278,7 @@ def create_mobile_registration_session():
         queue_id = read_uuid(source, "queue_id")
         machine_id = read_optional_machine_id(source, "machine_id")
         if machine_id is None:
-            raise ValidationError("machine_id 机台编号无效")
+            raise ValidationError("machine_id 机台编号无效。")
         machine_stable_id = (
             read_machine_internal_id(source, "machine_stable_id")
             if "machine_stable_id" in source
@@ -8955,7 +9291,7 @@ def create_mobile_registration_session():
         return jsonify(
             {
                 "ok": False,
-                "error": "服务端尚未配置公开网站地址，暂不能生成移动设备登记二维码",
+                "error": "服务端尚未配置公开网站地址，暂不能生成移动设备登记二维码。",
             }
         ), 503
 
@@ -8979,7 +9315,7 @@ def create_mobile_registration_session():
                     and existing["machine_stable_id"] != machine_stable_id
                 )
             ):
-                return jsonify({"ok": False, "error": "request_id 已用于其他登记会话"}), 409
+                return jsonify({"ok": False, "error": "request_id 已用于其他登记会话。"}), 409
             connection.commit()
             return jsonify(serialize_mobile_session(existing)), 200
 
@@ -8987,27 +9323,27 @@ def create_mobile_registration_session():
             "SELECT queue_id, device_id, payload, received_at FROM queue_snapshot WHERE id = 1"
         ).fetchone()
         if snapshot_row is None:
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         if not snapshot_is_online(snapshot_row):
             return jsonify(
-                {"ok": False, "error": "现场终端暂时离线，暂不能使用移动设备登记"}
+                {"ok": False, "error": "现场终端暂时离线，暂不能使用移动设备登记。"}
             ), 503
         if snapshot_row["device_id"] != device_id:
-            return jsonify({"ok": False, "error": "当前终端不是正在同步的终端"}), 409
+            return jsonify({"ok": False, "error": "当前终端不是正在同步的终端。"}), 409
         if snapshot_row["queue_id"] != queue_id:
-            return jsonify({"ok": False, "error": "排队批次已经变化，请重新打开登记页面"}), 409
+            return jsonify({"ok": False, "error": "排队批次已经变化，请重新打开移动设备登记。"}), 409
         snapshot = json.loads(snapshot_row["payload"])
         if not snapshot.get("website_remote_enabled", False):
-            return jsonify({"ok": False, "error": "与服务端同步已关闭，暂不能使用移动设备登记"}), 409
+            return jsonify({"ok": False, "error": "与服务端同步已关闭，暂不能使用移动设备登记。"}), 409
         if snapshot_in_closing_grace(snapshot):
-            return jsonify({"ok": False, "error": "闭店收尾期间不再接收新的排队登记"}), 409
+            return jsonify({"ok": False, "error": "闭店收尾期间不再接收新的排队登记。"}), 409
         if not online_registration_allowed(snapshot):
-            return jsonify({"ok": False, "error": "现场规则暂不允许线上登记"}), 409
+            return jsonify({"ok": False, "error": "系统规则不允许线上登记。"}), 409
         if not snapshot.get("registration_open", True):
-            return jsonify({"ok": False, "error": "现场当前没有使用登记排队"}), 409
+            return jsonify({"ok": False, "error": "现场当前未使用登记排队。"}), 409
         machine = snapshot.get("machines", {}).get(machine_id)
         if machine is None:
-            return jsonify({"ok": False, "error": "所选机台不存在"}), 404
+            return jsonify({"ok": False, "error": "所选机台不存在。"}), 404
         current_machine_stable_id = machine.get("stable_id") or default_machine_stable_id(
             machine_id
         )
@@ -9015,11 +9351,11 @@ def create_mobile_registration_session():
             machine_stable_id is not None
             and machine_stable_id != current_machine_stable_id
         ):
-            return jsonify({"ok": False, "error": "所选机台已经变化，请重新打开登记页面"}), 409
+            return jsonify({"ok": False, "error": "所选机台已经变化，请重新打开登记页面。"}), 409
         if not machine.get("operational", False):
-            return jsonify({"ok": False, "error": f"{machine['name']}已停止使用"}), 409
+            return jsonify({"ok": False, "error": f"{machine['name']} 已停止使用。"}), 409
         if machine.get("registration_count", 0) >= MAX_REGISTRATIONS_PER_MACHINE:
-            return jsonify({"ok": False, "error": f"{machine['name']}的登记已满"}), 409
+            return jsonify({"ok": False, "error": f"{machine['name']} 的登记已满。"}), 409
 
         session_token = secrets.token_urlsafe(32)
         connection.execute(
@@ -9087,33 +9423,33 @@ def validate_open_mobile_session(
             "SESSION_INVALIDATED",
         )
     if session["status"] != "OPEN":
-        return "这次移动设备登记已经提交", 409, "SESSION_SUBMITTED"
+        return "这次移动设备登记已经提交。", 409, "SESSION_SUBMITTED"
     if session["expires_at"] <= now:
-        return "移动设备登记二维码已过期，请在终端重新打开", 410, "SESSION_EXPIRED"
+        return "移动设备登记二维码已过期，请在终端重新打开移动设备登记。", 410, "SESSION_EXPIRED"
     snapshot_row = connection.execute(
         "SELECT queue_id, device_id, payload, received_at FROM queue_snapshot WHERE id = 1"
     ).fetchone()
     if snapshot_row is None:
-        return "排队终端暂未同步", 404, "TERMINAL_NOT_READY"
+        return "排队终端暂未同步。", 404, "TERMINAL_NOT_READY"
     if (
         snapshot_row["queue_id"] != session["queue_id"]
         or snapshot_row["device_id"] != session["device_id"]
     ):
-        return "这次移动设备登记已经失效，请在终端重新打开", 409, "SESSION_STALE"
+        return "这次移动设备登记已经失效，请在终端重新打开。", 409, "SESSION_STALE"
     if not snapshot_is_online(snapshot_row):
-        return "现场终端暂时离线，请稍后重试", 503, "TERMINAL_OFFLINE"
+        return "现场终端暂时离线，请稍后重试。", 503, "TERMINAL_OFFLINE"
     snapshot = json.loads(snapshot_row["payload"])
     if not snapshot.get("website_remote_enabled", False):
-        return "与服务端同步已关闭，暂不能使用移动设备登记", 503, "WEBSITE_SYNC_DISABLED"
+        return "与服务端同步已关闭，暂不能使用移动设备登记。", 503, "WEBSITE_SYNC_DISABLED"
     if snapshot_in_closing_grace(snapshot):
-        return "闭店收尾期间不再接收新的排队登记", 409, "REGISTRATION_CLOSED"
+        return "闭店收尾期间不再接收新的排队登记。", 409, "REGISTRATION_CLOSED"
     if not online_registration_allowed(snapshot):
-        return "现场规则暂不允许线上登记", 409, "ONLINE_REGISTRATION_DISABLED"
+        return "系统规则不允许线上登记。", 409, "ONLINE_REGISTRATION_DISABLED"
     if not snapshot.get("registration_open", True):
-        return "现场当前没有使用登记排队", 409, "REGISTRATION_CLOSED"
+        return "现场当前未使用登记排队。", 409, "REGISTRATION_CLOSED"
     machine = snapshot.get("machines", {}).get(session["machine_id"])
     if machine is None:
-        return "目标机台已经不存在", 409, "MACHINE_NOT_FOUND"
+        return "目标机台已经不存在。", 409, "MACHINE_NOT_FOUND"
     current_machine_stable_id = machine.get("stable_id") or default_machine_stable_id(
         session["machine_id"]
     )
@@ -9121,18 +9457,18 @@ def validate_open_mobile_session(
         session["machine_stable_id"] is not None
         and session["machine_stable_id"] != current_machine_stable_id
     ):
-        return "目标机台已经变化，请在终端重新打开", 409, "MACHINE_CHANGED"
+        return "目标机台已经变化，请在终端重新打开移动设备登记。", 409, "MACHINE_CHANGED"
     if not machine.get("operational", False):
-        return f"{machine['name']}已停止使用", 409, "MACHINE_STOPPED"
+        return f"{machine['name']}已停止使用。", 409, "MACHINE_STOPPED"
     if machine.get("registration_count", 0) >= MAX_REGISTRATIONS_PER_MACHINE:
-        return f"{machine['name']}的登记已满", 409, "MACHINE_FULL"
+        return f"{machine['name']}的登记已满。", 409, "MACHINE_FULL"
     return snapshot_row, snapshot, machine
 
 
 def read_mobile_registration_session(session_token: str):
     query = request.args.get("q", "").strip()
     if len(query) > 32:
-        return jsonify({"ok": False, "error": "搜索内容过长"}), 400
+        return jsonify({"ok": False, "error": "搜索内容过长。"}), 400
     now = int(time.time())
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -9140,7 +9476,7 @@ def read_mobile_registration_session(session_token: str):
         session = find_mobile_session(connection, session_token)
         if session is None:
             connection.commit()
-            return jsonify({"ok": False, "error": "没有找到这次移动设备登记"}), 404
+            return jsonify({"ok": False, "error": "没有找到这次移动设备登记。"}), 404
         validation = validate_open_mobile_session(connection, session, now)
         if isinstance(validation[0], str):
             detail, status_code, code = validation
@@ -9156,7 +9492,8 @@ def read_mobile_registration_session(session_token: str):
                    notification_enabled, notify_queue_changes,
                    notify_playing_position, notify_online_check_in,
                    notify_absence, notify_machine_status, setup_version,
-                   profile_revision, public_player_id, received_at
+                   profile_revision, public_player_id,
+                   paired_machine_queueing_introduced, received_at
             FROM player_profile
             WHERE device_id = ?
             ORDER BY usage_count DESC, COALESCE(last_used_at, 0) DESC,
@@ -9226,6 +9563,10 @@ def read_mobile_registration_session(session_token: str):
                 "machine_configuration": machine.get("configuration")
                 or default_machine_configuration(machine),
                 "expires_at": session["expires_at"] * 1000,
+                **mobile_session_paired_machine(snapshot, machine),
+                "paired_machine_queueing_available": paired_machine_queueing_available(
+                    snapshot
+                ),
             },
             "profiles": [
                 serialize_mobile_profile(
@@ -9246,6 +9587,20 @@ def read_mobile_registration_session(session_token: str):
             },
         }
     )
+
+
+def mobile_session_paired_machine(
+    snapshot: dict[str, Any], machine: dict[str, Any]
+) -> dict[str, Any]:
+    """The machine paired with the session's machine, for the choice to queue at both."""
+    paired_machine_id = machine.get("paired_machine_id")
+    paired_machine = snapshot.get("machines", {}).get(paired_machine_id or "")
+    if paired_machine is None:
+        return {"paired_machine_id": None, "paired_machine_name": None}
+    return {
+        "paired_machine_id": paired_machine_id,
+        "paired_machine_name": paired_machine["name"],
+    }
 
 
 def serialize_mobile_profile(
@@ -9274,6 +9629,10 @@ def serialize_mobile_profile(
         "last_used_at": profile["last_used_at"],
         "setup_complete": bool(profile["setup_version"] >= 1 and profile["qq_number"]),
         "profile_revision": profile["profile_revision"],
+        "paired_machine_queueing_introduced": (
+            "paired_machine_queueing_introduced" in profile.keys()
+            and bool(profile["paired_machine_queueing_introduced"])
+        ),
     }
 
 
@@ -9338,14 +9697,14 @@ def normalize_mobile_profile_settings(
     existing_qq: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(source, dict):
-        raise ValidationError("玩家资料设置不完整")
+        raise ValidationError("玩家资料设置不完整。")
     required = {"qq_visibility", *NOTIFICATION_FIELDS}
     if require_identity_fields:
         required.update({"nickname", "gender", "default_preference", "qq_number"})
     elif existing_qq is None:
         required.add("qq_number")
     if set(source) != required:
-        raise ValidationError("请确认并保存全部玩家资料设置")
+        raise ValidationError("请确认并保存全部玩家资料设置。")
 
     settings = {
         "qq_visibility": read_choice(source, "qq_visibility", QQ_VISIBILITIES),
@@ -9374,18 +9733,18 @@ def resolve_mobile_registration_preference(
     default_preference: str, requested_preference: Any
 ) -> str:
     if default_preference == "ASK_EVERY_TIME":
-        if requested_preference not in PREFERENCES:
-            raise ValidationError("请选择本次游玩偏好")
+        if not isinstance(requested_preference, str) or requested_preference not in PREFERENCES:
+            raise ValidationError("请选择本次游玩偏好。")
         return requested_preference
     if requested_preference is not None and requested_preference != default_preference:
-        raise ValidationError("玩家资料的默认游玩偏好已经变化，请重新确认")
+        raise ValidationError("玩家资料的默认游玩偏好已经变化，请重新确认。")
     return default_preference
 
 
 def submit_mobile_registration_session(session_token: str):
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     allowed_fields = {
         "request_id",
         "profile_id",
@@ -9393,17 +9752,24 @@ def submit_mobile_registration_session(session_token: str):
         "profile_completion",
         "new_profile",
         "preference",
+        "also_queues_at_paired_machine",
     }
     if set(source) - allowed_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的移动设备登记字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的移动设备登记字段。"}), 400
     try:
         command_id = read_uuid(source, "request_id")
+        # None when the page did not ask, as with a client older than the feature.
+        also_queues_at_paired_machine = (
+            read_boolean(source, "also_queues_at_paired_machine")
+            if "also_queues_at_paired_machine" in source
+            else None
+        )
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
     profile_id_value = source.get("profile_id")
     new_profile_source = source.get("new_profile")
     if (profile_id_value is None) == (new_profile_source is None):
-        return jsonify({"ok": False, "error": "请选择一份玩家资料或新建资料"}), 400
+        return jsonify({"ok": False, "error": "请选择一份玩家资料或创建资料。"}), 400
 
     now = int(time.time())
     with open_database() as connection:
@@ -9413,11 +9779,11 @@ def submit_mobile_registration_session(session_token: str):
         session = find_mobile_session(connection, session_token)
         if session is None:
             connection.commit()
-            return jsonify({"ok": False, "error": "没有找到这次移动设备登记"}), 404
+            return jsonify({"ok": False, "error": "没有找到这次移动设备登记。"}), 404
         if session["status"] == "SUBMITTED":
             if session["command_id"] != command_id:
                 connection.commit()
-                return jsonify({"ok": False, "error": "这次移动设备登记已经提交"}), 409
+                return jsonify({"ok": False, "error": "这次移动设备登记已经提交。"}), 409
             command = connection.execute(
                 "SELECT * FROM terminal_command WHERE command_id = ?",
                 (command_id,),
@@ -9451,7 +9817,7 @@ def submit_mobile_registration_session(session_token: str):
         ).fetchone()
         if existing_command is not None:
             return jsonify(
-                {"ok": False, "code": "REQUEST_ID_CONFLICT", "error": "request_id 已用于其他命令"}
+                {"ok": False, "code": "REQUEST_ID_CONFLICT", "error": "request_id 已用于其他命令。"}
             ), 409
 
         try:
@@ -9477,7 +9843,7 @@ def submit_mobile_registration_session(session_token: str):
                         {
                             "ok": False,
                             "code": "PROFILE_NOT_FOUND",
-                            "error": "这份玩家资料已经不存在",
+                            "error": "这份玩家资料已经不存在。",
                         }
                     ), 404
                 expected_revision = read_integer(
@@ -9491,7 +9857,7 @@ def submit_mobile_registration_session(session_token: str):
                         {
                             "ok": False,
                             "code": "PROFILE_UPDATED",
-                            "error": "玩家资料已经更新，请重新选择后再提交",
+                            "error": "玩家资料已经更新，请重新选择后再提交。",
                         }
                     ), 409
                 completion_source = source.get("profile_completion")
@@ -9500,7 +9866,7 @@ def submit_mobile_registration_session(session_token: str):
                 )
                 if profile_is_complete:
                     if completion_source is not None:
-                        raise ValidationError("完整玩家资料不能在此页面编辑")
+                        raise ValidationError("完整玩家资料不能在此页面编辑。")
                     profile_settings = None
                     actor_qq = profile["qq_number"]
                 else:
@@ -9526,9 +9892,9 @@ def submit_mobile_registration_session(session_token: str):
                 }
             else:
                 if source.get("profile_completion") is not None:
-                    raise ValidationError("新建资料不能同时提交补全资料内容")
+                    raise ValidationError("创建资料不能同时提交补全资料内容。")
                 if source.get("expected_profile_revision") is not None:
-                    raise ValidationError("新建资料不能包含旧资料版本")
+                    raise ValidationError("创建资料不能包含旧资料版本。")
                 profile_settings = normalize_mobile_profile_settings(
                     new_profile_source,
                     require_identity_fields=True,
@@ -9553,9 +9919,21 @@ def submit_mobile_registration_session(session_token: str):
                 {
                     "ok": False,
                     "code": "PROFILE_SETTINGS_INVALID",
-                    "error": str(error) or "玩家资料编号无效",
+                    "error": str(error) or "玩家资料编号无效。",
                 }
             ), 400
+
+        if also_queues_at_paired_machine is not None:
+            # The tick box on the page decides for this registration alone; a profile
+            # carries no setting for it.
+            if machine.get("paired_machine_id") is None:
+                return jsonify(
+                    {
+                        "ok": False,
+                        "code": "PAIRED_MACHINE_QUEUE_UNAVAILABLE",
+                        "error": f"{machine['name']}不属于一对机台，不能在两台机台之间安排登记。",
+                    }
+                ), 409
 
         duplicates = connection.execute(
             """
@@ -9594,9 +9972,9 @@ def submit_mobile_registration_session(session_token: str):
                         else "NICKNAME_ALREADY_USED"
                     ),
                     "error": (
-                        "这个 QQ 已经关联其他玩家资料"
+                        "这个 QQ 已经关联其他玩家资料。"
                         if duplicate_qq
-                        else "这个昵称已经用于其他玩家资料"
+                        else "这个昵称已经用于其他玩家资料。"
                     ),
                 }
             ), 409
@@ -9617,7 +9995,7 @@ def submit_mobile_registration_session(session_token: str):
                 {
                     "ok": False,
                     "code": "PLAYER_ALREADY_REGISTERED",
-                    "error": "这名玩家已经有一份正在排队的登记",
+                    "error": "这名玩家已经有一份正在排队的登记。",
                 }
             ), 409
         if any(
@@ -9629,7 +10007,7 @@ def submit_mobile_registration_session(session_token: str):
                 {
                     "ok": False,
                     "code": "NICKNAME_IN_QUEUE",
-                    "error": "这个昵称已经用于当前队列中的其他登记",
+                    "error": "这个昵称已经用于当前队列中的其他登记。",
                 }
             ), 409
         if recently_applied_join_waiting_for_snapshot(
@@ -9658,7 +10036,7 @@ def submit_mobile_registration_session(session_token: str):
                 {
                     "ok": False,
                     "code": "PLAYER_OPERATION_PENDING",
-                    "error": "这名玩家已有一项操作等待终端处理",
+                    "error": "这名玩家已有一项操作正在等待终端处理。",
                 }
             ), 409
 
@@ -9676,6 +10054,13 @@ def submit_mobile_registration_session(session_token: str):
             "session_id": session["session_id"],
             "profile": command_profile,
         }
+        if also_queues_at_paired_machine is not None:
+            payload["also_queues_at_paired_machine"] = also_queues_at_paired_machine
+        if also_queues_at_paired_machine is True and profile_id_value is not None:
+            # The phone page showed the explanation before the player could send this. A
+            # profile that this very command creates does not exist here yet; the terminal
+            # reports it together with the profile.
+            mark_paired_machine_queueing_introduced(connection, profile_scope_id, profile_id)
         connection.execute(
             """
             INSERT INTO terminal_command
@@ -9743,7 +10128,7 @@ def read_mobile_registration_result(session_token: str):
         session = find_mobile_session(connection, session_token)
         if session is None:
             connection.commit()
-            return jsonify({"ok": False, "error": "没有找到这次移动设备登记"}), 404
+            return jsonify({"ok": False, "error": "没有找到这次移动设备登记。"}), 404
         if session["status"] == "INVALIDATED":
             connection.commit()
             return jsonify(
@@ -9760,7 +10145,7 @@ def read_mobile_registration_result(session_token: str):
                     {
                         "ok": False,
                         "code": "SESSION_EXPIRED",
-                        "error": "移动设备登记二维码已过期，请在终端重新打开",
+                        "error": "移动设备登记二维码已过期，请在终端重新打开。",
                     }
                 ), 410
             return jsonify({"status": "OPEN", "session_id": session["session_id"]})
@@ -9786,7 +10171,8 @@ def find_player_profile_by_id(
                notify_absence, notify_machine_status, setup_version,
                profile_revision, created_at, profile_updated_at,
                public_player_id, web_account_bound, terminal_editing_allowed,
-               visited_venues_public, web_profile_revision, received_at
+               visited_venues_public, web_profile_revision,
+               paired_machine_queueing_introduced, received_at
         FROM player_profile
         WHERE device_id = ? AND profile_id = ?
         """,
@@ -9806,7 +10192,8 @@ def find_player_profile_by_qq(connection: sqlite3.Connection, qq_number: str):
                notify_absence, notify_machine_status, setup_version,
                profile_revision, created_at, profile_updated_at,
                public_player_id, web_account_bound, terminal_editing_allowed,
-               visited_venues_public, web_profile_revision, received_at
+               visited_venues_public, web_profile_revision,
+               paired_machine_queueing_introduced, received_at
         FROM player_profile
         WHERE device_id = ?
         """,
@@ -9876,6 +10263,10 @@ def serialize_player_profile(profile: sqlite3.Row) -> dict[str, Any]:
         "terminal_editing_allowed": bool(profile["terminal_editing_allowed"]),
         "visited_venues_public": bool(profile["visited_venues_public"]),
         "web_profile_revision": profile["web_profile_revision"],
+        "paired_machine_queueing_introduced": (
+            "paired_machine_queueing_introduced" in profile.keys()
+            and bool(profile["paired_machine_queueing_introduced"])
+        ),
     }
 
 def find_qq_registration_contexts(
@@ -9959,6 +10350,8 @@ def serialize_remote_machine(machine_id: str, machine: dict[str, Any]) -> dict[s
         "capacity": machine_capacity(machine),
         "available": unavailable_reason is None,
         "unavailable_reason": unavailable_reason,
+        # The other machine of the pair whose registrations may queue at both; null otherwise.
+        "paired_machine_id": machine.get("paired_machine_id"),
     }
 
 
@@ -9999,17 +10392,17 @@ def remote_operation_availability_error(
     operation: str,
 ):
     if not snapshot_is_online(snapshot_row):
-        return "现场终端暂时离线，暂不能执行远程排队操作", 503
+        return "现场终端暂时离线，暂不能执行远程排队操作。", 503
     if operation_source == "WEBSITE_REMOTE" and not snapshot.get(
         "website_remote_enabled", False
     ):
-        return "现场终端已关闭与服务端同步，暂不能在线操作", 503
+        return "现场终端已关闭与服务端同步，暂不能执行远程排队操作。", 503
     if operation_source == "QQ_BOT" and not snapshot.get("onebot_sync_enabled", True):
-        return "现场终端已关闭 QQ Bot 联动", 503
+        return "现场终端已关闭 QQ Bot 联动。", 503
     if operation == "JOIN_QUEUE" and snapshot_in_closing_grace(snapshot):
-        return "闭店收尾期间不再接收新的排队登记", 409
+        return "闭店收尾期间不再接收新的排队登记。", 409
     if operation == "JOIN_QUEUE" and not online_registration_allowed(snapshot):
-        return "现场规则暂不允许线上登记", 503
+        return "系统规则不允许线上登记。", 503
     return None
 
 
@@ -10018,7 +10411,7 @@ def read_optional_machine_id(source: dict[str, Any], key: str) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip() or len(value.strip()) > 8:
-        raise ValidationError(f"{key} 机台编号无效")
+        raise ValidationError(f"{key} 机台编号无效。")
     return value.strip().upper()
 
 
@@ -10029,10 +10422,10 @@ def create_profile_update_command(
     try:
         profile_id = str(UUID(profile_id))
     except ValueError:
-        return jsonify({"ok": False, "error": "玩家资料编号无效"}), 400
+        return jsonify({"ok": False, "error": "玩家资料编号无效。"}), 400
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     try:
         command_id = read_uuid(source, "request_id")
         actor_qq = (
@@ -10059,10 +10452,10 @@ def create_profile_update_command(
         allowed_update_fields.update({"terminal_editing_allowed", "visited_venues_public"})
     supplied_update_fields = allowed_update_fields.intersection(source)
     if not supplied_update_fields:
-        return jsonify({"ok": False, "error": "没有需要更新的玩家资料字段"}), 400
+        return jsonify({"ok": False, "error": "没有需要更新的玩家资料字段。"}), 400
     unknown_fields = set(source) - allowed_update_fields - {"request_id", "actor_qq"}
     if unknown_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的玩家资料字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的玩家资料字段。"}), 400
     try:
         requested_update = {}
         if "nickname" in source:
@@ -10092,7 +10485,7 @@ def create_profile_update_command(
         for key in ("terminal_editing_allowed", "visited_venues_public"):
             if key in source:
                 if not management_request:
-                    raise ValidationError("普通玩家命令不能修改终端敏感策略")
+                    raise ValidationError("QQ Bot 不能修改是否允许现场终端编辑资料和是否公开去过的机厅。")
                 requested_update[key] = read_boolean(source, key)
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
@@ -10113,7 +10506,7 @@ def create_profile_update_command(
             "SELECT device_id, payload, received_at FROM queue_snapshot WHERE id = 1"
         ).fetchone()
         if snapshot is None:
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         existing_command = connection.execute(
             "SELECT * FROM terminal_command WHERE command_id = ?", (command_id,)
         ).fetchone()
@@ -10123,19 +10516,19 @@ def create_profile_update_command(
                 existing_command["command_type"] != PROFILE_UPDATE_COMMAND
                 or existing_payload.get("_request") != request_identity
             ):
-                return jsonify({"ok": False, "error": "request_id 已用于其他命令"}), 409
+                return jsonify({"ok": False, "error": "request_id 已用于其他命令。"}), 409
             return jsonify(serialize_command(existing_command)), 200
 
         if not snapshot_is_online(snapshot):
             return jsonify(
-                {"ok": False, "error": "现场终端暂时离线，暂不能修改玩家资料"}
+                {"ok": False, "error": "现场终端暂时离线，暂不能修改玩家资料。"}
             ), 503
         snapshot_payload = json.loads(snapshot["payload"])
         if (
             not management_request
             and snapshot_payload.get("onebot_sync_enabled", True) is False
         ):
-            return jsonify({"ok": False, "error": "QQ Bot 联动已关闭"}), 503
+            return jsonify({"ok": False, "error": "QQ Bot 联动已关闭。"}), 503
 
         profile_scope_id = active_profile_scope_id(connection)
         profile = connection.execute(
@@ -10152,9 +10545,9 @@ def create_profile_update_command(
             (profile_scope_id, profile_id),
         ).fetchone()
         if profile is None:
-            return jsonify({"ok": False, "error": "没有找到这份玩家资料"}), 404
+            return jsonify({"ok": False, "error": "没有找到这份玩家资料。"}), 404
         if not management_request and profile["qq_number"] != actor_qq:
-            return jsonify({"ok": False, "error": "只能修改当前 QQ 对应的玩家资料"}), 403
+            return jsonify({"ok": False, "error": "只能修改当前 QQ 对应的玩家资料。"}), 403
 
         desired = {
             "profile_id": profile_id,
@@ -10220,7 +10613,7 @@ def create_profile_update_command(
             (profile_scope_id, profile_id, desired["nickname"]),
         ).fetchone()
         if duplicate_nickname is not None:
-            return jsonify({"ok": False, "error": "这个昵称已经用于其他玩家资料"}), 409
+            return jsonify({"ok": False, "error": "这个昵称已经用于其他玩家资料。"}), 409
 
         pending = connection.execute(
             """
@@ -10233,7 +10626,7 @@ def create_profile_update_command(
             (snapshot["device_id"], actor_qq, profile_id),
         ).fetchone()
         if pending is not None:
-            return jsonify({"ok": False, "error": "你已有一项操作正在等待终端处理"}), 409
+            return jsonify({"ok": False, "error": "已有一项操作正在等待终端处理。"}), 409
 
         connection.execute(
             """
@@ -10260,10 +10653,10 @@ def create_management_profile_delete_command(profile_id: str):
     try:
         profile_id = str(UUID(profile_id))
     except ValueError:
-        return jsonify({"ok": False, "error": "玩家资料编号无效"}), 400
+        return jsonify({"ok": False, "error": "玩家资料编号无效。"}), 400
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     allowed_fields = {
         "request_id",
         "expected_profile_revision",
@@ -10272,7 +10665,7 @@ def create_management_profile_delete_command(profile_id: str):
         "confirm",
     }
     if set(source) - allowed_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的删除资料字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的删除资料字段。"}), 400
     try:
         command_id = read_uuid(source, "request_id")
         expected_revision = read_integer(
@@ -10285,7 +10678,7 @@ def create_management_profile_delete_command(profile_id: str):
             "管理后台删除玩家资料"
         )
         if source.get("confirm") is not True:
-            raise ValidationError("必须明确确认删除玩家资料")
+            raise ValidationError("必须明确确认删除玩家资料。")
     except ValidationError as error:
         return jsonify(validation_error_payload(error)), 400
 
@@ -10311,7 +10704,7 @@ def create_management_profile_delete_command(profile_id: str):
                 or payload.get("_request") != request_identity
             ):
                 connection.rollback()
-                return jsonify({"ok": False, "error": "request_id 已用于其他命令"}), 409
+                return jsonify({"ok": False, "error": "request_id 已用于其他命令。"}), 409
             connection.commit()
             return jsonify(serialize_command(existing)), 200
 
@@ -10323,17 +10716,17 @@ def create_management_profile_delete_command(profile_id: str):
         ).fetchone()
         if snapshot_row is None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         if not snapshot_is_online(snapshot_row):
             connection.rollback()
-            return jsonify({"ok": False, "error": "现场终端暂时离线，不能删除玩家资料"}), 503
+            return jsonify({"ok": False, "error": "现场终端暂时离线，不能删除玩家资料。"}), 503
         snapshot = json.loads(snapshot_row["payload"])
         if not snapshot.get("management_policy_supported", False):
             connection.rollback()
-            return jsonify({"ok": False, "error": "当前现场终端不支持管理后台删除玩家资料"}), 409
+            return jsonify({"ok": False, "error": "当前现场终端不支持管理后台删除玩家资料。"}), 409
         if not snapshot.get("management_app_bound", False):
             connection.rollback()
-            return jsonify({"ok": False, "error": "请先绑定并接管现场终端设置"}), 409
+            return jsonify({"ok": False, "error": "请先绑定并接管现场终端设置。"}), 409
 
         queue_storage_id, profile_scope_id = snapshot_storage_context(snapshot_row, snapshot)
         profile = connection.execute(
@@ -10357,7 +10750,7 @@ def create_management_profile_delete_command(profile_id: str):
                 {
                     "ok": False,
                     "code": "PROFILE_ALREADY_DELETED" if tombstone else "PROFILE_NOT_FOUND",
-                    "error": "这份玩家资料已经删除" if tombstone else "没有找到这份玩家资料",
+                    "error": "这份玩家资料已经删除。" if tombstone else "没有找到这份玩家资料。",
                 }
             ), 404
         if (
@@ -10366,13 +10759,13 @@ def create_management_profile_delete_command(profile_id: str):
         ):
             connection.rollback()
             return jsonify(
-                {"ok": False, "code": "PROFILE_CONTEXT_CHANGED", "error": "玩家资料已经更新，请刷新后重试"}
+                {"ok": False, "code": "PROFILE_CONTEXT_CHANGED", "error": "玩家资料已经更新，请刷新后重试。"}
             ), 409
         if find_profile_registration_contexts(
             connection, queue_storage_id, snapshot, profile_id
         ):
             connection.rollback()
-            return jsonify({"ok": False, "error": "玩家资料仍有排队登记，请先处理登记后再删除"}), 409
+            return jsonify({"ok": False, "error": "玩家资料仍关联当前登记，请先退出排队或移除登记后再删除。"}), 409
         pending = connection.execute(
             """
             SELECT 1 FROM terminal_command
@@ -10384,7 +10777,7 @@ def create_management_profile_delete_command(profile_id: str):
         ).fetchone()
         if pending is not None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "这份玩家资料已有操作正在等待现场终端处理"}), 409
+            return jsonify({"ok": False, "error": "这份玩家资料已有操作正在等待现场终端处理。"}), 409
 
         payload = {
             "operation_source": "MANAGEMENT_APP",
@@ -10421,7 +10814,7 @@ def create_management_profile_delete_command(profile_id: str):
 def create_management_registration_command():
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     allowed_fields = {
         "request_id",
         "profile_id",
@@ -10433,7 +10826,7 @@ def create_management_registration_command():
         "reason",
     }
     if set(source) - allowed_fields:
-        return jsonify({"ok": False, "error": "请求包含不支持的新建登记字段"}), 400
+        return jsonify({"ok": False, "error": "请求包含不支持的创建登记字段。"}), 400
     try:
         command_id = read_uuid(source, "request_id")
         profile_id = str(UUID(read_string(source, "profile_id", maximum_length=36)))
@@ -10452,13 +10845,13 @@ def create_management_registration_command():
         )
         preference = read_optional_choice(source, "preference", PREFERENCES)
         reason = read_optional_string(source, "reason", maximum_length=200) or (
-            "管理后台新建登记"
+            "管理后台创建登记"
         )
     except (ValidationError, ValueError) as error:
-        detail = str(error) if isinstance(error, ValidationError) else "玩家资料编号无效"
+        detail = str(error) if isinstance(error, ValidationError) else "玩家资料编号无效。"
         return jsonify({"ok": False, "error": detail}), 400
     if expected_machine_id is None:
-        return jsonify({"ok": False, "error": "expected_machine_id 不能为空"}), 400
+        return jsonify({"ok": False, "error": "expected_machine_id 不能为空。"}), 400
 
     request_identity = {
         "operation_source": "MANAGEMENT_APP",
@@ -10485,7 +10878,7 @@ def create_management_registration_command():
                 or existing_payload.get("_request") != request_identity
             ):
                 connection.rollback()
-                return jsonify({"ok": False, "error": "request_id 已用于其他命令"}), 409
+                return jsonify({"ok": False, "error": "request_id 已用于其他命令。"}), 409
             connection.commit()
             return jsonify(serialize_command(existing_command)), 200
 
@@ -10497,36 +10890,36 @@ def create_management_registration_command():
         ).fetchone()
         if snapshot_row is None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "排队终端暂未同步"}), 404
+            return jsonify({"ok": False, "error": "排队终端暂未同步。"}), 404
         snapshot = json.loads(snapshot_row["payload"])
         if not snapshot_is_online(snapshot_row):
             connection.rollback()
-            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能新建登记"}), 503
+            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能创建登记。"}), 503
         if expected_queue_id != snapshot_row["queue_id"]:
             connection.rollback()
-            return jsonify({"ok": False, "error": "现场队列已经更新，请刷新后重试"}), 409
+            return jsonify({"ok": False, "error": "现场队列已经更新，请刷新后重试。"}), 409
         if expected_revision != snapshot.get("machine_configuration_revision", 1):
             connection.rollback()
-            return jsonify({"ok": False, "error": "现场机台配置已经更新，请刷新后重试"}), 409
+            return jsonify({"ok": False, "error": "现场机台配置已经更新，请刷新后重试。"}), 409
         if not snapshot.get("registration_open", True):
             connection.rollback()
-            return jsonify({"ok": False, "error": "现场当前已关闭登记"}), 409
+            return jsonify({"ok": False, "error": "现场当前未使用登记排队，暂不能创建登记。"}), 409
         machine = snapshot.get("machines", {}).get(expected_machine_id)
         if not isinstance(machine, dict):
             connection.rollback()
-            return jsonify({"ok": False, "error": "目标机台不存在"}), 409
+            return jsonify({"ok": False, "error": "目标机台不存在。"}), 409
         machine_stable_id = machine.get("stable_id") or default_machine_stable_id(
             expected_machine_id
         )
         if expected_machine_stable_id is not None and expected_machine_stable_id != machine_stable_id:
             connection.rollback()
-            return jsonify({"ok": False, "error": "目标机台已经变化，请刷新后重试"}), 409
+            return jsonify({"ok": False, "error": "目标机台已经变化，请刷新后重试。"}), 409
         if not machine.get("operational", False):
             connection.rollback()
-            return jsonify({"ok": False, "error": "目标机台已停止使用"}), 409
+            return jsonify({"ok": False, "error": "目标机台已停止使用。"}), 409
         if machine.get("registration_count", 0) >= MAX_REGISTRATIONS_PER_MACHINE:
             connection.rollback()
-            return jsonify({"ok": False, "error": "目标机台的登记已满"}), 409
+            return jsonify({"ok": False, "error": "目标机台的登记已满。"}), 409
 
         queue_storage_id, profile_scope_id = snapshot_storage_context(snapshot_row, snapshot)
         profile = connection.execute(
@@ -10538,25 +10931,25 @@ def create_management_registration_command():
         ).fetchone()
         if profile is None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "没有找到这份玩家资料"}), 404
+            return jsonify({"ok": False, "error": "没有找到这份玩家资料。"}), 404
         registration_contexts = find_profile_registration_contexts(
             connection, queue_storage_id, snapshot, profile_id
         )
         if registration_contexts:
             connection.rollback()
-            return jsonify({"ok": False, "error": "这名玩家已经有一份正在排队的登记"}), 409
+            return jsonify({"ok": False, "error": "这名玩家已经有一份正在排队的登记。"}), 409
         capacity = machine_capacity(machine)
         if capacity == 1:
             resolved_preference = "SOLO"
         elif profile["default_preference"] == "ASK_EVERY_TIME":
             if preference not in PREFERENCES:
                 connection.rollback()
-                return jsonify({"ok": False, "error": "请选择本次游玩偏好"}), 400
+                return jsonify({"ok": False, "error": "请选择本次游玩偏好。"}), 400
             resolved_preference = preference
         else:
             if preference is not None and preference != profile["default_preference"]:
                 connection.rollback()
-                return jsonify({"ok": False, "error": "玩家资料的默认游玩偏好已经变化"}), 409
+                return jsonify({"ok": False, "error": "玩家资料的默认游玩偏好已经变化。"}), 409
             resolved_preference = profile["default_preference"]
         pending = connection.execute(
             """
@@ -10569,7 +10962,7 @@ def create_management_registration_command():
         ).fetchone()
         if pending is not None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "这名玩家已有操作正在等待终端处理"}), 409
+            return jsonify({"ok": False, "error": "这名玩家已有一项操作正在等待终端处理。"}), 409
         payload = {
             "_queue_storage_id": queue_storage_id,
             "queue_id": snapshot_row["queue_id"],
@@ -10610,10 +11003,10 @@ def update_management_player_password(profile_id: str):
     try:
         profile_id = str(UUID(profile_id))
     except ValueError:
-        return jsonify({"ok": False, "error": "玩家资料编号无效"}), 400
+        return jsonify({"ok": False, "error": "玩家资料编号无效。"}), 400
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     try:
         new_password = validate_player_account_password(source.get("new_password"))
         confirmation = validate_player_account_password(
@@ -10643,7 +11036,7 @@ def update_management_player_password(profile_id: str):
         ).fetchone()
         if profile is None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "没有找到这份玩家资料"}), 404
+            return jsonify({"ok": False, "error": "没有找到这份玩家资料。"}), 404
         account = connection.execute(
             """
             SELECT * FROM player_account
@@ -10654,7 +11047,7 @@ def update_management_player_password(profile_id: str):
         if account is None or not profile["web_account_bound"]:
             connection.rollback()
             return jsonify(
-                {"ok": False, "error": "玩家尚未绑定网页后台，暂不能修改密码"}
+                {"ok": False, "error": "玩家尚未绑定网页后台，暂不能修改密码。"}
             ), 409
         salt = secrets.token_bytes(16)
         password_hash = hash_player_account_password(new_password, salt)
@@ -10689,7 +11082,7 @@ def read_bot_command(command_id: str):
     try:
         command_id = str(UUID(command_id))
     except ValueError:
-        return jsonify({"ok": False, "error": "命令编号无效"}), 400
+        return jsonify({"ok": False, "error": "命令编号无效。"}), 400
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         expire_pending_commands(connection, int(time.time()))
@@ -10698,7 +11091,7 @@ def read_bot_command(command_id: str):
         ).fetchone()
         connection.commit()
     if row is None:
-        return jsonify({"ok": False, "error": "没有找到这条命令"}), 404
+        return jsonify({"ok": False, "error": "没有找到这条命令。"}), 404
     return jsonify(serialize_command(row))
 
 
@@ -10877,16 +11270,16 @@ def complete_terminal_command(command_id: str):
     try:
         command_id = str(UUID(command_id))
     except ValueError:
-        return jsonify({"ok": False, "error": "命令编号无效"}), 400
+        return jsonify({"ok": False, "error": "命令编号无效。"}), 400
     source = request.get_json(silent=True)
     if not isinstance(source, dict):
-        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象"}), 400
+        return jsonify({"ok": False, "error": "请求内容必须是 JSON 对象。"}), 400
     status = source.get("status")
     detail = source.get("detail", "")
     if status not in {"APPLIED", "REJECTED"}:
-        return jsonify({"ok": False, "error": "命令结果状态无效"}), 400
+        return jsonify({"ok": False, "error": "命令结果状态无效。"}), 400
     if not isinstance(detail, str) or len(detail) > 500:
-        return jsonify({"ok": False, "error": "命令结果说明无效"}), 400
+        return jsonify({"ok": False, "error": "命令结果说明无效。"}), 400
     detail = detail.strip()
     result_registration_id = source.get("result_registration_id")
     if result_registration_id is not None:
@@ -10895,7 +11288,7 @@ def complete_terminal_command(command_id: str):
             or not isinstance(result_registration_id, str)
             or PUBLIC_ID_PATTERN.fullmatch(result_registration_id) is None
         ):
-            return jsonify({"ok": False, "error": "命令结果中的登记编号无效"}), 400
+            return jsonify({"ok": False, "error": "命令结果中的登记编号无效。"}), 400
     device_id = request.headers.get("X-Device-ID", "").strip()
     try:
         instance_id, instance_generation = read_terminal_instance_identity(device_id)
@@ -10909,10 +11302,10 @@ def complete_terminal_command(command_id: str):
             "SELECT * FROM terminal_command WHERE command_id = ?", (command_id,)
         ).fetchone()
         if row is None:
-            return jsonify({"ok": False, "error": "没有找到这条命令"}), 404
+            return jsonify({"ok": False, "error": "没有找到这条命令。"}), 404
         if row["device_id"] != device_id:
             connection.rollback()
-            return jsonify({"ok": False, "error": "此命令不属于当前终端"}), 403
+            return jsonify({"ok": False, "error": "此命令不属于当前终端。"}), 403
         current_terminal = connection.execute(
             """
             SELECT device_id, instance_id, instance_generation
@@ -10985,6 +11378,8 @@ def complete_terminal_command(command_id: str):
                     row,
                     deleted_at=int(time.time()),
                 )
+            if status == "APPLIED" and row["command_type"] == QUEUE_OPERATION_COMMAND:
+                record_explanation_shown_for_applied_command(connection, row)
             connection.commit()
             row = connection.execute(
                 "SELECT * FROM terminal_command WHERE command_id = ?", (command_id,)
@@ -11136,6 +11531,7 @@ def index_snapshot_registrations(snapshot: dict[str, Any]) -> dict[str, dict[str
                 "position": "PLAYING",
                 "position_index": None,
                 "estimated_wait_minutes": 0 if machine["operational"] else None,
+                "estimated_wait_uncertain": False,
                 **machine_context,
             }
         for waiting_position in machine.get("waiting_positions", []):
@@ -11152,6 +11548,11 @@ def index_snapshot_registrations(snapshot: dict[str, Any]) -> dict[str, dict[str
                     "estimated_wait_minutes": waiting_position[
                         "estimated_wait_minutes"
                     ],
+                    # Snapshots stored before the flag existed leave it out.
+                    "estimated_wait_uncertain": bool(
+                        waiting_position.get("estimated_wait_uncertain", False)
+                        and waiting_position["estimated_wait_minutes"] is not None
+                    ),
                     **machine_context,
                 }
     return indexed
@@ -11232,17 +11633,17 @@ def read_terminal_instance_identity(device_id: str) -> tuple[str, int]:
         # Terminals from before runtime-instance coordination use their stable device ID.
         return device_id, 0
     if not instance_id or not generation_source:
-        raise ValidationError("终端运行实例信息不完整")
+        raise ValidationError("终端运行实例信息不完整。")
     try:
         instance_id = str(UUID(instance_id))
     except ValueError as error:
-        raise ValidationError("终端运行实例编号无效") from error
+        raise ValidationError("终端运行实例编号无效。") from error
     try:
         instance_generation = int(generation_source)
     except ValueError as error:
-        raise ValidationError("终端运行实例代次无效") from error
+        raise ValidationError("终端运行实例代次无效。") from error
     if instance_generation < 1 or instance_generation > 2**63 - 1:
-        raise ValidationError("终端运行实例代次无效")
+        raise ValidationError("终端运行实例代次无效。")
     return instance_id, instance_generation
 
 
@@ -11263,7 +11664,7 @@ def terminal_instance_matches(
 def authorize_terminal():
     expected_token = configured_auth_token("SYNC_TOKEN", "BOT_TOKEN")
     if expected_token is None:
-        return jsonify({"ok": False, "error": "服务器鉴权配置无效"}), 503
+        return jsonify({"ok": False, "error": "服务器认证配置无效。"}), 503
 
     authorization = request.headers.get("Authorization", "")
     supplied_token = authorization[7:] if authorization.startswith("Bearer ") else ""
@@ -11272,12 +11673,12 @@ def authorize_terminal():
     except UnicodeEncodeError:
         supplied_token_bytes = b""
     if not hmac.compare_digest(supplied_token_bytes, expected_token):
-        return jsonify({"ok": False, "error": "终端认证失败"}), 401
+        return jsonify({"ok": False, "error": "终端认证失败，请核对终端同步令牌。"}), 401
 
     allowed_device_id = current_app.config["ALLOWED_DEVICE_ID"]
     supplied_device_id = request.headers.get("X-Device-ID", "").strip()
     if allowed_device_id and not hmac.compare_digest(supplied_device_id, allowed_device_id):
-        return jsonify({"ok": False, "error": "此终端未获准同步"}), 403
+        return jsonify({"ok": False, "error": "此终端未获准同步。"}), 403
     return None
 
 
@@ -11293,7 +11694,7 @@ def authorize_terminal_venue():
     try:
         schema_version = int(schema_header)
     except ValueError:
-        return jsonify({"ok": False, "error": "队列协议版本无效"}), 400
+        return jsonify({"ok": False, "error": "队列协议版本无效。"}), 400
     if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
         return jsonify({"ok": False, "error": "不支持的队列协议版本"}), 400
     if schema_version < 8:
@@ -11318,8 +11719,8 @@ def authorize_terminal_venue():
                 "ok": False,
                 "code": "VENUE_MISMATCH",
                 "error": (
-                    "终端绑定的机厅与当前服务器不一致。为防止读取或执行其他机厅的数据，"
-                    "私有资料和远程操作已暂停。"
+                    "终端绑定的机厅与当前服务器不一致。为防止读取其他机厅的数据或执行其他机厅的操作，"
+                    "私有资料和远程操作已暂停，请在设置中核对服务器与机厅。"
                 ),
             }
         ), 409
@@ -11329,7 +11730,7 @@ def authorize_terminal_venue():
 def authorize_bot():
     expected_token = configured_auth_token("BOT_TOKEN", "SYNC_TOKEN")
     if expected_token is None:
-        return jsonify({"ok": False, "error": "服务器鉴权配置无效"}), 503
+        return jsonify({"ok": False, "error": "服务器认证配置无效。"}), 503
 
     authorization = request.headers.get("Authorization", "")
     supplied_token = authorization[7:] if authorization.startswith("Bearer ") else ""
@@ -11338,7 +11739,7 @@ def authorize_bot():
     except UnicodeEncodeError:
         supplied_token_bytes = b""
     if not hmac.compare_digest(supplied_token_bytes, expected_token):
-        return jsonify({"ok": False, "error": "Bot 认证失败"}), 401
+        return jsonify({"ok": False, "error": "Bot 认证失败。"}), 401
     return None
 
 
@@ -11353,7 +11754,7 @@ def authorize_bot_link():
     if row is not None:
         snapshot = json.loads(row["payload"])
         if snapshot.get("onebot_sync_enabled", True) is False:
-            return jsonify({"ok": False, "error": "QQ Bot 联动已关闭"}), 503
+            return jsonify({"ok": False, "error": "QQ Bot 联动已关闭。"}), 503
     return None
 
 
@@ -11366,7 +11767,7 @@ def authorize_management():
     """
     expected_token = configured_management_auth_token()
     if expected_token is None:
-        return jsonify({"ok": False, "error": "管理后台鉴权配置无效"}), 503
+        return jsonify({"ok": False, "error": "管理后台鉴权配置无效。"}), 503
 
     authorization = request.headers.get("Authorization", "")
     supplied_token = authorization[7:] if authorization.startswith("Bearer ") else ""
@@ -11375,7 +11776,7 @@ def authorize_management():
     except UnicodeEncodeError:
         supplied_token_bytes = b""
     if not hmac.compare_digest(supplied_token_bytes, expected_token):
-        return jsonify({"ok": False, "error": "管理后台认证失败"}), 401
+        return jsonify({"ok": False, "error": "管理后台认证失败，请核对管理令牌。"}), 401
     return None
 
 
@@ -11445,10 +11846,10 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
     registration_open = read_boolean(payload, "registration_open")
     website_remote_enabled = payload.get("website_remote_enabled", False)
     if type(website_remote_enabled) is not bool:
-        raise ValidationError("website_remote_enabled 必须是布尔值")
+        raise ValidationError("website_remote_enabled 必须是布尔值。")
     onebot_sync_enabled = payload.get("onebot_sync_enabled", True)
     if type(onebot_sync_enabled) is not bool:
-        raise ValidationError("onebot_sync_enabled 必须是布尔值")
+        raise ValidationError("onebot_sync_enabled 必须是布尔值。")
     queue_rules = normalize_public_queue_rules(payload.get("queue_rules"))
     terminal_policy = normalize_terminal_policy(
         payload,
@@ -11459,7 +11860,7 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
     business_hours = normalize_public_business_hours(payload.get("business_hours"))
     terminal = payload.get("terminal")
     if not isinstance(terminal, dict):
-        raise ValidationError("terminal 必须是对象")
+        raise ValidationError("terminal 必须是对象。")
     app_version = read_optional_string(terminal, "app_version", maximum_length=32)
     terminal_name = (
         read_optional_string(terminal, "name", maximum_length=MAX_TERMINAL_NAME_CHARACTERS)
@@ -11470,13 +11871,13 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
 
     machines_source = payload.get("machines")
     if not isinstance(machines_source, dict):
-        raise ValidationError("machines 必须是对象")
+        raise ValidationError("machines 必须是对象。")
     configured_machine_ids = list(MACHINE_NAMES)[: len(machines_source)]
     if (
         not 1 <= len(machines_source) <= MAX_MACHINE_COUNT
         or set(machines_source) != set(configured_machine_ids)
     ):
-        raise ValidationError("机台必须按 A 至 J 的顺序连续配置 1 至 10 台")
+        raise ValidationError("机台必须按 A 至 J 的顺序连续配置 1 至 10 台。")
 
     machine_groups, default_machine_group_id = normalize_machine_groups(
         payload,
@@ -11497,17 +11898,21 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
     }
     stable_machine_ids = [machine["stable_id"] for machine in machines.values()]
     if len(stable_machine_ids) != len(set(stable_machine_ids)):
-        raise ValidationError("机台稳定标识不能重复")
+        raise ValidationError("机台稳定标识不能重复。")
     used_machine_group_ids = {machine["group_id"] for machine in machines.values()}
     if used_machine_group_ids != valid_machine_group_ids:
-        raise ValidationError("每个机台分组都必须至少包含一台机台")
+        raise ValidationError("每个机台分组都必须至少包含一台机台。")
     registration_ids = [
         registration["registration_id"]
         for machine in machines.values()
         for registration in all_machine_registrations(machine)
     ]
     if len(registration_ids) != len(set(registration_ids)):
-        raise ValidationError("登记公开编号不能重复")
+        raise ValidationError("登记公开编号不能重复。")
+    validate_paired_machines(machines)
+    paired_machine_queue_settings = normalize_snapshot_paired_machine_queue_settings(
+        payload.get("paired_machine_queue_settings"), machines
+    )
 
     recent_events = normalize_public_events(payload.get("recent_events", []))
     private_player_profiles = (
@@ -11557,6 +11962,7 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
         "machine_groups": machine_groups,
         "default_machine_group_id": default_machine_group_id,
         "machines": machines,
+        "paired_machine_queue_settings": paired_machine_queue_settings,
         "recent_events": recent_events,
         "private_player_contacts": private_player_contacts,
         "private_player_profiles": private_player_profiles,
@@ -11567,20 +11973,20 @@ def normalize_private_profiles(
     source: Any, *, schema_version: int
 ) -> list[dict[str, Any]]:
     if not isinstance(source, list):
-        raise ValidationError("private_player_profiles 必须是数组")
+        raise ValidationError("private_player_profiles 必须是数组。")
     if len(source) > MAX_PLAYER_PROFILES:
-        raise ValidationError("玩家资料数量超过限制")
+        raise ValidationError("玩家资料数量超过限制。")
 
     profiles = []
     for value in source:
         if not isinstance(value, dict):
-            raise ValidationError("private_player_profiles 包含无效资料")
+            raise ValidationError("private_player_profiles 包含无效资料。")
         qq_number = value.get("qq_number")
         if qq_number is not None and (
             not isinstance(qq_number, str)
             or QQ_NUMBER_PATTERN.fullmatch(qq_number) is None
         ):
-            raise ValidationError("玩家资料 QQ 号必须是 5 至 12 位数字")
+            raise ValidationError("玩家资料 QQ 号必须是 5 至 12 位数字。")
         if schema_version >= 5:
             qq_visibility = read_choice(value, "qq_visibility", QQ_VISIBILITIES)
             notification_enabled = read_boolean(value, "notification_enabled")
@@ -11618,7 +12024,7 @@ def normalize_private_profiles(
                     / f"{avatar_reference}.webp"
                 )
                 if not avatar_path.is_file():
-                    raise ValidationError("玩家资料头像不存在")
+                    raise ValidationError("玩家资料头像不存在。")
             web_account_bound = (
                 read_boolean(value, "web_account_bound")
                 if "web_account_bound" in value else False
@@ -11643,6 +12049,13 @@ def normalize_private_profiles(
             terminal_editing_allowed = True
             visited_venues_public = True
             web_profile_revision = 0
+        # Whether the player has been shown the explanation of letting the system arrange a
+        # registration between the two machines of a pair. The terminal sends it only when
+        # it is true, in every schema version.
+        paired_machine_queueing_introduced = (
+            read_boolean(value, "paired_machine_queueing_introduced")
+            if "paired_machine_queueing_introduced" in value else False
+        )
         last_used_at = read_optional_integer(value, "last_used_at", minimum=1)
         recent_usage_at = normalize_recent_usage_history(
             value.get("recent_usage_at") if "recent_usage_at" in value else None,
@@ -11677,6 +12090,7 @@ def normalize_private_profiles(
                 "terminal_editing_allowed": terminal_editing_allowed,
                 "visited_venues_public": visited_venues_public,
                 "web_profile_revision": web_profile_revision,
+                "paired_machine_queueing_introduced": paired_machine_queueing_introduced,
                 "legacy_revision": schema_version < 5,
                 "created_at": read_integer(value, "created_at", minimum=1),
                 "updated_at": read_integer(value, "updated_at", minimum=1),
@@ -11684,13 +12098,13 @@ def normalize_private_profiles(
         )
     profile_ids = [profile["profile_id"] for profile in profiles]
     if len(profile_ids) != len(set(profile_ids)):
-        raise ValidationError("玩家资料编号不能重复")
+        raise ValidationError("玩家资料编号不能重复。")
     nickname_keys = [profile["nickname"].casefold() for profile in profiles]
     if len(nickname_keys) != len(set(nickname_keys)):
-        raise ValidationError("玩家资料昵称不能重复")
+        raise ValidationError("玩家资料昵称不能重复。")
     qq_numbers = [profile["qq_number"] for profile in profiles if profile["qq_number"]]
     if len(qq_numbers) != len(set(qq_numbers)):
-        raise ValidationError("玩家资料 QQ 号不能重复")
+        raise ValidationError("玩家资料 QQ 号不能重复。")
     return profiles
 
 
@@ -11700,9 +12114,9 @@ def normalize_recent_usage_history(
     if source is None:
         return None
     if not isinstance(source, list):
-        raise ValidationError("玩家资料近期使用记录必须是数组")
+        raise ValidationError("玩家资料近期使用记录必须是数组。")
     if len(source) > MAX_RECENT_PLAYER_USAGE_EVENTS:
-        raise ValidationError("玩家资料近期使用记录数量超过限制")
+        raise ValidationError("玩家资料近期使用记录数量超过限制。")
     timestamps = [
         read_integer(
             {"used_at": value},
@@ -11760,7 +12174,7 @@ def normalize_submitted_venue(source: Any) -> dict[str, Any] | None:
     if source is None:
         return None
     if not isinstance(source, dict) or set(source) != {"id"}:
-        raise ValidationError("venue 必须只包含机厅 ID")
+        raise ValidationError("venue 必须只包含机厅 ID。")
     return {"id": read_uuid(source, "id")}
 
 
@@ -11769,7 +12183,7 @@ def read_optional_player_public_id(source: dict[str, Any], key: str) -> str | No
     if value is None:
         return None
     if not isinstance(value, str) or PLAYER_PUBLIC_ID_PATTERN.fullmatch(value) is None:
-        raise ValidationError("玩家编号必须是六位数字")
+        raise ValidationError("玩家编号必须是六位数字。")
     return value
 
 
@@ -11780,9 +12194,9 @@ def normalize_private_contacts(
     recent_events: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     if not isinstance(source, list):
-        raise ValidationError("private_player_contacts 必须是数组")
+        raise ValidationError("private_player_contacts 必须是数组。")
     if len(source) > MAX_PRIVATE_CONTACTS:
-        raise ValidationError("QQ 绑定数量超过限制")
+        raise ValidationError("QQ 绑定数量超过限制。")
 
     registrations = {
         registration["registration_id"]: registration
@@ -11798,20 +12212,20 @@ def normalize_private_contacts(
     contacts: list[dict[str, Any]] = []
     for value in source:
         if not isinstance(value, dict):
-            raise ValidationError("private_player_contacts 包含无效绑定")
+            raise ValidationError("private_player_contacts 包含无效绑定。")
         registration_id = read_public_id(value, "registration_id")
         profile_id = read_uuid(value, "profile_id")
         qq_number = value.get("qq_number")
         if not isinstance(qq_number, str) or QQ_NUMBER_PATTERN.fullmatch(qq_number) is None:
-            raise ValidationError("qq_number 必须是 5 至 12 位数字")
+            raise ValidationError("qq_number 必须是 5 至 12 位数字。")
         registration = registrations.get(registration_id)
         if registration is None and registration_id not in event_registration_ids:
-            raise ValidationError("QQ 绑定必须引用当前登记或最近事件中的登记")
+            raise ValidationError("QQ 绑定必须引用当前登记或最近事件中的登记。")
         if registration is not None and registration["registration_type"] != "PLAYER_PROFILE":
-            raise ValidationError("临时登记不能包含 QQ 绑定")
+            raise ValidationError("临时登记不能包含 QQ 绑定。")
         profile = profiles.get(profile_id)
         if profile is None or profile["qq_number"] != qq_number:
-            raise ValidationError("QQ 绑定与玩家资料不一致")
+            raise ValidationError("QQ 绑定与玩家资料不一致。")
         contacts.append(
             {
                 "registration_id": registration_id,
@@ -11823,14 +12237,14 @@ def normalize_private_contacts(
 
     registration_ids = [contact["registration_id"] for contact in contacts]
     if len(registration_ids) != len(set(registration_ids)):
-        raise ValidationError("QQ 绑定的登记编号不能重复")
+        raise ValidationError("QQ 绑定的登记编号不能重复。")
     current_profile_ids = [
         contact["profile_id"]
         for contact in contacts
         if contact["registration_id"] in registrations
     ]
     if len(current_profile_ids) != len(set(current_profile_ids)):
-        raise ValidationError("同一玩家资料不能关联多份当前登记")
+        raise ValidationError("同一玩家资料不能关联多份当前登记。")
     return contacts
 
 
@@ -11924,7 +12338,7 @@ def normalize_public_business_hours(source: Any) -> dict[str, Any]:
             "registration_closes_at": None,
         }
     if not isinstance(source, dict):
-        raise ValidationError("business_hours 必须是对象")
+        raise ValidationError("business_hours 必须是对象。")
     allowed_fields = {
         "enabled",
         "outside",
@@ -11934,7 +12348,7 @@ def normalize_public_business_hours(source: Any) -> dict[str, Any]:
         "registration_closes_at",
     }
     if set(source) - allowed_fields:
-        raise ValidationError("business_hours 包含不支持的字段")
+        raise ValidationError("business_hours 包含不支持的字段。")
     values = {
         "enabled": source.get("enabled", False),
         "outside": source.get("outside", False),
@@ -11942,15 +12356,15 @@ def normalize_public_business_hours(source: Any) -> dict[str, Any]:
         "closing_grace": source.get("closing_grace", False),
     }
     if any(type(value) is not bool for value in values.values()):
-        raise ValidationError("business_hours 状态必须是布尔值")
+        raise ValidationError("business_hours 状态必须是布尔值。")
     closes_at = source.get("closes_at")
     if closes_at is not None and (type(closes_at) is not int or closes_at < 1):
-        raise ValidationError("business_hours.closes_at 数值无效")
+        raise ValidationError("business_hours.closes_at 数值无效。")
     registration_closes_at = source.get("registration_closes_at")
     if registration_closes_at is not None and (
         type(registration_closes_at) is not int or registration_closes_at < 1
     ):
-        raise ValidationError("business_hours.registration_closes_at 数值无效")
+        raise ValidationError("business_hours.registration_closes_at 数值无效。")
     if not values["enabled"]:
         return {
             "enabled": False,
@@ -11961,11 +12375,11 @@ def normalize_public_business_hours(source: Any) -> dict[str, Any]:
             "registration_closes_at": None,
         }
     if values["outside"] and values["closing_soon"]:
-        raise ValidationError("非营业时间不能同时处于闭店提醒状态")
+        raise ValidationError("非营业时间不能同时处于闭店提醒状态。")
     if values["closing_grace"] and not values["outside"]:
-        raise ValidationError("营业时间内不能处于闭店收尾状态")
+        raise ValidationError("营业时间内不能处于闭店收尾状态。")
     if values["closing_grace"] != (registration_closes_at is not None):
-        raise ValidationError("闭店收尾状态与登记关闭时间不一致")
+        raise ValidationError("闭店收尾状态与登记关闭时间不一致。")
     return {
         **values,
         "closes_at": closes_at,
@@ -11976,18 +12390,18 @@ def normalize_public_business_hours(source: Any) -> dict[str, Any]:
 def normalize_venue_business_hours(source: Any) -> dict[str, Any]:
     """Validate the venue-owned weekly schedule, not its computed live state."""
     if not isinstance(source, dict):
-        raise ValidationError("营业时间配置必须是对象")
+        raise ValidationError("营业时间配置必须是对象。")
     allowed_fields = {"enabled", "use_weekly_schedule", "default_hours", "weekly_hours"}
     if set(source) - allowed_fields:
-        raise ValidationError("营业时间配置包含不支持的字段")
+        raise ValidationError("营业时间配置包含不支持的字段。")
     enabled = source.get("enabled", False)
     use_weekly = source.get("use_weekly_schedule", False)
     if type(enabled) is not bool or type(use_weekly) is not bool:
-        raise ValidationError("营业时间开关必须是布尔值")
+        raise ValidationError("营业时间开关必须是布尔值。")
 
     def normalize_daily(value: Any, field: str) -> dict[str, int]:
         if not isinstance(value, dict) or set(value) - {"opening_minutes", "closing_minutes"}:
-            raise ValidationError(f"{field} 必须包含开店和闭店分钟数")
+            raise ValidationError(f"{field} 必须包含开店和闭店分钟数。")
         opening = value.get("opening_minutes", 600)
         closing = value.get("closing_minutes", 1320)
         if (
@@ -11996,19 +12410,19 @@ def normalize_venue_business_hours(source: Any) -> dict[str, Any]:
             or not 0 <= opening < 1440
             or not 0 <= closing < 1440
         ):
-            raise ValidationError(f"{field} 的时间必须是 0 至 1439 分钟")
+            raise ValidationError(f"{field} 的时间必须是 0 至 1439 分钟。")
         return {"opening_minutes": opening, "closing_minutes": closing}
 
     default_hours = normalize_daily(source.get("default_hours", {}), "default_hours")
     weekly_source = source.get("weekly_hours", {})
     if not isinstance(weekly_source, dict):
-        raise ValidationError("weekly_hours 必须是对象")
+        raise ValidationError("weekly_hours 必须是对象。")
     valid_days = {
         "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY",
         "FRIDAY", "SATURDAY", "SUNDAY",
     }
     if set(weekly_source) - valid_days:
-        raise ValidationError("weekly_hours 包含无效的星期")
+        raise ValidationError("weekly_hours 包含无效的星期。")
     weekly_hours = {
         day: normalize_daily(weekly_source.get(day, default_hours), f"weekly_hours.{day}")
         for day in sorted(valid_days)
@@ -12029,10 +12443,10 @@ def normalize_public_queue_rules(source: Any) -> dict[str, bool]:
             "allow_online_registration": True,
         }
     if not isinstance(source, dict):
-        raise ValidationError("queue_rules 必须是对象")
+        raise ValidationError("queue_rules 必须是对象。")
     allow_online_registration = source.get("allow_online_registration", True)
     if type(allow_online_registration) is not bool:
-        raise ValidationError("allow_online_registration 必须是布尔值")
+        raise ValidationError("allow_online_registration 必须是布尔值。")
     return {
         "allow_defer_one_round": read_boolean(source, "allow_defer_one_round"),
         "allow_temporary_leave": read_boolean(source, "allow_temporary_leave"),
@@ -12055,7 +12469,7 @@ def normalize_terminal_policy(
     """
     supported = payload.get("management_policy_supported", False)
     if type(supported) is not bool:
-        raise ValidationError("management_policy_supported 必须是布尔值")
+        raise ValidationError("management_policy_supported 必须是布尔值。")
     if not supported:
         return {
             "supported": False,
@@ -12071,7 +12485,7 @@ def normalize_terminal_policy(
 
     management_app_bound = payload.get("management_app_bound", False)
     if type(management_app_bound) is not bool:
-        raise ValidationError("management_app_bound 必须是布尔值")
+        raise ValidationError("management_app_bound 必须是布尔值。")
     revision = read_integer(
         payload,
         "management_policy_revision",
@@ -12082,12 +12496,12 @@ def normalize_terminal_policy(
     if policy_source is None:
         policy_source = {}
     if not isinstance(policy_source, dict):
-        raise ValidationError("management_policy 必须是对象")
+        raise ValidationError("management_policy 必须是对象。")
 
     def read_policy_boolean(name: str, fallback: bool) -> bool:
         value = policy_source.get(name, fallback)
         if type(value) is not bool:
-            raise ValidationError(f"management_policy.{name} 必须是布尔值")
+            raise ValidationError(f"management_policy.{name} 必须是布尔值。")
         return value
 
     policy = {
@@ -12120,7 +12534,7 @@ def normalize_terminal_settings(payload: dict[str, Any]) -> dict[str, Any]:
     """
     supported = payload.get("management_settings_supported", False)
     if type(supported) is not bool:
-        raise ValidationError("management_settings_supported 必须是布尔值")
+        raise ValidationError("management_settings_supported 必须是布尔值。")
     if not supported:
         return {
             "supported": False,
@@ -12137,10 +12551,10 @@ def normalize_terminal_settings(payload: dict[str, Any]) -> dict[str, Any]:
     )
     show_common_play_preview = payload.get("show_common_play_preview")
     if type(show_common_play_preview) is not bool:
-        raise ValidationError("show_common_play_preview 必须是布尔值")
+        raise ValidationError("show_common_play_preview 必须是布尔值。")
     registration_control_open = payload.get("registration_control_open")
     if type(registration_control_open) is not bool:
-        raise ValidationError("registration_control_open 必须是布尔值")
+        raise ValidationError("registration_control_open 必须是布尔值。")
     business_hours = normalize_venue_business_hours(
         payload.get("business_hours_settings")
     )
@@ -12160,7 +12574,9 @@ def normalize_public_event(source: Any) -> dict[str, Any]:
             code="invalid_recent_event",
         )
     machine_id = source.get("machine_id")
-    if machine_id is not None and machine_id not in MACHINE_NAMES:
+    if machine_id is not None and (
+        not isinstance(machine_id, str) or machine_id not in MACHINE_NAMES
+    ):
         raise ValidationError(
             "机台编号无效：必须为空或使用 A 至 J 中已配置的编号。",
             code="invalid_recent_event_machine_id",
@@ -12193,7 +12609,7 @@ def normalize_public_event(source: Any) -> dict[str, Any]:
             machine_name = read_optional_string(source, "machine_name", 120)
         except ValidationError as error:
             raise ValidationError(
-                f"机台名称无效：{error}。",
+                f"机台名称无效：{str(error).rstrip('。')}。",
                 code="invalid_recent_event_machine_name",
                 field="machine_name",
             ) from error
@@ -12358,22 +12774,22 @@ def normalize_machine_groups(
 
     source = payload.get("machine_groups")
     if not isinstance(source, list) or not 1 <= len(source) <= len(configured_machine_ids):
-        raise ValidationError("机台分组数量必须为 1 至当前机台数量")
+        raise ValidationError("机台分组数量必须为 1 至当前机台数量。")
     groups: list[dict[str, str]] = []
     for index, item in enumerate(source):
         if not isinstance(item, dict) or set(item) != {"id", "name"}:
-            raise ValidationError(f"第 {index + 1} 个机台分组字段不完整")
+            raise ValidationError(f"第 {index + 1} 个机台分组字段不完整。")
         group_id = read_machine_internal_id(item, "id")
         name = read_string(item, "name", MAX_MACHINE_GROUP_NAME_CHARACTERS)
         if not name.isprintable():
-            raise ValidationError(f"第 {index + 1} 个机台分组名称内容无效")
+            raise ValidationError(f"第 {index + 1} 个机台分组名称内容无效。")
         groups.append({"id": group_id, "name": name})
     group_ids = [group["id"] for group in groups]
     if len(group_ids) != len(set(group_ids)):
-        raise ValidationError("机台分组标识不能重复")
+        raise ValidationError("机台分组标识不能重复。")
     default_group_id = read_machine_internal_id(payload, "default_machine_group_id")
     if default_group_id not in set(group_ids):
-        raise ValidationError("默认机台分组不存在")
+        raise ValidationError("默认机台分组不存在。")
     return groups, default_group_id
 
 
@@ -12390,7 +12806,7 @@ def normalize_machine(
     valid_machine_group_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(source, dict):
-        raise ValidationError(f"机台 {machine_id} 必须是对象")
+        raise ValidationError(f"机台 {machine_id} 必须是对象。")
 
     name = normalize_machine_name(machine_id, source, allow_custom_name)
     configuration = normalize_machine_configuration(
@@ -12410,31 +12826,31 @@ def normalize_machine(
         else DEFAULT_MACHINE_GROUP_ID
     )
     if valid_machine_group_ids is not None and group_id not in valid_machine_group_ids:
-        raise ValidationError(f"机台 {machine_id} 引用了不存在的机台分组")
+        raise ValidationError(f"机台 {machine_id} 引用了不存在的机台分组。")
     operational = read_boolean(source, "operational")
     stop_reason = read_optional_choice(source, "stop_reason", STOP_REASONS)
     stop_reason_detail = read_optional_string(
         source, "stop_reason_detail", MAX_STOP_REASON_DETAIL_CHARACTERS
     )
     if operational and stop_reason is not None:
-        raise ValidationError(f"正常使用的机台 {machine_id} 不能包含停止原因")
+        raise ValidationError(f"正常使用的机台 {machine_id} 不能包含停止原因。")
     if not operational and stop_reason is None:
-        raise ValidationError(f"停止使用的机台 {machine_id} 必须包含停止原因")
+        raise ValidationError(f"停止使用的机台 {machine_id} 必须包含停止原因。")
     if stop_reason != "OTHER" and stop_reason_detail is not None:
-        raise ValidationError(f"机台 {machine_id} 仅能为其他原因补充说明")
+        raise ValidationError(f"机台 {machine_id} 仅能为其他原因补充说明。")
 
     playing = normalize_registration_list(source.get("playing"), f"机台 {machine_id} 游玩位置")
     if len(playing) > 2:
-        raise ValidationError(f"机台 {machine_id} 游玩位置不能超过 2 个登记")
+        raise ValidationError(f"机台 {machine_id} 游玩位置不能超过 2 个登记。")
     if any(registration["online_registration_pending_check_in"] for registration in playing):
-        raise ValidationError(f"机台 {machine_id} 的待签到登记不能处于游玩位置")
+        raise ValidationError(f"机台 {machine_id} 的待签到登记不能处于游玩位置。")
     validate_registration_group(playing, f"机台 {machine_id} 游玩位置")
     if configuration["capacity"] == 1 and len(playing) > 1:
-        raise ValidationError(f"机台 {machine_id} 的游玩容量为 1，游玩位置不能超过 1 个登记")
+        raise ValidationError(f"机台 {machine_id} 的游玩容量为 1，游玩位置不能超过 1 个登记。")
 
     positions_source = source.get("waiting_positions")
     if not isinstance(positions_source, list):
-        raise ValidationError(f"机台 {machine_id} 的 waiting_positions 必须是数组")
+        raise ValidationError(f"机台 {machine_id} 的 waiting_positions 必须是数组。")
     waiting_positions = [
         normalize_waiting_position(machine_id, index, position)
         for index, position in enumerate(positions_source)
@@ -12444,11 +12860,11 @@ def normalize_machine(
         len(position["registrations"]) for position in waiting_positions
     )
     if registration_count > MAX_REGISTRATIONS_PER_MACHINE:
-        raise ValidationError(f"机台 {machine_id} 超过 20 个登记")
+        raise ValidationError(f"机台 {machine_id} 超过 20 个登记。")
 
     position_ids = [position["position_id"] for position in waiting_positions]
     if len(position_ids) != len(set(position_ids)):
-        raise ValidationError(f"机台 {machine_id} 的等待位置编号不能重复")
+        raise ValidationError(f"机台 {machine_id} 的等待位置编号不能重复。")
 
     registrations_by_id = {
         registration["registration_id"]: registration
@@ -12467,15 +12883,15 @@ def normalize_machine(
             continue
         previewed = registrations_by_id.get(preview["registration_id"])
         if previewed is None:
-            raise ValidationError(f"机台 {machine_id} 的共同游玩预览登记不存在")
+            raise ValidationError(f"机台 {machine_id} 的共同游玩预览登记不存在。")
         position_registration_ids = {
             registration["registration_id"]
             for registration in position["registrations"]
         }
         if preview["registration_id"] in position_registration_ids:
-            raise ValidationError(f"机台 {machine_id} 的共同游玩预览不能重复当前位置登记")
+            raise ValidationError(f"机台 {machine_id} 的共同游玩预览不能重复当前位置登记。")
         if previewed["display_id"] != preview["display_id"]:
-            raise ValidationError(f"机台 {machine_id} 的共同游玩预览昵称不一致")
+            raise ValidationError(f"机台 {machine_id} 的共同游玩预览昵称不一致。")
         if (
             len(position["registrations"]) != 1
             or position["registrations"][0]["preference"] != "OPEN_TO_JOIN"
@@ -12483,7 +12899,7 @@ def normalize_machine(
             or previewed["preference"] != "OPEN_TO_JOIN"
             or previewed["fixed_pair"]
         ):
-            raise ValidationError(f"机台 {machine_id} 的共同游玩预览与游玩偏好不一致")
+            raise ValidationError(f"机台 {machine_id} 的共同游玩预览与游玩偏好不一致。")
 
     if configuration["capacity"] == 1:
         registrations = [
@@ -12499,12 +12915,33 @@ def normalize_machine(
             for registration in registrations
         ):
             raise ValidationError(
-                f"机台 {machine_id} 的游玩容量为 1，登记必须使用单人游玩且不能组成固定组合"
+                f"机台 {machine_id} 的游玩容量为 1，登记必须使用单人游玩且不能组成固定组合。"
             )
         if any(len(position["registrations"]) != 1 for position in waiting_positions):
-            raise ValidationError(f"机台 {machine_id} 的游玩容量为 1，等待位置只能包含 1 个登记")
+            raise ValidationError(f"机台 {machine_id} 的游玩容量为 1，等待位置只能包含 1 个登记。")
         if any(position["common_play_preview"] is not None for position in waiting_positions):
-            raise ValidationError(f"机台 {machine_id} 的游玩容量为 1，不能包含共同游玩预览")
+            raise ValidationError(f"机台 {machine_id} 的游玩容量为 1，不能包含共同游玩预览。")
+
+    paired_machine_id = normalize_paired_machine_id(machine_id, source)
+    if paired_machine_id is None and any(
+        registration["also_queues_at_paired_machine"]
+        for registration in registrations_by_id.values()
+    ):
+        raise ValidationError(
+            f"机台 {machine_id} 不属于一对机台，不能自动在两台机台之间安排登记。"
+        )
+    paired_waiting_positions = normalize_paired_waiting_positions(
+        machine_id,
+        source.get("paired_waiting_positions"),
+        paired_machine_id=paired_machine_id,
+        operational=operational,
+        capacity=configuration["capacity"],
+        waiting_registration_ids={
+            registration["registration_id"]
+            for position in waiting_positions
+            for registration in position["registrations"]
+        },
+    )
 
     playing_started_at = read_optional_integer(
         source, "playing_started_at", minimum=1
@@ -12519,7 +12956,11 @@ def normalize_machine(
         playing_started_at = None
         new_registration_estimated_wait_minutes = None
         waiting_positions = [
-            {**position, "estimated_wait_minutes": None}
+            {
+                **position,
+                "estimated_wait_minutes": None,
+                "estimated_wait_uncertain": False,
+            }
             for position in waiting_positions
         ]
 
@@ -12540,6 +12981,8 @@ def normalize_machine(
         "new_registration_estimated_wait_minutes": new_registration_estimated_wait_minutes,
         "playing": playing,
         "waiting_positions": waiting_positions,
+        "paired_machine_id": paired_machine_id,
+        "paired_waiting_positions": paired_waiting_positions,
     }
 
 
@@ -12572,10 +13015,10 @@ def normalize_machine_configuration(
         maximum_length=MAX_MACHINE_REMARK_CHARACTERS,
     )
     if submitted_remark != remark:
-        raise ValidationError(f"机台 {machine_id} 的备注与名称不一致")
+        raise ValidationError(f"机台 {machine_id} 的备注与名称不一致。")
     configuration = source.get("configuration")
     if not isinstance(configuration, dict):
-        raise ValidationError(f"机台 {machine_id} 的 configuration 必须是对象")
+        raise ValidationError(f"机台 {machine_id} 的 configuration 必须是对象。")
     allowed_fields = {
         "game_type",
         "custom_game_type",
@@ -12588,7 +13031,7 @@ def normalize_machine_configuration(
         "shared_round_minutes",
     }
     if set(configuration) != allowed_fields:
-        raise ValidationError(f"机台 {machine_id} 的 configuration 字段不完整")
+        raise ValidationError(f"机台 {machine_id} 的 configuration 字段不完整。")
 
     game_type = read_choice(configuration, "game_type", MACHINE_GAME_TYPES)
     custom_game_type = read_optional_string(
@@ -12597,9 +13040,9 @@ def normalize_machine_configuration(
         MAX_MACHINE_TYPE_CHARACTERS,
     )
     if game_type == "OTHER" and custom_game_type is None:
-        raise ValidationError(f"机台 {machine_id} 选择其他游戏类型时必须填写名称")
+        raise ValidationError(f"机台 {machine_id} 选择其他游戏类型时必须填写名称。")
     if game_type != "OTHER" and custom_game_type is not None:
-        raise ValidationError(f"机台 {machine_id} 仅能为其他游戏类型填写自定义名称")
+        raise ValidationError(f"机台 {machine_id} 仅能为其他游戏类型填写自定义名称。")
 
     server = read_choice(configuration, "server", MACHINE_SERVERS)
     custom_server = read_optional_string(
@@ -12608,11 +13051,11 @@ def normalize_machine_configuration(
         MAX_MACHINE_SERVER_CHARACTERS,
     )
     if game_type not in SERVER_CONFIGURABLE_GAME_TYPES and server != "HIDDEN":
-        raise ValidationError(f"机台 {machine_id} 的游戏类型不支持配置服务器")
+        raise ValidationError(f"机台 {machine_id} 的游戏类型不支持配置服务器。")
     if server == "OTHER" and custom_server is None:
-        raise ValidationError(f"机台 {machine_id} 选择其他服务器时必须填写名称")
+        raise ValidationError(f"机台 {machine_id} 选择其他服务器时必须填写名称。")
     if server != "OTHER" and custom_server is not None:
-        raise ValidationError(f"机台 {machine_id} 仅能为其他服务器填写自定义名称")
+        raise ValidationError(f"机台 {machine_id} 仅能为其他服务器填写自定义名称。")
 
     game_version = read_optional_string(
         configuration,
@@ -12621,7 +13064,7 @@ def normalize_machine_configuration(
     )
     game_version_visible = read_boolean(configuration, "game_version_visible")
     if game_version_visible and game_version is None:
-        raise ValidationError(f"机台 {machine_id} 显示游戏版本前必须填写版本")
+        raise ValidationError(f"机台 {machine_id} 显示游戏版本前必须填写版本。")
     capacity = read_integer(configuration, "capacity", minimum=1, maximum=2)
     return {
         "remark": remark,
@@ -12662,10 +13105,10 @@ def normalize_machine_name(
     )
     name = compact_middle_dots(name)
     if not name.endswith(suffix):
-        raise ValidationError(f"机台 {machine_id} 名称必须以“{suffix.strip()}”结尾")
+        raise ValidationError(f"机台 {machine_id} 名称必须以“{suffix.strip()}”结尾。")
     remark = name[: -len(suffix)]
     if not remark or remark != remark.strip() or len(remark) > MAX_MACHINE_REMARK_CHARACTERS:
-        raise ValidationError(f"机台 {machine_id} 备注必须为 1 至 8 个字符")
+        raise ValidationError(f"机台 {machine_id} 备注必须为 1 至 8 个字符。")
     return f"{remark}{suffix}"
 
 
@@ -12683,30 +13126,308 @@ def compact_public_middle_dots(value: Any) -> Any:
     return compact_middle_dots(value)
 
 
+def normalize_paired_machine_queue_settings(
+    source: Any, capacity_by_stable_id: dict[str, int]
+) -> dict[str, Any]:
+    """
+    The venue setting for queueing at two machines: whether it is on, and which machines form
+    pairs, named by their stable ids. A machine belongs to at most one pair, and both machines
+    of a pair have the same play capacity.
+    """
+    if not isinstance(source, dict):
+        raise ValidationError("paired_machine_queue_settings 必须是对象。")
+    if set(source) != {"enabled", "pairs"}:
+        raise ValidationError("paired_machine_queue_settings 必须正好包含 enabled 和 pairs。")
+    enabled = read_boolean(source, "enabled")
+    pairs_source = source["pairs"]
+    if not isinstance(pairs_source, list) or len(pairs_source) > MAX_MACHINE_COUNT // 2:
+        raise ValidationError("一对机台的设置无效。")
+    used_stable_ids: set[str] = set()
+    pairs: list[list[str]] = []
+    for item in pairs_source:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not all(
+                isinstance(stable_id, str)
+                and MACHINE_INTERNAL_ID_PATTERN.fullmatch(stable_id) is not None
+                for stable_id in item
+            )
+        ):
+            raise ValidationError("一对机台必须是两个机台内部标识。")
+        first, second = item
+        if first == second or first in used_stable_ids or second in used_stable_ids:
+            raise ValidationError("一台机台最多属于一对机台。")
+        if first not in capacity_by_stable_id or second not in capacity_by_stable_id:
+            raise ValidationError("一对机台引用了不存在的机台。")
+        if capacity_by_stable_id[first] != capacity_by_stable_id[second]:
+            raise ValidationError("一对机台的游玩容量必须相同。")
+        used_stable_ids.update(item)
+        pairs.append([first, second])
+    return {"enabled": enabled, "pairs": pairs}
+
+
+def normalize_snapshot_paired_machine_queue_settings(
+    source: Any, machines: dict[str, dict[str, Any]]
+) -> dict[str, Any] | None:
+    """
+    The setting as the terminal reports it. A terminal that sends it can also apply changes to
+    it from the management app; null means the terminal does not offer that.
+    """
+    if source is None:
+        return None
+    settings = normalize_paired_machine_queue_settings(
+        source,
+        {
+            machine["stable_id"]: machine["configuration"]["capacity"]
+            for machine in machines.values()
+        },
+    )
+    # The pairs the queue actually uses must be the ones the setting names.
+    machine_id_by_stable_id = {
+        machine["stable_id"]: machine_id for machine_id, machine in machines.items()
+    }
+    expected_partner: dict[str, str] = {}
+    if settings["enabled"]:
+        for first, second in settings["pairs"]:
+            first_id = machine_id_by_stable_id[first]
+            second_id = machine_id_by_stable_id[second]
+            expected_partner[first_id] = second_id
+            expected_partner[second_id] = first_id
+    for machine_id, machine in machines.items():
+        if machine["paired_machine_id"] != expected_partner.get(machine_id):
+            raise ValidationError(
+                f"机台 {machine_id} 的 paired_machine_id 与一对机台的设置不一致。"
+            )
+    return settings
+
+
+def normalize_paired_machine_id(machine_id: str, source: dict[str, Any]) -> str | None:
+    """The other machine of the pair whose registrations may queue at both machines."""
+    value = source.get("paired_machine_id")
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in MACHINE_NAMES or value == machine_id:
+        raise ValidationError(f"机台 {machine_id} 的 paired_machine_id 无效。")
+    return value
+
+
+def normalize_paired_waiting_positions(
+    machine_id: str,
+    source: Any,
+    *,
+    paired_machine_id: str | None,
+    operational: bool,
+    capacity: int,
+    waiting_registration_ids: set[str],
+) -> list[dict[str, Any]] | None:
+    """
+    The waiting order of a paired machine as players should see it: its own waiting
+    registrations together with registrations of the other machine that are expected to
+    play here first. Registrations are referred to by their public id only; whether a
+    referenced preview really waits at the other machine is checked across machines in
+    validate_paired_machines.
+    """
+    if source is None:
+        return None
+    label = f"机台 {machine_id} 的 paired_waiting_positions"
+    if not isinstance(source, list) or not source:
+        raise ValidationError(f"{label} 必须是非空数组或 null。")
+    if paired_machine_id is None:
+        raise ValidationError(
+            f"机台 {machine_id} 不属于一对机台，不能包含另一机台的登记预览。"
+        )
+    if not operational:
+        raise ValidationError(f"停止使用的机台 {machine_id} 不能包含另一机台的登记预览。")
+    if len(source) > 2 * MAX_REGISTRATIONS_PER_MACHINE:
+        raise ValidationError(f"{label} 超过数量限制。")
+
+    positions = []
+    seen_registration_ids: set[str] = set()
+    for index, position_source in enumerate(source):
+        if not isinstance(position_source, dict):
+            raise ValidationError(f"{label} 的位置必须是对象。")
+        entries_source = position_source.get("registrations")
+        if not isinstance(entries_source, list) or not 1 <= len(entries_source) <= 2:
+            raise ValidationError(f"{label} 的每个位置必须包含 1 或 2 个登记。")
+        if capacity == 1 and len(entries_source) != 1:
+            raise ValidationError(
+                f"机台 {machine_id} 的游玩容量为 1，paired_waiting_positions 的每个位置只能包含 1 个登记。"
+            )
+        entries = []
+        for entry_source in entries_source:
+            if not isinstance(entry_source, dict):
+                raise ValidationError(f"{label} 包含无效登记。")
+            registration_id = read_public_id(entry_source, "registration_id")
+            if registration_id in seen_registration_ids:
+                raise ValidationError(f"{label} 不能重复包含同一份登记。")
+            seen_registration_ids.add(registration_id)
+            entries.append(
+                {
+                    "registration_id": registration_id,
+                    "paired_place_preview": read_boolean(
+                        entry_source, "paired_place_preview"
+                    ),
+                }
+            )
+        common_play_preview = normalize_common_play_preview(
+            position_source.get("common_play_preview")
+        )
+        if capacity == 1 and common_play_preview is not None:
+            raise ValidationError(f"机台 {machine_id} 的游玩容量为 1，不能包含共同游玩预览。")
+        position_id = read_public_id(position_source, "position_id")
+        estimated_wait_minutes = read_optional_integer(
+            position_source,
+            "estimated_wait_minutes",
+            minimum=0,
+            maximum=MAX_ESTIMATED_WAIT_MINUTES,
+        )
+        positions.append(
+            {
+                "index": index + 1,
+                "position_id": position_id,
+                "estimated_wait_minutes": estimated_wait_minutes,
+                "estimated_wait_uncertain": read_estimated_wait_uncertain(
+                    position_source, estimated_wait_minutes
+                ),
+                "registrations": entries,
+                "common_play_preview": common_play_preview,
+            }
+        )
+
+    position_ids = [position["position_id"] for position in positions]
+    if len(position_ids) != len(set(position_ids)):
+        raise ValidationError(f"{label} 的位置编号不能重复。")
+    own_registration_ids = {
+        entry["registration_id"]
+        for position in positions
+        for entry in position["registrations"]
+        if not entry["paired_place_preview"]
+    }
+    if own_registration_ids != waiting_registration_ids:
+        raise ValidationError(f"{label} 必须正好包含当前机台等待中的全部登记。")
+    if len(own_registration_ids) == len(seen_registration_ids):
+        raise ValidationError(f"{label} 没有另一机台的登记预览时必须为 null。")
+    return positions
+
+
+def registration_holds_paired_place(registration: dict[str, Any]) -> bool:
+    """Whether a waiting registration currently also holds a place at the paired machine."""
+    return (
+        registration["also_queues_at_paired_machine"]
+        and not registration.get("skips_paired_machine_this_round", False)
+        and not registration["fixed_pair"]
+        and not registration["deferred_once"]
+        and not registration.get("skips_one_turn", False)
+        and not registration["temporarily_away"]
+        and not registration["online_registration_pending_check_in"]
+    )
+
+
+def validate_paired_machines(machines: dict[str, dict[str, Any]]) -> None:
+    """Checks, across machines, the pairs and the previews that refer to the other machine."""
+    for machine_id, machine in machines.items():
+        partner_id = machine["paired_machine_id"]
+        if partner_id is None:
+            continue
+        partner = machines.get(partner_id)
+        if partner is None or partner["paired_machine_id"] != machine_id:
+            raise ValidationError(
+                f"机台 {machine_id} 与机台 {partner_id} 必须互为一对机台。"
+            )
+        if partner["configuration"]["capacity"] != machine["configuration"]["capacity"]:
+            raise ValidationError(
+                f"机台 {machine_id} 与机台 {partner_id} 的游玩容量不同，不能设为一对机台。"
+            )
+        positions = machine["paired_waiting_positions"]
+        if positions is None:
+            continue
+
+        own_registrations = {
+            registration["registration_id"]: registration
+            for registration in all_machine_registrations(machine)
+        }
+        place_holders = {
+            registration["registration_id"]: registration
+            for position in partner["waiting_positions"]
+            for registration in position["registrations"]
+            if registration_holds_paired_place(registration)
+        }
+        for position in positions:
+            entries = position["registrations"]
+            for entry in entries:
+                if (
+                    entry["paired_place_preview"]
+                    and entry["registration_id"] not in place_holders
+                ):
+                    raise ValidationError(
+                        f"机台 {machine_id} 的另一机台登记预览必须是正在机台 {partner_id} "
+                        "等待并已允许系统在两台机台之间安排的登记。"
+                    )
+            preview = position["common_play_preview"]
+            if preview is None:
+                continue
+            previewed = own_registrations.get(
+                preview["registration_id"]
+            ) or place_holders.get(preview["registration_id"])
+            if previewed is None:
+                raise ValidationError(f"机台 {machine_id} 的共同游玩预览登记不存在。")
+            if any(
+                entry["registration_id"] == preview["registration_id"]
+                for entry in entries
+            ):
+                raise ValidationError(
+                    f"机台 {machine_id} 的共同游玩预览不能重复当前位置登记。"
+                )
+            if previewed["display_id"] != preview["display_id"]:
+                raise ValidationError(f"机台 {machine_id} 的共同游玩预览昵称不一致。")
+            positioned = (
+                own_registrations.get(entries[0]["registration_id"])
+                or place_holders.get(entries[0]["registration_id"])
+                if len(entries) == 1
+                else None
+            )
+            if (
+                positioned is None
+                or positioned["preference"] != "OPEN_TO_JOIN"
+                or positioned["fixed_pair"]
+                or previewed["preference"] != "OPEN_TO_JOIN"
+                or previewed["fixed_pair"]
+            ):
+                raise ValidationError(
+                    f"机台 {machine_id} 的共同游玩预览与游玩偏好不一致。"
+                )
+
+
 def normalize_waiting_position(machine_id: str, index: int, source: Any) -> dict[str, Any]:
     if not isinstance(source, dict):
-        raise ValidationError(f"机台 {machine_id} 的等待位置必须是对象")
+        raise ValidationError(f"机台 {machine_id} 的等待位置必须是对象。")
     registrations = normalize_registration_list(
         source.get("registrations"), f"机台 {machine_id} 位置 {index + 1}"
     )
     if not 1 <= len(registrations) <= 2:
-        raise ValidationError(f"机台 {machine_id} 的每个等待位置必须包含 1 或 2 个登记")
+        raise ValidationError(f"机台 {machine_id} 的每个等待位置必须包含 1 或 2 份登记。")
     validate_registration_group(registrations, f"机台 {machine_id} 位置 {index + 1}")
 
     fixed_pair = read_boolean(source, "fixed_pair")
     actual_fixed_pair = registrations[0]["fixed_pair"] if registrations else False
     if fixed_pair != actual_fixed_pair:
-        raise ValidationError(f"机台 {machine_id} 位置 {index + 1} 的固定组合状态不一致")
+        raise ValidationError(f"机台 {machine_id} 位置 {index + 1} 的固定组合状态不一致。")
 
+    position_id = read_public_id(source, "position_id")
+    estimated_wait_minutes = read_optional_integer(
+        source,
+        "estimated_wait_minutes",
+        minimum=0,
+        maximum=MAX_ESTIMATED_WAIT_MINUTES,
+    )
     return {
         "index": index + 1,
-        "position_id": read_public_id(source, "position_id"),
+        "position_id": position_id,
         "fixed_pair": fixed_pair,
-        "estimated_wait_minutes": read_optional_integer(
-            source,
-            "estimated_wait_minutes",
-            minimum=0,
-            maximum=MAX_ESTIMATED_WAIT_MINUTES,
+        "estimated_wait_minutes": estimated_wait_minutes,
+        "estimated_wait_uncertain": read_estimated_wait_uncertain(
+            source, estimated_wait_minutes
         ),
         "registrations": registrations,
         "common_play_preview": normalize_common_play_preview(
@@ -12719,7 +13440,7 @@ def normalize_common_play_preview(source: Any) -> dict[str, str] | None:
     if source is None:
         return None
     if not isinstance(source, dict):
-        raise ValidationError("共同游玩预览必须是对象或 null")
+        raise ValidationError("共同游玩预览必须是对象或 null。")
     return {
         "registration_id": read_public_id(source, "registration_id"),
         "display_id": read_string(source, "display_id", maximum_length=18),
@@ -12728,65 +13449,121 @@ def normalize_common_play_preview(source: Any) -> dict[str, str] | None:
 
 def normalize_registration_list(source: Any, label: str) -> list[dict[str, Any]]:
     if not isinstance(source, list):
-        raise ValidationError(f"{label}的登记必须是数组")
+        raise ValidationError(f"{label} 的登记必须是数组。")
     return [normalize_registration(value, label) for value in source]
 
 
 def normalize_registration(source: Any, label: str) -> dict[str, Any]:
     if not isinstance(source, dict):
-        raise ValidationError(f"{label}包含无效登记")
+        raise ValidationError(f"{label}包含无效登记。")
     fixed_pair = read_boolean(source, "fixed_pair")
     fixed_pair_id = read_optional_public_id(source, "fixed_pair_id")
     if fixed_pair != (fixed_pair_id is not None):
-        raise ValidationError(f"{label}的固定组合编号不一致")
+        raise ValidationError(f"{label}的固定组合编号不一致。")
     temporarily_away = source.get("temporarily_away", False)
     if type(temporarily_away) is not bool:
-        raise ValidationError("temporarily_away 必须是布尔值")
+        raise ValidationError("temporarily_away 必须是布尔值。")
+    # 将轮空一次: at its next turn the registration goes to the tail, which counts one skipped
+    # turn in temporary_away_skipped_turns, and the state ends. Older terminals leave it out.
+    skips_one_turn = read_optional_flag(source, "skips_one_turn")
     temporary_away_skipped_turns = source.get("temporary_away_skipped_turns", 0)
     if (
         type(temporary_away_skipped_turns) is not int
         or temporary_away_skipped_turns < 0
         or temporary_away_skipped_turns > 3
     ):
-        raise ValidationError("temporary_away_skipped_turns 数值无效")
-    if not temporarily_away and temporary_away_skipped_turns != 0:
-        raise ValidationError("非暂时离开登记不能包含轮空次数")
+        raise ValidationError("temporary_away_skipped_turns 数值无效。")
+    if not (temporarily_away or skips_one_turn) and temporary_away_skipped_turns != 0:
+        raise ValidationError("只有暂时离开或将轮空一次的登记才能包含轮空次数。")
     deferred_once = read_boolean(source, "deferred_once")
-    if deferred_once and temporarily_away:
-        raise ValidationError("登记不能同时处于暂缓一次和暂时离开状态")
+    if sum((deferred_once, skips_one_turn, temporarily_away)) > 1:
+        raise ValidationError("登记最多只能处于将暂缓一次、将轮空一次和暂时离开中的一种状态。")
+    # 暂缓一次 has been used and the registration has not played a round since; and an
+    # online registration has been checked in but has not played a round yet. Both only
+    # restrict what players may ask for; older terminals leave them out.
+    defer_one_round_used = read_optional_flag(source, "defer_one_round_used")
+    online_registration_not_played = read_optional_flag(
+        source, "online_registration_not_played"
+    )
     no_show_count = read_integer(source, "no_show_count", minimum=0, maximum=10_000)
     last_no_show_action_was_defer = read_boolean(
         source, "last_no_show_action_was_defer"
     )
     if no_show_count == 0 and last_no_show_action_was_defer:
-        raise ValidationError("没有未到场记录时不能包含上次处理方式")
+        raise ValidationError("没有未到场记录时不能包含上次处理方式。")
     online_registration_pending_check_in = source.get(
         "online_registration_pending_check_in", False
     )
     if type(online_registration_pending_check_in) is not bool:
-        raise ValidationError("online_registration_pending_check_in 必须是布尔值")
+        raise ValidationError("online_registration_pending_check_in 必须是布尔值。")
     registration_type = read_choice(source, "registration_type", REGISTRATION_TYPES)
     if online_registration_pending_check_in and registration_type != "PLAYER_PROFILE":
-        raise ValidationError("待签到的线上登记必须关联玩家资料")
-    if online_registration_pending_check_in and (deferred_once or temporarily_away):
-        raise ValidationError("待签到的线上登记不能同时暂缓一次或暂时离开")
+        raise ValidationError("待签到的线上登记必须关联玩家资料。")
+    if online_registration_pending_check_in and (
+        deferred_once or skips_one_turn or temporarily_away
+    ):
+        raise ValidationError("待签到的线上登记不能处于将暂缓一次、将轮空一次或暂时离开状态。")
+    also_queues_at_paired_machine = source.get("also_queues_at_paired_machine", False)
+    if type(also_queues_at_paired_machine) is not bool:
+        raise ValidationError("also_queues_at_paired_machine 必须是布尔值。")
+    if also_queues_at_paired_machine and fixed_pair:
+        raise ValidationError(f"{label}的固定组合登记不能在两台机台之间安排。")
+    # Only a registration of a player profile can be arranged between two machines: a temporary
+    # one cannot be told that it is about to be moved.
+    if also_queues_at_paired_machine and registration_type != "PLAYER_PROFILE":
+        raise ValidationError(f"{label}的临时登记不能在两台机台之间安排。")
+    # The registration gave up its place at the paired machine until it has played a round.
+    # The terminal keeps this flag independently of the player's choice above, so it may be
+    # set while that choice is off.
+    skips_paired_machine_this_round = source.get(
+        "skips_paired_machine_this_round", False
+    )
+    if type(skips_paired_machine_this_round) is not bool:
+        raise ValidationError("skips_paired_machine_this_round 必须是布尔值。")
+    # A preview at the other machine announces that this registration may be moved there, and
+    # from when on. The moment is left out while the terminal holds the count. Both only mean
+    # something for a registration whose choice above is on; without it they are not kept.
+    paired_arrangement_announced = source.get("paired_arrangement_announced", False)
+    if type(paired_arrangement_announced) is not bool:
+        raise ValidationError("paired_arrangement_announced 必须是布尔值。")
+    paired_arrangement_not_before = source.get("paired_arrangement_not_before")
+    if paired_arrangement_not_before is not None:
+        if (
+            type(paired_arrangement_not_before) is not int
+            or paired_arrangement_not_before < 0
+        ):
+            raise ValidationError("paired_arrangement_not_before 数值无效。")
+        if not paired_arrangement_announced:
+            raise ValidationError(
+                "paired_arrangement_not_before 只能与 paired_arrangement_announced 一同出现。"
+            )
+    if not also_queues_at_paired_machine:
+        paired_arrangement_announced = False
+        paired_arrangement_not_before = None
     created_at = read_integer(source, "created_at", minimum=1)
     online_check_in_started_at = source.get("online_check_in_started_at", created_at)
     if type(online_check_in_started_at) is not int or online_check_in_started_at < 1:
-        raise ValidationError("online_check_in_started_at 数值无效")
+        raise ValidationError("online_check_in_started_at 数值无效。")
 
     return {
         "registration_id": read_public_id(source, "registration_id"),
         "display_id": read_string(source, "display_id", maximum_length=18),
         "preference": read_choice(source, "preference", PREFERENCES),
         "deferred_once": deferred_once,
+        "skips_one_turn": skips_one_turn,
         "temporarily_away": temporarily_away,
         "temporary_away_skipped_turns": temporary_away_skipped_turns,
+        "defer_one_round_used": defer_one_round_used,
+        "online_registration_not_played": online_registration_not_played,
         "fixed_pair": fixed_pair,
         "fixed_pair_id": fixed_pair_id,
         "no_show_count": no_show_count,
         "last_no_show_action_was_defer": last_no_show_action_was_defer,
         "online_registration_pending_check_in": online_registration_pending_check_in,
+        "also_queues_at_paired_machine": also_queues_at_paired_machine,
+        "skips_paired_machine_this_round": skips_paired_machine_this_round,
+        "paired_arrangement_announced": paired_arrangement_announced,
+        "paired_arrangement_not_before": paired_arrangement_not_before,
         "registration_type": registration_type,
         "created_at": created_at,
         "online_check_in_started_at": online_check_in_started_at,
@@ -12799,13 +13576,14 @@ def validate_registration_group(registrations: list[dict[str, Any]], label: str)
     if not fixed_registrations:
         return
     if len(registrations) != 2 or len(fixed_registrations) != 2:
-        raise ValidationError(f"{label}的固定组合必须正好包含 2 个登记")
+        raise ValidationError(f"{label}的固定组合必须正好包含 2 个登记。")
     pair_ids = {registration["fixed_pair_id"] for registration in fixed_registrations}
     if len(pair_ids) != 1:
-        raise ValidationError(f"{label}的固定组合编号不一致")
+        raise ValidationError(f"{label}的固定组合编号不一致。")
     absence_states = {
         (
             registration["deferred_once"],
+            registration["skips_one_turn"],
             registration["temporarily_away"],
             registration["temporary_away_skipped_turns"],
             registration["online_registration_pending_check_in"],
@@ -12813,7 +13591,7 @@ def validate_registration_group(registrations: list[dict[str, Any]], label: str)
         for registration in fixed_registrations
     }
     if len(absence_states) != 1:
-        raise ValidationError(f"{label}的固定组合可用状态不一致")
+        raise ValidationError(f"{label}的固定组合可用状态不一致。")
 
 
 def all_machine_registrations(machine: dict[str, Any]):
@@ -12840,10 +13618,10 @@ def attach_public_registration_contacts(
 def read_string(source: dict[str, Any], key: str, maximum_length: int) -> str:
     value = source.get(key)
     if not isinstance(value, str):
-        raise ValidationError(f"{key} 必须是文本")
+        raise ValidationError(f"{key} 必须是文本。")
     value = value.strip()
     if not value or len(value) > maximum_length:
-        raise ValidationError(f"{key} 长度无效")
+        raise ValidationError(f"{key} 长度无效。")
     return value
 
 
@@ -12854,12 +13632,12 @@ def read_optional_string(
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValidationError(f"{key} 必须是文本")
+        raise ValidationError(f"{key} 必须是文本。")
     value = value.strip()
     if not value:
         return None
     if len(value) > maximum_length or not value.isprintable():
-        raise ValidationError(f"{key} 长度或内容无效")
+        raise ValidationError(f"{key} 长度或内容无效。")
     return value
 
 
@@ -12869,21 +13647,31 @@ def read_optional_semantic_version(source: dict[str, Any], key: str) -> str | No
         return None
     normalized = normalize_semantic_version(value)
     if normalized is None:
-        raise ValidationError(f"{key} 必须是有效的语义版本号")
+        raise ValidationError(f"{key} 必须是有效的语义版本号。")
     return normalized[0]
 
 
 def read_qq_number(source: dict[str, Any], key: str) -> str:
     value = source.get(key)
     if not isinstance(value, str) or QQ_NUMBER_PATTERN.fullmatch(value) is None:
-        raise ValidationError(f"{key} 必须是 5 至 12 位 QQ 号")
+        raise ValidationError(f"{key} 必须是 5 至 12 位 QQ 号。")
     return value
 
 
 def read_boolean(source: dict[str, Any], key: str) -> bool:
     value = source.get(key)
     if type(value) is not bool:
-        raise ValidationError(f"{key} 必须是布尔值")
+        raise ValidationError(f"{key} 必须是布尔值。")
+    return value
+
+
+def read_optional_flag(source: dict[str, Any], key: str) -> bool:
+    """A boolean that older terminals leave out; absent or null means false."""
+    value = source.get(key)
+    if value is None:
+        return False
+    if type(value) is not bool:
+        raise ValidationError(f"{key} 必须是布尔值。")
     return value
 
 
@@ -12895,7 +13683,7 @@ def read_integer(
 ) -> int:
     value = source.get(key)
     if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
-        raise ValidationError(f"{key} 数值无效")
+        raise ValidationError(f"{key} 数值无效。")
     return value
 
 
@@ -12910,10 +13698,28 @@ def read_optional_integer(
     return read_integer(source, key, minimum, maximum)
 
 
+def read_estimated_wait_uncertain(
+    source: dict[str, Any], estimated_wait_minutes: int | None
+) -> bool:
+    """
+    Whether a position's wait estimate may be inaccurate because the system may move
+    registrations between the two machines of a pair. Older terminals leave it out, which
+    means false; a position without an estimate is never marked.
+    """
+    value = source.get("estimated_wait_uncertain")
+    if value is None:
+        return False
+    if type(value) is not bool:
+        raise ValidationError("estimated_wait_uncertain 必须是布尔值。")
+    return value and estimated_wait_minutes is not None
+
+
 def read_choice(source: dict[str, Any], key: str, choices: set[str]) -> str:
     value = source.get(key)
-    if value not in choices:
-        raise ValidationError(f"{key} 选项无效")
+    # The type is checked first: a list or an object cannot be looked up in a set and would
+    # otherwise end the request with an unhandled error instead of a validation message.
+    if not isinstance(value, str) or value not in choices:
+        raise ValidationError(f"{key} 选项无效。")
     return value
 
 
@@ -12925,27 +13731,41 @@ def read_optional_choice(
     return read_choice(source, key, choices)
 
 
+def parse_uuid_text(value: Any) -> str | None:
+    """
+    The canonical text of a UUID that was given as a string, or None for anything else.
+    `UUID()` itself fails with an AttributeError on a number or a list, which callers that
+    only expect a ValueError would let through as an unhandled error.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(UUID(value))
+    except ValueError:
+        return None
+
+
 def read_uuid(source: dict[str, Any], key: str) -> str:
     value = source.get(key)
     if not isinstance(value, str):
-        raise ValidationError(f"{key} 必须是 UUID")
+        raise ValidationError(f"{key} 必须是 UUID。")
     try:
         return str(UUID(value))
     except ValueError as error:
-        raise ValidationError(f"{key} 必须是 UUID") from error
+        raise ValidationError(f"{key} 必须是 UUID。") from error
 
 
 def read_public_id(source: dict[str, Any], key: str) -> str:
     value = source.get(key)
     if not isinstance(value, str) or PUBLIC_ID_PATTERN.fullmatch(value) is None:
-        raise ValidationError(f"{key} 公开编号无效")
+        raise ValidationError(f"{key} 公开编号无效。")
     return value
 
 
 def read_machine_internal_id(source: dict[str, Any], key: str) -> str:
     value = source.get(key)
     if not isinstance(value, str) or MACHINE_INTERNAL_ID_PATTERN.fullmatch(value) is None:
-        raise ValidationError(f"{key} 机台内部标识无效")
+        raise ValidationError(f"{key} 机台内部标识无效。")
     return value
 
 

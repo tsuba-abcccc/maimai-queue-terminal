@@ -1,9 +1,12 @@
 package com.abcccc.maimaiqueue
 
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.em
+import androidx.compose.ui.unit.isSpecified
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
 import org.junit.Test
@@ -98,5 +101,28 @@ class PanguSpacingTest {
         assertEquals(2, formatted.spanStyles.single().start)
         assertEquals(3, formatted.spanStyles.single().end)
         assertEquals(FontWeight.Bold, formatted.spanStyles.single().item.fontWeight)
+    }
+
+    @Test
+    fun drawnMiddleDotsGetEvenSideRoomWithoutChangingTheText() {
+        val source = buildAnnotatedString {
+            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                append("左侧·")
+            }
+            append("机台 A·2 份登记")
+        }
+
+        val spaced = withAppMiddleDotSideSpace(source)
+
+        assertEquals("左侧·机台 A·2 份登记", spaced.text)
+        val dotSpans = spaced.spanStyles.filter { it.item.letterSpacing.isSpecified }
+        assertEquals(listOf(2, 7), dotSpans.map { it.start })
+        assertEquals(listOf(3, 8), dotSpans.map { it.end })
+        dotSpans.forEach {
+            assertEquals((APP_MIDDLE_DOT_SIDE_SPACE_EM * 2).em, it.item.letterSpacing)
+        }
+        assertEquals(FontWeight.Bold, spaced.spanStyles.first().item.fontWeight)
+        val plain = AnnotatedString("没有分隔号")
+        assertSame(plain, withAppMiddleDotSideSpace(plain))
     }
 }

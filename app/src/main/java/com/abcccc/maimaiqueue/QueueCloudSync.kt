@@ -162,8 +162,65 @@ internal data class TerminalSettingsUpdateCommand(
     val machineGroupAssignments: Map<MachineId, String>,
     val machineGroups: List<MachineGroupConfiguration>,
     val defaultMachineGroupId: String,
-    val reason: String?
+    val reason: String?,
+    /**
+     * The setting for queueing at two machines; null when the command does not mention it, in
+     * which case the terminal keeps its own.
+     */
+    val pairedMachineQueue: PairedMachineQueueConfiguration? = null
 ) : RemoteTerminalCommand
+
+/** Whether registrations may queue at two machines, and the pairs, by machine stable id. */
+internal data class PairedMachineQueueConfiguration(
+    val enabled: Boolean,
+    val pairs: List<Pair<String, String>>
+) {
+    /** The pairs without regard to the order of pairs or of the machines in one. */
+    val unorderedPairs: Set<Set<String>>
+        get() = pairs.mapTo(mutableSetOf()) { setOf(it.first, it.second) }
+}
+
+/** Why the command cannot be applied to the terminal's current state; null when it can. */
+internal fun TerminalSettingsUpdateCommand.rejectionDetail(
+    currentQueueId: String,
+    settings: QueueRuleSettings,
+    registrationOpen: Boolean
+): String? = when {
+    queueId != currentQueueId -> "现场已开始新的队列，请刷新后重试。"
+    !settings.managementAppBound -> "现场终端已经解除管理后台接管，请重新绑定后再提交。"
+    expectedPolicyRevision != settings.managementPolicyRevision ->
+        "终端接管策略已经更新，请管理后台刷新后重试。"
+    expectedSettingsRevision != settings.managementSettingsRevision ->
+        "终端设置已经更新，请刷新后重试。"
+    nextSettingsRevision != expectedSettingsRevision + 1L -> "终端设置版本无效，未应用这次修改。"
+    expectedMachineConfigurationRevision != settings.machineConfigurationRevision ->
+        "现场机台配置已经更新，请管理后台刷新后重试。"
+    expectedRegistrationOpen != registrationOpen -> "登记排队状态已经更新，请管理后台刷新后重试。"
+    else -> null
+}
+
+/** The settings the command asks for, on top of [current]. */
+internal fun TerminalSettingsUpdateCommand.requestedSettings(
+    current: QueueRuleSettings
+): QueueRuleSettings = current.copy(
+    showCommonPlayPreview = showCommonPlayPreview,
+    businessHours = businessHours,
+    configuredMachineCount = configuredMachineCount,
+    machineConfigurations = MachineId.entries.associateWith { machineId ->
+        machineConfigurations[machineId] ?: DEFAULT_MACHINE_CONFIGURATIONS.getValue(machineId)
+    },
+    machineStableIds = MachineId.entries.associateWith { machineId ->
+        machineStableIds[machineId] ?: defaultMachineStableId(machineId)
+    },
+    machineGroupAssignments = MachineId.entries.associateWith { machineId ->
+        machineGroupAssignments[machineId] ?: defaultMachineGroupId
+    },
+    machineGroups = machineGroups,
+    defaultMachineGroupId = defaultMachineGroupId,
+    pairedMachineQueueEnabled = pairedMachineQueue?.enabled ?: current.pairedMachineQueueEnabled,
+    pairedMachineStableIds = pairedMachineQueue?.pairs ?: current.pairedMachineStableIds,
+    managementSettingsRevision = nextSettingsRevision
+)
 
 internal data class MachineStatusUpdateCommand(
     override val commandId: String,
@@ -217,7 +274,7 @@ internal fun decidePlayerProfileUpdate(
         return if (desiredAlreadyPresent) {
             PlayerProfileCommandDecision.AlreadyApplied
         } else {
-            PlayerProfileCommandDecision.Reject("玩家资料已在终端发生更新，请重新提交修改。")
+            PlayerProfileCommandDecision.Reject("玩家资料已经更新，请刷新后重新提交修改。")
         }
     }
     if (profiles.any {
@@ -333,7 +390,14 @@ internal data class QueuePublicDisplaySettings(
     val managementSettingsSupported: Boolean = false,
     val managementSettingsRevision: Long = 0L,
     val businessHoursSettings: BusinessHoursSettings = BusinessHoursSettings(),
-    val businessHours: QueuePublicBusinessHours = QueuePublicBusinessHours()
+    val businessHours: QueuePublicBusinessHours = QueuePublicBusinessHours(),
+    /** Machines whose registrations may queue at both, in both directions. */
+    val machinePartners: Map<MachineId, MachineId> = emptyMap(),
+    /**
+     * The venue setting behind [machinePartners], reported so that the management app can show
+     * and change it; null leaves it out of the snapshot.
+     */
+    val pairedMachineQueueSettings: PairedMachineQueueConfiguration? = null
 ) {
     fun machineConfiguration(machineId: MachineId): MachineConfiguration =
         machineConfigurations[machineId]?.let { configuration ->
@@ -1125,7 +1189,9 @@ private fun parseSyncedPlayerProfile(source: JSONObject?): PlayerProfile? {
             setupVersion = source.optInt("setup_version", 0).coerceAtLeast(0),
             revision = source.optLong("profile_revision", 1L).coerceAtLeast(1L),
             createdAtMillis = source.getLong("created_at"),
-            updatedAtMillis = source.getLong("updated_at")
+            updatedAtMillis = source.getLong("updated_at"),
+            pairedMachineQueueingIntroduced =
+                source.optBoolean("paired_machine_queueing_introduced", false)
         ).withCanonicalContact()
     }.getOrNull()?.takeIf { profile ->
         runCatching { UUID.fromString(profile.id) }.isSuccess &&
@@ -1408,7 +1474,19 @@ private fun parseTerminalSettingsUpdate(command: JSONObject?): TerminalSettingsU
             },
             machineGroups = groups,
             defaultMachineGroupId = payload.getString("default_machine_group_id"),
-            reason = payload.optionalNonBlankString("reason")
+            reason = payload.optionalNonBlankString("reason"),
+            pairedMachineQueue = payload.optJSONObject("paired_machine_queue_settings")
+                ?.let { source ->
+                    val pairs = source.getJSONArray("pairs")
+                    PairedMachineQueueConfiguration(
+                        enabled = source.getBoolean("enabled"),
+                        pairs = List(pairs.length()) { index ->
+                            val pair = pairs.getJSONArray(index)
+                            check(pair.length() == 2)
+                            pair.getString(0) to pair.getString(1)
+                        }
+                    )
+                }
         )
     }.getOrNull()?.takeIf { parsed ->
         if (!isUuid(parsed.commandId) ||
@@ -1434,9 +1512,19 @@ private fun parseTerminalSettingsUpdate(command: JSONObject?): TerminalSettingsU
                     machineGroups = parsed.machineGroups,
                     defaultMachineGroupId = parsed.defaultMachineGroupId,
                     businessHours = parsed.businessHours,
-                    showCommonPlayPreview = parsed.showCommonPlayPreview
+                    showCommonPlayPreview = parsed.showCommonPlayPreview,
+                    pairedMachineQueueEnabled = parsed.pairedMachineQueue?.enabled == true,
+                    pairedMachineStableIds = parsed.pairedMachineQueue?.pairs.orEmpty()
                 )
             )
+            // Every pair the command names must survive normalization: two different machines
+            // of this layout with the same capacity, each machine in one pair at most.
+            (parsed.pairedMachineQueue == null ||
+                (parsed.pairedMachineQueue.unorderedPairs.size ==
+                    parsed.pairedMachineQueue.pairs.size &&
+                    draft.pairedMachineStableIds.mapTo(mutableSetOf()) {
+                        setOf(it.first, it.second)
+                    } == parsed.pairedMachineQueue.unorderedPairs)) &&
             draft.configuredMachineCount == parsed.configuredMachineCount &&
                 draft.configuredMachineIds.all { machineId ->
                     draft.machineConfiguration(machineId) ==
@@ -1566,7 +1654,12 @@ private fun parseQueueOperation(command: JSONObject?): RemoteQueueOperationComma
             expectedRegistrationOrder = payload.optionalRegistrationOrder(
                 "expected_registration_order"
             ),
-            registrationOrder = payload.optionalRegistrationOrder("registration_order")
+            registrationOrder = payload.optionalRegistrationOrder("registration_order"),
+            alsoQueuesAtPairedMachine = if (payload.has("also_queues_at_paired_machine")) {
+                payload.getBoolean("also_queues_at_paired_machine")
+            } else {
+                null
+            }
         )
     }.getOrNull()?.takeIf(::isValidQueueOperationCommand)
 }
@@ -1650,7 +1743,12 @@ private fun parseManagementQueueAction(
                 true
             ),
             advanceWhenPlayingEmpty = payload.optBoolean("advance_when_playing_empty", false),
-            reason = payload.optionalNonBlankString("reason")
+            reason = payload.optionalNonBlankString("reason"),
+            alsoQueuesAtPairedMachine = if (payload.has("also_queues_at_paired_machine")) {
+                payload.getBoolean("also_queues_at_paired_machine")
+            } else {
+                null
+            }
         )
     }.getOrNull()?.takeIf(::isValidManagementQueueActionCommand)
 }
@@ -1746,12 +1844,16 @@ private fun isValidManagementQueueActionCommand(
                 command.targetMachineId != command.machineId
         ManagementQueueAction.CHANGE_PREFERENCE ->
             command.registrationIds.size == 1 && command.preference != null
+        ManagementQueueAction.SET_PAIRED_MACHINE_QUEUEING ->
+            command.registrationIds.size == 1 && command.alsoQueuesAtPairedMachine != null
         ManagementQueueAction.RETURN_PLAYING_TO_WAITING_FRONT,
         ManagementQueueAction.ADVANCE_TO_WAITING_POSITION,
         ManagementQueueAction.REMOVE_REGISTRATIONS -> command.registrationIds.isNotEmpty()
         ManagementQueueAction.MOVE_WAITING_REGISTRATION_INTO_CURRENT_ROUND,
         ManagementQueueAction.DEFER_ONE_ROUND,
         ManagementQueueAction.CANCEL_DEFER_ONE_ROUND,
+        ManagementQueueAction.SKIP_ONE_TURN,
+        ManagementQueueAction.CANCEL_SKIP_ONE_TURN,
         ManagementQueueAction.TEMPORARILY_LEAVE,
         ManagementQueueAction.CANCEL_TEMPORARY_LEAVE,
         ManagementQueueAction.CHECK_IN -> command.registrationIds.size == 1
@@ -1806,7 +1908,12 @@ private fun parseMobileDeviceRegistration(
             newProfile = newProfile,
             machineConfigurationRevision = payload.optionalPositiveLong(
                 "machine_configuration_revision"
-            )
+            ),
+            alsoQueuesAtPairedMachine = if (payload.has("also_queues_at_paired_machine")) {
+                payload.getBoolean("also_queues_at_paired_machine")
+            } else {
+                null
+            }
         ).also { parsed ->
             check((mode == "NEW") == (parsed.newProfile != null))
             check((mode == "EXISTING") == (parsed.newProfile == null))
@@ -1986,7 +2093,7 @@ internal fun queuePublishFailureDetail(error: Throwable): String = when (error) 
     } else {
         "网络连接被设备中断。"
     }
-    else -> "同步请求在发送前失败。"
+    else -> "同步请求未能完成。"
 }
 
 internal fun queueServerErrorMessage(responseBody: String): String? = runCatching {
@@ -2310,6 +2417,10 @@ internal fun buildQueueSyncSnapshot(
                         put("profile_revision", profile.revision)
                         put("created_at", profile.createdAtMillis)
                         put("updated_at", profile.updatedAtMillis)
+                        // Only ever sent as true: the server keeps it once it has been set.
+                        if (profile.pairedMachineQueueingIntroduced) {
+                            put("paired_machine_queueing_introduced", true)
+                        }
                     }
                 )
             }
@@ -2532,6 +2643,28 @@ internal fun buildPublicQueueSnapshot(
         }
     )
     put("default_machine_group_id", effectiveDefaultGroupId)
+    displaySettings.pairedMachineQueueSettings?.let { settings ->
+        put(
+            "paired_machine_queue_settings",
+            JSONObject().apply {
+                put("enabled", settings.enabled)
+                put(
+                    "pairs",
+                    JSONArray().apply {
+                        settings.pairs.forEach { (first, second) ->
+                            put(JSONArray().apply { put(first); put(second) })
+                        }
+                    }
+                )
+            }
+        )
+    }
+    val pairedMachines = PairedMachinePublication.create(
+        state = state,
+        displaySettings = displaySettings,
+        capturedAtMillis = capturedAtMillis
+    )
+    val waitEstimates = publicWaitEstimates(state, displaySettings, capturedAtMillis)
     put(
         "machines",
         JSONObject().apply {
@@ -2541,6 +2674,8 @@ internal fun buildPublicQueueSnapshot(
                 put(
                     machineId.name,
                     buildPublicMachine(
+                    pairedMachines = pairedMachines,
+                    waitEstimates = waitEstimates,
                     queueId = state.queueId,
                     machineId = machineId.name,
                     machineName = publicMachineName(
@@ -2667,7 +2802,136 @@ private fun buildPublicQueueEvent(
     }
 }
 
+/** The wait estimates of every configured machine, as the terminal shows them. */
+internal fun publicWaitEstimates(
+    state: PersistedQueueState,
+    displaySettings: QueuePublicDisplaySettings,
+    capturedAtMillis: Long
+): WaitEstimator.Result {
+    val machineIds = state.configuredMachineIds
+    val partners = displaySettings.machinePartners.filter { (machineId, partnerId) ->
+        machineId in machineIds && partnerId in machineIds
+    }
+    return WaitEstimator.estimate(
+        state = QueueEngineState(
+            queues = machineIds.associateTo(linkedMapOf()) { machineId ->
+                machineId.name to state.machine(machineId).queue
+            },
+            pairedMachineOrders = buildMap {
+                machineIds.forEach { machineId ->
+                    val order = state.machine(machineId).pairedOrder
+                    if (order.isNotEmpty()) put(machineId.name, order)
+                }
+            },
+            pairedArrangements = state.pairedArrangements
+        ),
+        policy = QueueEnginePolicy(
+            machineStatuses = machineIds.associate { machineId ->
+                machineId.name to state.machine(machineId).status
+            },
+            machineCapacities = machineIds.associate { machineId ->
+                machineId.name to displaySettings.machineConfiguration(machineId).capacity
+            },
+            maxRegistrationsPerMachine = 20,
+            machinePartners = partners.entries.associate { (machineId, partnerId) ->
+                machineId.name to partnerId.name
+            },
+            pairedArrangementRules = PairedArrangementRules()
+        ),
+        durations = machineIds.associate { machineId ->
+            val configuration = displaySettings.machineConfiguration(machineId)
+            machineId.name to PairedMachineForecast.RoundDurations(
+                soloMillis = configuration.soloRoundMinutes * 60_000L,
+                sharedMillis = configuration.sharedRoundMinutes * 60_000L
+            )
+        },
+        nowMillis = capturedAtMillis
+    )
+}
+
+/**
+ * What a snapshot needs to know about machines whose registrations queue at both machines of a
+ * pair: which machines are paired, and where and when each registration is expected to play.
+ */
+private class PairedMachinePublication(
+    private val state: QueueEngineState,
+    private val policy: QueueEnginePolicy,
+    private val durations: Map<String, PairedMachineForecast.RoundDurations>,
+    private val nowMillis: Long
+) {
+    val forecast: PairedMachineForecast.Result =
+        PairedMachineForecast.forecast(state, policy, durations, nowMillis)
+
+    fun pairedMachineId(machineId: String): String? =
+        PairedMachineForecast.pairedMachineId(state, policy, machineId)
+
+    /**
+     * The waiting order of [machineId] including registrations of the other machine that are
+     * expected to play here first, with the keys of those registrations; null when there are none.
+     */
+    fun waitingWithPreviews(machineId: String): Pair<MachineQueue, Set<Int>>? =
+        PairedMachineForecast.displayQueue(state, policy, machineId, forecast)
+            .takeIf { (_, previewKeys) -> previewKeys.isNotEmpty() }
+
+    /** What the player of a waiting registration is told about a coming arrangement. */
+    fun arrangementOutlook(registrationKey: Int): PairedArrangementOutlook? =
+        QueueEngine.pairedArrangementOutlook(state, policy, registrationKey)
+
+    companion object {
+        fun create(
+            state: PersistedQueueState,
+            displaySettings: QueuePublicDisplaySettings,
+            capturedAtMillis: Long
+        ): PairedMachinePublication? {
+            val machineIds = state.configuredMachineIds
+            val partners = displaySettings.machinePartners.filter { (machineId, partnerId) ->
+                machineId in machineIds && partnerId in machineIds
+            }
+            if (partners.isEmpty()) return null
+            return PairedMachinePublication(
+                state = QueueEngineState(
+                    queues = machineIds.associateTo(linkedMapOf()) { machineId ->
+                        machineId.name to state.machine(machineId).queue
+                    },
+                    pairedMachineOrders = buildMap {
+                        machineIds.forEach { machineId ->
+                            val order = state.machine(machineId).pairedOrder
+                            if (order.isNotEmpty()) put(machineId.name, order)
+                        }
+                    },
+                    pairedArrangements = state.pairedArrangements
+                ),
+                policy = QueueEnginePolicy(
+                    machineStatuses = machineIds.associate { machineId ->
+                        machineId.name to state.machine(machineId).status
+                    },
+                    machineCapacities = machineIds.associate { machineId ->
+                        machineId.name to displaySettings.machineConfiguration(machineId).capacity
+                    },
+                    maxRegistrationsPerMachine = 20,
+                    machinePartners = partners.entries.associate { (machineId, partnerId) ->
+                        machineId.name to partnerId.name
+                    },
+                    // The same rules as on the terminal: the forecast only expects a
+                    // registration at the other machine once a preview announces it.
+                    pairedArrangementRules = PairedArrangementRules()
+                ),
+                durations = machineIds.associate { machineId ->
+                    val configuration = displaySettings.machineConfiguration(machineId)
+                    machineId.name to PairedMachineForecast.RoundDurations(
+                        soloMillis = configuration.soloRoundMinutes * 60_000L,
+                        sharedMillis = configuration.sharedRoundMinutes * 60_000L
+                    )
+                },
+                nowMillis = capturedAtMillis
+            )
+        }
+    }
+}
+
 private fun buildPublicMachine(
+    pairedMachines: PairedMachinePublication?,
+    waitEstimates: WaitEstimator.Result,
     queueId: String,
     machineId: String,
     machineName: String,
@@ -2677,11 +2941,34 @@ private fun buildPublicMachine(
     showCommonPlayPreview: Boolean,
     capturedAtMillis: Long
 ): JSONObject {
+    val includeCommonPlayPreview = showCommonPlayPreview &&
+        status.isOperational &&
+        configuration.capacity == 2
     val waitingProjection = queue.waitingProjection(
-        includeCommonPlayPreview = showCommonPlayPreview &&
-            status.isOperational &&
-            configuration.capacity == 2
+        includeCommonPlayPreview = includeCommonPlayPreview
     ).positions
+    // Waits come from the estimate over all machines (docs/releases/wait-estimate-2026-11.md):
+    // registered players are shown an early value, marked when a move between the machines of a
+    // pair may make it wrong.
+    val pairedMachineId = pairedMachines?.pairedMachineId(machineId)
+    fun positionWaits(positions: List<Set<Int>>): List<WaitEstimator.Estimate?> =
+        if (!status.isOperational) {
+            positions.map { null }
+        } else {
+            positions.map { keys -> waitEstimates.estimate(keys) }
+        }
+    val waitingKeys = waitingProjection.map { position -> position.registrations.map { it.key }.toSet() }
+    val waitingEstimates = positionWaits(waitingKeys)
+    val waitingMinutes = WaitEstimator.displayMinutesInOrder(waitingEstimates)
+    fun commonPlayPreviewJson(preview: Registration?): Any = preview?.let {
+        JSONObject().apply {
+            put("registration_id", publicRegistrationId(queueId, preview.key))
+            put("display_id", preview.displayId)
+        }
+    } ?: JSONObject.NULL
+    val waitingWithPreviews = pairedMachines
+        ?.takeIf { pairedMachineId != null && status.isOperational }
+        ?.waitingWithPreviews(machineId)
     return JSONObject().apply {
         put("id", machineId)
         put("name", machineName)
@@ -2727,11 +3014,9 @@ private fun buildPublicMachine(
         put(
             "new_registration_estimated_wait_minutes",
             if (status.isOperational && queue.registrationCount < 20) {
-                estimatedWaitForNewOpenRegistration(
-                    queue,
-                    capturedAtMillis,
-                    configuration
-                ) ?: JSONObject.NULL
+                waitEstimates.newRegistrationWaitMillis[machineId]
+                    ?.let { WaitEstimator.displayMinutes(it, roundDown = false) }
+                    ?: JSONObject.NULL
             } else {
                 JSONObject.NULL
             }
@@ -2759,46 +3044,104 @@ private fun buildPublicMachine(
                             })
                             put(
                                 "estimated_wait_minutes",
-                                if (status.isOperational) {
-                                    estimatedMinutesUntilPlaying(
-                                        queue = queue,
-                                        targetRegistrationKeys = registrationKeys,
-                                        nowMillis = capturedAtMillis,
-                                        configuration = configuration
-                                    ) ?: JSONObject.NULL
-                                } else {
-                                    JSONObject.NULL
-                                }
+                                waitingMinutes[index] ?: JSONObject.NULL
+                            )
+                            put(
+                                "estimated_wait_uncertain",
+                                waitingMinutes[index] != null && waitingEstimates[index]?.uncertain == true
                             )
                             put(
                                 "registrations",
                                 JSONArray().apply {
                                     registrations.forEach { registration ->
-                                        put(buildPublicRegistration(queueId, registration))
+                                        put(
+                                            buildPublicRegistration(
+                                                queueId,
+                                                registration,
+                                                pairedMachines?.arrangementOutlook(registration.key)
+                                            )
+                                        )
                                     }
                                 }
                             )
                             put(
                                 "common_play_preview",
-                                position.commonPlayPreview?.let { preview ->
-                                    JSONObject().apply {
-                                        put(
-                                            "registration_id",
-                                            publicRegistrationId(queueId, preview.key)
-                                        )
-                                        put("display_id", preview.displayId)
-                                    }
-                                } ?: JSONObject.NULL
+                                commonPlayPreviewJson(position.commonPlayPreview)
                             )
                         }
                     )
                 }
             }
         )
+        put("paired_machine_id", pairedMachineId ?: JSONObject.NULL)
+        // The waiting order as players should see it when registrations of the other machine
+        // are expected to play here first. Those registrations stay listed in full under their
+        // own machine and are only referred to here.
+        put(
+            "paired_waiting_positions",
+            waitingWithPreviews?.let { (displayQueue, previewKeys) ->
+                JSONArray().apply {
+                    val pairedPositions = displayQueue.waitingProjection(
+                        includeCommonPlayPreview = includeCommonPlayPreview
+                    ).positions
+                    val pairedEstimates = positionWaits(
+                        pairedPositions.map { position -> position.registrations.map { it.key }.toSet() }
+                    )
+                    val pairedMinutes = WaitEstimator.displayMinutesInOrder(pairedEstimates)
+                    pairedPositions.forEachIndexed { index, position ->
+                        val registrationKeys = position.registrations.map { it.key }.toSet()
+                        put(
+                            JSONObject().apply {
+                                put("index", index + 1)
+                                put("position_id", publicPositionId(queueId, registrationKeys))
+                                put(
+                                    "estimated_wait_minutes",
+                                    pairedMinutes[index] ?: JSONObject.NULL
+                                )
+                                put(
+                                    "estimated_wait_uncertain",
+                                    pairedMinutes[index] != null && pairedEstimates[index]?.uncertain == true
+                                )
+                                put(
+                                    "registrations",
+                                    JSONArray().apply {
+                                        position.registrations.forEach { registration ->
+                                            put(
+                                                JSONObject().apply {
+                                                    put(
+                                                        "registration_id",
+                                                        publicRegistrationId(
+                                                            queueId,
+                                                            registration.key
+                                                        )
+                                                    )
+                                                    put(
+                                                        "paired_place_preview",
+                                                        registration.key in previewKeys
+                                                    )
+                                                }
+                                            )
+                                        }
+                                    }
+                                )
+                                put(
+                                    "common_play_preview",
+                                    commonPlayPreviewJson(position.commonPlayPreview)
+                                )
+                            }
+                        )
+                    }
+                }
+            } ?: JSONObject.NULL
+        )
     }
 }
 
-private fun buildPublicRegistration(queueId: String, registration: Registration): JSONObject =
+private fun buildPublicRegistration(
+    queueId: String,
+    registration: Registration,
+    arrangementOutlook: PairedArrangementOutlook? = null
+): JSONObject =
     JSONObject().apply {
         put("registration_id", publicRegistrationId(queueId, registration.key))
         put("display_id", registration.displayId)
@@ -2811,7 +3154,12 @@ private fun buildPublicRegistration(queueId: String, registration: Registration)
             "temporarily_away",
             registration.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
         )
-        put("temporary_away_skipped_turns", registration.temporaryAwaySkippedTurns)
+        put("skips_one_turn", registration.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN)
+        put("temporary_away_skipped_turns", registration.publishedTemporaryAwaySkippedTurns)
+        // 暂缓一次 is grey until the registration has played a round; a checked-in online
+        // registration that has not played cannot be postponed at all (2026-11-25).
+        put("defer_one_round_used", registration.deferOneRoundUsed)
+        put("online_registration_not_played", registration.mustBeRemovedWhenAbsent)
         put("fixed_pair", registration.fixedPartnerKey != null)
         put(
             "fixed_pair_id",
@@ -2822,6 +3170,16 @@ private fun buildPublicRegistration(queueId: String, registration: Registration)
         put("no_show_count", registration.noShowCount)
         put("last_no_show_action_was_defer", registration.lastNoShowActionWasDefer)
         put("online_registration_pending_check_in", registration.requiresOnSiteCheckIn)
+        put("also_queues_at_paired_machine", registration.alsoQueuesAtPairedMachine)
+        if (registration.skipsPairedMachineThisRound) {
+            put("skips_paired_machine_this_round", true)
+        }
+        // A preview at the other machine announces that this registration may be moved there,
+        // and from when on; the time is left out while the count is held.
+        if (arrangementOutlook != null) {
+            put("paired_arrangement_announced", true)
+            arrangementOutlook.notBeforeMillis?.let { put("paired_arrangement_not_before", it) }
+        }
         put("registration_type", if (registration.isTemporary) "TEMPORARY" else "PLAYER_PROFILE")
         put("created_at", registration.createdAtMillis)
         put(
@@ -2927,3 +3285,19 @@ private const val MAX_PRIVATE_CONTACTS_PER_SNAPSHOT = 600
 private const val MAX_PUBLIC_EVENT_TITLE_LENGTH = 120
 private const val MAX_PUBLIC_EVENT_DETAIL_LENGTH = 2_000
 private const val NETWORK_TIMEOUT_MILLIS = 8_000
+
+/**
+ * The count of missed turns as other parties are told it. To the server, the website and the
+ * Bot it only means something while the registration is temporarily away or will skip one turn
+ * (the two share the count), and the server refuses a snapshot that carries it otherwise; that
+ * it is kept until the registration has played is known to the terminal alone.
+ */
+internal val Registration.publishedTemporaryAwaySkippedTurns: Int
+    get() = if (
+        absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY ||
+        absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN
+    ) {
+        temporaryAwaySkippedTurns
+    } else {
+        0
+    }

@@ -97,7 +97,7 @@ internal class LocalTerminalCommandReceiptRepository(context: Context) :
                 TerminalCommandReceipt(
                     commandId = commandId,
                     applied = true,
-                    detail = "这条命令已经由现场终端执行。"
+                    detail = "已通过移动设备加入排队。"
                 )
             }
         return (migrated + persisted).takeLast(MAX_RECENT_COMMAND_IDS)

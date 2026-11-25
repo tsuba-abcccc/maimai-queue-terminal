@@ -19,6 +19,7 @@ const {
   formatQueueMessages,
   formatQueueNotification,
   joinQueueFromBot,
+  leaveQueueFromBot,
   nicknameValidationError,
   parseGender,
   parseMachineChoice,
@@ -789,7 +790,7 @@ test('stops the personal playing timer while the terminal is offline', () => {
   assert.doesNotMatch(text, /正在游玩位置 A/)
   assert.doesNotMatch(text, /已游玩 \d+ 分钟/)
   assert.match(text, /游玩偏好：单人游玩/)
-  assert.doesNotMatch(text, /\n\n - (修改游玩偏好|退出排队)/)
+  assert.doesNotMatch(text, /\n\n - (更改游玩偏好|退出排队)/)
 })
 
 test('shows the computed business-hours state in the queue header', () => {
@@ -969,6 +970,210 @@ test('notification position summaries handle playing and unavailable estimates',
   )
 })
 
+const UNCERTAIN_NOTE = '受系统在两台机台之间安排登记的影响，等待时间可能不准确，请以现场实际情况为准。'
+
+function uncertainEstimateQueue({ online = true, operational = true } = {}) {
+  const registration = (id, displayId, fields = {}) => ({
+    registration_id: id,
+    display_id: displayId,
+    preference: 'SOLO',
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    fixed_pair: false,
+    no_show_count: 0,
+    ...fields,
+  })
+  return {
+    queue_id: 'queue-uncertain',
+    captured_at: Date.now(),
+    registration_open: true,
+    terminal: { online },
+    machines: {
+      A: {
+        id: 'A',
+        name: '左侧 · 机台 A',
+        operational,
+        stop_reason: operational ? null : 'NETWORK_DISCONNECTED',
+        stop_reason_detail: null,
+        playing_started_at: null,
+        playing: [],
+        waiting_positions: [
+          {
+            index: 1,
+            estimated_wait_minutes: 0,
+            estimated_wait_uncertain: true,
+            registrations: [registration('registration-1', '甲')],
+          },
+          {
+            index: 2,
+            estimated_wait_minutes: 7,
+            estimated_wait_uncertain: true,
+            registrations: [registration('registration-2', '乙')],
+          },
+          {
+            index: 3,
+            estimated_wait_minutes: 19,
+            estimated_wait_uncertain: false,
+            registrations: [registration('registration-3', '丙')],
+          },
+          {
+            index: 4,
+            estimated_wait_minutes: 31,
+            registrations: [registration('registration-4', '丁')],
+          },
+        ],
+      },
+    },
+  }
+}
+
+test('writes estimates marked as possibly inaccurate as the earliest time, with the note once', () => {
+  const text = formatQueue(uncertainEstimateQueue())
+
+  assert.match(text, /位置 A1·可能很快可以游玩\n/)
+  assert.match(text, /位置 A2·最快约 7 分钟后\n/)
+  assert.match(text, /位置 A3·约 19 分钟后\n/)
+  assert.match(text, /位置 A4·约 31 分钟后\n/)
+  assert.equal(text.split(UNCERTAIN_NOTE).length - 1, 1)
+  assert.ok(text.endsWith(`\n\n${UNCERTAIN_NOTE}`))
+
+  const offline = formatQueue(uncertainEstimateQueue({ online: false }))
+  assert.doesNotMatch(offline, /最快|可能很快/)
+  assert.ok(!offline.includes(UNCERTAIN_NOTE))
+
+  const stopped = formatQueue(uncertainEstimateQueue({ operational: false }))
+  assert.doesNotMatch(stopped, /最快|可能很快/)
+  assert.ok(!stopped.includes(UNCERTAIN_NOTE))
+
+  const away = uncertainEstimateQueue()
+  away.machines.A.waiting_positions = away.machines.A.waiting_positions.slice(1, 2)
+  away.machines.A.waiting_positions[0].registrations[0].temporarily_away = true
+  const awayText = formatQueue(away)
+  assert.match(awayText, /位置 A2·暂时离开，无法估算/)
+  assert.ok(!awayText.includes(UNCERTAIN_NOTE))
+
+  const certain = uncertainEstimateQueue()
+  certain.machines.A.waiting_positions.forEach((position) => {
+    position.estimated_wait_uncertain = null
+  })
+  const certainText = formatQueue(certain)
+  assert.match(certainText, /位置 A1·预计很快可以游玩\n/)
+  assert.match(certainText, /位置 A2·约 7 分钟后\n/)
+  assert.ok(!certainText.includes(UNCERTAIN_NOTE))
+})
+
+test('puts the note on estimates marked as possibly inaccurate once at the end of a split queue', () => {
+  const queue = uncertainEstimateQueue()
+  const complete = formatQueue(queue)
+  const messages = formatQueueMessages(queue, complete.length - 1)
+
+  assert.ok(messages.length > 1)
+  assert.ok(messages.every((message) => message.length <= complete.length - 1))
+  assert.equal(messages.join('\n').split(UNCERTAIN_NOTE).length - 1, 1)
+  assert.ok(messages[messages.length - 1].endsWith(UNCERTAIN_NOTE))
+})
+
+test('own queue status writes a possibly inaccurate estimate as the earliest time', () => {
+  const player = {
+    registration_id: 'registration-uncertain',
+    profile_id: 'profile-uncertain',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'A',
+    position: 'WAITING',
+    position_index: 2,
+    estimated_wait_minutes: 6,
+    estimated_wait_uncertain: true,
+    preference: 'SOLO',
+    fixed_pair: false,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+  }
+
+  const text = formatOwnQueue([player])
+  assert.match(text, /你位于队列位置 A2，最快约 6 分钟后可以游玩。/)
+  assert.match(text, new RegExp(`\n\n${UNCERTAIN_NOTE}\n\n`))
+
+  const soon = formatOwnQueue([{ ...player, estimated_wait_minutes: 0 }])
+  assert.match(soon, /你位于队列位置 A2，可能很快可以游玩。/)
+  assert.doesNotMatch(soon, /预计很快/)
+
+  const both = formatOwnQueue([
+    player,
+    { ...player, registration_id: 'registration-other', display_id: '青空', position_index: 3, estimated_wait_minutes: 14 },
+  ])
+  assert.match(both, /小雨：位于队列位置 A2，最快约 6 分钟后可以游玩。/)
+  assert.match(both, /青空：位于队列位置 A3，最快约 14 分钟后可以游玩。/)
+  assert.equal(both.split(UNCERTAIN_NOTE).length - 1, 1)
+
+  for (const changed of [
+    { estimated_wait_uncertain: false },
+    { estimated_wait_uncertain: undefined },
+    { estimated_wait_minutes: null },
+    { temporarily_away: true },
+    { machine_operational: false },
+  ]) {
+    const unchanged = formatOwnQueue([{ ...player, ...changed }])
+    assert.doesNotMatch(unchanged, /最快|可能很快/)
+    assert.ok(!unchanged.includes(UNCERTAIN_NOTE))
+  }
+  assert.match(
+    formatOwnQueue([{ ...player, estimated_wait_uncertain: false }]),
+    /你位于队列位置 A2，约 6 分钟后可以游玩。/,
+  )
+})
+
+test('notification status writes a possibly inaccurate estimate as the earliest time', () => {
+  const player = {
+    registration_id: 'registration-notification',
+    profile_id: 'profile-notification',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'B',
+    position: 'WAITING',
+    position_index: 2,
+    estimated_wait_minutes: 12,
+    estimated_wait_uncertain: true,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+  }
+
+  assert.equal(
+    formatNotificationQueueStatus([player]),
+    `现在，你位于队列位置 B2，最快约 12 分钟后可以游玩。\n${UNCERTAIN_NOTE}`,
+  )
+  assert.equal(
+    formatNotificationQueueStatus([{ ...player, estimated_wait_minutes: 0 }]),
+    `现在，你位于队列位置 B2，可能很快可以游玩。\n${UNCERTAIN_NOTE}`,
+  )
+  assert.equal(
+    formatNotificationQueueStatus([
+      player,
+      { ...player, display_id: '青空', position_index: 3, estimated_wait_minutes: 20 },
+    ]),
+    `现在，“小雨”位于队列位置 B2，最快约 12 分钟后可以游玩。\n现在，“青空”位于队列位置 B3，最快约 20 分钟后可以游玩。\n${UNCERTAIN_NOTE}`,
+  )
+  assert.equal(
+    formatNotificationQueueStatus([{ ...player, estimated_wait_uncertain: false }]),
+    '现在，你位于队列位置 B2，约 12 分钟后可以游玩。',
+  )
+  assert.equal(
+    formatNotificationQueueStatus([{ ...player, estimated_wait_minutes: null }]),
+    '现在，你位于队列位置 B2，暂时无法估算。',
+  )
+  assert.equal(
+    formatNotificationQueueStatus([{ ...player, position: 'PLAYING' }]),
+    '现在，你正在游玩位置 B。',
+  )
+})
+
 test('does not keep advancing public timers or estimates while the terminal is offline', () => {
   const text = formatQueue({
     queue_id: 'queue-offline',
@@ -1051,7 +1256,7 @@ test('shows the pending check-in state and only allows leaving the queue', () =>
   assert.match(text, /请在创建登记后的 30 分钟内/)
   assert.match(text, /当前状态：线上登记·待签到。/)
   assert.match(text, /\n\n - 退出排队$/)
-  assert.doesNotMatch(text, /暂缓一次|暂时离开|切换机台|修改游玩偏好/)
+  assert.doesNotMatch(text, /暂缓一次|暂时离开|切换机台|更改游玩偏好/)
   assert.deepEqual(formatOwnQueueActions(player), ['退出排队'])
 
   const restartedText = formatOwnQueue([{
@@ -1182,25 +1387,26 @@ test('changes the personal menu with absence state and queue rules', () => {
     allow_temporary_leave: true,
   }), [
     '暂缓一次',
+    '轮空一次',
     '暂时离开',
     '切换机台',
-    '修改游玩偏好',
+    '更改游玩偏好',
     '退出排队',
   ])
   assert.deepEqual(formatOwnQueueActions({ ...player, deferred_once: true }), [
     '取消暂缓一次',
     '切换机台',
-    '修改游玩偏好',
+    '更改游玩偏好',
     '退出排队',
   ])
+  // No queue rule switches 轮空一次 off.
   assert.deepEqual(formatOwnQueueActions(player, {
     allow_defer_one_round: false,
     allow_temporary_leave: false,
-  }), ['切换机台', '修改游玩偏好', '退出排队'])
+  }), ['轮空一次', '切换机台', '更改游玩偏好', '退出排队'])
+  // Deferring and leaving temporarily are for registrations that wait.
   assert.deepEqual(formatOwnQueueActions({ ...player, position: 'PLAYING' }), [
-    '暂缓一次',
-    '暂时离开',
-    '修改游玩偏好',
+    '更改游玩偏好',
     '退出排队',
   ])
   assert.deepEqual(formatOwnQueueActions({
@@ -1209,24 +1415,48 @@ test('changes the personal menu with absence state and queue rules', () => {
     temporarily_away: true,
   }), [
     '取消暂时离开',
-    '修改游玩偏好',
+    '更改游玩偏好',
     '退出排队',
   ])
-  assert.deepEqual(formatOwnQueueActions(player, undefined, false), [])
+  // While its machine is stopped a registration can still leave the queue or move away.
+  assert.deepEqual(formatOwnQueueActions(player, undefined, false), [
+    '切换机台',
+    '退出排队',
+  ])
   assert.deepEqual(formatOwnQueueActions({
     ...player,
     machine_operational: false,
-  }), [])
+  }), ['切换机台', '退出排队'])
+  assert.deepEqual(formatOwnQueueActions({
+    ...player,
+    machine_operational: false,
+    deferred_once: true,
+  }), ['切换机台', '退出排队'])
+  assert.deepEqual(formatOwnQueueActions(player, undefined, false, 2, false), [
+    '退出排队',
+  ])
+  assert.deepEqual(formatOwnQueueActions({
+    ...player,
+    position: 'PLAYING',
+    machine_operational: false,
+  }), ['退出排队'])
+  assert.deepEqual(formatOwnQueueActions({
+    ...player,
+    machine_operational: false,
+    online_registration_pending_check_in: true,
+  }), ['退出排队'])
   assert.deepEqual(formatOwnQueueActions(player, undefined, true, 1), [
     '暂缓一次',
+    '轮空一次',
     '暂时离开',
     '切换机台',
     '退出排队',
   ])
   assert.deepEqual(formatOwnQueueActions(player, undefined, true, 2, false), [
     '暂缓一次',
+    '轮空一次',
     '暂时离开',
-    '修改游玩偏好',
+    '更改游玩偏好',
     '退出排队',
   ])
 })
@@ -1256,7 +1486,7 @@ test('does not offer machine transfer when the queue overview is unavailable', (
   })
 
   assert.doesNotMatch(text, /切换机台/)
-  assert.match(text, /修改游玩偏好/)
+  assert.match(text, /更改游玩偏好/)
   assert.match(text, /退出排队/)
 })
 
@@ -1418,7 +1648,7 @@ test('explains the persistent solo preference before transferring to a single-pl
   assert.match(sent[0], /本次登记将使用“单人游玩”/)
   assert.match(sent[0], /默认游玩偏好不会改变/)
   assert.match(sent[0], /转回支持共同游玩的机台时，本次登记仍会保持“单人游玩”/)
-  assert.match(text, /登记已转至右侧·机台 B/)
+  assert.match(text, /登记已转至 右侧·机台 B/)
 })
 
 test('cancels temporary leave for a fixed pair after the terminal snapshot confirms it', async () => {
@@ -1491,81 +1721,11 @@ test('cancels temporary leave for a fixed pair after the terminal snapshot confi
     },
   }])
   assert.match(text, /固定组合的两份登记已同时取消暂时离开/)
-  assert.match(text, /轮空次数均已清零/)
+  assert.match(text, /已轮空次数会在游玩一轮后清零/)
 })
 
-test('uses the terminal result when deferring from the playing position', async () => {
-  const player = {
-    registration_id: 'registration-playing-player',
-    profile_id: 'profile-playing-player',
-    qq_number: '12345678',
-    display_id: '小雨',
-    machine_id: 'A',
-    position: 'PLAYING',
-    position_index: null,
-    estimated_wait_minutes: 0,
-    fixed_pair: false,
-    deferred_once: false,
-    temporarily_away: false,
-    temporary_away_skipped_turns: 0,
-    no_show_count: 0,
-    last_no_show_action_was_defer: false,
-    online_registration_pending_check_in: false,
-  }
-  let playerReads = 0
-  const submitted = []
-  const api = {
-    getPlayers: async () => {
-      playerReads += 1
-      return {
-        queue_id: 'queue-playing',
-        queue_rules: {
-          allow_defer_one_round: true,
-          allow_temporary_leave: true,
-        },
-        players: [player],
-      }
-    },
-    createQueueCommand: async (_qq, operation, fields) => {
-      submitted.push({ operation, fields })
-      return {
-        command_id: 'command-playing',
-        status: 'APPLIED',
-        result_detail: '本次游玩机会已暂缓并完成；登记已回到等待顺序前端，当前不再处于暂缓状态。',
-      }
-    },
-  }
-
-  const text = await changeAbsenceState(
-    api,
-    { commandWaitSeconds: 3 },
-    { platform: 'onebot', userId: '12345678', isDirect: true },
-    'DEFER_ONE_ROUND',
-  )
-
-  assert.equal(playerReads, 1)
-  assert.equal(
-    text,
-    '本次游玩机会已暂缓并完成；登记已回到等待顺序前端，当前不再处于暂缓状态。',
-  )
-  assert.equal(submitted[0].fields.expected_position, 'PLAYING')
-})
-
-test('keeps the complete temporary-leave rules when leaving the playing position', async () => {
-  for (const scenario of [
-    {
-      fixedPair: false,
-      terminalDetail: '登记已设为暂时离开，已离开游玩位置并累计轮空 1 次。',
-      guidance: /返回后需要手动发送“取消暂时离开”/,
-      removalRule: /第四次仍未返回将退出排队/,
-    },
-    {
-      fixedPair: true,
-      terminalDetail: '固定组合的两份登记已经设为暂时离开，已离开游玩位置并累计轮空 1 次。',
-      guidance: /可以通过其中任一份登记发送“取消暂时离开”/,
-      removalRule: /第四次仍未返回时，整组将退出排队/,
-    },
-  ]) {
+test('refuses to defer or leave temporarily for a registration in the playing position', async () => {
+  for (const fixedPair of [false, true]) {
     const player = {
       registration_id: 'registration-playing-player',
       profile_id: 'profile-playing-player',
@@ -1575,7 +1735,7 @@ test('keeps the complete temporary-leave rules when leaving the playing position
       position: 'PLAYING',
       position_index: null,
       estimated_wait_minutes: 0,
-      fixed_pair: scenario.fixedPair,
+      fixed_pair: fixedPair,
       deferred_once: false,
       temporarily_away: false,
       temporary_away_skipped_turns: 0,
@@ -1583,6 +1743,7 @@ test('keeps the complete temporary-leave rules when leaving the playing position
       last_no_show_action_was_defer: false,
       online_registration_pending_check_in: false,
     }
+    const submitted = []
     const api = {
       getPlayers: async () => ({
         queue_id: 'queue-playing',
@@ -1592,23 +1753,177 @@ test('keeps the complete temporary-leave rules when leaving the playing position
         },
         players: [player],
       }),
-      createQueueCommand: async () => ({
-        command_id: 'command-playing-away',
-        status: 'APPLIED',
-        result_detail: scenario.terminalDetail,
-      }),
+      createQueueCommand: async (_qq, operation, fields) => {
+        submitted.push({ operation, fields })
+        return { command_id: 'command-playing', status: 'APPLIED' }
+      },
     }
+    const session = { platform: 'onebot', userId: '12345678', isDirect: true }
 
-    const text = await changeAbsenceState(
-      api,
-      { commandWaitSeconds: 3 },
-      { platform: 'onebot', userId: '12345678', isDirect: true },
-      'TEMPORARILY_LEAVE',
+    await assert.rejects(
+      changeAbsenceState(api, { commandWaitSeconds: 3 }, session, 'DEFER_ONE_ROUND'),
+      { message: '处于游玩位置的登记不能暂缓一次，请先在现场终端撤回至等待顺序。' },
     )
+    await assert.rejects(
+      changeAbsenceState(api, { commandWaitSeconds: 3 }, session, 'TEMPORARILY_LEAVE'),
+      { message: '处于游玩位置的登记不能暂时离开，请先在现场终端撤回至等待顺序。' },
+    )
+    // Nothing is sent to the server: the answer is known beforehand.
+    assert.deepEqual(submitted, [])
+  }
+})
 
-    assert.match(text, /已离开游玩位置并累计轮空 1 次/)
-    assert.match(text, scenario.guidance)
-    assert.match(text, scenario.removalRule)
+test('names the rule that is switched off before the playing position', async () => {
+  const api = {
+    getPlayers: async () => ({
+      queue_id: 'queue-playing',
+      queue_rules: {
+        allow_defer_one_round: false,
+        allow_temporary_leave: false,
+      },
+      players: [{
+        registration_id: 'registration-playing-player',
+        profile_id: 'profile-playing-player',
+        qq_number: '12345678',
+        display_id: '小雨',
+        machine_id: 'A',
+        position: 'PLAYING',
+        position_index: null,
+        fixed_pair: false,
+        deferred_once: false,
+        temporarily_away: false,
+        temporary_away_skipped_turns: 0,
+        online_registration_pending_check_in: false,
+      }],
+    }),
+    createQueueCommand: async () => assert.fail('no command may be sent'),
+  }
+  const session = { platform: 'onebot', userId: '12345678', isDirect: true }
+
+  await assert.rejects(
+    changeAbsenceState(api, { commandWaitSeconds: 3 }, session, 'DEFER_ONE_ROUND'),
+    { message: '系统规则不允许暂缓一次。' },
+  )
+  await assert.rejects(
+    changeAbsenceState(api, { commandWaitSeconds: 3 }, session, 'TEMPORARILY_LEAVE'),
+    { message: '系统规则不允许暂时离开。' },
+  )
+})
+
+function stoppedMachineScenario(playerFields = {}) {
+  const sent = []
+  const submitted = []
+  const player = {
+    registration_id: 'registration-stopped',
+    profile_id: 'profile-stopped',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'A',
+    machine_operational: false,
+    position: 'WAITING',
+    position_index: 1,
+    estimated_wait_minutes: null,
+    fixed_pair: false,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+    online_registration_pending_check_in: false,
+    preference: 'OPEN_TO_JOIN',
+    ...playerFields,
+  }
+  const api = {
+    getPlayers: async () => ({
+      queue_id: 'queue-stopped',
+      machine_configuration_revision: 7,
+      queue_rules: {
+        allow_defer_one_round: true,
+        allow_temporary_leave: true,
+      },
+      players: [player],
+    }),
+    getQueue: async () => ({
+      queue_id: 'queue-stopped',
+      captured_at: 1,
+      registration_open: true,
+      terminal: { online: true },
+      machines: {
+        A: {
+          id: 'A',
+          name: '左侧·机台 A',
+          operational: false,
+          stop_reason: 'MAINTENANCE',
+          playing: [],
+          waiting_positions: [],
+          registration_count: 1,
+          configuration: { capacity: 2 },
+        },
+        B: {
+          id: 'B',
+          name: '右侧·机台 B',
+          operational: true,
+          playing: [],
+          waiting_positions: [],
+          registration_count: 0,
+          configuration: { capacity: 2 },
+        },
+      },
+    }),
+    createQueueCommand: async (_qq, operation, fields) => {
+      submitted.push({ operation, fields })
+      return { command_id: 'command-stopped', status: 'APPLIED' }
+    },
+  }
+  const session = (reply) => ({
+    platform: 'onebot',
+    userId: '12345678',
+    isDirect: true,
+    send: async message => sent.push(message),
+    prompt: async () => reply,
+  })
+  return { api, sent, session, submitted }
+}
+
+test('lets a registration at a stopped machine leave the queue or move to another machine', async () => {
+  const leaving = stoppedMachineScenario()
+  const left = await leaveQueueFromBot(
+    leaving.api,
+    { commandWaitSeconds: 0 },
+    leaving.session('确认退出排队'),
+  )
+  assert.deepEqual(leaving.submitted.map(command => command.operation), ['LEAVE_QUEUE'])
+  assert.match(left, /退出排队/)
+
+  const moving = stoppedMachineScenario()
+  const moved = await transferQueueMachine(
+    moving.api,
+    { commandWaitSeconds: 0 },
+    moving.session('确认切换机台'),
+  )
+  assert.deepEqual(moving.submitted.map(command => command.operation), ['TRANSFER_MACHINE'])
+  assert.equal(moving.submitted[0].fields.target_machine_id, 'B')
+  assert.match(moved, /登记已转至 右侧·机台 B/)
+})
+
+test('keeps every other operation waiting while the machine of a registration is stopped', async () => {
+  for (const operation of [
+    'DEFER_ONE_ROUND',
+    'TEMPORARILY_LEAVE',
+    'CANCEL_DEFER_ONE_ROUND',
+    'CANCEL_TEMPORARY_LEAVE',
+  ]) {
+    const scenario = stoppedMachineScenario()
+    await assert.rejects(
+      changeAbsenceState(
+        scenario.api,
+        { commandWaitSeconds: 3 },
+        scenario.session(''),
+        operation,
+      ),
+      { message: '登记所在机台已停止使用，恢复正常使用前只能退出排队或转至其他机台。' },
+    )
+    assert.deepEqual(scenario.submitted, [])
   }
 })
 
@@ -1624,7 +1939,7 @@ test('fixed-pair personal menu exposes the matching cancel action', () => {
   assert.deepEqual(actions, [
     '取消暂时离开',
     '切换机台',
-    '修改游玩偏好',
+    '更改游玩偏好',
     '退出排队',
   ])
 })
@@ -1632,7 +1947,7 @@ test('fixed-pair personal menu exposes the matching cancel action', () => {
 test('explains all fixed-pair absence operations as whole-group changes', () => {
   assert.match(
     absenceOperationSuccessMessage('DEFER_ONE_ROUND', true),
-    /两份登记已同时暂缓一次.*跳过整组/,
+    /两份登记将同时暂缓一次.*跳过整组/,
   )
   assert.match(
     absenceOperationSuccessMessage('CANCEL_DEFER_ONE_ROUND', true),
@@ -1640,11 +1955,11 @@ test('explains all fixed-pair absence operations as whole-group changes', () => 
   )
   assert.match(
     absenceOperationSuccessMessage('TEMPORARILY_LEAVE', true),
-    /两份登记已同时设为暂时离开.*忽略整组.*整组将退出排队/s,
+    /两份登记已同时设为暂时离开.*忽略整组.*整组登记会自动移除/s,
   )
   assert.match(
     absenceOperationSuccessMessage('CANCEL_TEMPORARY_LEAVE', true),
-    /两份登记已同时取消暂时离开.*轮空次数均已清零/,
+    /两份登记已同时取消暂时离开.*已轮空次数会在游玩一轮后清零/,
   )
   assert.doesNotMatch(
     absenceOperationSuccessMessage('CANCEL_TEMPORARY_LEAVE', false),
@@ -1842,4 +2157,247 @@ test('rejects unsafe or oversized profile nicknames', () => {
   assert.equal(nicknameValidationError('  '), '昵称应为 1 至 18 个字符。')
   assert.equal(nicknameValidationError('第一行\n第二行'), '昵称不能包含换行或控制字符。')
   assert.equal(nicknameValidationError('一二三四五六七八九十一二三四五六七八九'), '昵称应为 1 至 18 个字符。')
+})
+
+// 轮空一次 and the limits on postponing (maintainer, 2026-11-25).
+
+function postponementScenario(playerFields = {}, laterFields = null) {
+  const submitted = []
+  const player = {
+    registration_id: 'registration-postponed',
+    profile_id: 'profile-postponed',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'A',
+    machine_operational: true,
+    position: 'WAITING',
+    position_index: 1,
+    estimated_wait_minutes: 6,
+    fixed_pair: false,
+    deferred_once: false,
+    skips_one_turn: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    defer_one_round_used: false,
+    online_registration_not_played: false,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+    online_registration_pending_check_in: false,
+    ...playerFields,
+  }
+  const responses = [player, { ...player, ...(laterFields || {}) }].map(current => ({
+    queue_id: 'queue-postponed',
+    queue_rules: {
+      allow_defer_one_round: true,
+      allow_temporary_leave: true,
+    },
+    players: [current],
+  }))
+  const api = {
+    getPlayers: async () => responses.length > 1 ? responses.shift() : responses[0],
+    createQueueCommand: async (_qq, operation, fields) => {
+      submitted.push({ operation, fields })
+      return { command_id: 'command-postponed', status: 'APPLIED', result_detail: null }
+    },
+  }
+  const session = { platform: 'onebot', userId: '12345678', isDirect: true }
+  return { api, session, submitted }
+}
+
+test('sets 轮空一次 for a waiting registration and explains the count', async () => {
+  const scenario = postponementScenario({}, { skips_one_turn: true })
+
+  const text = await changeAbsenceState(
+    scenario.api,
+    { commandWaitSeconds: 3 },
+    scenario.session,
+    'SKIP_ONE_TURN',
+  )
+
+  assert.equal(scenario.submitted.length, 1)
+  assert.equal(scenario.submitted[0].operation, 'SKIP_ONE_TURN')
+  assert.equal(scenario.submitted[0].fields.expected_absence_status, 'NONE')
+  assert.equal(
+    text,
+    '登记将轮空一次。下一次轮到时会移至队尾，计一次轮空，随后自动解除。',
+  )
+})
+
+test('cancels 轮空一次 against the confirmed 轮空一次 state', async () => {
+  const scenario = postponementScenario(
+    { skips_one_turn: true, temporary_away_skipped_turns: 1 },
+    { skips_one_turn: false },
+  )
+
+  const text = await changeAbsenceState(
+    scenario.api,
+    { commandWaitSeconds: 3 },
+    scenario.session,
+    'CANCEL_SKIP_ONE_TURN',
+  )
+
+  assert.equal(scenario.submitted[0].operation, 'CANCEL_SKIP_ONE_TURN')
+  assert.equal(scenario.submitted[0].fields.expected_absence_status, 'SKIP_ONE_TURN')
+  assert.equal(scenario.submitted[0].fields.expected_temporary_away_skipped_turns, 1)
+  assert.equal(text, '登记已取消轮空一次，将按照当前等待顺序正常轮候。')
+})
+
+test('refuses the postponements a player cannot ask for without asking the server', async () => {
+  const cases = [
+    [
+      { defer_one_round_used: true },
+      'DEFER_ONE_ROUND',
+      '这份登记已暂缓过一次，游玩一轮之后才能再次暂缓。',
+    ],
+    ...['DEFER_ONE_ROUND', 'SKIP_ONE_TURN', 'TEMPORARILY_LEAVE'].map(operation => [
+      { online_registration_not_played: true },
+      operation,
+      '已签到的线上登记在游玩一轮之前不能延后。',
+    ]),
+    [
+      { position: 'PLAYING', position_index: null },
+      'SKIP_ONE_TURN',
+      '处于游玩位置的登记不能轮空一次，请先在现场终端撤回至等待顺序。',
+    ],
+  ]
+  for (const [fields, operation, message] of cases) {
+    const scenario = postponementScenario(fields)
+    await assert.rejects(
+      changeAbsenceState(scenario.api, { commandWaitSeconds: 3 }, scenario.session, operation),
+      { message },
+    )
+    assert.deepEqual(scenario.submitted, [])
+  }
+
+  // A used 暂缓一次 leaves the other two.
+  const skipping = postponementScenario({ defer_one_round_used: true }, { skips_one_turn: true })
+  await changeAbsenceState(
+    skipping.api,
+    { commandWaitSeconds: 3 },
+    skipping.session,
+    'SKIP_ONE_TURN',
+  )
+  assert.equal(skipping.submitted[0].operation, 'SKIP_ONE_TURN')
+})
+
+test('the personal menu follows 轮空一次 and the postponement limits', () => {
+  const player = {
+    position: 'WAITING',
+    deferred_once: false,
+    temporarily_away: false,
+    online_registration_pending_check_in: false,
+  }
+  const rules = { allow_defer_one_round: true, allow_temporary_leave: true }
+
+  assert.deepEqual(formatOwnQueueActions({ ...player, skips_one_turn: true }, rules), [
+    '取消轮空一次',
+    '切换机台',
+    '更改游玩偏好',
+    '退出排队',
+  ])
+  assert.deepEqual(formatOwnQueueActions({ ...player, defer_one_round_used: true }, rules), [
+    '轮空一次',
+    '暂时离开',
+    '切换机台',
+    '更改游玩偏好',
+    '退出排队',
+  ])
+  assert.deepEqual(
+    formatOwnQueueActions({ ...player, online_registration_not_played: true }, rules),
+    ['切换机台', '更改游玩偏好', '退出排队'],
+  )
+})
+
+test('writes a set state with 将 before the turn', () => {
+  const base = {
+    registration_id: 'registration-1',
+    profile_id: 'profile-1',
+    qq_number: '12345678',
+    display_id: '小雨',
+    machine_id: 'A',
+    position: 'WAITING',
+    position_index: 2,
+    estimated_wait_minutes: 8,
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+  }
+
+  assert.match(formatOwnQueue([{ ...base, deferred_once: true }]), /将暂缓一次/)
+  const skipping = formatOwnQueue([{
+    ...base,
+    skips_one_turn: true,
+    temporary_away_skipped_turns: 1,
+  }])
+  assert.match(skipping, /将轮空一次·已轮空 1 次/)
+  assert.match(skipping, /取消轮空一次/)
+
+  assert.equal(
+    absenceOperationSuccessMessage('DEFER_ONE_ROUND', false),
+    '登记将暂缓一次。下一次轮到时会跳过这份登记，之后自动解除暂缓；队列会显示预计下次游玩的位置，真实等待顺序不变。',
+  )
+  assert.match(
+    absenceOperationSuccessMessage('SKIP_ONE_TURN', true),
+    /^固定组合的两份登记将同时轮空一次。下一次轮到时整组会移至队尾，计一次轮空，随后自动解除。$/,
+  )
+  assert.equal(
+    absenceOperationSuccessMessage('CANCEL_SKIP_ONE_TURN', true),
+    '固定组合的两份登记已同时取消轮空一次，将按照当前等待顺序正常轮候。',
+  )
+})
+
+test('the queue list marks a registration set to 轮空一次', () => {
+  const text = formatQueue({
+    queue_id: 'queue-1',
+    captured_at: 1,
+    registration_open: true,
+    terminal: { online: true },
+    machines: {
+      A: {
+        id: 'A',
+        name: '左侧·机台 A',
+        operational: true,
+        stop_reason: null,
+        stop_reason_detail: null,
+        playing_started_at: null,
+        playing: [],
+        waiting_positions: [{
+          index: 1,
+          estimated_wait_minutes: 4,
+          registrations: [
+            {
+              registration_id: 'r1',
+              display_id: '小雨',
+              preference: 'SOLO',
+              deferred_once: false,
+              skips_one_turn: true,
+              temporarily_away: false,
+              temporary_away_skipped_turns: 2,
+              fixed_pair: false,
+              no_show_count: 0,
+              estimated_wait_minutes: 4,
+            },
+            {
+              registration_id: 'r2',
+              display_id: '小风',
+              preference: 'SOLO',
+              deferred_once: true,
+              temporarily_away: false,
+              temporary_away_skipped_turns: 0,
+              fixed_pair: false,
+              no_show_count: 0,
+              estimated_wait_minutes: 4,
+            },
+          ],
+        }],
+        registration_count: 2,
+        configuration: { capacity: 2 },
+      },
+    },
+  })
+
+  assert.match(text, / {4}- 将轮空一次·已轮空 2 次/)
+  assert.match(text, / {4}- 将暂缓一次/)
 })

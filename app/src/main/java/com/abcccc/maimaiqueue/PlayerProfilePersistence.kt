@@ -102,6 +102,23 @@ internal class PlayerProfilePersistenceCoordinator(
         ) -> Boolean
     ): CloudPlayerProfilePersistenceResult = writeMutex.withLock {
         val localProfiles = currentProfiles()
+        // "Has been shown the explanation" only ever turns on, wherever it was recorded. A copy
+        // from the cloud never clears it here, and a cloud copy that has it sets it here even
+        // when nothing else about the profile is newer.
+        val introducedLocally = localProfiles
+            .filter { it.pairedMachineQueueingIntroduced }
+            .mapTo(mutableSetOf(), PlayerProfile::id)
+        @Suppress("NAME_SHADOWING")
+        val cloudProfiles = cloudProfiles.map { cloudProfile ->
+            if (!cloudProfile.pairedMachineQueueingIntroduced && cloudProfile.id in introducedLocally) {
+                cloudProfile.copy(pairedMachineQueueingIntroduced = true)
+            } else {
+                cloudProfile
+            }
+        }
+        val introducedInCloud = cloudProfiles
+            .filter { it.pairedMachineQueueingIntroduced }
+            .mapTo(mutableSetOf(), PlayerProfile::id)
         val cloudById = cloudProfiles.associateBy(PlayerProfile::id)
         val validAliases = profileAliases.filter { (sourceId, targetId) ->
             sourceId != targetId && targetId in cloudById
@@ -109,6 +126,13 @@ internal class PlayerProfilePersistenceCoordinator(
         val aliasSources = validAliases.keys
         val workingProfiles = localProfiles
             .filterNot { it.id in aliasSources }
+            .map { localProfile ->
+                if (!localProfile.pairedMachineQueueingIntroduced && localProfile.id in introducedInCloud) {
+                    localProfile.copy(pairedMachineQueueingIntroduced = true)
+                } else {
+                    localProfile
+                }
+            }
             .toMutableList()
         val appliedProfiles = mutableListOf<PlayerProfile>()
 

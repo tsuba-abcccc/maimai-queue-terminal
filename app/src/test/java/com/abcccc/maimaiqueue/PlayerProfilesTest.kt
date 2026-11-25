@@ -408,4 +408,5 @@ class PlayerProfilesTest {
     private companion object {
         const val DAY = 24L * 60L * 60L * 1_000L
     }
+
 }

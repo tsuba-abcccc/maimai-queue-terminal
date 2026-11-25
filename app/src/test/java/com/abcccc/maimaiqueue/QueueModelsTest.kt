@@ -208,23 +208,25 @@ class QueueModelsTest {
     }
 
     @Test
-    fun deferOneRoundFromPlayingKeepsRegistrationAtFrontAndStartsFollowingGroup() {
+    fun registrationsInThePlayingPositionCanNeitherDeferNorLeaveTemporarily() {
         val queue = MachineQueue(
-            playing = listOf(registration(1, PlayPreference.SOLO)),
-            waiting = listOf(registration(2, PlayPreference.SOLO))
-        ).deferOneRound(1)
+            playing = listOf(registration(1), registration(2)),
+            waiting = listOf(registration(3, PlayPreference.SOLO)),
+            playingStartedAtMillis = 100L
+        )
 
-        assertEquals(listOf(2), queue.playing.map { it.key })
-        assertEquals(listOf(1), queue.waiting.map { it.key })
-        assertEquals(QueueAbsenceStatus.NONE, queue.waiting.single().absenceStatus)
+        assertEquals(queue, queue.deferOneRound(1))
+        assertEquals(queue, queue.temporarilyLeave(1))
     }
 
     @Test
-    fun deferOneRoundFromPlayingDoesNotReserveAnOpenPartnerSlot() {
+    fun deferringAfterBeingTakenBackToTheFrontDoesNotReserveAnOpenPartnerSlot() {
         val queue = MachineQueue(
             playing = listOf(registration(1)),
             waiting = listOf(registration(2), registration(3))
-        ).deferOneRound(1)
+        ).returnPlayingRegistrationsToWaitingFront(setOf(1))
+            .deferOneRound(1)
+            .enterPlayingPosition()
 
         assertEquals(listOf(2, 3), queue.playing.map { it.key })
         assertEquals(listOf(1), queue.waiting.map { it.key })
@@ -234,8 +236,9 @@ class QueueModelsTest {
     @Test
     fun deferOneRoundWithNoFollowingGroupConsumesTheDeferralAndStaysAtFront() {
         val queue = MachineQueue(
-            playing = listOf(registration(1, PlayPreference.SOLO))
+            waiting = listOf(registration(1, PlayPreference.SOLO))
         ).deferOneRound(1)
+            .enterPlayingPosition()
 
         assertTrue(queue.playing.isEmpty())
         assertEquals(listOf(1), queue.waiting.map { it.key })
@@ -314,19 +317,6 @@ class QueueModelsTest {
     }
 
     @Test
-    fun temporarilyLeavingFromPlayingCountsOnceAndDoesNotRepeatInSameAdvance() {
-        val queue = MachineQueue(
-            playing = listOf(registration(1, PlayPreference.SOLO)),
-            waiting = listOf(registration(2, PlayPreference.SOLO))
-        ).temporarilyLeave(1)
-
-        assertEquals(listOf(2), queue.playing.map { it.key })
-        assertEquals(listOf(1), queue.waiting.map { it.key })
-        assertEquals(QueueAbsenceStatus.TEMPORARILY_AWAY, queue.waiting.single().absenceStatus)
-        assertEquals(1, queue.waiting.single().temporaryAwaySkippedTurns)
-    }
-
-    @Test
     fun fourthTemporarilyAwayOpportunityRemovesRegistration() {
         val queue = MachineQueue(
             waiting = listOf(
@@ -361,8 +351,8 @@ class QueueModelsTest {
     }
 
     @Test
-    fun cancellingTemporaryLeaveClearsCountWithoutChangingOrder() {
-        val queue = MachineQueue(
+    fun cancellingTemporaryLeaveKeepsTheCountUntilARoundIsPlayed() {
+        val returned = MachineQueue(
             waiting = listOf(
                 registration(1, PlayPreference.SOLO).copy(
                     absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
@@ -372,9 +362,19 @@ class QueueModelsTest {
             )
         ).cancelTemporaryLeave(1)
 
-        assertEquals(listOf(1, 2), queue.waiting.map { it.key })
-        assertEquals(QueueAbsenceStatus.NONE, queue.waiting.first().absenceStatus)
-        assertEquals(0, queue.waiting.first().temporaryAwaySkippedTurns)
+        assertEquals(listOf(1, 2), returned.waiting.map { it.key })
+        assertEquals(QueueAbsenceStatus.NONE, returned.waiting.first().absenceStatus)
+        assertEquals(2, returned.waiting.first().temporaryAwaySkippedTurns)
+        assertTrue(returned.invariantViolations().isEmpty())
+
+        // Leaving again counts on from there.
+        assertEquals(2, returned.temporarilyLeave(1).waiting.first().temporaryAwaySkippedTurns)
+
+        // Only a round that was actually played clears the count.
+        val playing = returned.enterPlayingPosition()
+        assertEquals(2, playing.playing.single().temporaryAwaySkippedTurns)
+        val played = playing.finishRound(atMillis = 9_000L)
+        assertEquals(0, played.waiting.first { it.key == 1 }.temporaryAwaySkippedTurns)
     }
 
     @Test

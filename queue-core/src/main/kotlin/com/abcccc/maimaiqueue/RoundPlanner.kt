@@ -351,6 +351,23 @@ object RoundPlanner {
                 continue
             }
 
+            // 轮空一次 of a fixed pair: both go to the tail together, counting one skipped turn
+            // as 暂时离开 does; with three already counted they are removed instead.
+            val fixedPairSkipsOneTurn = isFixedPair && group.any {
+                it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN
+            }
+            if (fixedPairSkipsOneTurn) {
+                val skippedTurns = group.maxOf { it.temporaryAwaySkippedTurns }
+                if (skippedTurns < 3) {
+                    movedToTail += group.map {
+                        it.copy(
+                            absenceStatus = QueueAbsenceStatus.NONE,
+                            temporaryAwaySkippedTurns = skippedTurns + 1
+                        )
+                    }
+                }
+                continue
+            }
             val fixedPairIsTemporarilyAway = isFixedPair && group.any {
                 it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
             }
@@ -382,7 +399,19 @@ object RoundPlanner {
                         }
                     }
                     registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND -> {
-                        retained += registration.copy(absenceStatus = QueueAbsenceStatus.NONE)
+                        // Used now: no second deferral before the registration has played.
+                        retained += registration.copy(
+                            absenceStatus = QueueAbsenceStatus.NONE,
+                            deferOneRoundUsed = true
+                        )
+                    }
+                    registration.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN -> {
+                        if (registration.temporaryAwaySkippedTurns < 3) {
+                            movedToTail += registration.copy(
+                                absenceStatus = QueueAbsenceStatus.NONE,
+                                temporaryAwaySkippedTurns = registration.temporaryAwaySkippedTurns + 1
+                            )
+                        }
                     }
                     else -> retained += registration
                 }

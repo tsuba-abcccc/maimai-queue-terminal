@@ -60,7 +60,13 @@ data class PlayerProfile(
     val setupVersion: Int = 0,
     val revision: Long = 1L,
     val createdAtMillis: Long = System.currentTimeMillis(),
-    val updatedAtMillis: Long = createdAtMillis
+    val updatedAtMillis: Long = createdAtMillis,
+    /**
+     * Whether the player has been shown the explanation of letting the system arrange a
+     * registration between two machines. A record, not a setting: it only ever turns on, and
+     * all it decides is whether the explanation opens by itself the next time.
+     */
+    val pairedMachineQueueingIntroduced: Boolean = false
 ) {
     val hasValidContact: Boolean
         get() = normalizedQqNumber() != null && isValidQqNumber(normalizedQqNumber())
@@ -92,9 +98,13 @@ data class PlayerProfile(
 
     fun recordUsage(
         atMillis: Long = System.currentTimeMillis(),
-        preferenceToRemember: PlayPreference? = null
+        preferenceToRemember: PlayPreference? = null,
+        /** The explanation was shown where this registration was created, see the field. */
+        pairedMachineQueueingIntroducedNow: Boolean = false
     ): PlayerProfile = copy(
         defaultPreference = preferenceToRemember?.toProfilePlayPreference() ?: defaultPreference,
+        pairedMachineQueueingIntroduced =
+            pairedMachineQueueingIntroduced || pairedMachineQueueingIntroducedNow,
         usageCount = usageCount + 1,
         lastUsedAtMillis = atMillis,
         recentUsageAtMillis = normalizeRecentUsageTimestamps(
@@ -123,6 +133,13 @@ internal fun normalizeRecentUsageTimestamps(
 
 val PlayerProfile.canEditOnTerminal: Boolean
     get() = !webAccountBound || terminalEditingAllowed
+
+/**
+ * Whether the profile must be completed in the editor before it can be used to create or claim
+ * a registration.
+ */
+fun PlayerProfile.needsCompletionBeforeUse(): Boolean =
+    !hasValidContact || !hasCompleteRequiredDetails
 
 internal fun normalizePlayerAvatarReference(value: String?): String? {
     val normalized = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null

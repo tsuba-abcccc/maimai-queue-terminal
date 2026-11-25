@@ -1167,39 +1167,53 @@ class QueueEngineDifferentialTest {
     }
 
     @Test
-    fun stoppedMachineBlocksPlayerRemovalButAllowsSystemCleanup() {
-        val queue = MachineQueue(waiting = listOf(registration(1)))
-        val state = QueueEngineState.single(machineA, queue)
+    fun stoppedMachineStillLetsRegistrationsLeaveOrMoveAway() {
+        val state = QueueEngineState(
+            mapOf(
+                machineA to MachineQueue(waiting = listOf(registration(1), registration(2))),
+                machineB to MachineQueue(waiting = listOf(registration(3)))
+            )
+        )
         val policy = QueueEnginePolicy(
             machineStatuses = mapOf(
                 machineA to MachineStatus().stop(MachineStopReason.MAINTENANCE, 1_000L)
             ),
             requireOperationalForPlayerActions = true
         )
-        val action = QueueAction.RemoveRegistrations(machineA, setOf(1))
+        fun execute(action: QueueAction, origin: QueueActionOrigin = QueueActionOrigin.ON_SITE_TERMINAL) =
+            QueueEngine.execute(state, action, QueueActionContext(origin = origin, policy = policy))
 
-        val playerResult = QueueEngine.execute(
-            state,
-            action,
-            QueueActionContext(
-                origin = QueueActionOrigin.ON_SITE_TERMINAL,
-                policy = policy
-            )
-        )
-        val cleanupResult = QueueEngine.execute(
-            state,
-            action,
-            QueueActionContext(
-                origin = QueueActionOrigin.SYSTEM,
-                policy = policy
-            )
-        )
-
+        // Nobody is held at a machine that cannot be played on.
+        val left = execute(QueueAction.RemoveRegistrations(machineA, setOf(1)))
         assertEquals(
-            QueueActionFailureCode.MACHINE_STOPPED,
-            (playerResult as QueueActionExecution.Rejected).failure.code
+            listOf(2),
+            (left as QueueActionExecution.Applied).state.queue(machineA)!!.waiting.map { it.key }
         )
-        assertTrue(cleanupResult is QueueActionExecution.Applied)
+        val moved = execute(QueueAction.TransferRegistrations(machineA, machineB, setOf(1)))
+        assertEquals(
+            listOf(3, 1),
+            (moved as QueueActionExecution.Applied).state.queue(machineB)!!.waiting.map { it.key }
+        )
+
+        // Everything else stays suspended, and nothing joins the stopped machine.
+        listOf(
+            QueueAction.DeferOneRound(machineA, 1),
+            QueueAction.TemporarilyLeave(machineA, 1),
+            QueueAction.EnterPlayingPosition(machineA),
+            QueueAction.ChangePreference(machineA, 1, PlayPreference.SOLO),
+            QueueAction.TransferRegistrations(machineB, machineA, setOf(3))
+        ).forEach { action ->
+            assertEquals(
+                "$action",
+                QueueActionFailureCode.MACHINE_STOPPED,
+                (execute(action) as QueueActionExecution.Rejected).failure.code
+            )
+        }
+
+        val cleanupResult = execute(
+            QueueAction.RemoveRegistrations(machineA, setOf(1, 2)),
+            QueueActionOrigin.SYSTEM
+        )
         assertTrue((cleanupResult as QueueActionExecution.Applied)
             .state.queue(machineA)!!.allRegistrations.isEmpty())
     }
@@ -1287,11 +1301,20 @@ class QueueEngineDifferentialTest {
                 .filter { it.absenceStatus == QueueAbsenceStatus.NONE }
                 .randomOrNull(random)
                 ?.let { selected ->
-                    candidates += QueueAction.DeferOneRound(machineA, selected.key) to {
-                        it.deferOneRound(selected.key, actionTime)
+                    // 暂缓一次 once used waits until the registration has played, and a
+                    // checked-in online registration that has not played cannot be postponed
+                    // at all from the terminal (2026-11-25).
+                    val group = queue.allRegistrations.filter { it.key in queue.fixedGroupKeys(selected.key) }
+                    val postponable = group.none(Registration::mustBeRemovedWhenAbsent)
+                    if (postponable && group.none(Registration::deferOneRoundUsed)) {
+                        candidates += QueueAction.DeferOneRound(machineA, selected.key) to {
+                            it.deferOneRound(selected.key)
+                        }
                     }
-                    candidates += QueueAction.TemporarilyLeave(machineA, selected.key) to {
-                        it.temporarilyLeave(selected.key, actionTime)
+                    if (postponable) {
+                        candidates += QueueAction.TemporarilyLeave(machineA, selected.key) to {
+                            it.temporarilyLeave(selected.key)
+                        }
                     }
                     val nextPreference = if (selected.preference == PlayPreference.SOLO) {
                         PlayPreference.OPEN_TO_JOIN

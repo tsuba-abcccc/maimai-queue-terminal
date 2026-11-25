@@ -22,7 +22,12 @@ enum class QueueStateSaveResult {
 
 data class PersistedMachineState(
     val queue: MachineQueue = MachineQueue(),
-    val status: MachineStatus = MachineStatus()
+    val status: MachineStatus = MachineStatus(),
+    /**
+     * For a machine that is half of a pair: its waiting registrations interleaved with the
+     * places held here by registrations of the other machine, as registration keys.
+     */
+    val pairedOrder: List<Int> = emptyList()
 )
 
 data class PersistedQueueState(
@@ -32,7 +37,9 @@ data class PersistedQueueState(
     val registrationOpen: Boolean,
     val nextRegistrationKey: Int,
     val savedAtMillis: Long,
-    val terminalCommandReceipts: List<TerminalCommandReceipt> = emptyList()
+    val terminalCommandReceipts: List<TerminalCommandReceipt> = emptyList(),
+    /** What the engine remembers about registrations that may be arranged to the other machine. */
+    val pairedArrangements: Map<Int, PairedArrangementRecord> = emptyMap()
 ) {
     constructor(
         queueId: String,
@@ -182,10 +189,31 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                     put(machineId.name, JSONObject().apply {
                         put("queue", encodeQueue(machine.queue))
                         put("status", encodeStatus(machine.status))
+                        if (machine.pairedOrder.isNotEmpty()) {
+                            put("pairedOrder", JSONArray(machine.pairedOrder))
+                        }
                     })
                 }
             }
         )
+        if (state.pairedArrangements.isNotEmpty()) {
+            put(
+                "pairedArrangements",
+                JSONObject().apply {
+                    state.pairedArrangements.forEach { (key, record) ->
+                        put(key.toString(), JSONObject().apply {
+                            record.previewSinceMillis?.let { put("previewSinceMillis", it) }
+                            record.previewPausedAtMillis?.let { put("previewPausedAtMillis", it) }
+                            record.noticedAtMillis?.let { put("noticedAtMillis", it) }
+                            record.arrangedFromMachineId?.let { put("arrangedFromMachineId", it) }
+                            if (record.aheadKeysAtOrigin.isNotEmpty()) {
+                                put("aheadKeysAtOrigin", JSONArray(record.aheadKeysAtOrigin))
+                            }
+                        })
+                    }
+                }
+            )
+        }
         put(
             "terminalCommandReceipts",
             JSONArray().apply {
@@ -224,6 +252,7 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                     put("lastPlayedAtMillis", registration.lastPlayedAtMillis ?: JSONObject.NULL)
                     put("noShowCount", registration.noShowCount)
                     put("lastNoShowActionWasDefer", registration.lastNoShowActionWasDefer)
+                    put("deferOneRoundUsed", registration.deferOneRoundUsed)
                     put("fixedPartnerKey", registration.fixedPartnerKey ?: JSONObject.NULL)
                     put("gender", registration.gender?.name ?: JSONObject.NULL)
                     put("playerProfileId", registration.playerProfileId ?: JSONObject.NULL)
@@ -236,6 +265,15 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                         "originatingCommandId",
                         registration.originatingCommandId ?: JSONObject.NULL
                     )
+                    if (registration.wasOnlineRegistration) {
+                        put("wasOnlineRegistration", true)
+                    }
+                    if (registration.alsoQueuesAtPairedMachine) {
+                        put("alsoQueuesAtPairedMachine", true)
+                    }
+                    if (registration.skipsPairedMachineThisRound) {
+                        put("skipsPairedMachineThisRound", true)
+                    }
                 }
             )
         }
@@ -294,7 +332,8 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                 decodeTerminalCommandReceipts(root.optJSONArray("terminalCommandReceipts"))
             } else {
                 emptyList()
-            }
+            },
+            pairedArrangements = decodePairedArrangements(root.optJSONObject("pairedArrangements"))
         )
     }.getOrNull()
 
@@ -318,7 +357,8 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                     machineId,
                     PersistedMachineState(
                         queue = queue,
-                        status = decodeStatus(item.optJSONObject("status"))
+                        status = decodeStatus(item.optJSONObject("status")),
+                        pairedOrder = decodePairedOrder(item.optJSONArray("pairedOrder"))
                     )
                 )
             }
@@ -383,13 +423,8 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                 displayId = displayId,
                 preference = preference,
                 absenceStatus = absenceStatus,
-                temporaryAwaySkippedTurns = if (
-                    absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
-                ) {
-                    item.optInt("temporaryAwaySkippedTurns").coerceIn(0, 3)
-                } else {
-                    0
-                },
+                // Kept after the player came back, until the registration has played a round.
+                temporaryAwaySkippedTurns = item.optInt("temporaryAwaySkippedTurns").coerceIn(0, 3),
                 isTemporary = item.optBoolean("isTemporary", true),
                 createdAtMillis = item.optLong("createdAtMillis").takeIf { it > 0L }
                     ?: return null,
@@ -398,6 +433,8 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                 noShowCount = noShowCount,
                 lastNoShowActionWasDefer = noShowCount > 0 &&
                     item.optBoolean("lastNoShowActionWasDefer"),
+                // Older saves have no such field: 暂缓一次 is then available again.
+                deferOneRoundUsed = item.optBoolean("deferOneRoundUsed", false),
                 fixedPartnerKey = item.optIntOrNull("fixedPartnerKey")?.takeIf { it > 0 },
                 gender = item.optNullableString("gender")?.let { name ->
                     enumValues<PlayerGender>().firstOrNull { it.name == name }
@@ -411,10 +448,55 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                     item.optNullableString("originatingCommandId")
                         ?: item.optNullableString("onlineRegistrationCommandId")
                     )
-                    ?.takeIf { value -> runCatching { java.util.UUID.fromString(value) }.isSuccess }
+                    ?.takeIf { value -> runCatching { java.util.UUID.fromString(value) }.isSuccess },
+                alsoQueuesAtPairedMachine = item.optBoolean("alsoQueuesAtPairedMachine", false),
+                skipsPairedMachineThisRound = item.optBoolean("skipsPairedMachineThisRound", false),
+                wasOnlineRegistration = item.optBoolean("wasOnlineRegistration", false)
             )
         }
         return registrations
+    }
+
+    /**
+     * The stored order is only a starting point: the queue engine reconciles it with the
+     * queues and the configured pairs when the state is loaded.
+     */
+    private fun decodePairedArrangements(source: JSONObject?): Map<Int, PairedArrangementRecord> {
+        if (source == null) return emptyMap()
+        return buildMap {
+            source.keys().forEach { name ->
+                val key = name.toIntOrNull() ?: return@forEach
+                val item = source.optJSONObject(name) ?: return@forEach
+                fun millis(field: String): Long? =
+                    if (item.has(field) && !item.isNull(field)) item.optLong(field) else null
+                val ahead = item.optJSONArray("aheadKeysAtOrigin")
+                put(
+                    key,
+                    PairedArrangementRecord(
+                        previewSinceMillis = millis("previewSinceMillis"),
+                        previewPausedAtMillis = millis("previewPausedAtMillis"),
+                        noticedAtMillis = millis("noticedAtMillis"),
+                        arrangedFromMachineId = item.optString("arrangedFromMachineId")
+                            .takeIf { it.isNotEmpty() },
+                        aheadKeysAtOrigin = if (ahead == null) {
+                            emptyList()
+                        } else {
+                            List(ahead.length()) { index -> ahead.optInt(index) }
+                        }
+                    )
+                )
+            }
+        }
+    }
+
+    private fun decodePairedOrder(value: JSONArray?): List<Int> {
+        value ?: return emptyList()
+        return buildList {
+            repeat(value.length().coerceAtMost(MAX_REGISTRATIONS_PER_MACHINE * 2)) { index ->
+                val key = value.optInt(index)
+                if (key > 0 && key !in this) add(key)
+            }
+        }
     }
 
     private fun decodeStatus(value: JSONObject?): MachineStatus {
@@ -469,7 +551,6 @@ internal fun normalizeRestoredMachineQueue(queue: MachineQueue): MachineQueue {
     val playing = normalizeRestoredRegistrations(queue.playing).map {
         it.copy(
             absenceStatus = QueueAbsenceStatus.NONE,
-            temporaryAwaySkippedTurns = 0,
             requiresOnSiteCheckIn = false
         )
     }
@@ -495,13 +576,7 @@ private fun normalizeRestoredRegistrations(
         }
         registration.copy(
             displayId = displayId,
-            temporaryAwaySkippedTurns = if (
-                normalizedAbsenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
-            ) {
-                registration.temporaryAwaySkippedTurns.coerceIn(0, 3)
-            } else {
-                0
-            },
+            temporaryAwaySkippedTurns = registration.temporaryAwaySkippedTurns.coerceIn(0, 3),
             absenceStatus = normalizedAbsenceStatus,
             createdAtMillis = registration.createdAtMillis.coerceAtLeast(1L),
             onSiteCheckInStartedAtMillis = registration.onSiteCheckInStartedAtMillis
@@ -525,6 +600,9 @@ private fun normalizeRestoredRegistrations(
             registration.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY ||
                 partner.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY ->
                 QueueAbsenceStatus.TEMPORARILY_AWAY
+            registration.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN ||
+                partner.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN ->
+                QueueAbsenceStatus.SKIP_ONE_TURN
             registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND ||
                 partner.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND ->
                 QueueAbsenceStatus.DEFER_ONE_ROUND
@@ -533,16 +611,10 @@ private fun normalizeRestoredRegistrations(
         registration.copy(
             preference = PlayPreference.OPEN_TO_JOIN,
             absenceStatus = pairAbsenceStatus,
-            temporaryAwaySkippedTurns = if (
-                pairAbsenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
-            ) {
-                maxOf(
-                    registration.temporaryAwaySkippedTurns,
-                    partner.temporaryAwaySkippedTurns
-                )
-            } else {
-                0
-            }
+            temporaryAwaySkippedTurns = maxOf(
+                registration.temporaryAwaySkippedTurns,
+                partner.temporaryAwaySkippedTurns
+            )
         )
     }
 }

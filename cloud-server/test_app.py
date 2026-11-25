@@ -1664,7 +1664,7 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertEqual(503, short_sync.status_code)
         self.assertEqual(
-            {"ok": False, "error": "服务器鉴权配置无效"}, short_sync.get_json()
+            {"ok": False, "error": "服务器认证配置无效。"}, short_sync.get_json()
         )
         self.assertNotIn("s" * 31, short_sync.get_data(as_text=True))
         self.assertEqual(200, health.status_code)
@@ -1672,7 +1672,7 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(503, short_bot.status_code)
         self.assertEqual(503, missing_bot.status_code)
         self.assertEqual(
-            {"ok": False, "error": "服务器鉴权配置无效"}, missing_bot.get_json()
+            {"ok": False, "error": "服务器认证配置无效。"}, missing_bot.get_json()
         )
         self.assertEqual(200, bot_with_missing_sync.status_code)
         self.assertEqual(503, missing_sync.status_code)
@@ -2298,6 +2298,2165 @@ class QueueStatusApiTest(unittest.TestCase):
                 self.assertEqual(400, response.status_code)
                 self.assertIn("共同游玩预览", response.get_json()["error"])
 
+    def paired_snapshot(self, revision=40):
+        """Machines A and B form a pair; one registration waiting at A also queues at B."""
+        snapshot = self.snapshot(revision=revision)
+        machine_a = snapshot["machines"]["A"]
+        machine_b = snapshot["machines"]["B"]
+        waiting = self.registration("c" * 24, "同时排队玩家")
+        waiting["also_queues_at_paired_machine"] = True
+        machine_a["waiting_positions"] = [
+            {
+                "index": 1,
+                "position_id": "d" * 24,
+                "fixed_pair": False,
+                "estimated_wait_minutes": 6,
+                "registrations": [waiting],
+                "common_play_preview": None,
+            }
+        ]
+        machine_a["registration_count"] = 2
+        machine_a["waiting_position_count"] = 1
+        machine_a["paired_machine_id"] = "B"
+        machine_b["playing"] = [self.registration("b" * 24, "机台乙玩家")]
+        machine_b["playing_started_at"] = 900_000
+        machine_b["registration_count"] = 1
+        machine_b["paired_machine_id"] = "A"
+        machine_b["paired_waiting_positions"] = [
+            {
+                "index": 7,
+                "position_id": "e" * 24,
+                "estimated_wait_minutes": 6,
+                "registrations": [
+                    {"registration_id": "c" * 24, "paired_place_preview": True}
+                ],
+                "common_play_preview": None,
+            }
+        ]
+        return snapshot
+
+    def test_paired_machine_fields_default_to_absent(self):
+        publish = self.client.post(
+            "/api/queue-status", json=self.snapshot(revision=39), headers=self.headers
+        )
+        machine = self.client.get("/api/queue-status").get_json()["machines"]["A"]
+
+        self.assertEqual(204, publish.status_code)
+        self.assertIsNone(machine["paired_machine_id"])
+        self.assertIsNone(machine["paired_waiting_positions"])
+        self.assertIs(False, machine["playing"][0]["also_queues_at_paired_machine"])
+        self.assertIs(False, machine["playing"][0]["skips_paired_machine_this_round"])
+        self.assertIs(False, machine["playing"][0]["paired_arrangement_announced"])
+        self.assertIsNone(machine["playing"][0]["paired_arrangement_not_before"])
+
+    def test_registration_that_gave_up_its_place_for_this_round_is_public(self):
+        # The registration still has the player's choice on, but holds no place at B.
+        snapshot = self.paired_snapshot(revision=43)
+        waiting = snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+        waiting["skips_paired_machine_this_round"] = True
+        snapshot["machines"]["B"]["paired_waiting_positions"] = None
+
+        publish = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        machines = self.client.get("/api/queue-status").get_json()["machines"]
+        published = machines["A"]["waiting_positions"][0]["registrations"][0]
+
+        self.assertEqual(204, publish.status_code, publish.get_json())
+        self.assertIs(True, published["also_queues_at_paired_machine"])
+        self.assertIs(True, published["skips_paired_machine_this_round"])
+        self.assertIsNone(machines["B"]["paired_waiting_positions"])
+        # Registrations the terminal did not mark carry the key as false.
+        self.assertIs(False, machines["A"]["playing"][0]["skips_paired_machine_this_round"])
+
+    def test_giving_up_the_place_for_this_round_is_kept_while_the_choice_is_off(self):
+        # The terminal keeps the mark when the player turns the choice off in the same round.
+        snapshot = self.paired_snapshot(revision=44)
+        waiting = snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+        waiting["also_queues_at_paired_machine"] = False
+        waiting["skips_paired_machine_this_round"] = True
+        snapshot["machines"]["B"]["paired_waiting_positions"] = None
+
+        publish = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        published = self.client.get("/api/queue-status").get_json()["machines"]["A"][
+            "waiting_positions"
+        ][0]["registrations"][0]
+
+        self.assertEqual(204, publish.status_code, publish.get_json())
+        self.assertIs(False, published["also_queues_at_paired_machine"])
+        self.assertIs(True, published["skips_paired_machine_this_round"])
+
+    def test_announced_arrangement_is_public_with_its_earliest_moment(self):
+        snapshot = self.paired_snapshot(revision=45)
+        waiting = snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+        waiting["paired_arrangement_announced"] = True
+        waiting["paired_arrangement_not_before"] = 1_700_000_300_000
+
+        publish = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        machines = self.client.get("/api/queue-status").get_json()["machines"]
+        published = machines["A"]["waiting_positions"][0]["registrations"][0]
+
+        self.assertEqual(204, publish.status_code, publish.get_json())
+        self.assertIs(True, published["paired_arrangement_announced"])
+        self.assertEqual(1_700_000_300_000, published["paired_arrangement_not_before"])
+        # Registrations without an announcement carry the keys as false and null.
+        self.assertIs(False, machines["A"]["playing"][0]["paired_arrangement_announced"])
+        self.assertIsNone(machines["A"]["playing"][0]["paired_arrangement_not_before"])
+
+    def test_announced_arrangement_may_come_without_a_moment(self):
+        # The terminal holds the count while a round runs unusually long: no time is promised.
+        snapshot = self.paired_snapshot(revision=46)
+        waiting = snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+        waiting["paired_arrangement_announced"] = True
+
+        publish = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        published = self.client.get("/api/queue-status").get_json()["machines"]["A"][
+            "waiting_positions"
+        ][0]["registrations"][0]
+
+        self.assertEqual(204, publish.status_code, publish.get_json())
+        self.assertIs(True, published["paired_arrangement_announced"])
+        self.assertIsNone(published["paired_arrangement_not_before"])
+
+    def test_announcement_is_not_kept_for_a_registration_whose_choice_is_off(self):
+        snapshot = self.paired_snapshot(revision=47)
+        waiting = snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+        waiting["also_queues_at_paired_machine"] = False
+        waiting["paired_arrangement_announced"] = True
+        waiting["paired_arrangement_not_before"] = 1_700_000_300_000
+        snapshot["machines"]["B"]["paired_waiting_positions"] = None
+
+        publish = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        published = self.client.get("/api/queue-status").get_json()["machines"]["A"][
+            "waiting_positions"
+        ][0]["registrations"][0]
+
+        self.assertEqual(204, publish.status_code, publish.get_json())
+        self.assertIs(False, published["paired_arrangement_announced"])
+        self.assertIsNone(published["paired_arrangement_not_before"])
+
+    def test_paired_machine_preview_is_public_and_does_not_count_as_a_registration(self):
+        publish = self.client.post(
+            "/api/queue-status", json=self.paired_snapshot(), headers=self.headers
+        )
+        machines = self.client.get("/api/queue-status").get_json()["machines"]
+
+        self.assertEqual(204, publish.status_code)
+        self.assertEqual("B", machines["A"]["paired_machine_id"])
+        self.assertEqual("A", machines["B"]["paired_machine_id"])
+        self.assertIsNone(machines["A"]["paired_waiting_positions"])
+        self.assertIs(
+            True,
+            machines["A"]["waiting_positions"][0]["registrations"][0][
+                "also_queues_at_paired_machine"
+            ],
+        )
+        # The registration is still counted and listed once, at machine A.
+        self.assertEqual(2, machines["A"]["registration_count"])
+        self.assertEqual(1, machines["B"]["registration_count"])
+        self.assertEqual([], machines["B"]["waiting_positions"])
+        self.assertEqual(
+            [
+                {
+                    "index": 1,
+                    "position_id": "e" * 24,
+                    "estimated_wait_minutes": 6,
+                    "estimated_wait_uncertain": False,
+                    "registrations": [
+                        {"registration_id": "c" * 24, "paired_place_preview": True}
+                    ],
+                    "common_play_preview": None,
+                }
+            ],
+            machines["B"]["paired_waiting_positions"],
+        )
+
+    def test_paired_machine_preview_may_share_a_position_and_carry_common_play_preview(self):
+        snapshot = self.paired_snapshot(revision=41)
+        machine_a = snapshot["machines"]["A"]
+        machine_b = snapshot["machines"]["B"]
+        machine_a["waiting_positions"][0]["registrations"][0]["preference"] = "OPEN_TO_JOIN"
+        own = self.registration("f" * 24, "机台乙等待玩家")
+        own["preference"] = "OPEN_TO_JOIN"
+        later = self.registration("9" * 24, "机台乙靠后玩家")
+        later["preference"] = "OPEN_TO_JOIN"
+        machine_b["playing"][0]["preference"] = "OPEN_TO_JOIN"
+        machine_b["waiting_positions"] = [
+            {
+                "index": 1,
+                "position_id": "1" * 24,
+                "fixed_pair": False,
+                "estimated_wait_minutes": 6,
+                "registrations": [own, later],
+                "common_play_preview": None,
+            }
+        ]
+        machine_b["registration_count"] = 3
+        machine_b["waiting_position_count"] = 1
+        machine_b["paired_waiting_positions"] = [
+            {
+                "index": 1,
+                "position_id": "2" * 24,
+                "estimated_wait_minutes": 6,
+                "registrations": [
+                    {"registration_id": "f" * 24, "paired_place_preview": False},
+                    {"registration_id": "c" * 24, "paired_place_preview": True},
+                ],
+                "common_play_preview": None,
+            },
+            {
+                "index": 2,
+                "position_id": "3" * 24,
+                "estimated_wait_minutes": 21,
+                "registrations": [
+                    {"registration_id": "9" * 24, "paired_place_preview": False}
+                ],
+                "common_play_preview": {
+                    "registration_id": "b" * 24,
+                    "display_id": "机台乙玩家",
+                },
+            },
+        ]
+
+        publish = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+        positions = self.client.get("/api/queue-status").get_json()["machines"]["B"][
+            "paired_waiting_positions"
+        ]
+
+        self.assertEqual(204, publish.status_code, publish.get_json())
+        self.assertEqual([2, 1], [len(position["registrations"]) for position in positions])
+        self.assertEqual(
+            {"registration_id": "b" * 24, "display_id": "机台乙玩家"},
+            positions[1]["common_play_preview"],
+        )
+
+    def test_wait_estimate_uncertain_flag_is_optional(self):
+        missing = object()
+
+        def published_positions(revision, value, estimated_wait_minutes=6):
+            snapshot = self.paired_snapshot(revision=revision)
+            own = snapshot["machines"]["A"]["waiting_positions"][0]
+            paired = snapshot["machines"]["B"]["paired_waiting_positions"][0]
+            for position in (own, paired):
+                position["estimated_wait_minutes"] = estimated_wait_minutes
+                if value is not missing:
+                    position["estimated_wait_uncertain"] = value
+            publish = self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            )
+            self.assertEqual(204, publish.status_code, publish.get_json())
+            machines = self.client.get("/api/queue-status").get_json()["machines"]
+            return (
+                machines["A"]["waiting_positions"][0]["estimated_wait_uncertain"],
+                machines["B"]["paired_waiting_positions"][0]["estimated_wait_uncertain"],
+            )
+
+        # Older terminals leave the flag out; it then means false.
+        self.assertEqual((False, False), published_positions(50, missing))
+        self.assertEqual((False, False), published_positions(51, None))
+        self.assertEqual((False, False), published_positions(52, False))
+        self.assertEqual((True, True), published_positions(53, True))
+        self.assertEqual((True, True), published_positions(54, True, 0))
+        # A position without an estimate is never marked.
+        self.assertEqual((False, False), published_positions(55, True, None))
+
+    def test_wait_estimate_uncertain_flag_reaches_player_account_and_bot(self):
+        def published(revision, value):
+            snapshot = self.paired_remote_snapshot(
+                revision, with_registration=True, registration_queues_at_both=True
+            )
+            own = snapshot["machines"]["A"]["waiting_positions"][0]
+            own["estimated_wait_minutes"] = 4
+            paired = {
+                "index": 1,
+                "position_id": "e" * 24,
+                "estimated_wait_minutes": 3,
+                "registrations": [
+                    {"registration_id": "a" * 24, "paired_place_preview": True}
+                ],
+                "common_play_preview": None,
+            }
+            if value is not None:
+                own["estimated_wait_uncertain"] = value
+                paired["estimated_wait_uncertain"] = value
+            snapshot["machines"]["B"]["paired_waiting_positions"] = [paired]
+            self.publish(snapshot)
+            machines = self.client.get("/api/queue-status").get_json()["machines"]
+            account = self.client.get("/api/player-account/queue").get_json()[
+                "registrations"
+            ][0]
+            bot_player = self.client.post(
+                "/api/queue-bot/players",
+                json={"qq": "12345678"},
+                headers=self.bot_headers,
+            ).get_json()["players"][0]
+            return machines, account, bot_player
+
+        self.publish(self.paired_remote_snapshot(80))
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+        completed = self.client.post(
+            f"/api/player-account/bindings/{binding.get_json()['binding_token']}/complete",
+            json={"password": "first-password"},
+        )
+        self.assertEqual(201, completed.status_code, completed.get_json())
+
+        machines, account, bot_player = published(81, True)
+        self.assertIs(True, machines["A"]["waiting_positions"][0]["estimated_wait_uncertain"])
+        self.assertIs(
+            True, machines["B"]["paired_waiting_positions"][0]["estimated_wait_uncertain"]
+        )
+        self.assertEqual(4, account["estimated_wait_minutes"])
+        self.assertIs(True, account["estimated_wait_uncertain"])
+        self.assertEqual(4, bot_player["estimated_wait_minutes"])
+        self.assertIs(True, bot_player["estimated_wait_uncertain"])
+
+        machines, account, bot_player = published(82, None)
+        self.assertIs(False, machines["A"]["waiting_positions"][0]["estimated_wait_uncertain"])
+        self.assertIs(False, account["estimated_wait_uncertain"])
+        self.assertIs(False, bot_player["estimated_wait_uncertain"])
+
+    def test_playing_registration_wait_estimate_is_never_uncertain(self):
+        snapshot = self.remote_ready_snapshot(
+            revision=83, with_registration=True
+        )
+        machine = snapshot["machines"]["A"]
+        registration = machine["waiting_positions"][0]["registrations"][0]
+        machine["playing"] = [registration]
+        machine["playing_started_at"] = 900_000
+        machine["waiting_positions"] = []
+        machine["waiting_position_count"] = 0
+        self.publish(snapshot)
+
+        bot_player = self.client.post(
+            "/api/queue-bot/players",
+            json={"qq": "12345678"},
+            headers=self.bot_headers,
+        ).get_json()["players"][0]
+
+        self.assertEqual("PLAYING", bot_player["position"])
+        self.assertEqual(0, bot_player["estimated_wait_minutes"])
+        self.assertIs(False, bot_player["estimated_wait_uncertain"])
+
+    def test_rejects_invalid_paired_machine_data(self):
+        cases = []
+
+        def case(label, expected_error, change):
+            snapshot = self.paired_snapshot(revision=42)
+            change(snapshot["machines"]["A"], snapshot["machines"]["B"])
+            cases.append((label, expected_error, snapshot))
+
+        def waiting_registration(machine):
+            return machine["waiting_positions"][0]["registrations"][0]
+
+        def preview_position(machine):
+            return machine["paired_waiting_positions"][0]
+
+        case(
+            "同时排队标记不是布尔值",
+            "also_queues_at_paired_machine 必须是布尔值。",
+            lambda a, b: waiting_registration(a).update(also_queues_at_paired_machine="true"),
+        )
+
+        case(
+            "本轮只在当前机台排队的标记不是布尔值",
+            "skips_paired_machine_this_round 必须是布尔值。",
+            lambda a, b: waiting_registration(a).update(
+                skips_paired_machine_this_round="true"
+            ),
+        )
+
+        case(
+            "预告标记不是布尔值",
+            "paired_arrangement_announced 必须是布尔值。",
+            lambda a, b: waiting_registration(a).update(paired_arrangement_announced=1),
+        )
+        for label, value in (
+            ("是负数", -1),
+            ("是字符串", "1700000300000"),
+            ("是布尔值", True),
+            ("是小数", 1.5),
+        ):
+            case(
+                f"最早转至时刻{label}",
+                "paired_arrangement_not_before 数值无效。",
+                lambda a, b, value=value: waiting_registration(a).update(
+                    paired_arrangement_announced=True,
+                    paired_arrangement_not_before=value,
+                ),
+            )
+        case(
+            "只有最早转至时刻而没有预告标记",
+            "paired_arrangement_not_before 只能与 paired_arrangement_announced 一同出现。",
+            lambda a, b: waiting_registration(a).update(
+                paired_arrangement_not_before=1_700_000_300_000
+            ),
+        )
+
+        def unpaired_flag(a, b):
+            a["paired_machine_id"] = None
+            b["paired_machine_id"] = None
+            b["paired_waiting_positions"] = None
+
+        case("机台未成对但登记同时排队", "不属于一对机台", unpaired_flag)
+
+        def fixed_pair_flag(a, b):
+            waiting_registration(a).update(fixed_pair=True, fixed_pair_id="8" * 24)
+
+        case("固定组合登记同时排队", "固定组合登记不能在两台机台之间安排", fixed_pair_flag)
+
+        def temporary_flag(a, b):
+            waiting_registration(a).update(registration_type="TEMPORARY")
+
+        case("临时登记允许系统安排", "临时登记不能在两台机台之间安排", temporary_flag)
+
+        for label, value in (
+            ("指向自身", "A"),
+            ("不是机台字母", "Z"),
+            ("不是字符串", 2),
+            ("是数组", ["B"]),
+            ("是对象", {"id": "B"}),
+        ):
+            case(
+                f"另一机台标识{label}",
+                "paired_machine_id 无效。",
+                lambda a, b, value=value: a.update(paired_machine_id=value),
+            )
+
+        def one_sided(a, b):
+            b["paired_machine_id"] = None
+            b["paired_waiting_positions"] = None
+
+        case("只有一方声明成对", "必须互为一对机台", one_sided)
+
+        def unconfigured_partner(a, b):
+            a["paired_machine_id"] = "C"
+            b["paired_machine_id"] = None
+            b["paired_waiting_positions"] = None
+
+        case("另一机台未配置", "必须互为一对机台", unconfigured_partner)
+
+        def preview_without_pair(a, b):
+            waiting_registration(a)["also_queues_at_paired_machine"] = False
+            a["paired_machine_id"] = None
+            b["paired_machine_id"] = None
+
+        case("未成对的机台包含预览", "不能包含另一机台的登记预览", preview_without_pair)
+
+        def preview_on_stopped_machine(a, b):
+            b.update(
+                operational=False,
+                stop_reason="MAINTENANCE",
+                stopped_at=950_000,
+                playing_started_at=None,
+            )
+
+        case("停止使用的机台包含预览", "停止使用的机台 B 不能包含", preview_on_stopped_machine)
+
+        for label, value in (("空数组", []), ("不是数组", {"0": {}}), ("是字符串", "none")):
+            case(
+                f"预览顺序{label}",
+                "必须是非空数组或 null",
+                lambda a, b, value=value: b.update(paired_waiting_positions=value),
+            )
+        case(
+            "位置不是对象",
+            "的位置必须是对象",
+            lambda a, b: b.update(paired_waiting_positions=["invalid"]),
+        )
+        case(
+            "位置数量超过限制",
+            "超过数量限制",
+            lambda a, b: b.update(
+                paired_waiting_positions=[preview_position(b)] * 41
+            ),
+        )
+        case(
+            "位置没有登记",
+            "每个位置必须包含 1 或 2 个登记",
+            lambda a, b: preview_position(b).update(registrations=[]),
+        )
+        case(
+            "位置的登记不是数组",
+            "每个位置必须包含 1 或 2 个登记",
+            lambda a, b: preview_position(b).update(registrations="cccc"),
+        )
+        case(
+            "登记引用不是对象",
+            "包含无效登记",
+            lambda a, b: preview_position(b).update(registrations=["c" * 24]),
+        )
+        case(
+            "登记编号无效",
+            "registration_id 公开编号无效。",
+            lambda a, b: preview_position(b)["registrations"][0].update(
+                registration_id=["c" * 24]
+            ),
+        )
+        case(
+            "预览标记不是布尔值",
+            "paired_place_preview 必须是布尔值。",
+            lambda a, b: preview_position(b)["registrations"][0].update(
+                paired_place_preview=1
+            ),
+        )
+        case(
+            "重复包含同一份登记",
+            "不能重复包含同一份登记",
+            lambda a, b: preview_position(b)["registrations"].append(
+                {"registration_id": "c" * 24, "paired_place_preview": True}
+            ),
+        )
+        case(
+            "位置编号无效",
+            "position_id 公开编号无效。",
+            lambda a, b: preview_position(b).update(position_id=None),
+        )
+        case(
+            "估算时间无效",
+            "estimated_wait_minutes 数值无效。",
+            lambda a, b: preview_position(b).update(estimated_wait_minutes=-1),
+        )
+        case(
+            "预览位置的估算不准确标记不是布尔值",
+            "estimated_wait_uncertain 必须是布尔值。",
+            lambda a, b: preview_position(b).update(estimated_wait_uncertain="true"),
+        )
+        case(
+            "等待位置的估算不准确标记不是布尔值",
+            "estimated_wait_uncertain 必须是布尔值。",
+            lambda a, b: a["waiting_positions"][0].update(estimated_wait_uncertain=1),
+        )
+
+        def duplicate_position_ids(a, b):
+            waiting_registration(a)["also_queues_at_paired_machine"] = True
+            second = self.registration("7" * 24, "另一位同时排队玩家")
+            second["also_queues_at_paired_machine"] = True
+            a["waiting_positions"].append(
+                {
+                    "index": 2,
+                    "position_id": "6" * 24,
+                    "fixed_pair": False,
+                    "estimated_wait_minutes": 18,
+                    "registrations": [second],
+                    "common_play_preview": None,
+                }
+            )
+            a["registration_count"] = 3
+            a["waiting_position_count"] = 2
+            b["paired_waiting_positions"].append(
+                {
+                    "index": 2,
+                    "position_id": "e" * 24,
+                    "estimated_wait_minutes": 18,
+                    "registrations": [
+                        {"registration_id": "7" * 24, "paired_place_preview": True}
+                    ],
+                    "common_play_preview": None,
+                }
+            )
+
+        case("位置编号重复", "位置编号不能重复", duplicate_position_ids)
+
+        def missing_own_registration(a, b):
+            own = self.registration("f" * 24, "机台乙等待玩家")
+            b["waiting_positions"] = [
+                {
+                    "index": 1,
+                    "position_id": "1" * 24,
+                    "fixed_pair": False,
+                    "estimated_wait_minutes": 6,
+                    "registrations": [own],
+                    "common_play_preview": None,
+                }
+            ]
+            b["registration_count"] = 2
+            b["waiting_position_count"] = 1
+
+        case("缺少本机台等待中的登记", "必须正好包含当前机台等待中的全部登记", missing_own_registration)
+        case(
+            "把另一机台的登记写成本机台登记",
+            "必须正好包含当前机台等待中的全部登记",
+            lambda a, b: preview_position(b)["registrations"][0].update(
+                paired_place_preview=False
+            ),
+        )
+
+        def no_preview_at_all(a, b):
+            missing_own_registration(a, b)
+            preview_position(b)["registrations"] = [
+                {"registration_id": "f" * 24, "paired_place_preview": False}
+            ]
+
+        case("没有任何预览", "没有另一机台的登记预览时必须为 null", no_preview_at_all)
+
+        placeholder_error = "必须是正在机台 A 等待并已允许系统在两台机台之间安排的登记"
+        case(
+            "预览的登记不存在",
+            placeholder_error,
+            lambda a, b: preview_position(b)["registrations"][0].update(
+                registration_id="5" * 24
+            ),
+        )
+        case(
+            "预览的登记没有同时排队",
+            placeholder_error,
+            lambda a, b: waiting_registration(a).update(
+                also_queues_at_paired_machine=False
+            ),
+        )
+        case(
+            "预览的登记暂缓一次",
+            placeholder_error,
+            lambda a, b: waiting_registration(a).update(deferred_once=True),
+        )
+        case(
+            "预览的登记暂时离开",
+            placeholder_error,
+            lambda a, b: waiting_registration(a).update(temporarily_away=True),
+        )
+        case(
+            "预览的登记将轮空一次",
+            placeholder_error,
+            lambda a, b: waiting_registration(a).update(skips_one_turn=True),
+        )
+        case(
+            "预览的登记尚未签到",
+            placeholder_error,
+            lambda a, b: waiting_registration(a).update(
+                online_registration_pending_check_in=True
+            ),
+        )
+
+        case(
+            "预览的登记本轮只在当前机台排队",
+            placeholder_error,
+            lambda a, b: waiting_registration(a).update(
+                skips_paired_machine_this_round=True
+            ),
+        )
+
+        def preview_of_playing_registration(a, b):
+            a["playing"][0]["also_queues_at_paired_machine"] = True
+            preview_position(b)["registrations"][0]["registration_id"] = "a" * 24
+
+        case("预览的登记正在游玩", placeholder_error, preview_of_playing_registration)
+
+        def unknown_common_play_preview(a, b):
+            preview_position(b)["common_play_preview"] = {
+                "registration_id": "5" * 24,
+                "display_id": "不存在",
+            }
+
+        case("共同游玩预览引用不存在的登记", "共同游玩预览登记不存在", unknown_common_play_preview)
+
+        def repeated_common_play_preview(a, b):
+            preview_position(b)["common_play_preview"] = {
+                "registration_id": "c" * 24,
+                "display_id": "同时排队玩家",
+            }
+
+        case("共同游玩预览重复当前位置登记", "共同游玩预览不能重复当前位置登记", repeated_common_play_preview)
+
+        def misnamed_common_play_preview(a, b):
+            waiting_registration(a)["preference"] = "OPEN_TO_JOIN"
+            b["playing"][0]["preference"] = "OPEN_TO_JOIN"
+            preview_position(b)["common_play_preview"] = {
+                "registration_id": "b" * 24,
+                "display_id": "错误昵称",
+            }
+
+        case("共同游玩预览昵称不一致", "共同游玩预览昵称不一致", misnamed_common_play_preview)
+
+        def solo_common_play_preview(a, b):
+            preview_position(b)["common_play_preview"] = {
+                "registration_id": "b" * 24,
+                "display_id": "机台乙玩家",
+            }
+
+        case("共同游玩预览与游玩偏好不一致", "共同游玩预览与游玩偏好不一致", solo_common_play_preview)
+
+        for label, expected_error, snapshot in cases:
+            with self.subTest(label=label):
+                response = self.client.post(
+                    "/api/queue-status", json=snapshot, headers=self.headers
+                )
+                self.assertEqual(400, response.status_code, label)
+                self.assertIn(expected_error, response.get_json()["error"])
+        # Nothing of the rejected uploads was stored.
+        self.assertEqual(404, self.client.get("/api/queue-status").status_code)
+
+    def uploaded_profile_snapshot(self, revision, **profile_fields):
+        snapshot = self.remote_ready_snapshot(revision=revision)
+        snapshot["private_player_profiles"][0].update(profile_fields)
+        return snapshot
+
+    def terminal_profile(self):
+        response = self.client.get("/api/queue-terminal/profiles", headers=self.headers)
+        self.assertEqual(200, response.status_code, response.get_json())
+        return next(
+            profile
+            for profile in response.get_json()["profiles"]
+            if profile["profile_id"] == self.profile_id
+        )
+
+    def test_profile_field_of_the_removed_setting_is_ignored(self):
+        # A profile no longer carries a setting for paired machines. A terminal that still
+        # uploads that field is not turned away, whatever it contains, and nothing of it is
+        # kept or sent back.
+        for revision, fields in (
+            (50, {"paired_machine_queueing": "ON"}),
+            (51, {"paired_machine_queueing": "SOMETIMES"}),
+        ):
+            with self.subTest(fields=fields):
+                response = self.client.post(
+                    "/api/queue-status",
+                    json=self.uploaded_profile_snapshot(revision, **fields),
+                    headers=self.headers,
+                )
+                profile = self.terminal_profile()
+                self.assertEqual(204, response.status_code, response.get_json())
+                self.assertNotIn("paired_machine_queueing", profile)
+
+    def profile_was_shown_the_explanation(self):
+        return self.terminal_profile()["paired_machine_queueing_introduced"]
+
+    def test_explanation_record_of_a_profile_stays_once_it_is_set(self):
+        # The terminal reports that a player has been shown the explanation only as true.
+        # The server keeps it by OR: an upload without the key, or with false, resets nothing.
+        def upload(revision, **fields):
+            response = self.client.post(
+                "/api/queue-status",
+                json=self.uploaded_profile_snapshot(revision, **fields),
+                headers=self.headers,
+            )
+            return response.status_code
+
+        self.assertEqual(204, upload(50))
+        not_yet = self.profile_was_shown_the_explanation()
+        self.assertEqual(204, upload(51, paired_machine_queueing_introduced=True))
+        shown = self.profile_was_shown_the_explanation()
+        self.assertEqual(204, upload(52))
+        after_upload_without_the_key = self.profile_was_shown_the_explanation()
+        self.assertEqual(204, upload(53, paired_machine_queueing_introduced=False))
+        after_upload_with_false = self.profile_was_shown_the_explanation()
+        not_a_boolean = self.client.post(
+            "/api/queue-status",
+            json=self.uploaded_profile_snapshot(54, paired_machine_queueing_introduced=1),
+            headers=self.headers,
+        )
+
+        self.assertIs(False, not_yet)
+        self.assertIs(True, shown)
+        self.assertIs(True, after_upload_without_the_key)
+        self.assertIs(True, after_upload_with_false)
+        self.assertEqual(400, not_a_boolean.status_code)
+        self.assertEqual(
+            "paired_machine_queueing_introduced 必须是布尔值。",
+            not_a_boolean.get_json()["error"],
+        )
+
+    def paired_remote_snapshot(
+        self,
+        revision=60,
+        *,
+        with_registration=False,
+        registration_queues_at_both=False,
+    ):
+        """Remote-ready snapshot whose machines A and B form a pair."""
+        snapshot = self.remote_ready_snapshot(
+            revision=revision,
+            default_preference="SOLO",
+            with_registration=with_registration,
+        )
+        snapshot["machines"]["A"]["paired_machine_id"] = "B"
+        snapshot["machines"]["B"]["paired_machine_id"] = "A"
+        if with_registration:
+            registration = snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+            registration["also_queues_at_paired_machine"] = registration_queues_at_both
+        return snapshot
+
+    def publish(self, snapshot):
+        response = self.client.post("/api/queue-status", json=snapshot, headers=self.headers)
+        self.assertEqual(204, response.status_code, response.get_json())
+
+    def pending_command_payloads(self):
+        return [
+            command["payload"]
+            for command in self.client.get(
+                "/api/queue-terminal/commands", headers=self.headers
+            ).get_json()["commands"]
+        ]
+
+    def test_online_lookup_reports_paired_machines_and_no_profile_setting(self):
+        self.publish(self.paired_remote_snapshot())
+
+        lookup = self.client.post(
+            "/api/queue-online/profile", json={"qq": "12345678"}
+        ).get_json()
+
+        self.assertNotIn("paired_machine_queueing", lookup["profile"])
+        # Only whether the explanation has been shown is kept on a profile.
+        self.assertIs(False, lookup["profile"]["paired_machine_queueing_introduced"])
+        self.assertEqual(
+            {"A": "B", "B": "A"},
+            {machine["id"]: machine["paired_machine_id"] for machine in lookup["machines"]},
+        )
+
+    def test_online_join_carries_the_choice_to_queue_at_two_machines(self):
+        self.publish(self.paired_remote_snapshot())
+        request_body = {
+            "request_id": "00000000-0000-0000-0000-000000000461",
+            "qq": "12345678",
+            "machine_id": "A",
+            "also_queues_at_paired_machine": True,
+        }
+
+        created = self.client.post("/api/queue-online/join", json=request_body)
+        repeated = self.client.post("/api/queue-online/join", json=request_body)
+        changed = self.client.post(
+            "/api/queue-online/join",
+            json={**request_body, "also_queues_at_paired_machine": False},
+        )
+        payloads = self.pending_command_payloads()
+
+        self.assertEqual(202, created.status_code, created.get_json())
+        self.assertEqual(200, repeated.status_code)
+        # The same request_id with another choice is a different request.
+        self.assertEqual(409, changed.status_code)
+        self.assertEqual(1, len(payloads))
+        self.assertIs(True, payloads[0]["also_queues_at_paired_machine"])
+
+    def online_join(self, request_number, ticked):
+        return self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": f"00000000-0000-0000-0000-0000000005{request_number}",
+                "qq": "12345678",
+                "machine_id": "A",
+                "preference": "SOLO",
+                "also_queues_at_paired_machine": ticked,
+            },
+        )
+
+    def complete_command(self, command_id, status):
+        """Lets the terminal fetch its commands and report the outcome of one."""
+        self.client.get("/api/queue-terminal/commands", headers=self.headers)
+        completed = self.client.post(
+            f"/api/queue-terminal/commands/{command_id}/result",
+            json={"status": status, "detail": "终端行为测试完成。"},
+            headers=self.headers,
+        )
+        self.assertEqual(status, completed.get_json()["status"], completed.get_json())
+
+    def test_online_join_with_the_tick_box_on_records_the_explanation_once_applied(self):
+        # An online join only names a QQ number and needs no sign-in, so anybody can send
+        # it for anybody. Accepting it therefore says nothing about what the player has
+        # been shown; only a join the terminal has carried out is recorded.
+        self.publish(self.paired_remote_snapshot())
+        before = self.profile_was_shown_the_explanation()
+
+        refused = self.online_join(10, True)
+        after_request = self.profile_was_shown_the_explanation()
+        self.complete_command(refused.get_json()["command_id"], "REJECTED")
+        after_refusal = self.profile_was_shown_the_explanation()
+        lookup_after_refusal = self.client.post(
+            "/api/queue-online/profile", json={"qq": "12345678"}
+        ).get_json()
+
+        applied = self.online_join(13, True)
+        self.complete_command(applied.get_json()["command_id"], "APPLIED")
+
+        self.assertIs(False, before)
+        self.assertEqual(202, refused.status_code, refused.get_json())
+        self.assertIs(False, after_request)
+        self.assertIs(False, after_refusal)
+        self.assertIs(
+            False, lookup_after_refusal["profile"]["paired_machine_queueing_introduced"]
+        )
+        self.assertEqual(202, applied.status_code, applied.get_json())
+        self.assertIs(True, self.profile_was_shown_the_explanation())
+
+    def test_applied_online_join_with_the_tick_box_off_records_nothing(self):
+        self.publish(self.paired_remote_snapshot())
+
+        applied = self.online_join(14, False)
+        self.complete_command(applied.get_json()["command_id"], "APPLIED")
+
+        self.assertEqual(202, applied.status_code, applied.get_json())
+        self.assertIs(False, self.profile_was_shown_the_explanation())
+
+    def test_applied_online_join_records_the_explanation_among_the_test_data(self):
+        # The test data of a terminal keep their own profiles; the record goes to the data
+        # set the command was made for, and the official profile stays as it was.
+        self.app.config["ALLOWED_DEVICE_ID"] = ""
+        self.app.config["PRIMARY_DEVICE_ID"] = "terminal-1"
+        official = self.paired_remote_snapshot(revision=5)
+        self.publish(official)
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE queue_snapshot SET received_at = ? WHERE id = 1",
+                (int(time.time()) - 91,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        test_headers = {
+            **self.headers,
+            "X-Device-ID": "terminal-2",
+            "X-Queue-Sync-Mode": "test",
+        }
+        test_snapshot = copy.deepcopy(official)
+        test_snapshot["revision"] = 99
+        started = self.client.post(
+            "/api/queue-status", json=test_snapshot, headers=test_headers
+        )
+
+        def records():
+            connection = sqlite3.connect(self.database_path)
+            try:
+                return {
+                    ("test" if ":test:" in scope else "official"): bool(introduced)
+                    for scope, introduced in connection.execute(
+                        """
+                        SELECT device_id, paired_machine_queueing_introduced
+                        FROM player_profile WHERE profile_id = ?
+                        """,
+                        (self.profile_id,),
+                    )
+                }
+            finally:
+                connection.close()
+
+        before = records()
+        applied = self.online_join(15, True)
+        after_request = records()
+        self.client.get("/api/queue-terminal/commands", headers=test_headers)
+        completed = self.client.post(
+            f"/api/queue-terminal/commands/{applied.get_json()['command_id']}/result",
+            json={"status": "APPLIED", "detail": "终端行为测试完成。"},
+            headers=test_headers,
+        )
+
+        self.assertEqual(204, started.status_code, started.get_json())
+        self.assertTrue(self.client.get("/api/queue-status").get_json()["test_data"])
+        self.assertEqual({"official": False, "test": False}, before)
+        self.assertEqual(202, applied.status_code, applied.get_json())
+        self.assertEqual({"official": False, "test": False}, after_request)
+        self.assertEqual("APPLIED", completed.get_json()["status"], completed.get_json())
+        self.assertEqual({"official": False, "test": True}, records())
+
+    def test_online_join_with_the_tick_box_off_records_nothing(self):
+        self.publish(self.paired_remote_snapshot())
+
+        created = self.online_join(11, False)
+
+        self.assertEqual(202, created.status_code, created.get_json())
+        self.assertIs(False, self.profile_was_shown_the_explanation())
+
+    def test_rejected_online_join_records_nothing(self):
+        # The machine has no pair: the request is refused and nothing is noted.
+        self.publish(self.remote_ready_snapshot(revision=61, default_preference="SOLO"))
+
+        rejected = self.online_join(12, True)
+
+        self.assertEqual(409, rejected.status_code, rejected.get_json())
+        self.assertIs(False, self.profile_was_shown_the_explanation())
+
+    def test_mobile_submit_with_the_tick_box_on_records_the_explanation(self):
+        snapshot = self.paired_remote_snapshot(70)
+        self.publish(snapshot)
+        token = self.open_mobile_session(snapshot, 61)
+        opened = self.client.get(f"/api/queue-mobile/sessions/{token}").get_json()
+
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000862",
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+                "also_queues_at_paired_machine": True,
+            },
+        )
+
+        self.assertIs(False, opened["profiles"][0]["paired_machine_queueing_introduced"])
+        self.assertEqual(202, submitted.status_code, submitted.get_json())
+        self.assertIs(True, self.profile_was_shown_the_explanation())
+
+    def test_account_turning_the_tick_box_on_records_the_explanation(self):
+        self.publish(self.paired_remote_snapshot(with_registration=True))
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+        completed = self.client.post(
+            f"/api/player-account/bindings/{binding.get_json()['binding_token']}/complete",
+            json={"password": "first-password"},
+        )
+        queue_payload = self.client.get("/api/player-account/queue").get_json()
+        registration = queue_payload["registrations"][0]
+        queue = queue_payload["queue"]
+
+        switched = self.client.post(
+            "/api/player-account/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000778",
+                "operation": "SET_PAIRED_MACHINE_QUEUEING",
+                "also_queues_at_paired_machine": True,
+                "expected_queue_id": queue["queue_id"],
+                "expected_registration_id": registration["registration_id"],
+                "expected_machine_id": registration["machine_id"],
+                "expected_position": registration["position"],
+                "expected_fixed_pair_id": registration["fixed_pair_id"],
+                "expected_absence_status": "NONE",
+                "expected_temporary_away_skipped_turns": 0,
+                "expected_pending_check_in": False,
+                "expected_machine_configuration_revision": queue[
+                    "machine_configuration_revision"
+                ],
+                "expected_machine_stable_id": registration["machine_stable_id"],
+            },
+            headers={
+                "X-CSRF-Token": self.client.get_cookie("maimai_q_session_csrf").value
+            },
+        )
+        account = self.client.get("/api/player-account").get_json()
+
+        self.assertEqual(201, completed.status_code, completed.get_json())
+        self.assertIs(
+            False,
+            completed.get_json()["account"]["profile"]["paired_machine_queueing_introduced"],
+        )
+        self.assertEqual(202, switched.status_code, switched.get_json())
+        self.assertIs(True, self.profile_was_shown_the_explanation())
+        self.assertIs(
+            True, account["account"]["profile"]["paired_machine_queueing_introduced"]
+        )
+
+    def test_bot_turning_the_tick_box_on_records_nothing(self):
+        # The Bot shows no explanation, so its requests say nothing about one.
+        self.publish(self.paired_remote_snapshot(with_registration=True))
+
+        switched = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000484",
+                "actor_qq": "12345678",
+                "operation": "SET_PAIRED_MACHINE_QUEUEING",
+                "also_queues_at_paired_machine": True,
+            },
+            headers=self.bot_headers,
+        )
+
+        self.assertEqual(202, switched.status_code, switched.get_json())
+        self.assertIs(False, self.profile_was_shown_the_explanation())
+
+    def test_messages_never_speak_of_queueing_at_two_machines(self):
+        # Players and staff are told that the system arranges a registration between two
+        # machines; the old wording must not come back in any message of the server.
+        import ast
+
+        source = (Path(__file__).parent / "app.py").read_text(encoding="utf-8")
+        literals = [
+            node.value
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ]
+        offending = [
+            text
+            for text in literals
+            if "同时排队" in text
+            or ("同时在" in text and "排队" in text.split("同时在", 1)[1])
+            # After 允许 the sentence names who arranges: 允许系统在……之间安排.
+            or "允许在两台机台之间" in text
+            or "允许在一对机台之间" in text
+        ]
+        self.assertEqual([], offending)
+
+    def test_online_join_without_the_choice_sends_none_to_the_terminal(self):
+        self.publish(self.paired_remote_snapshot())
+
+        created = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000462",
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+
+        self.assertEqual(202, created.status_code, created.get_json())
+        # Without the tick box the registration is created for its own machine only.
+        self.assertNotIn("also_queues_at_paired_machine", self.pending_command_payloads()[0])
+
+    def test_online_join_rejects_a_choice_that_cannot_apply(self):
+        cases = (
+            (
+                "机台不属于一对机台",
+                self.remote_ready_snapshot(revision=61, default_preference="SOLO"),
+                True,
+                409,
+                "不属于一对机台，不能自动在两台机台之间安排登记",
+            ),
+            (
+                "不是布尔值",
+                self.paired_remote_snapshot(64),
+                "yes",
+                400,
+                "also_queues_at_paired_machine 必须是布尔值。",
+            ),
+        )
+        for index, (label, snapshot, choice, status_code, expected_error) in enumerate(cases):
+            with self.subTest(label=label):
+                self.publish(snapshot)
+                response = self.client.post(
+                    "/api/queue-online/join",
+                    json={
+                        "request_id": f"00000000-0000-0000-0000-00000000047{index}",
+                        "qq": "12345678",
+                        "machine_id": "A",
+                        "also_queues_at_paired_machine": choice,
+                    },
+                )
+                self.assertEqual(status_code, response.status_code, response.get_json())
+                self.assertIn(expected_error, response.get_json()["error"])
+        self.assertEqual([], self.pending_command_payloads())
+
+    def test_online_join_carries_an_unticked_box_as_given(self):
+        self.publish(self.paired_remote_snapshot(65))
+
+        created = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000481",
+                "qq": "12345678",
+                "machine_id": "A",
+                "also_queues_at_paired_machine": False,
+            },
+        )
+        payloads = self.pending_command_payloads()
+
+        # No profile setting stands in the way of either answer.
+        self.assertEqual(202, created.status_code, created.get_json())
+        self.assertEqual(1, len(payloads))
+        self.assertIs(False, payloads[0]["also_queues_at_paired_machine"])
+
+    def mobile_new_profile(self, nickname="移动新玩家", qq_number="87654321"):
+        return {
+            "nickname": nickname,
+            "gender": "FEMALE",
+            "default_preference": "SOLO",
+            "qq_number": qq_number,
+            "qq_visibility": "PUBLIC_WEBSITE",
+            "notification_enabled": True,
+            "notify_queue_changes": True,
+            "notify_playing_position": False,
+            "notify_online_check_in": True,
+            "notify_absence": True,
+            "notify_machine_status": False,
+        }
+
+    def test_mobile_registration_needs_no_profile_setting(self):
+        snapshot = self.paired_remote_snapshot(70)
+        self.publish(snapshot)
+        token = self.open_mobile_session(snapshot, 60)
+        body = {
+            "request_id": "00000000-0000-0000-0000-000000000861",
+            "profile_id": self.profile_id,
+            "expected_profile_revision": 3,
+        }
+
+        opened = self.client.get(f"/api/queue-mobile/sessions/{token}").get_json()
+        # The page of the removed setting sent this key; unknown keys are refused here.
+        removed_field = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json={**body, "paired_machine_queueing": "ON"},
+        )
+        nothing_pending = self.pending_command_payloads()
+        submitted = self.client.post(f"/api/queue-mobile/sessions/{token}/submit", json=body)
+        payloads = self.pending_command_payloads()
+
+        # The page shows the tick box where the venue has paired machines.
+        self.assertIs(True, opened["session"]["paired_machine_queueing_available"])
+        self.assertNotIn("paired_machine_queueing", opened["profiles"][0])
+        self.assertIs(False, opened["profiles"][0]["paired_machine_queueing_introduced"])
+        self.assertEqual(400, removed_field.status_code, removed_field.get_json())
+        self.assertEqual("请求包含不支持的移动设备登记字段。", removed_field.get_json()["error"])
+        self.assertEqual([], nothing_pending)
+        self.assertEqual(202, submitted.status_code, submitted.get_json())
+        self.assertEqual(1, len(payloads))
+        self.assertNotIn("also_queues_at_paired_machine", payloads[0])
+        self.assertNotIn("paired_machine_queueing", payloads[0]["profile"])
+
+    def test_mobile_session_offers_no_tick_box_where_the_venue_has_no_paired_machines(self):
+        snapshot = self.remote_ready_snapshot(revision=72, default_preference="SOLO")
+        self.publish(snapshot)
+        token = self.open_mobile_session(snapshot, 64)
+
+        opened = self.client.get(f"/api/queue-mobile/sessions/{token}").get_json()
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000865",
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+            },
+        )
+
+        self.assertIs(False, opened["session"]["paired_machine_queueing_available"])
+        self.assertIsNone(opened["session"]["paired_machine_id"])
+        self.assertEqual(202, submitted.status_code, submitted.get_json())
+
+    def test_mobile_registration_with_a_new_profile_carries_the_tick_box(self):
+        snapshot = self.paired_remote_snapshot(73)
+        self.publish(snapshot)
+        token = self.open_mobile_session(snapshot, 66)
+
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000867",
+                "preference": "SOLO",
+                "new_profile": self.mobile_new_profile(),
+                "also_queues_at_paired_machine": True,
+            },
+        )
+        payloads = self.pending_command_payloads()
+
+        self.assertEqual(202, submitted.status_code, submitted.get_json())
+        self.assertEqual("NEW", payloads[0]["profile"]["mode"])
+        # The tick box belongs to this registration; the new profile gets no setting from it.
+        self.assertIs(True, payloads[0]["also_queues_at_paired_machine"])
+        self.assertNotIn("paired_machine_queueing", payloads[0]["profile"])
+        self.assertNotIn("paired_machine_queueing", payloads[0]["profile"]["profile"])
+
+    def open_profile_creation(self, request_number):
+        created = self.client.post(
+            "/api/queue-terminal/player-profile-sessions",
+            json={"request_id": f"00000000-0000-0000-0000-0000000009{request_number}"},
+            headers=self.headers,
+        )
+        self.assertEqual(201, created.status_code, created.get_json())
+        return created.get_json()["profile_creation_url"].split(
+            "player_profile_creation=", 1
+        )[1]
+
+    def profile_creation_body(self, **fields):
+        return {
+            "nickname": "网页建档玩家",
+            "gender": "UNDISCLOSED",
+            "default_preference": "ASK_EVERY_TIME",
+            "qq_number": "23456789",
+            "password": "mobile-password",
+            "password_confirmation": "mobile-password",
+            "notification_enabled": True,
+            "notify_queue_changes": True,
+            "notify_playing_position": False,
+            "notify_online_check_in": True,
+            "notify_absence": True,
+            "notify_machine_status": False,
+            **fields,
+        }
+
+    def test_web_profile_creation_has_no_setting_for_paired_machines(self):
+        self.publish(self.paired_remote_snapshot(74))
+        token = self.open_profile_creation(61)
+        endpoint = f"/api/player-profile-creation/sessions/{token}"
+
+        opened = self.client.get(endpoint).get_json()
+        # The page of the removed setting sent this field; the form takes exactly its fields.
+        removed_field = self.client.post(
+            f"{endpoint}/complete",
+            json=self.profile_creation_body(paired_machine_queueing="ON"),
+        )
+        completed = self.client.post(f"{endpoint}/complete", json=self.profile_creation_body())
+        account_profile = completed.get_json()["account"]["profile"]
+
+        self.assertNotIn("paired_machine_queueing_available", opened)
+        self.assertEqual(400, removed_field.status_code, removed_field.get_json())
+        self.assertEqual(201, completed.status_code, completed.get_json())
+        self.assertNotIn("paired_machine_queueing", account_profile)
+        self.assertIs(False, account_profile["paired_machine_queueing_introduced"])
+
+    def test_bot_can_switch_queueing_at_two_machines_for_a_registration(self):
+        self.publish(self.paired_remote_snapshot(with_registration=True))
+
+        def switch(request_number, **fields):
+            return self.client.post(
+                "/api/queue-bot/queue-commands",
+                json={
+                    "request_id": f"00000000-0000-0000-0000-0000000004{request_number}",
+                    "actor_qq": "12345678",
+                    "operation": "SET_PAIRED_MACHINE_QUEUEING",
+                    **fields,
+                },
+                headers=self.bot_headers,
+            )
+
+        missing = switch(80)
+        invalid = switch(81, also_queues_at_paired_machine=1)
+        created = switch(82, also_queues_at_paired_machine=True)
+        payloads = self.pending_command_payloads()
+        other_operation = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000483",
+                "actor_qq": "12345678",
+                "operation": "LEAVE_QUEUE",
+                "also_queues_at_paired_machine": True,
+            },
+            headers=self.bot_headers,
+        )
+
+        self.assertEqual(400, missing.status_code)
+        self.assertEqual("请选择是否允许系统在两台机台之间安排登记。", missing.get_json()["error"])
+        self.assertEqual(400, invalid.status_code)
+        self.assertEqual(202, created.status_code, created.get_json())
+        self.assertEqual(1, len(payloads))
+        self.assertEqual("SET_PAIRED_MACHINE_QUEUEING", payloads[0]["operation"])
+        self.assertIs(True, payloads[0]["also_queues_at_paired_machine"])
+        self.assertEqual("A", payloads[0]["machine_id"])
+        self.assertEqual(400, other_operation.status_code)
+        self.assertIn("这项操作不接受", other_operation.get_json()["error"])
+
+    def test_switching_queueing_at_two_machines_needs_a_paired_machine(self):
+        self.publish(self.remote_ready_snapshot(revision=65, with_registration=True))
+
+        for choice in (True, False):
+            with self.subTest(choice=choice):
+                response = self.client.post(
+                    "/api/queue-bot/queue-commands",
+                    json={
+                        "request_id": f"00000000-0000-0000-0000-00000000049{int(choice)}",
+                        "actor_qq": "12345678",
+                        "operation": "SET_PAIRED_MACHINE_QUEUEING",
+                        "also_queues_at_paired_machine": choice,
+                    },
+                    headers=self.bot_headers,
+                )
+                # Without a pair nothing is sent to the terminal, which may be one that does
+                # not know this operation.
+                self.assertEqual(409, response.status_code)
+                self.assertEqual(
+                    "系统规则不允许自动在两台机台之间安排登记。", response.get_json()["error"]
+                )
+        self.assertEqual([], self.pending_command_payloads())
+
+    def test_registration_arranged_between_two_machines_can_still_be_moved_by_hand(self):
+        self.publish(
+            self.paired_remote_snapshot(
+                with_registration=True, registration_queues_at_both=True
+            )
+        )
+
+        response = self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000495",
+                "actor_qq": "12345678",
+                "operation": "TRANSFER_MACHINE",
+                "target_machine_id": "B",
+            },
+            headers=self.bot_headers,
+        )
+
+        # The terminal moves it to the tail of the other machine; the choice stays on.
+        self.assertEqual(202, response.status_code, response.get_json())
+        payloads = self.pending_command_payloads()
+        self.assertEqual(1, len(payloads))
+        self.assertEqual("B", payloads[0]["target_machine_id"])
+
+    def open_mobile_session(self, snapshot, request_number):
+        created = self.client.post(
+            "/api/queue-terminal/mobile-registration-sessions",
+            json={
+                "request_id": f"00000000-0000-0000-0000-0000000008{request_number}",
+                "queue_id": snapshot["queue_id"],
+                "machine_id": "A",
+            },
+            headers=self.headers,
+        )
+        self.assertEqual(201, created.status_code, created.get_json())
+        return created.get_json()["session_token"]
+
+    def test_mobile_registration_offers_and_carries_the_choice_to_queue_at_two_machines(self):
+        snapshot = self.paired_remote_snapshot(66)
+        self.publish(snapshot)
+        token = self.open_mobile_session(snapshot, 70)
+
+        opened = self.client.get(f"/api/queue-mobile/sessions/{token}").get_json()
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000871",
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+                "also_queues_at_paired_machine": True,
+            },
+        )
+        payloads = self.pending_command_payloads()
+
+        self.assertEqual("B", opened["session"]["paired_machine_id"])
+        self.assertEqual(snapshot["machines"]["B"]["name"].replace(" · ", "·"),
+                         opened["session"]["paired_machine_name"])
+        self.assertEqual(202, submitted.status_code, submitted.get_json())
+        self.assertEqual(1, len(payloads))
+        self.assertIs(True, payloads[0]["also_queues_at_paired_machine"])
+
+    def test_mobile_registration_rejects_a_choice_that_cannot_apply(self):
+        cases = (
+            (
+                "机台不属于一对机台",
+                self.remote_ready_snapshot(revision=67, default_preference="SOLO"),
+                3,
+                True,
+                "PAIRED_MACHINE_QUEUE_UNAVAILABLE",
+                409,
+            ),
+            (
+                "不是布尔值",
+                self.paired_remote_snapshot(69),
+                3,
+                "true",
+                None,
+                400,
+            ),
+        )
+        for index, (label, snapshot, revision, choice, code, status_code) in enumerate(cases):
+            with self.subTest(label=label):
+                self.publish(snapshot)
+                token = self.open_mobile_session(snapshot, 80 + index)
+                opened = self.client.get(f"/api/queue-mobile/sessions/{token}").get_json()
+                response = self.client.post(
+                    f"/api/queue-mobile/sessions/{token}/submit",
+                    json={
+                        "request_id": f"00000000-0000-0000-0000-00000000089{index}",
+                        "profile_id": self.profile_id,
+                        "expected_profile_revision": revision,
+                        "also_queues_at_paired_machine": choice,
+                    },
+                )
+                if label == "机台不属于一对机台":
+                    self.assertIsNone(opened["session"]["paired_machine_id"])
+                    self.assertIsNone(opened["session"]["paired_machine_name"])
+                self.assertEqual(status_code, response.status_code, response.get_json())
+                self.assertEqual(code, response.get_json().get("code"))
+        self.assertEqual([], self.pending_command_payloads())
+
+    def test_player_account_queue_reports_a_place_given_up_for_this_round(self):
+        def account_registration(revision, **registration_fields):
+            snapshot = self.paired_remote_snapshot(
+                revision, with_registration=True, registration_queues_at_both=True
+            )
+            snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0].update(
+                registration_fields
+            )
+            self.publish(snapshot)
+            return self.client.get("/api/player-account/queue").get_json()[
+                "registrations"
+            ][0]
+
+        self.publish(self.paired_remote_snapshot(70))
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+        completed = self.client.post(
+            f"/api/player-account/bindings/{binding.get_json()['binding_token']}/complete",
+            json={"password": "first-password"},
+        )
+        self.assertEqual(201, completed.status_code, completed.get_json())
+
+        queueing_at_both = account_registration(71)
+        gave_up_this_round = account_registration(
+            72, skips_paired_machine_this_round=True
+        )
+
+        self.assertEqual("B", queueing_at_both["paired_machine_id"])
+        self.assertIs(True, queueing_at_both["also_queues_at_paired_machine"])
+        self.assertIs(False, queueing_at_both["skips_paired_machine_this_round"])
+        self.assertIs(True, gave_up_this_round["also_queues_at_paired_machine"])
+        self.assertIs(True, gave_up_this_round["skips_paired_machine_this_round"])
+        self.assertIs(False, queueing_at_both["paired_arrangement_announced"])
+        self.assertIsNone(queueing_at_both["paired_arrangement_not_before"])
+
+        # A preview at machine B announces the move; the page is told from when on.
+        announced = account_registration(
+            73,
+            paired_arrangement_announced=True,
+            paired_arrangement_not_before=1_700_000_300_000,
+        )
+        held = account_registration(74, paired_arrangement_announced=True)
+        self.assertIs(True, announced["paired_arrangement_announced"])
+        self.assertEqual(1_700_000_300_000, announced["paired_arrangement_not_before"])
+        self.assertIs(True, held["paired_arrangement_announced"])
+        self.assertIsNone(held["paired_arrangement_not_before"])
+
+    def test_player_account_profile_has_no_setting_for_paired_machines(self):
+        self.publish(self.remote_ready_snapshot())
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+        completed = self.client.post(
+            f"/api/player-account/bindings/{binding.get_json()['binding_token']}/complete",
+            json={"password": "first-password"},
+        )
+        bound_profile = completed.get_json()["account"]["profile"]
+        csrf_headers = {
+            "X-CSRF-Token": self.client.get_cookie("maimai_q_session_csrf").value
+        }
+
+        # The account page of the removed setting sent this field.
+        removed_field = self.client.patch(
+            "/api/player-account/profile",
+            json={
+                "expected_profile_revision": bound_profile["profile_revision"],
+                "paired_machine_queueing": "ON",
+            },
+            headers=csrf_headers,
+        )
+
+        self.assertEqual(201, completed.status_code, completed.get_json())
+        self.assertNotIn("paired_machine_queueing", bound_profile)
+        self.assertIs(False, bound_profile["paired_machine_queueing_introduced"])
+        self.assertEqual(400, removed_field.status_code, removed_field.get_json())
+        self.assertEqual("请求包含不支持的玩家资料字段。", removed_field.get_json()["error"])
+        self.assertEqual(
+            bound_profile["profile_revision"], self.terminal_profile()["profile_revision"]
+        )
+
+    def management_paired_snapshot(self, *, paired=True, queues_at_both=False):
+        snapshot, terminal_headers = self.management_control_snapshot(with_registration=True)
+        registration = snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+        if paired:
+            snapshot["machines"]["A"]["paired_machine_id"] = "B"
+            snapshot["machines"]["B"]["paired_machine_id"] = "A"
+            registration["also_queues_at_paired_machine"] = queues_at_both
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=terminal_headers
+        )
+        self.assertEqual(204, response.status_code, response.get_json())
+        return snapshot, terminal_headers
+
+    def management_terminal_action_body(self, snapshot, request_number, **fields):
+        machine = snapshot["machines"]["A"]
+        return {
+            "request_id": f"00000000-0000-0000-0000-0000000007{request_number}",
+            "expected_queue_id": snapshot["queue_id"],
+            "expected_queue_revision": snapshot["revision"],
+            "expected_machine_configuration_revision": snapshot[
+                "machine_configuration_revision"
+            ],
+            "machine_id": "A",
+            "expected_machine_stable_id": machine["stable_id"],
+            "expected_playing_registration_ids": [
+                registration["registration_id"] for registration in machine["playing"]
+            ],
+            "expected_waiting_positions": [
+                [registration["registration_id"] for registration in position["registrations"]]
+                for position in machine["waiting_positions"]
+            ],
+            **fields,
+        }
+
+    def test_management_overview_and_action_cover_queueing_at_two_machines(self):
+        snapshot, terminal_headers = self.management_paired_snapshot(queues_at_both=True)
+        registration_id = snapshot["machines"]["A"]["waiting_positions"][0][
+            "registrations"
+        ][0]["registration_id"]
+
+        overview = self.client.get(
+            "/api/queue-management/overview", headers=self.management_headers
+        ).get_json()
+        machine_a = next(
+            machine for machine in overview["queue"]["machines"] if machine["id"] == "A"
+        )
+
+        def act(request_number, **fields):
+            return self.client.post(
+                "/api/queue-management/terminal-actions",
+                json=self.management_terminal_action_body(
+                    snapshot,
+                    request_number,
+                    action="SET_PAIRED_MACHINE_QUEUEING",
+                    registration_ids=[registration_id],
+                    **fields,
+                ),
+                headers=self.management_headers,
+            )
+
+        missing = act(10)
+        invalid = act(11, also_queues_at_paired_machine="no")
+        created = act(12, also_queues_at_paired_machine=False)
+        repeated = act(12, also_queues_at_paired_machine=False)
+        changed = act(12, also_queues_at_paired_machine=True)
+        misplaced = self.client.post(
+            "/api/queue-management/terminal-actions",
+            json=self.management_terminal_action_body(
+                snapshot,
+                13,
+                action="CHECK_IN",
+                registration_ids=[registration_id],
+                also_queues_at_paired_machine=True,
+            ),
+            headers=self.management_headers,
+        )
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=terminal_headers
+        ).get_json()["commands"]
+
+        self.assertEqual("B", machine_a["paired_machine_id"])
+        self.assertIs(
+            True,
+            machine_a["waiting_positions"][0]["registrations"][0][
+                "also_queues_at_paired_machine"
+            ],
+        )
+        self.assertEqual(400, missing.status_code)
+        self.assertEqual("请选择是否允许系统在两台机台之间安排登记。", missing.get_json()["error"])
+        self.assertEqual(400, invalid.status_code)
+        self.assertEqual(202, created.status_code, created.get_json())
+        self.assertEqual(200, repeated.status_code)
+        self.assertEqual(409, changed.status_code)
+        self.assertEqual(400, misplaced.status_code)
+        self.assertIn("这项操作不接受", misplaced.get_json()["error"])
+        self.assertEqual(1, len(commands))
+        self.assertEqual("MANAGEMENT_QUEUE_ACTION", commands[0]["type"])
+        self.assertEqual("SET_PAIRED_MACHINE_QUEUEING", commands[0]["payload"]["action"])
+        self.assertIs(False, commands[0]["payload"]["also_queues_at_paired_machine"])
+        self.assertEqual([registration_id], commands[0]["payload"]["registration_ids"])
+
+    def test_management_overview_forwards_wait_estimate_uncertain_flag(self):
+        snapshot, terminal_headers = self.management_control_snapshot(
+            with_registration=True
+        )
+        position = snapshot["machines"]["A"]["waiting_positions"][0]
+        position["estimated_wait_minutes"] = 5
+        position["estimated_wait_uncertain"] = True
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=terminal_headers
+        )
+        self.assertEqual(204, response.status_code, response.get_json())
+
+        overview = self.client.get(
+            "/api/queue-management/overview", headers=self.management_headers
+        ).get_json()
+        machine_a = next(
+            machine for machine in overview["queue"]["machines"] if machine["id"] == "A"
+        )
+        machine_b = next(
+            machine for machine in overview["queue"]["machines"] if machine["id"] == "B"
+        )
+
+        self.assertEqual(5, machine_a["waiting_positions"][0]["estimated_wait_minutes"])
+        self.assertIs(True, machine_a["waiting_positions"][0]["estimated_wait_uncertain"])
+        self.assertEqual([], machine_b["waiting_positions"])
+
+    def test_management_turning_the_tick_box_on_records_nothing(self):
+        # Staff act for a player without showing that player anything.
+        snapshot, _ = self.management_paired_snapshot()
+        registration_id = snapshot["machines"]["A"]["waiting_positions"][0][
+            "registrations"
+        ][0]["registration_id"]
+
+        switched = self.client.post(
+            "/api/queue-management/terminal-actions",
+            json=self.management_terminal_action_body(
+                snapshot,
+                30,
+                action="SET_PAIRED_MACHINE_QUEUEING",
+                registration_ids=[registration_id],
+                also_queues_at_paired_machine=True,
+            ),
+            headers=self.management_headers,
+        )
+        connection = sqlite3.connect(self.database_path)
+        try:
+            profiles, shown = connection.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(paired_machine_queueing_introduced), 0)
+                FROM player_profile
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(202, switched.status_code, switched.get_json())
+        self.assertGreater(profiles, 0)
+        self.assertEqual(0, shown)
+
+    def test_management_overview_reports_a_place_given_up_for_this_round(self):
+        snapshot, terminal_headers = self.management_control_snapshot(with_registration=True)
+        snapshot["machines"]["A"]["paired_machine_id"] = "B"
+        snapshot["machines"]["B"]["paired_machine_id"] = "A"
+        registration = snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+        registration["also_queues_at_paired_machine"] = True
+        registration["skips_paired_machine_this_round"] = True
+        published = self.client.post(
+            "/api/queue-status", json=snapshot, headers=terminal_headers
+        )
+
+        overview = self.client.get(
+            "/api/queue-management/overview", headers=self.management_headers
+        ).get_json()
+        machine_a = next(
+            machine for machine in overview["queue"]["machines"] if machine["id"] == "A"
+        )
+        reported = machine_a["waiting_positions"][0]["registrations"][0]
+
+        self.assertEqual(204, published.status_code, published.get_json())
+        self.assertIs(True, reported["also_queues_at_paired_machine"])
+        self.assertIs(True, reported["skips_paired_machine_this_round"])
+        self.assertIs(False, reported["paired_arrangement_announced"])
+        self.assertIsNone(reported["paired_arrangement_not_before"])
+        self.assertTrue(
+            all(
+                playing["skips_paired_machine_this_round"] is False
+                for playing in machine_a["playing"]
+            )
+        )
+
+    def test_management_overview_reports_an_announced_arrangement(self):
+        snapshot, terminal_headers = self.management_control_snapshot(with_registration=True)
+        snapshot["machines"]["A"]["paired_machine_id"] = "B"
+        snapshot["machines"]["B"]["paired_machine_id"] = "A"
+        registration = snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+        registration["also_queues_at_paired_machine"] = True
+        registration["paired_arrangement_announced"] = True
+        registration["paired_arrangement_not_before"] = 1_700_000_300_000
+        published = self.client.post(
+            "/api/queue-status", json=snapshot, headers=terminal_headers
+        )
+
+        overview = self.client.get(
+            "/api/queue-management/overview", headers=self.management_headers
+        ).get_json()
+        machine_a = next(
+            machine for machine in overview["queue"]["machines"] if machine["id"] == "A"
+        )
+        reported = machine_a["waiting_positions"][0]["registrations"][0]
+
+        self.assertEqual(204, published.status_code, published.get_json())
+        self.assertIs(True, reported["paired_arrangement_announced"])
+        self.assertEqual(1_700_000_300_000, reported["paired_arrangement_not_before"])
+
+    def test_management_cannot_switch_queueing_at_two_machines_without_a_pair(self):
+        snapshot, terminal_headers = self.management_paired_snapshot(paired=False)
+        registration_id = snapshot["machines"]["A"]["waiting_positions"][0][
+            "registrations"
+        ][0]["registration_id"]
+
+        response = self.client.post(
+            "/api/queue-management/terminal-actions",
+            json=self.management_terminal_action_body(
+                snapshot,
+                20,
+                action="SET_PAIRED_MACHINE_QUEUEING",
+                registration_ids=[registration_id],
+                also_queues_at_paired_machine=True,
+            ),
+            headers=self.management_headers,
+        )
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=terminal_headers
+        ).get_json()["commands"]
+
+        self.assertEqual(409, response.status_code, response.get_json())
+        self.assertEqual("系统规则不允许自动在两台机台之间安排登记。", response.get_json()["error"])
+        self.assertEqual([], commands)
+
+    def management_pair_settings_snapshot(self, *, enabled=True, reports_setting=True):
+        """A bound terminal whose machines A and B are configured as a pair."""
+        snapshot, terminal_headers = self.management_control_snapshot()
+        stable_a = snapshot["machines"]["A"]["stable_id"]
+        stable_b = snapshot["machines"]["B"]["stable_id"]
+        if reports_setting:
+            snapshot["paired_machine_queue_settings"] = {
+                "enabled": enabled,
+                "pairs": [[stable_a, stable_b]],
+            }
+        if enabled and reports_setting:
+            snapshot["machines"]["A"]["paired_machine_id"] = "B"
+            snapshot["machines"]["B"]["paired_machine_id"] = "A"
+        return snapshot, terminal_headers
+
+    def test_terminal_reports_the_pair_setting_to_the_management_overview(self):
+        snapshot, terminal_headers = self.management_pair_settings_snapshot()
+        published = self.client.post(
+            "/api/queue-status", json=snapshot, headers=terminal_headers
+        )
+        overview = self.client.get(
+            "/api/queue-management/overview", headers=self.management_headers
+        ).get_json()
+        public = self.client.get("/api/queue-status").get_json()
+
+        self.assertEqual(204, published.status_code, published.get_json())
+        self.assertEqual(
+            snapshot["paired_machine_queue_settings"],
+            overview["queue"]["terminal_settings"]["paired_machine_queue_settings"],
+        )
+        self.assertIs(True, overview["capabilities"]["PAIRED_MACHINE_QUEUE_EDIT"])
+        self.assertEqual(
+            snapshot["paired_machine_queue_settings"],
+            public["paired_machine_queue_settings"],
+        )
+
+    def test_terminal_without_the_pair_setting_does_not_offer_it_to_management(self):
+        snapshot, terminal_headers = self.management_pair_settings_snapshot(
+            reports_setting=False
+        )
+        self.client.post("/api/queue-status", json=snapshot, headers=terminal_headers)
+        overview = self.client.get(
+            "/api/queue-management/overview", headers=self.management_headers
+        ).get_json()
+        stable_a = snapshot["machines"]["A"]["stable_id"]
+        stable_b = snapshot["machines"]["B"]["stable_id"]
+
+        rejected = self.client.patch(
+            "/api/queue-management/terminal-settings",
+            json={
+                **self.management_terminal_settings_body(
+                    snapshot, "00000000-0000-0000-0000-000000000760"
+                ),
+                "paired_machine_queue_settings": {
+                    "enabled": True,
+                    "pairs": [[stable_a, stable_b]],
+                },
+            },
+            headers=self.management_headers,
+        )
+
+        self.assertIsNone(overview["queue"]["terminal_settings"]["paired_machine_queue_settings"])
+        self.assertIs(False, overview["capabilities"]["PAIRED_MACHINE_QUEUE_EDIT"])
+        self.assertEqual(409, rejected.status_code, rejected.get_json())
+        self.assertEqual(
+            "当前现场终端不支持远程修改一对机台的设置。", rejected.get_json()["error"]
+        )
+
+    def test_rejects_a_reported_pair_setting_that_does_not_match_the_machines(self):
+        def snapshot_with(change):
+            snapshot, terminal_headers = self.management_pair_settings_snapshot()
+            change(snapshot)
+            return snapshot, terminal_headers
+
+        stable = "f" * 32
+        cases = (
+            ("设置说成对而机台没有", lambda s: s["machines"]["A"].update(paired_machine_id=None)
+                or s["machines"]["B"].update(paired_machine_id=None), "与一对机台的设置不一致"),
+            ("设置关闭而机台仍成对", lambda s: s["paired_machine_queue_settings"].update(enabled=False),
+                "与一对机台的设置不一致"),
+            ("不是对象", lambda s: s.update(paired_machine_queue_settings=[]), "必须是对象"),
+            ("缺少字段", lambda s: s["paired_machine_queue_settings"].pop("pairs"),
+                "必须正好包含 enabled 和 pairs"),
+            ("开关不是布尔值", lambda s: s["paired_machine_queue_settings"].update(enabled=1),
+                "enabled 必须是布尔值。"),
+            ("pairs 不是数组", lambda s: s["paired_machine_queue_settings"].update(pairs={}),
+                "一对机台的设置无效。"),
+            ("一对不是两台", lambda s: s["paired_machine_queue_settings"].update(pairs=[[stable]]),
+                "必须是两个机台内部标识"),
+            ("标识不是字符串", lambda s: s["paired_machine_queue_settings"].update(pairs=[[1, 2]]),
+                "必须是两个机台内部标识"),
+            ("引用不存在的机台", lambda s: s["paired_machine_queue_settings"].update(
+                pairs=[[s["machines"]["A"]["stable_id"], stable]]), "引用了不存在的机台"),
+            ("同一台机台两次", lambda s: s["paired_machine_queue_settings"].update(
+                pairs=[[s["machines"]["A"]["stable_id"]] * 2]), "最多属于一对"),
+        )
+        for label, change, expected_error in cases:
+            with self.subTest(label=label):
+                snapshot, terminal_headers = snapshot_with(change)
+                response = self.client.post(
+                    "/api/queue-status", json=snapshot, headers=terminal_headers
+                )
+                self.assertEqual(400, response.status_code, label)
+                self.assertIn(expected_error, response.get_json()["error"])
+
+    def test_management_settings_command_carries_the_pair_setting(self):
+        snapshot, terminal_headers = self.management_pair_settings_snapshot(enabled=False)
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=terminal_headers
+            ).status_code,
+        )
+        stable_a = snapshot["machines"]["A"]["stable_id"]
+        stable_b = snapshot["machines"]["B"]["stable_id"]
+        desired = {"enabled": True, "pairs": [[stable_a, stable_b]]}
+
+        def submit(request_number, settings):
+            body = self.management_terminal_settings_body(
+                snapshot, f"00000000-0000-0000-0000-0000000007{request_number}"
+            )
+            if settings is not None:
+                body["paired_machine_queue_settings"] = settings
+            return self.client.patch(
+                "/api/queue-management/terminal-settings",
+                json=body,
+                headers=self.management_headers,
+            )
+
+        invalid = [
+            submit(70, {"enabled": True, "pairs": [[stable_a, "e" * 32]]}),
+            submit(71, {"enabled": True, "pairs": [[stable_a, stable_a]]}),
+            submit(72, {"enabled": "yes", "pairs": []}),
+            submit(73, {"enabled": True}),
+            submit(74, "on"),
+        ]
+        created = submit(75, desired)
+        commands = self.client.get(
+            "/api/queue-terminal/commands", headers=terminal_headers
+        ).get_json()["commands"]
+
+        for response in invalid:
+            self.assertEqual(400, response.status_code, response.get_json())
+        self.assertEqual(202, created.status_code, created.get_json())
+        self.assertEqual(1, len(commands))
+        self.assertEqual("UPDATE_TERMINAL_SETTINGS", commands[0]["type"])
+        self.assertEqual(desired, commands[0]["payload"]["paired_machine_queue_settings"])
+
+    def test_management_settings_command_without_the_pair_setting_leaves_it_alone(self):
+        snapshot, terminal_headers = self.management_pair_settings_snapshot()
+        self.client.post("/api/queue-status", json=snapshot, headers=terminal_headers)
+
+        created = self.client.patch(
+            "/api/queue-management/terminal-settings",
+            json=self.management_terminal_settings_body(
+                snapshot, "00000000-0000-0000-0000-000000000776"
+            ),
+            headers=self.management_headers,
+        )
+        payload = self.client.get(
+            "/api/queue-terminal/commands", headers=terminal_headers
+        ).get_json()["commands"][0]["payload"]
+
+        self.assertEqual(202, created.status_code, created.get_json())
+        # The terminal keeps its own setting when the command does not mention it.
+        self.assertNotIn("paired_machine_queue_settings", payload)
+
+    def test_management_cannot_pair_machines_of_different_capacity(self):
+        snapshot, terminal_headers = self.management_pair_settings_snapshot(enabled=False)
+        snapshot["paired_machine_queue_settings"]["pairs"] = []
+        snapshot["registration_open"] = False
+        snapshot["registration_control_open"] = False
+        self.client.post("/api/queue-status", json=snapshot, headers=terminal_headers)
+        body = self.management_terminal_settings_body(
+            snapshot, "00000000-0000-0000-0000-000000000777"
+        )
+        # The same command changes machine B to single play and asks to pair it with A.
+        body["machines"]["B"]["configuration"]["capacity"] = 1
+        body["paired_machine_queue_settings"] = {
+            "enabled": True,
+            "pairs": [
+                [snapshot["machines"]["A"]["stable_id"], snapshot["machines"]["B"]["stable_id"]]
+            ],
+        }
+
+        response = self.client.patch(
+            "/api/queue-management/terminal-settings",
+            json=body,
+            headers=self.management_headers,
+        )
+
+        self.assertEqual(400, response.status_code, response.get_json())
+        self.assertEqual("一对机台的游玩容量必须相同。", response.get_json()["error"])
+
+    def test_contact_of_a_deleted_profile_is_dropped_without_failing_the_upload(self):
+        def snapshot_with_public_contact(revision):
+            snapshot = self.snapshot(revision=revision)
+            snapshot["schema_version"] = 5
+            profile = self.player_profile()
+            profile["qq_visibility"] = "PUBLIC_WEBSITE"
+            snapshot["private_player_profiles"] = [profile]
+            snapshot["private_player_contacts"] = [
+                {
+                    "registration_id": snapshot["machines"]["A"]["playing"][0][
+                        "registration_id"
+                    ],
+                    "profile_id": self.profile_id,
+                    "qq_number": "12345678",
+                }
+            ]
+            return snapshot
+
+        first = self.client.post(
+            "/api/queue-status", json=snapshot_with_public_contact(70), headers=self.headers
+        )
+        before = self.client.get("/api/queue-status").get_json()
+        # The server learns that the profile was deleted, while a terminal that still holds
+        # it keeps uploading the profile's contact.
+        connection = sqlite3.connect(self.database_path)
+        try:
+            scopes = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT DISTINCT device_id FROM player_profile WHERE profile_id = ?",
+                    (self.profile_id,),
+                )
+            ]
+            for scope in scopes:
+                connection.execute(
+                    """
+                    INSERT INTO deleted_player_profile
+                        (profile_scope_id, profile_id, deleted_at, command_id)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (scope, self.profile_id, 1_000, "00000000-0000-0000-0000-000000000700"),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        second = self.client.post(
+            "/api/queue-status", json=snapshot_with_public_contact(71), headers=self.headers
+        )
+        after = self.client.get("/api/queue-status").get_json()
+        connection = sqlite3.connect(self.database_path)
+        try:
+            stored_contacts = connection.execute(
+                "SELECT COUNT(*) FROM queue_private_contact WHERE player_id = ?",
+                (self.profile_id,),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        self.assertEqual(204, first.status_code, first.get_json())
+        self.assertEqual(1, len(scopes))
+        self.assertEqual("12345678", before["machines"]["A"]["playing"][0]["qq_number"])
+        # The upload used to fail on every attempt for as long as the contact was sent.
+        self.assertEqual(204, second.status_code, second.get_json())
+        self.assertEqual(71, after["revision"])
+        # Neither the contact nor the deleted profile's public QQ comes back.
+        self.assertIsNone(after["machines"]["A"]["playing"][0]["qq_number"])
+        self.assertEqual(0, stored_contacts)
+
+    def test_identifiers_that_are_not_strings_are_rejected_as_invalid(self):
+        self.publish(self.remote_ready_snapshot())
+        for label, value in (("数字", 5), ("数组", ["x"]), ("对象", {"id": "x"}), ("布尔值", True)):
+            with self.subTest(label=label, endpoint="player-bindings"):
+                binding = self.client.post(
+                    "/api/queue-terminal/player-bindings",
+                    json={"profile_id": value},
+                    headers=self.headers,
+                )
+                self.assertEqual(400, binding.status_code)
+                self.assertEqual("玩家资料编号无效。", binding.get_json()["error"])
+            with self.subTest(label=label, endpoint="installation"):
+                installation = self.client.post(
+                    "/api/queue-terminal/installation",
+                    json={"venue_id": value, "venue_name": "机厅", "terminal_name": "终端"},
+                    headers=self.headers,
+                )
+                self.assertEqual(400, installation.status_code)
+                self.assertEqual("机厅 ID 无效。", installation.get_json()["error"])
+            with self.subTest(label=label, endpoint="queue-status"):
+                snapshot, terminal_headers = self.management_schema_eight_snapshot()
+                snapshot["revision"] = 80
+                snapshot["venue"] = {"id": value}
+                upload = self.client.post(
+                    "/api/queue-status", json=snapshot, headers=terminal_headers
+                )
+                self.assertEqual(409, upload.status_code)
+                self.assertEqual("VENUE_ID_REQUIRED", upload.get_json()["code"])
+
+    def test_values_that_cannot_be_looked_up_are_rejected_as_invalid(self):
+        # A list or an object in place of a text value used to end in an unhandled error.
+        event_snapshot = self.snapshot(revision=81)
+        event_snapshot["recent_events"] = [
+            {**self.event("00000000-0000-0000-0000-000000000781", "QUEUE_UPDATED", 990_000),
+             "machine_id": ["A"]}
+        ]
+        event_upload = self.client.post(
+            "/api/queue-status", json=event_snapshot, headers=self.headers
+        )
+
+        ask_snapshot = self.remote_ready_snapshot(revision=82, default_preference="ASK_EVERY_TIME")
+        self.publish(ask_snapshot)
+        token = self.open_mobile_session(ask_snapshot, 95)
+        mobile = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000896",
+                "profile_id": self.profile_id,
+                "expected_profile_revision": 3,
+                "preference": ["SOLO"],
+            },
+        )
+        join = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000897",
+                "qq": "12345678",
+                "machine_id": "A",
+                "preference": {"value": "SOLO"},
+            },
+        )
+
+        self.assertEqual(400, event_upload.status_code)
+        self.assertEqual("invalid_recent_event_machine_id", event_upload.get_json()["code"])
+        self.assertEqual(400, mobile.status_code)
+        self.assertEqual("请选择本次游玩偏好。", mobile.get_json()["error"])
+        self.assertEqual(400, join.status_code)
+        self.assertEqual("preference 选项无效。", join.get_json()["error"])
+
+    def test_rejects_paired_machines_of_different_capacity(self):
+        snapshot = self.paired_snapshot(revision=43)
+        snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0][
+            "also_queues_at_paired_machine"
+        ] = False
+        snapshot["machines"]["B"]["paired_waiting_positions"] = None
+        self.upgrade_snapshot_to_schema_v6(snapshot, capacities={"A": 2, "B": 1})
+
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("游玩容量不同，不能设为一对机台", response.get_json()["error"])
+
+    def test_rejects_paired_preview_positions_that_exceed_single_capacity(self):
+        snapshot = self.paired_snapshot(revision=44)
+        own = self.registration("f" * 24, "机台乙等待玩家")
+        machine_b = snapshot["machines"]["B"]
+        machine_b["waiting_positions"] = [
+            {
+                "index": 1,
+                "position_id": "1" * 24,
+                "fixed_pair": False,
+                "estimated_wait_minutes": 6,
+                "registrations": [own],
+                "common_play_preview": None,
+            }
+        ]
+        machine_b["registration_count"] = 2
+        machine_b["waiting_position_count"] = 1
+        machine_b["paired_waiting_positions"][0]["registrations"].insert(
+            0, {"registration_id": "f" * 24, "paired_place_preview": False}
+        )
+        self.upgrade_snapshot_to_schema_v6(snapshot, capacities={"A": 1, "B": 1})
+
+        response = self.client.post(
+            "/api/queue-status", json=snapshot, headers=self.headers
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("每个位置只能包含 1 个登记", response.get_json()["error"])
+
     def test_preserves_temporary_away_state_and_rejects_invalid_count(self):
         snapshot = self.snapshot()
         registration = snapshot["machines"]["A"]["playing"][0]
@@ -2648,6 +4807,7 @@ class QueueStatusApiTest(unittest.TestCase):
                         "position_id": "c" * 24,
                         "fixed_pair": False,
                         "estimated_wait_minutes": 12,
+                        "estimated_wait_uncertain": True,
                         "registrations": [waiting_registration],
                     }
                 ],
@@ -2677,9 +4837,13 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertIsNone(
             public_machine["waiting_positions"][0]["estimated_wait_minutes"]
         )
+        self.assertIs(
+            False, public_machine["waiting_positions"][0]["estimated_wait_uncertain"]
+        )
         self.assertFalse(bot_player["machine_operational"])
         self.assertIsNone(bot_player["playing_started_at"])
         self.assertIsNone(bot_player["estimated_wait_minutes"])
+        self.assertIs(False, bot_player["estimated_wait_uncertain"])
 
     def test_exposes_only_computed_business_hours_state(self):
         snapshot = self.snapshot()
@@ -2828,7 +4992,7 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertTrue(all(response.status_code == 503 for response in blocked_responses))
         self.assertTrue(
             all(
-                response.get_json()["error"] == "QQ Bot 联动已关闭"
+                response.get_json()["error"] == "QQ Bot 联动已关闭。"
                 for response in blocked_responses
             )
         )
@@ -2859,7 +5023,7 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(0, recipient_count)
         self.assertEqual(1, profile_count)
         self.assertEqual(
-            ("REJECTED", "BOT_DISABLED", "QQ Bot 联动已关闭，这次修改没有执行。"),
+            ("REJECTED", "BOT_DISABLED", "QQ Bot 联动已关闭，这次操作没有执行。"),
             command,
         )
 
@@ -3040,7 +5204,7 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertEqual(503, response.status_code)
         self.assertEqual(
-            "现场终端暂时离线，暂不能修改玩家资料",
+            "现场终端暂时离线，暂不能修改玩家资料。",
             response.get_json()["error"],
         )
         self.assertEqual(0, command_count)
@@ -4469,7 +6633,7 @@ class QueueStatusApiTest(unittest.TestCase):
 
         self.assertEqual(400, response.status_code)
         self.assertEqual(
-            "同一玩家资料不能关联多份当前登记",
+            "同一玩家资料不能关联多份当前登记。",
             response.get_json()["error"],
         )
 
@@ -5483,7 +7647,7 @@ class QueueStatusApiTest(unittest.TestCase):
             headers=self.bot_headers,
         )
         self.assertEqual(409, transfer.status_code)
-        self.assertIn("先释放固定组合", transfer.get_json()["error"])
+        self.assertIn("先解除固定组合", transfer.get_json()["error"])
 
     def test_four_machine_profile_lookup_and_website_join_target_machine_c(self):
         snapshot = self.remote_ready_snapshot(revision=31)
@@ -5949,7 +8113,7 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertFalse(public_status["capabilities"]["online_registration"])
         self.assertTrue(public_status["capabilities"]["remote_actions"])
         self.assertEqual(503, website_profile.status_code)
-        self.assertEqual("现场规则暂不允许线上登记", website_profile.get_json()["error"])
+        self.assertEqual("系统规则不允许线上登记。", website_profile.get_json()["error"])
         self.assertEqual(503, website_join.status_code)
         self.assertEqual(503, bot_join.status_code)
         self.assertEqual(200, bot_players.status_code)
@@ -5983,7 +8147,7 @@ class QueueStatusApiTest(unittest.TestCase):
             "/api/queue-bot/players", json={}, headers=self.bot_headers
         )
         self.assertEqual(503, disabled_response.status_code)
-        self.assertIn("QQ Bot 联动已关闭", disabled_response.get_json()["error"])
+        self.assertIn("QQ Bot 联动已关闭。", disabled_response.get_json()["error"])
 
         online_again = copy.deepcopy(bot_disabled)
         online_again["revision"] += 1
@@ -6119,19 +8283,105 @@ class QueueStatusApiTest(unittest.TestCase):
                 "/api/queue-status", json=stopped, headers=self.headers
             ).status_code,
         )
-        leave = self.client.post(
+        defer = self.client.post(
             "/api/queue-bot/queue-commands",
             json={
                 "request_id": "00000000-0000-0000-0000-000000000427",
                 "actor_qq": "12345678",
-                "operation": "LEAVE_QUEUE",
+                "operation": "DEFER_ONE_ROUND",
                 "machine_id": "A",
             },
             headers=self.bot_headers,
         )
 
-        self.assertEqual(409, leave.status_code)
-        self.assertIn("机台已停止使用", leave.get_json()["error"])
+        self.assertEqual(409, defer.status_code)
+        self.assertEqual(
+            "左侧·机台 A 已停止使用，恢复正常使用前只能退出排队或转至其他机台。",
+            defer.get_json()["error"],
+        )
+
+    def stopped_machine_snapshot(self, revision=26):
+        """Remote-ready snapshot whose only registration waits at a stopped machine A."""
+        snapshot = self.remote_ready_snapshot(revision=revision, with_registration=True)
+        snapshot["machines"]["A"].update(
+            operational=False,
+            stop_reason="MAINTENANCE",
+            stopped_at=2_300_000,
+        )
+        return snapshot
+
+    def bot_operation(self, request_number, operation, **fields):
+        return self.client.post(
+            "/api/queue-bot/queue-commands",
+            json={
+                "request_id": f"00000000-0000-0000-0000-0000000004{request_number}",
+                "actor_qq": "12345678",
+                "operation": operation,
+                **fields,
+            },
+            headers=self.bot_headers,
+        )
+
+    def test_registration_at_a_stopped_machine_can_still_leave_the_queue(self):
+        # Nobody is held at a machine that cannot be played on.
+        self.publish(self.stopped_machine_snapshot())
+
+        leave = self.bot_operation(60, "LEAVE_QUEUE")
+        commands = self.pending_command_payloads()
+
+        self.assertEqual(202, leave.status_code, leave.get_json())
+        self.assertEqual(["LEAVE_QUEUE"], [command["operation"] for command in commands])
+        self.assertEqual("A", commands[0]["machine_id"])
+
+    def test_registration_at_a_stopped_machine_can_still_move_to_a_running_machine(self):
+        self.publish(self.stopped_machine_snapshot())
+
+        transfer = self.bot_operation(61, "TRANSFER_MACHINE", target_machine_id="B")
+        commands = self.pending_command_payloads()
+
+        self.assertEqual(202, transfer.status_code, transfer.get_json())
+        self.assertEqual(["TRANSFER_MACHINE"], [command["operation"] for command in commands])
+        self.assertEqual("A", commands[0]["machine_id"])
+        self.assertEqual("B", commands[0]["target_machine_id"])
+
+    def test_everything_else_waits_while_the_machine_of_a_registration_is_stopped(self):
+        self.publish(self.stopped_machine_snapshot())
+
+        refused = {
+            operation: self.bot_operation(62 + index, operation, **fields)
+            for index, (operation, fields) in enumerate(
+                (
+                    ("DEFER_ONE_ROUND", {}),
+                    ("TEMPORARILY_LEAVE", {}),
+                    ("CANCEL_DEFER_ONE_ROUND", {}),
+                    ("CANCEL_TEMPORARY_LEAVE", {}),
+                    ("CHANGE_PLAY_PREFERENCE", {"preference": "SOLO"}),
+                )
+            )
+        }
+
+        for operation, response in refused.items():
+            with self.subTest(operation=operation):
+                self.assertEqual(409, response.status_code, response.get_json())
+                self.assertEqual(
+                    "左侧·机台 A 已停止使用，恢复正常使用前只能退出排队或转至其他机台。",
+                    response.get_json()["error"],
+                )
+        self.assertEqual([], self.pending_command_payloads())
+
+    def test_no_registration_moves_to_a_stopped_machine(self):
+        snapshot = self.remote_ready_snapshot(revision=26, with_registration=True)
+        snapshot["machines"]["B"].update(
+            operational=False,
+            stop_reason="MAINTENANCE",
+            stopped_at=2_300_000,
+        )
+        self.publish(snapshot)
+
+        transfer = self.bot_operation(70, "TRANSFER_MACHINE", target_machine_id="B")
+
+        self.assertEqual(409, transfer.status_code, transfer.get_json())
+        self.assertIn("已停止使用，暂不能转入", transfer.get_json()["error"])
 
     def test_online_join_requires_a_current_preference_when_profile_asks_each_time(self):
         snapshot = self.remote_ready_snapshot(default_preference="ASK_EVERY_TIME")
@@ -6156,7 +8406,7 @@ class QueueStatusApiTest(unittest.TestCase):
         )
 
         self.assertEqual(400, missing.status_code)
-        self.assertEqual("请选择本次游玩偏好", missing.get_json()["error"])
+        self.assertEqual("请选择本次游玩偏好。", missing.get_json()["error"])
         self.assertEqual(202, selected.status_code)
 
     def test_pending_online_registration_only_allows_remote_leave(self):
@@ -6661,6 +8911,72 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual("", response.get_json()["payload"]["actor_qq"])
 
+    def test_management_can_neither_defer_nor_leave_for_the_playing_position(self):
+        # The same rule as for players: a registration in the playing position has to be
+        # taken back to the front of the waiting order first.
+        snapshot, terminal_headers = self.management_schema_eight_snapshot(
+            with_registration=True,
+            pending_check_in=False,
+        )
+        machine = snapshot["machines"]["A"]
+        registration = machine["waiting_positions"][0]["registrations"][0]
+        machine["playing"] = [registration]
+        machine["playing_started_at"] = 900_000
+        machine["waiting_positions"] = []
+        machine["waiting_position_count"] = 0
+        published = self.client.post(
+            "/api/queue-status", json=snapshot, headers=terminal_headers
+        )
+        refusals = {
+            "DEFER_ONE_ROUND": "处于游玩位置的登记不能暂缓一次，请先在现场终端撤回至等待顺序。",
+            "TEMPORARILY_LEAVE": "处于游玩位置的登记不能暂时离开，请先在现场终端撤回至等待顺序。",
+        }
+
+        self.assertEqual(204, published.status_code, published.get_json())
+        for index, (operation, refusal) in enumerate(refusals.items()):
+            with self.subTest(operation=operation):
+                by_profile = self.client.post(
+                    "/api/queue-management/queue-commands",
+                    json={
+                        "request_id": f"00000000-0000-0000-0000-00000000098{index}",
+                        "profile_id": self.profile_id,
+                        "operation": operation,
+                        "expected_queue_id": snapshot["queue_id"],
+                        "expected_registration_id": registration["registration_id"],
+                        "expected_machine_id": "A",
+                        "expected_position": "PLAYING",
+                        "expected_fixed_pair_id": None,
+                        "expected_absence_status": "NONE",
+                        "expected_temporary_away_skipped_turns": 0,
+                        "expected_pending_check_in": False,
+                        "expected_machine_configuration_revision": 1,
+                        "expected_machine_stable_id": machine["stable_id"],
+                    },
+                    headers=self.management_headers,
+                )
+                by_registration = self.client.post(
+                    "/api/queue-management/terminal-actions",
+                    json=self.management_terminal_action_body(
+                        snapshot,
+                        20 + index,
+                        action=operation,
+                        registration_ids=[registration["registration_id"]],
+                    ),
+                    headers=self.management_headers,
+                )
+                self.assertEqual(409, by_profile.status_code, by_profile.get_json())
+                self.assertEqual(refusal, by_profile.get_json()["error"])
+                self.assertEqual(
+                    409, by_registration.status_code, by_registration.get_json()
+                )
+                self.assertEqual(refusal, by_registration.get_json()["error"])
+        self.assertEqual(
+            [],
+            self.client.get(
+                "/api/queue-terminal/commands", headers=terminal_headers
+            ).get_json()["commands"],
+        )
+
     def test_management_can_edit_temporary_registration_and_reorder_waiting_queue(self):
         snapshot, terminal_headers = self.management_schema_eight_snapshot(
             with_registration=True,
@@ -6910,7 +9226,7 @@ class QueueStatusApiTest(unittest.TestCase):
             headers=self.management_headers,
         )
         self.assertEqual(409, rejected.status_code)
-        self.assertIn("排队登记", rejected.get_json()["error"])
+        self.assertIn("仍关联当前登记", rejected.get_json()["error"])
 
     def test_bot_confirmation_context_rejects_a_changed_registration_state(self):
         snapshot = self.remote_ready_snapshot(with_registration=True)
@@ -6967,7 +9283,10 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual("WAITING", commands[0]["payload"]["expected_position"])
         self.assertEqual("NONE", commands[0]["payload"]["expected_absence_status"])
 
-    def test_playing_registration_forwards_absence_commands_to_the_terminal(self):
+    def test_playing_registration_can_neither_defer_nor_leave_temporarily(self):
+        # Deferring and leaving temporarily are for registrations that wait. One in the
+        # playing position has to be taken back to the front of the waiting order on the
+        # terminal first; leaving the queue stays possible.
         snapshot = self.remote_ready_snapshot(with_registration=True)
         registration = snapshot["machines"]["A"]["waiting_positions"][0][
             "registrations"
@@ -6993,33 +9312,37 @@ class QueueStatusApiTest(unittest.TestCase):
             "expected_pending_check_in": False,
         }
 
-        for request_id, operation in (
-            ("00000000-0000-0000-0000-000000000408", "DEFER_ONE_ROUND"),
-            ("00000000-0000-0000-0000-000000000409", "TEMPORARILY_LEAVE"),
+        for request_id, operation, refusal in (
+            (
+                "00000000-0000-0000-0000-000000000408",
+                "DEFER_ONE_ROUND",
+                "处于游玩位置的登记不能暂缓一次，请先在现场终端撤回至等待顺序。",
+            ),
+            (
+                "00000000-0000-0000-0000-000000000409",
+                "TEMPORARILY_LEAVE",
+                "处于游玩位置的登记不能暂时离开，请先在现场终端撤回至等待顺序。",
+            ),
         ):
-            response = self.client.post(
-                "/api/queue-bot/queue-commands",
-                json={
-                    "request_id": request_id,
-                    "actor_qq": "12345678",
-                    "operation": operation,
-                    **expected_context,
-                },
-                headers=self.bot_headers,
-            )
-            self.assertEqual(202, response.status_code)
-            commands = self.client.get(
+            with self.subTest(operation=operation):
+                response = self.client.post(
+                    "/api/queue-bot/queue-commands",
+                    json={
+                        "request_id": request_id,
+                        "actor_qq": "12345678",
+                        "operation": operation,
+                        **expected_context,
+                    },
+                    headers=self.bot_headers,
+                )
+                self.assertEqual(409, response.status_code, response.get_json())
+                self.assertEqual(refusal, response.get_json()["error"])
+        self.assertEqual(
+            [],
+            self.client.get(
                 "/api/queue-terminal/commands", headers=self.headers
-            ).get_json()["commands"]
-            command = next(item for item in commands if item["command_id"] == request_id)
-            self.assertEqual(operation, command["payload"]["operation"])
-            self.assertEqual("PLAYING", command["payload"]["expected_position"])
-            completed = self.client.post(
-                f"/api/queue-terminal/commands/{request_id}/result",
-                json={"status": "APPLIED", "detail": "终端行为测试完成。"},
-                headers=self.headers,
-            )
-            self.assertEqual("APPLIED", completed.get_json()["status"])
+            ).get_json()["commands"],
+        )
 
         transfer = self.client.post(
             "/api/queue-bot/queue-commands",
@@ -7034,6 +9357,364 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual(409, transfer.status_code)
         self.assertIn("游玩位置", transfer.get_json()["error"])
+
+    # 轮空一次 and the limits on postponing (maintainer, 2026-11-25).
+
+    def postponement_snapshot(self, revision=4, pending_check_in=False, **fields):
+        """Remote-ready snapshot whose only registration waits at machine A with [fields]."""
+        snapshot = self.remote_ready_snapshot(
+            revision=revision, with_registration=True, pending_check_in=pending_check_in
+        )
+        snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0].update(fields)
+        return snapshot
+
+    def bot_confirmation_context(self, **fields):
+        return {
+            "expected_queue_id": self.postponement_snapshot()["queue_id"],
+            "expected_registration_id": "a" * 24,
+            "expected_machine_id": "A",
+            "expected_position": "WAITING",
+            "expected_fixed_pair_id": None,
+            "expected_absence_status": "NONE",
+            "expected_temporary_away_skipped_turns": 0,
+            "expected_pending_check_in": False,
+            **fields,
+        }
+
+    def stored_waiting_registration(self):
+        return self.client.get("/api/queue-status").get_json()["machines"]["A"][
+            "waiting_positions"
+        ][0]["registrations"][0]
+
+    def test_snapshot_keeps_skip_one_turn_and_the_postponement_limits(self):
+        # 将轮空一次 counts its turn together with 暂时离开, so the count goes with it.
+        self.publish(
+            self.postponement_snapshot(
+                skips_one_turn=True,
+                temporary_away_skipped_turns=2,
+                defer_one_round_used=True,
+                online_registration_not_played=True,
+            )
+        )
+        stored = self.stored_waiting_registration()
+        self.assertIs(True, stored["skips_one_turn"])
+        self.assertIs(False, stored["deferred_once"])
+        self.assertIs(False, stored["temporarily_away"])
+        self.assertEqual(2, stored["temporary_away_skipped_turns"])
+        self.assertIs(True, stored["defer_one_round_used"])
+        self.assertIs(True, stored["online_registration_not_played"])
+
+        # Older terminals leave the three fields out or send null.
+        older = self.postponement_snapshot(revision=5, skips_one_turn=None)
+        self.publish(older)
+        stored = self.stored_waiting_registration()
+        self.assertIs(False, stored["skips_one_turn"])
+        self.assertIs(False, stored["defer_one_round_used"])
+        self.assertIs(False, stored["online_registration_not_played"])
+
+        rejected = {
+            "skips_one_turn 不是布尔值": (
+                self.postponement_snapshot(revision=6, skips_one_turn="true"),
+                "skips_one_turn 必须是布尔值。",
+            ),
+            "defer_one_round_used 不是布尔值": (
+                self.postponement_snapshot(revision=7, defer_one_round_used=1),
+                "defer_one_round_used 必须是布尔值。",
+            ),
+            "online_registration_not_played 不是布尔值": (
+                self.postponement_snapshot(revision=8, online_registration_not_played=0),
+                "online_registration_not_played 必须是布尔值。",
+            ),
+            "轮空次数不属于暂时离开或将轮空一次": (
+                self.postponement_snapshot(revision=9, temporary_away_skipped_turns=1),
+                "只有暂时离开或将轮空一次的登记才能包含轮空次数。",
+            ),
+            "将轮空一次与将暂缓一次": (
+                self.postponement_snapshot(
+                    revision=10, skips_one_turn=True, deferred_once=True
+                ),
+                "登记最多只能处于将暂缓一次、将轮空一次和暂时离开中的一种状态。",
+            ),
+            "将轮空一次与暂时离开": (
+                self.postponement_snapshot(
+                    revision=11, skips_one_turn=True, temporarily_away=True
+                ),
+                "登记最多只能处于将暂缓一次、将轮空一次和暂时离开中的一种状态。",
+            ),
+            "待签到时将轮空一次": (
+                self.postponement_snapshot(
+                    revision=12, pending_check_in=True, skips_one_turn=True
+                ),
+                "待签到的线上登记不能处于将暂缓一次、将轮空一次或暂时离开状态。",
+            ),
+        }
+        for label, (snapshot, error) in rejected.items():
+            with self.subTest(label):
+                response = self.client.post(
+                    "/api/queue-status", json=snapshot, headers=self.headers
+                )
+                self.assertEqual(400, response.status_code, response.get_json())
+                self.assertEqual(error, response.get_json()["error"])
+
+    def test_fixed_pair_shares_skip_one_turn(self):
+        def pair_snapshot(revision, second_skips):
+            snapshot = self.remote_ready_snapshot(revision=revision)
+            first = self.registration("a" * 24, "公开昵称")
+            second = self.registration("c" * 24, "固定搭档")
+            for registration in (first, second):
+                registration.update(
+                    preference="OPEN_TO_JOIN", fixed_pair=True, fixed_pair_id="f" * 24
+                )
+            first["skips_one_turn"] = True
+            second["skips_one_turn"] = second_skips
+            snapshot["machines"]["A"]["waiting_positions"] = [
+                {
+                    "index": 1,
+                    "position_id": "b" * 24,
+                    "fixed_pair": True,
+                    "estimated_wait_minutes": 0,
+                    "registrations": [first, second],
+                }
+            ]
+            snapshot["machines"]["A"]["registration_count"] = 2
+            snapshot["machines"]["A"]["waiting_position_count"] = 1
+            return snapshot
+
+        self.publish(pair_snapshot(4, True))
+        mismatched = self.client.post(
+            "/api/queue-status", json=pair_snapshot(5, False), headers=self.headers
+        )
+        self.assertEqual(400, mismatched.status_code)
+        self.assertIn("固定组合可用状态不一致", mismatched.get_json()["error"])
+
+    def test_skip_one_turn_reaches_player_account_bot_and_management(self):
+        snapshot = self.management_control_snapshot(with_registration=True)[0]
+        snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0].update(
+            skips_one_turn=True,
+            temporary_away_skipped_turns=1,
+            defer_one_round_used=True,
+            online_registration_not_played=True,
+        )
+        response = self.client.post(
+            "/api/queue-status",
+            json=snapshot,
+            headers=self.schema_eight_terminal_headers(),
+        )
+        self.assertEqual(204, response.status_code, response.get_json())
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+        completed = self.client.post(
+            f"/api/player-account/bindings/{binding.get_json()['binding_token']}/complete",
+            json={"password": "first-password"},
+        )
+        self.assertEqual(201, completed.status_code, completed.get_json())
+
+        account = self.client.get("/api/player-account/queue").get_json()[
+            "registrations"
+        ][0]
+        bot_player = self.client.post(
+            "/api/queue-bot/players", json={"qq": "12345678"}, headers=self.bot_headers
+        ).get_json()["players"][0]
+        overview = self.client.get(
+            "/api/queue-management/overview", headers=self.management_headers
+        ).get_json()
+        machine_a = next(
+            machine for machine in overview["queue"]["machines"] if machine["id"] == "A"
+        )
+        managed = machine_a["waiting_positions"][0]["registrations"][0]
+
+        for label, registration in (
+            ("account", account),
+            ("bot", bot_player),
+            ("management", managed),
+        ):
+            with self.subTest(label):
+                self.assertIs(True, registration["skips_one_turn"])
+                self.assertIs(False, registration["deferred_once"])
+                self.assertIs(False, registration["temporarily_away"])
+                self.assertEqual(1, registration["temporary_away_skipped_turns"])
+                self.assertIs(True, registration["defer_one_round_used"])
+                self.assertIs(True, registration["online_registration_not_played"])
+
+    def test_skip_one_turn_is_forwarded_like_defer_one_round(self):
+        self.publish(self.postponement_snapshot())
+
+        skip = self.bot_operation(80, "SKIP_ONE_TURN", **self.bot_confirmation_context())
+        commands = self.pending_command_payloads()
+
+        self.assertEqual(202, skip.status_code, skip.get_json())
+        self.assertEqual(["SKIP_ONE_TURN"], [command["operation"] for command in commands])
+        self.assertEqual("a" * 24, commands[0]["registration_id"])
+        self.assertEqual("NONE", commands[0]["expected_absence_status"])
+
+    def test_cancel_skip_one_turn_confirms_the_skip_one_turn_state(self):
+        self.publish(
+            self.postponement_snapshot(skips_one_turn=True, temporary_away_skipped_turns=1)
+        )
+
+        stale = self.bot_operation(
+            81,
+            "CANCEL_SKIP_ONE_TURN",
+            **self.bot_confirmation_context(expected_temporary_away_skipped_turns=1),
+        )
+        cancel = self.bot_operation(
+            82,
+            "CANCEL_SKIP_ONE_TURN",
+            **self.bot_confirmation_context(
+                expected_absence_status="SKIP_ONE_TURN",
+                expected_temporary_away_skipped_turns=1,
+            ),
+        )
+        commands = self.pending_command_payloads()
+
+        self.assertEqual(409, stale.status_code, stale.get_json())
+        self.assertIn("确认期间登记状态已经变化", stale.get_json()["error"])
+        self.assertEqual(202, cancel.status_code, cancel.get_json())
+        self.assertEqual(
+            ["CANCEL_SKIP_ONE_TURN"], [command["operation"] for command in commands]
+        )
+        self.assertEqual("SKIP_ONE_TURN", commands[0]["expected_absence_status"])
+        self.assertEqual(1, commands[0]["expected_temporary_away_skipped_turns"])
+
+    def test_skip_one_turn_is_refused_for_the_playing_position(self):
+        snapshot = self.remote_ready_snapshot(with_registration=True)
+        machine = snapshot["machines"]["A"]
+        registration = machine["waiting_positions"][0]["registrations"][0]
+        machine["playing"] = [registration]
+        machine["playing_started_at"] = 900_000
+        machine["waiting_positions"] = []
+        machine["waiting_position_count"] = 0
+        self.publish(snapshot)
+
+        response = self.bot_operation(
+            83,
+            "SKIP_ONE_TURN",
+            **self.bot_confirmation_context(expected_position="PLAYING"),
+        )
+
+        self.assertEqual(409, response.status_code, response.get_json())
+        self.assertEqual(
+            "处于游玩位置的登记不能轮空一次，请先在现场终端撤回至等待顺序。",
+            response.get_json()["error"],
+        )
+        self.assertEqual([], self.pending_command_payloads())
+
+    def test_used_defer_one_round_is_refused_until_the_registration_has_played(self):
+        self.publish(self.postponement_snapshot(defer_one_round_used=True))
+
+        defer = self.bot_operation(84, "DEFER_ONE_ROUND")
+        self.assertEqual(409, defer.status_code, defer.get_json())
+        self.assertEqual(
+            "这份登记已暂缓过一次，游玩一轮之后才能再次暂缓。",
+            defer.get_json()["error"],
+        )
+        self.assertEqual([], self.pending_command_payloads())
+
+        # The other two remain.
+        skip = self.bot_operation(85, "SKIP_ONE_TURN")
+        self.assertEqual(202, skip.status_code, skip.get_json())
+
+    def test_checked_in_online_registration_cannot_be_postponed_before_playing(self):
+        self.publish(self.postponement_snapshot(online_registration_not_played=True))
+
+        for request_number, operation in (
+            (86, "DEFER_ONE_ROUND"),
+            (87, "SKIP_ONE_TURN"),
+            (88, "TEMPORARILY_LEAVE"),
+        ):
+            with self.subTest(operation):
+                response = self.bot_operation(request_number, operation)
+                self.assertEqual(409, response.status_code, response.get_json())
+                self.assertEqual(
+                    "已签到的线上登记在游玩一轮之前不能延后。",
+                    response.get_json()["error"],
+                )
+        self.assertEqual([], self.pending_command_payloads())
+
+        # Leaving the queue stays possible.
+        leave = self.bot_operation(89, "LEAVE_QUEUE")
+        self.assertEqual(202, leave.status_code, leave.get_json())
+
+    def test_management_app_may_postpone_despite_the_player_limits(self):
+        snapshot, terminal_headers = self.management_schema_eight_snapshot(
+            with_registration=True
+        )
+        registration = snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+        registration.update(defer_one_round_used=True, online_registration_not_played=True)
+        published = self.client.post(
+            "/api/queue-status", json=snapshot, headers=terminal_headers
+        )
+        self.assertEqual(204, published.status_code, published.get_json())
+
+        by_profile = self.client.post(
+            "/api/queue-management/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000990",
+                "profile_id": self.profile_id,
+                "operation": "DEFER_ONE_ROUND",
+                "expected_queue_id": snapshot["queue_id"],
+                "expected_registration_id": registration["registration_id"],
+                "expected_machine_id": "A",
+                "expected_position": "WAITING",
+                "expected_fixed_pair_id": None,
+                "expected_absence_status": "NONE",
+                "expected_temporary_away_skipped_turns": 0,
+                "expected_pending_check_in": False,
+                "expected_machine_configuration_revision": 1,
+                "expected_machine_stable_id": snapshot["machines"]["A"]["stable_id"],
+            },
+            headers=self.management_headers,
+        )
+        by_registration = self.client.post(
+            "/api/queue-management/terminal-actions",
+            json=self.management_terminal_action_body(
+                snapshot,
+                30,
+                action="SKIP_ONE_TURN",
+                registration_ids=[registration["registration_id"]],
+            ),
+            headers=self.management_headers,
+        )
+
+        self.assertEqual(202, by_profile.status_code, by_profile.get_json())
+        self.assertEqual("DEFER_ONE_ROUND", by_profile.get_json()["payload"]["operation"])
+        self.assertEqual(202, by_registration.status_code, by_registration.get_json())
+        self.assertEqual("SKIP_ONE_TURN", by_registration.get_json()["payload"]["action"])
+
+    def test_management_cannot_skip_one_turn_for_the_playing_position(self):
+        snapshot, terminal_headers = self.management_schema_eight_snapshot(
+            with_registration=True
+        )
+        machine = snapshot["machines"]["A"]
+        registration = machine["waiting_positions"][0]["registrations"][0]
+        machine["playing"] = [registration]
+        machine["playing_started_at"] = 900_000
+        machine["waiting_positions"] = []
+        machine["waiting_position_count"] = 0
+        published = self.client.post(
+            "/api/queue-status", json=snapshot, headers=terminal_headers
+        )
+        self.assertEqual(204, published.status_code, published.get_json())
+
+        by_registration = self.client.post(
+            "/api/queue-management/terminal-actions",
+            json=self.management_terminal_action_body(
+                snapshot,
+                31,
+                action="SKIP_ONE_TURN",
+                registration_ids=[registration["registration_id"]],
+            ),
+            headers=self.management_headers,
+        )
+
+        self.assertEqual(409, by_registration.status_code, by_registration.get_json())
+        self.assertEqual(
+            "处于游玩位置的登记不能轮空一次，请先在现场终端撤回至等待顺序。",
+            by_registration.get_json()["error"],
+        )
 
     def test_fixed_pair_cancel_temporary_leave_is_forwarded_for_terminal_validation(self):
         snapshot = self.remote_ready_snapshot()
@@ -7325,7 +10006,7 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(202, queue_command.status_code)
         self.assertEqual(409, profile_command.status_code)
         self.assertEqual(
-            "你已有一项操作正在等待终端处理",
+            "已有一项操作正在等待终端处理。",
             profile_command.get_json()["error"],
         )
 
@@ -7340,7 +10021,7 @@ class QueueStatusApiTest(unittest.TestCase):
                 "/api/queue-bot/identity",
                 json={
                     "bot_qq": "87654321",
-                    "bot_version": "0.3.13",
+                    "bot_version": "0.4.0",
                     "website_version": "v0.13.2",
                 },
                 headers=self.bot_headers,
@@ -7358,14 +10039,14 @@ class QueueStatusApiTest(unittest.TestCase):
             {
                 "name": "现场终端",
                 "current_version": "0.10.0",
-                "latest_version": "0.13.6",
+                "latest_version": "1.0.0",
                 "status": "UPDATE_AVAILABLE",
                 "updated_at": 1_234_000,
             },
             payload["components"]["terminal"],
         )
         self.assertEqual(
-            "0.13.4", payload["components"]["website"]["latest_version"]
+            "1.0.0", payload["components"]["website"]["latest_version"]
         )
         self.assertEqual(
             "UPDATE_AVAILABLE", payload["components"]["website"]["status"]
@@ -7612,7 +10293,7 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual(409, while_active.status_code)
         self.assertEqual(
-            "这名玩家已经有一份正在排队的登记",
+            "这名玩家已经有一份正在排队的登记。",
             while_active.get_json()["error"],
         )
         self.assertEqual(
@@ -8287,7 +10968,7 @@ class QueueStatusApiTest(unittest.TestCase):
             headers=self.headers,
         )
         self.assertEqual(409, rejected.status_code)
-        self.assertEqual("现场规则暂不允许线上登记", rejected.get_json()["error"])
+        self.assertEqual("系统规则不允许线上登记。", rejected.get_json()["error"])
 
     def test_mobile_registration_rechecks_online_registration_switch_before_submission(self):
         snapshot = self.remote_ready_snapshot(revision=26)

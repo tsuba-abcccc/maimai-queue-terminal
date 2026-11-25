@@ -42,9 +42,9 @@ QUEUE_PLAYER_AUTH_LIMIT_BLOCK_SECONDS=900
 QUEUE_PLAYER_AUTH_LIMIT_FAILURES=5
 QUEUE_PLAYER_AUTH_LOOKUP_LIMIT_REQUESTS=30
 QUEUE_PLAYER_COOKIE_SECURE=true
-QUEUE_LATEST_TERMINAL_VERSION=0.13.6
-QUEUE_LATEST_WEBSITE_VERSION=0.13.4
-QUEUE_LATEST_BOT_VERSION=0.3.13
+QUEUE_LATEST_TERMINAL_VERSION=1.0.0
+QUEUE_LATEST_WEBSITE_VERSION=1.0.0
+QUEUE_LATEST_BOT_VERSION=0.4.0
 ```
 
 `QUEUE_PROFILE_SCOPE_ID` 表示同一机厅共享的玩家资料库。主备终端使用相同值即可读取同一份云端资料；同 UUID 通过递增的资料版本合并，终端仍负责拒绝昵称、QQ 和当前队列冲突。
@@ -168,7 +168,7 @@ PATCH /api/queue-management/machine-status
 GET   /api/queue-management/logs
 ```
 
-管理命令只进入待执行命令表，不直接改写 `queue_snapshot`。现场终端会复核队列批次、登记上下文、机台稳定身份和配置修订号；过期或冲突请求返回拒绝结果。设置接口覆盖登记开放状态、营业时间、机台分组与完整配置、机台停止状态和已经开放的终端策略。同步总开关、同步模式、服务地址和终端令牌仍由现场终端维护，不通过管理 API 迁移。`/api/queue-management/overview` 和 `/logs` 返回完整私有数据，只能从受控管理 App 调用。
+管理命令只进入待执行命令表，不直接改写 `queue_snapshot`。现场终端会复核队列批次、登记上下文、机台稳定身份和配置修订号；过期或冲突请求返回拒绝结果。设置接口覆盖登记排队状态、营业时间、机台分组与完整配置、机台停止状态和已经开放的终端策略。同步总开关、同步模式、服务地址和终端令牌仍由现场终端维护，不通过管理 API 迁移。`/api/queue-management/overview` 和 `/logs` 返回完整私有数据，只能从受控管理 App 调用。
 
 当公开快照中的 `onebot_sync_enabled` 为 `false` 时，上述所有 Bot 接口返回 `503 QQ Bot 联动已关闭`。服务器保留玩家资料，但会拒绝待执行命令、清除当前通知收件关系，并且不会在重新开启后补发关闭期间的事件。
 
@@ -330,7 +330,7 @@ curl -i https://example.com/api/queue-mobile/sessions/invalid-token
 curl -i 'https://example.com/api/queue-bot/events?after=0&limit=1'
 ```
 
-第一条应返回 `200`。第二条故意不带管理令牌，应返回 `401` 和“管理后台认证失败”；带正确管理令牌时应返回 `200` 或现场终端尚未上传新版快照时的明确状态。第三条未登录上传头像应返回 JSON `401`；第四条不存在的头像应返回 JSON `404`。随后线上登记测试 QQ 不存在时通常返回 `404 PROFILE_NOT_FOUND`，移动登记无效令牌返回 JSON `404`，无令牌访问 Bot 路由返回 `401` 和“Bot 认证失败”。其他结果的含义如下：
+第一条应返回 `200`。第二条故意不带管理令牌，应返回 `401` 和“管理后台认证失败，请核对管理令牌”；带正确管理令牌时应返回 `200` 或现场终端尚未上传新版快照时的明确状态。第三条未登录上传头像应返回 JSON `401`；第四条不存在的头像应返回 JSON `404`。随后线上登记测试 QQ 不存在时通常返回 `404 PROFILE_NOT_FOUND`，移动登记无效令牌返回 JSON `404`，无令牌访问 Bot 路由返回 `401` 和“Bot 认证失败”。其他结果的含义如下：
 
 - `404 接口不存在`：新版 `app.py` 或 Nginx 的 `/api/queue-bot/` 路由尚未部署。
 - `503 服务器鉴权配置无效`：Bot 令牌缺失、少于 32 字节，或与终端令牌相同。

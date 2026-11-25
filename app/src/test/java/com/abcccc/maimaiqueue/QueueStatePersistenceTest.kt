@@ -29,6 +29,206 @@ class QueueStatePersistenceTest {
     )
 
     @Test
+    fun skippingOneTurnAndAUsedDeferralSurviveSaveAndRestore() {
+        val original = state(
+            machineA = MachineQueue(
+                waiting = listOf(
+                    Registration(
+                        key = 1,
+                        displayId = "将轮空",
+                        preference = PlayPreference.SOLO,
+                        createdAtMillis = 1_000L,
+                        absenceStatus = QueueAbsenceStatus.SKIP_ONE_TURN,
+                        temporaryAwaySkippedTurns = 2
+                    ),
+                    Registration(
+                        key = 2,
+                        displayId = "已暂缓过",
+                        preference = PlayPreference.SOLO,
+                        createdAtMillis = 2_000L,
+                        deferOneRoundUsed = true
+                    )
+                )
+            ),
+            nextRegistrationKey = 3
+        )
+        val encoded = LocalQueueStateRepository.Codec.encodeState(original)
+        assertEquals(original, LocalQueueStateRepository.Codec.decodeState(encoded.toString()))
+    }
+
+    @Test
+    fun queueingAtBothMachinesOfAPairSurvivesSaveAndRestore() {
+        val waitingOnA = Registration(
+            key = 3,
+            displayId = "同时排队",
+            preference = PlayPreference.SOLO,
+            createdAtMillis = 3_000L,
+            alsoQueuesAtPairedMachine = true
+        )
+        val original = PersistedQueueState(
+            queueId = "00000000-0000-0000-0000-000000000001",
+            revision = 3L,
+            machines = linkedMapOf(
+                MachineId.A to PersistedMachineState(
+                    queue = MachineQueue(waiting = listOf(waitingOnA)),
+                    pairedOrder = listOf(3)
+                ),
+                MachineId.B to PersistedMachineState(
+                    queue = MachineQueue(
+                        waiting = listOf(
+                            Registration(
+                                key = 5,
+                                displayId = "只排一台",
+                                preference = PlayPreference.SOLO,
+                                createdAtMillis = 5_000L
+                            )
+                        )
+                    ),
+                    pairedOrder = listOf(5, 3)
+                )
+            ),
+            registrationOpen = true,
+            nextRegistrationKey = 6,
+            savedAtMillis = 1_000L
+        )
+
+        val restored = LocalQueueStateRepository.Codec.decodeState(
+            LocalQueueStateRepository.Codec.encodeState(original).toString()
+        )
+
+        assertEquals(original, restored)
+        assertTrue(restored!!.machine(MachineId.A).queue.waiting.single().alsoQueuesAtPairedMachine)
+        assertEquals(listOf(5, 3), restored.machine(MachineId.B).pairedOrder)
+    }
+
+    @Test
+    fun announcementsAndArrivalsSurviveSaveAndRestore() {
+        val original = state(
+            machineA = MachineQueue(
+                waiting = listOf(
+                    Registration(
+                        key = 3,
+                        displayId = "资料玩家",
+                        preference = PlayPreference.SOLO,
+                        isTemporary = false,
+                        createdAtMillis = 3_000L,
+                        alsoQueuesAtPairedMachine = true
+                    )
+                )
+            )
+        ).copy(
+            pairedArrangements = mapOf(
+                3 to PairedArrangementRecord(
+                    previewSinceMillis = 10_000L,
+                    previewPausedAtMillis = 40_000L,
+                    noticedAtMillis = 30_000L
+                ),
+                7 to PairedArrangementRecord(
+                    arrangedFromMachineId = "A",
+                    aheadKeysAtOrigin = listOf(2, 4)
+                )
+            )
+        )
+        val encoded = LocalQueueStateRepository.Codec.encodeState(original)
+        assertEquals(setOf("3", "7"), encoded.getJSONObject("pairedArrangements").keys().asSequence().toSet())
+
+        assertEquals(original, LocalQueueStateRepository.Codec.decodeState(encoded.toString()))
+    }
+
+    @Test
+    fun theMarkOfAnOnlineRegistrationSurvivesSaveAndRestore() {
+        val original = state(
+            machineA = MachineQueue(
+                waiting = listOf(
+                    Registration(
+                        key = 3,
+                        displayId = "线上玩家",
+                        preference = PlayPreference.SOLO,
+                        isTemporary = false,
+                        createdAtMillis = 3_000L,
+                        wasOnlineRegistration = true
+                    ),
+                    Registration(
+                        key = 4,
+                        displayId = "现场玩家",
+                        preference = PlayPreference.SOLO,
+                        isTemporary = false,
+                        createdAtMillis = 4_000L
+                    )
+                )
+            )
+        )
+
+        val restored = LocalQueueStateRepository.Codec.decodeState(
+            LocalQueueStateRepository.Codec.encodeState(original).toString()
+        )
+
+        assertEquals(original, restored)
+        val waiting = restored!!.machines.getValue(MachineId.A).queue.waiting
+        assertTrue(waiting.first().mustBeRemovedWhenAbsent)
+        assertFalse(waiting.last().mustBeRemovedWhenAbsent)
+    }
+
+    @Test
+    fun stateSavedBeforePairedMachinesExistedRestoresWithoutPlaces() {
+        val encoded = LocalQueueStateRepository.Codec.encodeState(
+            state(
+                machineA = MachineQueue(
+                    waiting = listOf(
+                        Registration(
+                            key = 1,
+                            displayId = "旧登记",
+                            preference = PlayPreference.SOLO,
+                            createdAtMillis = 1_000L
+                        )
+                    )
+                )
+            )
+        )
+        val machineA = encoded.getJSONObject("machines").getJSONObject("A")
+        assertFalse(encoded.has("pairedArrangements"))
+        assertFalse(machineA.has("pairedOrder"))
+        assertFalse(
+            machineA.getJSONObject("queue").getJSONArray("waiting").getJSONObject(0)
+                .has("alsoQueuesAtPairedMachine")
+        )
+        assertFalse(
+            machineA.getJSONObject("queue").getJSONArray("waiting").getJSONObject(0)
+                .has("skipsPairedMachineThisRound")
+        )
+        val restored = LocalQueueStateRepository.Codec.decodeState(encoded.toString())!!
+        assertTrue(restored.machine(MachineId.A).pairedOrder.isEmpty())
+        assertTrue(restored.pairedArrangements.isEmpty())
+        assertFalse(restored.machine(MachineId.A).queue.waiting.single().alsoQueuesAtPairedMachine)
+        assertFalse(restored.machine(MachineId.A).queue.waiting.single().skipsPairedMachineThisRound)
+    }
+
+    @Test
+    fun placeGivenUpForThisRoundSurvivesSaveAndRestore() {
+        val original = state(
+            machineA = MachineQueue(
+                waiting = listOf(
+                    Registration(
+                        key = 3,
+                        displayId = "被调整的登记",
+                        preference = PlayPreference.SOLO,
+                        createdAtMillis = 3_000L,
+                        alsoQueuesAtPairedMachine = true,
+                        skipsPairedMachineThisRound = true
+                    )
+                )
+            )
+        )
+        val restored = LocalQueueStateRepository.Codec.decodeState(
+            LocalQueueStateRepository.Codec.encodeState(original).toString()
+        )
+        assertEquals(original, restored)
+        val registration = restored!!.machine(MachineId.A).queue.waiting.single()
+        assertTrue(registration.alsoQueuesAtPairedMachine)
+        assertTrue(registration.skipsPairedMachineThisRound)
+    }
+
+    @Test
     fun emptyOperationalStateHasNoMeaningfulQueueContent() {
         assertFalse(state().hasMeaningfulState)
     }
@@ -551,7 +751,8 @@ class QueueStatePersistenceTest {
         )
 
         assertEquals(QueueAbsenceStatus.NONE, restored.playing.single().absenceStatus)
-        assertEquals(0, restored.playing.single().temporaryAwaySkippedTurns)
+        // The missed turns stay on record until the round has been played.
+        assertEquals(2, restored.playing.single().temporaryAwaySkippedTurns)
         assertEquals(QueueAbsenceStatus.NONE, restored.waiting.first().absenceStatus)
         assertEquals(null, restored.waiting.first().fixedPartnerKey)
         assertEquals(null, restored.waiting.last().fixedPartnerKey)

@@ -164,7 +164,9 @@ fun createQueueAuditLog(
     publicEventTypeOverride: PublicQueueEventType? = null,
     affectedRegistrationKeysOverride: Collection<Int> = emptyList(),
     source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
-    timestampMillis: Long = System.currentTimeMillis()
+    timestampMillis: Long = System.currentTimeMillis(),
+    /** The registrations that left were taken out by the player, not by someone else. */
+    removedByPlayer: Boolean = false
 ): AuditLogEntry? {
     if (before == after) return null
     val details = mutableListOf<String>()
@@ -179,8 +181,10 @@ fun createQueueAuditLog(
         publicEventTypeOverride == PublicQueueEventType.TEMPORARY_AWAY_EXPIRED ||
         publicEventTypeOverride == PublicQueueEventType.ONLINE_CHECK_IN_MISSED
     ) {
+        // 轮空一次 counts in the same three skipped turns as 暂时离开.
         removed.filter {
-            it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
+            (it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY ||
+                it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN) &&
                 it.temporaryAwaySkippedTurns >= 3
         }
     } else {
@@ -202,7 +206,7 @@ fun createQueueAuditLog(
         details += if (publicEventTypeOverride == PublicQueueEventType.QUEUE_RESTORED) {
             "撤销操作后恢复 ${quotedNames(added)}"
         } else {
-            "新增 ${quotedNames(added)}"
+            "${quotedNames(added)}的登记已创建"
         }
     }
     if (removed.isNotEmpty()) {
@@ -214,20 +218,29 @@ fun createQueueAuditLog(
                 if (removedPendingCheckIn.isNotEmpty()) {
                     details += "${quotedNames(removedPendingCheckIn)}未在本次 30 分钟签到时限内完成现场签到，登记已自动移除"
                 }
-                if (otherRemoved.isNotEmpty()) details += "移除 ${quotedNames(otherRemoved)}"
+                if (otherRemoved.isNotEmpty()) details += "${quotedNames(otherRemoved)}的登记已移除"
             }
             PublicQueueEventType.ONLINE_CHECK_IN_MISSED -> {
                 if (removedPendingCheckIn.isNotEmpty()) {
                     details += "${quotedNames(removedPendingCheckIn)}轮到进入游玩位置时尚未完成现场签到，登记已自动移除"
                 }
-                if (otherRemoved.isNotEmpty()) details += "移除 ${quotedNames(otherRemoved)}"
+                if (otherRemoved.isNotEmpty()) details += "${quotedNames(otherRemoved)}的登记已移除"
             }
             else -> if (unclassifiedRemoved.isNotEmpty()) {
-                details += "移除 ${quotedNames(unclassifiedRemoved)}"
+                details += if (removedByPlayer) {
+                    "${quotedNames(unclassifiedRemoved)}已退出排队"
+                } else {
+                    "${quotedNames(unclassifiedRemoved)}的登记已移除"
+                }
             }
         }
-        if (temporaryAwayExpired.isNotEmpty()) {
-            details += "${quotedNames(temporaryAwayExpired)}在暂时离开期间第四次轮到，已自动退出排队"
+        val awayExpired = temporaryAwayExpired.filter { it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY }
+        val skipExpired = temporaryAwayExpired.filter { it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN }
+        if (awayExpired.isNotEmpty()) {
+            details += "${quotedNames(awayExpired)}在暂时离开期间第 4 次轮到，已自动移除"
+        }
+        if (skipExpired.isNotEmpty()) {
+            details += "${quotedNames(skipExpired)}已轮空 3 次，再次轮到时已自动移除"
         }
     }
 
@@ -237,17 +250,17 @@ fun createQueueAuditLog(
         if (old.displayId != new.displayId) {
             affectedRegistrationKeys += key
             changeKinds += "renamed"
-            details += "“${old.displayId}”更名为“${new.displayId}”"
+            details += "“${old.displayId}”的昵称已改为“${new.displayId}”"
         }
         if (old.gender != new.gender) {
             affectedRegistrationKeys += key
             changeKinds += "profile"
-            details += "“${new.displayId}”的性别标识已更新"
+            details += "“${new.displayId}”的性别已修改"
         }
         if (old.preference != new.preference) {
             affectedRegistrationKeys += key
             changeKinds += "preference"
-            details += "“${new.displayId}”改为${queuePreferenceLabel(new)}"
+            details += "“${new.displayId}”的本次游玩偏好已改为“${queuePreferenceLabel(new)}”"
         }
         if (old.fixedPartnerKey != new.fixedPartnerKey) {
             affectedRegistrationKeys += key
@@ -256,28 +269,47 @@ fun createQueueAuditLog(
                 old.fixedPartnerKey == null && new.fixedPartnerKey != null -> {
                     val partnerName = afterByKey[new.fixedPartnerKey]?.displayId
                     if (partnerName == null) {
-                        "“${new.displayId}”已建立固定组合"
+                        "“${new.displayId}”已组成固定组合"
                     } else {
-                        "“${new.displayId}”已与“$partnerName”建立固定组合"
+                        "“${new.displayId}”已与“${partnerName}”组成固定组合"
                     }
                 }
                 old.fixedPartnerKey != null && new.fixedPartnerKey == null ->
-                    "“${new.displayId}”的固定组合已解除，当前游玩偏好为${queuePreferenceLabel(new)}"
+                    "“${new.displayId}”的固定组合已解除，本次游玩偏好为“${queuePreferenceLabel(new)}”"
                 else -> {
                     val oldPartnerName = old.fixedPartnerKey?.let(beforeByKey::get)?.displayId
                     val newPartnerName = new.fixedPartnerKey?.let(afterByKey::get)?.displayId
-                    "“${new.displayId}”的固定组合已由“${oldPartnerName ?: "原搭档"}”改为“${newPartnerName ?: "新搭档"}”"
+                    when {
+                        oldPartnerName != null && newPartnerName != null ->
+                            "“${new.displayId}”的固定组合已由“${oldPartnerName}”改为“${newPartnerName}”"
+                        newPartnerName != null -> "“${new.displayId}”已改为与“${newPartnerName}”组成固定组合"
+                        else -> "“${new.displayId}”的固定组合已改变"
+                    }
                 }
             }
         }
         if (old.absenceStatus != new.absenceStatus) {
             affectedRegistrationKeys += key
             changeKinds += "absence"
+            // Before the turn a state is written with 将; once it has happened, with 已
+            // (maintainer, 2026-11-25).
             details += when (new.absenceStatus) {
-                QueueAbsenceStatus.DEFER_ONE_ROUND -> "“${new.displayId}”已暂缓一次"
+                QueueAbsenceStatus.DEFER_ONE_ROUND -> "“${new.displayId}”将暂缓一次"
+                QueueAbsenceStatus.SKIP_ONE_TURN -> "“${new.displayId}”将轮空一次"
                 QueueAbsenceStatus.TEMPORARILY_AWAY -> "“${new.displayId}”已设为暂时离开"
                 QueueAbsenceStatus.NONE -> when (old.absenceStatus) {
-                    QueueAbsenceStatus.DEFER_ONE_ROUND -> "“${new.displayId}”已结束暂缓"
+                    QueueAbsenceStatus.DEFER_ONE_ROUND ->
+                        if (new.deferOneRoundUsed && !old.deferOneRoundUsed) {
+                            "“${new.displayId}”已暂缓一次"
+                        } else {
+                            "“${new.displayId}”已取消暂缓一次"
+                        }
+                    QueueAbsenceStatus.SKIP_ONE_TURN ->
+                        if (new.temporaryAwaySkippedTurns > old.temporaryAwaySkippedTurns) {
+                            "“${new.displayId}”已轮空一次并移至队尾，已轮空 ${new.temporaryAwaySkippedTurns} 次"
+                        } else {
+                            "“${new.displayId}”已取消轮空一次"
+                        }
                     QueueAbsenceStatus.TEMPORARILY_AWAY -> "“${new.displayId}”已取消暂时离开"
                     QueueAbsenceStatus.NONE -> "“${new.displayId}”已恢复正常排队状态"
                 }
@@ -338,7 +370,8 @@ fun createQueueAuditLog(
         affectedRegistrationKeys += afterOrder
         changeKinds += "order"
         if ("playing" !in changeKinds) {
-            details += "登记顺序已调整为${quotedNames(after.allRegistrations)}"
+            // The playing position did not change: name the waiting registrations only.
+            details += "等待顺序已调整为${quotedNames(after.waiting)}"
         }
     }
     if (
@@ -346,7 +379,7 @@ fun createQueueAuditLog(
         before.playing.map { it.key } == after.playing.map { it.key }
     ) {
         changeKinds += "timer"
-        details += "本轮计时已更新"
+        details += "本轮计时已重置"
     }
 
     val publicEventType = publicEventTypeOverride ?: when {
@@ -361,27 +394,33 @@ fun createQueueAuditLog(
         else -> PublicQueueEventType.OTHER
     }
     val generatedTitle = when (publicEventType) {
-        PublicQueueEventType.NO_SHOW_DEFERRED -> "未到场·已暂缓一次"
-        PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场·已移至队尾"
-        PublicQueueEventType.NO_SHOW_REMOVED -> "未到场·已移除登记"
-        PublicQueueEventType.TEMPORARY_AWAY_EXPIRED -> "暂时离开已达轮空上限"
+        PublicQueueEventType.NO_SHOW_DEFERRED -> "未到场，已暂缓一次"
+        PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场，已移至队尾"
+        PublicQueueEventType.NO_SHOW_REMOVED -> "未到场，已移除登记"
+        PublicQueueEventType.TEMPORARY_AWAY_EXPIRED ->
+            if (temporaryAwayExpired.all { it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY }) {
+                "暂时离开已达轮空上限"
+            } else {
+                "已达轮空上限，登记已移除"
+            }
         PublicQueueEventType.ONLINE_REGISTRATION_ADDED -> "线上登记已创建"
-        PublicQueueEventType.ONLINE_CHECK_IN_COMPLETED -> "线上登记签到状态已更新"
+        PublicQueueEventType.ONLINE_CHECK_IN_COMPLETED -> "线上登记已完成签到"
         PublicQueueEventType.ONLINE_CHECK_IN_TIMED_OUT -> "线上登记签到超时"
         PublicQueueEventType.ONLINE_CHECK_IN_MISSED -> "未签到登记已自动移除"
         else -> when {
-            "added" in changeKinds && "removed" !in changeKinds -> "新增登记"
-            "removed" in changeKinds && "added" !in changeKinds -> "移除登记"
+            "added" in changeKinds && "removed" !in changeKinds -> "登记已创建"
+            "removed" in changeKinds && "added" !in changeKinds ->
+                if (removedByPlayer) "登记已退出排队" else "登记已移除"
             "claimed" in changeKinds -> "登记已认领"
             "renamed" in changeKinds -> "登记昵称已修改"
             "profile" in changeKinds -> "登记资料已更新"
             "no_show" in changeKinds -> "未到场状态已更新"
             "check_in" in changeKinds -> "线上登记签到状态已更新"
-            "absence" in changeKinds -> "暂缓一次或暂时离开状态已修改"
+            "absence" in changeKinds -> "暂缓一次或暂时离开状态已更新"
             "pair" in changeKinds -> "固定组合已修改"
-            "preference" in changeKinds -> "游玩偏好已修改"
+            "preference" in changeKinds -> "游玩偏好已更改"
             "playing" in changeKinds -> "游玩位置已更新"
-            "order" in changeKinds -> "登记顺序已调整"
+            "order" in changeKinds -> "等待顺序已调整"
             "timer" in changeKinds -> "本轮计时已重置"
             else -> "队列已更新"
         }
@@ -416,7 +455,7 @@ fun createQueueAuditLog(
     }
     return createAuditLogEntry(
         category = category,
-        title = titleOverride ?: "$machineLabel·$generatedTitle",
+        title = titleOverride ?: "${machineLabel}：$generatedTitle",
         detail = if (details.isEmpty()) {
             "队列状态发生变化。"
         } else {
@@ -475,6 +514,27 @@ fun createQueueAuditLogs(
     } else {
         emptyList()
     }
+    // 轮空一次 counts in the same three skipped turns as 暂时离开 (2026-11-25).
+    val skipExpired = if (classifyAvailabilityOutcomes) {
+        removed.filter {
+            it.key !in noShowKeys &&
+                it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN &&
+                it.temporaryAwaySkippedTurns >= 3
+        }
+    } else {
+        emptyList()
+    }
+    val skipCompleted = if (classifyAvailabilityOutcomes) {
+        after.allRegistrations.filter { registration ->
+            val old = beforeByKey[registration.key]
+            registration.key !in noShowKeys &&
+                old?.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN &&
+                registration.absenceStatus == QueueAbsenceStatus.NONE &&
+                registration.temporaryAwaySkippedTurns > old.temporaryAwaySkippedTurns
+        }
+    } else {
+        emptyList()
+    }
     val deferredCompleted = if (classifyAvailabilityOutcomes) {
         after.allRegistrations.filter { registration ->
             registration.key !in noShowKeys &&
@@ -504,31 +564,14 @@ fun createQueueAuditLogs(
     } else {
         emptyList()
     }
-    fun fixedGroupKeys(registrationKey: Int): Set<Int> {
-        val registration = before.allRegistrations.firstOrNull { it.key == registrationKey }
-            ?: return emptySet()
-        val partner = registration.fixedPartnerKey?.let { partnerKey ->
-            before.allRegistrations.firstOrNull { it.key == partnerKey }
-        }
-        return if (partner?.fixedPartnerKey == registration.key) {
-            setOf(registration.key, partner.key)
-        } else {
-            setOf(registration.key)
-        }
-    }
-    val semanticAbsenceKeys = when (semanticAction) {
-        is QueueAction.DeferOneRound -> fixedGroupKeys(semanticAction.registrationKey)
-        is QueueAction.TemporarilyLeave -> fixedGroupKeys(semanticAction.registrationKey)
-        else -> emptySet()
-    }.filterTo(mutableSetOf()) { key -> before.playing.any { it.key == key } }
-
     val splitKeys = buildSet {
         addAll(noShowKeys)
         addAll(pendingCheckInRemoved.map(Registration::key))
         addAll(temporaryAwayExpired.map(Registration::key))
+        addAll(skipExpired.map(Registration::key))
         addAll(deferredCompleted.map(Registration::key))
+        addAll(skipCompleted.map(Registration::key))
         addAll(temporaryAwayAdvanced.map(Registration::key))
-        addAll(semanticAbsenceKeys)
     }
     if (splitKeys.isEmpty() && noShowRecordsCleared.isEmpty()) {
         return listOfNotNull(
@@ -541,7 +584,8 @@ fun createQueueAuditLogs(
                 publicEventTypeOverride = publicEventTypeOverride,
                 affectedRegistrationKeysOverride = affectedRegistrationKeysOverride,
                 source = source,
-                timestampMillis = timestampMillis
+                timestampMillis = timestampMillis,
+                removedByPlayer = semanticAction is QueueAction.LeaveQueue
             )
         )
     }
@@ -556,7 +600,7 @@ fun createQueueAuditLogs(
         keys: Collection<Int>
     ): AuditLogEntry = createAuditLogEntry(
         category = category,
-        title = "$machineLabel·$title",
+        title = "${machineLabel}：$title",
         detail = detail,
         source = source,
         timestampMillis = timestampMillis,
@@ -573,7 +617,7 @@ fun createQueueAuditLogs(
         val detail = when (publicEventTypeOverride) {
             PublicQueueEventType.NO_SHOW_DEFERRED -> {
                 if (stillDeferred) {
-                    "${names(registrations)}本次未到场，记录已更新并暂缓一次；相关登记会在跳过本次机会后自动恢复。"
+                    "${names(registrations)}本次未到场，未到场记录已更新并暂缓一次；跳过本次机会后，暂缓状态会自动解除。"
                 } else {
                     "${names(registrations)}本次未到场，记录已更新；本次机会已跳过，暂缓状态已自动解除。"
                 }
@@ -583,9 +627,9 @@ fun createQueueAuditLogs(
                     semanticAction is QueueAction.MarkNoShow &&
                     semanticAction.startNextWhenPlayingBecomesEmpty
                 ) {
-                    "${names(registrations)}本次未到场，记录已更新并移至等待顺序末端；本次自动安排不会再次选中相关登记。"
+                    "${names(registrations)}本次未到场，记录已更新并移至队尾；本次自动安排不会再次选中相关登记。"
                 } else {
-                    "${names(registrations)}本次未到场，记录已更新并移至等待顺序末端；游玩位置保持当前状态，等待工作人员安排。"
+                    "${names(registrations)}本次未到场，记录已更新并移至队尾；游玩位置保持当前状态。"
                 }
             else -> "${names(registrations)}本次未到场，相关登记已移除。"
         }
@@ -593,12 +637,12 @@ fun createQueueAuditLogs(
             type = publicEventTypeOverride ?: PublicQueueEventType.REGISTRATION_UPDATED,
             title = when (publicEventTypeOverride) {
                 PublicQueueEventType.NO_SHOW_DEFERRED -> if (stillDeferred) {
-                    "未到场·已暂缓一次"
+                    "未到场，已暂缓一次"
                 } else {
-                    "未到场·本次机会已跳过"
+                    "未到场，本次机会已跳过"
                 }
-                PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场·已移至队尾"
-                else -> "未到场·已移除登记"
+                PublicQueueEventType.NO_SHOW_MOVED_TO_TAIL -> "未到场，已移至队尾"
+                else -> "未到场，已移除登记"
             },
             detail = detail,
             keys = noShowKeys
@@ -616,10 +660,28 @@ fun createQueueAuditLogs(
         entries += event(
             PublicQueueEventType.TEMPORARY_AWAY_EXPIRED,
             "暂时离开已达轮空上限",
-            "${names(temporaryAwayExpired)}在暂时离开期间第四次轮到，已自动退出排队。",
+            "${names(temporaryAwayExpired)}在暂时离开期间第 4 次轮到，已自动移除。",
             temporaryAwayExpired.map(Registration::key)
         )
     }
+    if (skipExpired.isNotEmpty()) {
+        entries += event(
+            PublicQueueEventType.TEMPORARY_AWAY_EXPIRED,
+            "已达轮空上限，登记已移除",
+            "${names(skipExpired)}已轮空 3 次，再次轮到时已自动移除。",
+            skipExpired.map(Registration::key)
+        )
+    }
+    skipCompleted.groupBy(Registration::temporaryAwaySkippedTurns)
+        .toSortedMap()
+        .forEach { (skippedTurns, registrations) ->
+            entries += event(
+                PublicQueueEventType.ABSENCE_CHANGED,
+                "轮空一次，已轮空 $skippedTurns 次",
+                "${names(registrations)}本次已轮空并移至队尾，累计已轮空 $skippedTurns 次；轮空一次随即自动解除。",
+                registrations.map(Registration::key)
+            )
+        }
     if (deferredCompleted.isNotEmpty()) {
         entries += event(
             PublicQueueEventType.ABSENCE_CHANGED,
@@ -641,30 +703,11 @@ fun createQueueAuditLogs(
         .forEach { (skippedTurns, registrations) ->
             entries += event(
                 PublicQueueEventType.ABSENCE_CHANGED,
-                "暂时离开·已轮空 $skippedTurns 次",
-                "${names(registrations)}本次已轮空并移至等待顺序末端，累计已轮空 $skippedTurns 次。",
+                "暂时离开，已轮空 $skippedTurns 次",
+                "${names(registrations)}本次已轮空并移至队尾，累计已轮空 $skippedTurns 次。",
                 registrations.map(Registration::key)
             )
         }
-    if (semanticAbsenceKeys.isNotEmpty()) {
-        val registrations = semanticAbsenceKeys.mapNotNull(beforeByKey::get)
-        when (semanticAction) {
-            is QueueAction.DeferOneRound -> entries += event(
-                PublicQueueEventType.ABSENCE_CHANGED,
-                "暂缓一次已执行",
-                "${names(registrations)}已跳过当前游玩机会并回到等待顺序前端，暂缓状态已随即解除。",
-                semanticAbsenceKeys
-            )
-            is QueueAction.TemporarilyLeave -> entries += event(
-                PublicQueueEventType.ABSENCE_CHANGED,
-                "已设为暂时离开",
-                "${names(registrations)}已离开游玩位置并移至等待顺序末端，累计已轮空 1 次；返回后需要手动取消暂时离开。",
-                semanticAbsenceKeys
-            )
-            else -> Unit
-        }
-    }
-
     val clearedNoShowByKey = noShowRecordsCleared.associateBy(Registration::key)
     val beforeWithoutSplitOutcomes = before.removeAll(splitKeys)
     val remainingBefore = beforeWithoutSplitOutcomes.copy(
@@ -698,7 +741,8 @@ fun createQueueAuditLogs(
             it in splitKeys
         },
         source = source,
-        timestampMillis = timestampMillis
+        timestampMillis = timestampMillis,
+        removedByPlayer = semanticAction is QueueAction.LeaveQueue
     )?.let(entries::add)
     return entries
 }
@@ -732,8 +776,8 @@ fun createPlayerProfileAuditLog(
     if (before == null) {
         return createAuditLogEntry(
             category = AuditLogCategory.PLAYER_PROFILE,
-            title = "新建玩家资料",
-            detail = "已创建“${after.nickname}”，默认偏好为${profilePreferenceAuditLabel(after.defaultPreference)}。",
+            title = "玩家资料已创建",
+            detail = "已创建“${after.nickname}”，默认游玩偏好为“${profilePreferenceAuditLabel(after.defaultPreference)}”。",
             source = source,
             timestampMillis = timestampMillis
         )
@@ -742,7 +786,7 @@ fun createPlayerProfileAuditLog(
         if (before.nickname != after.nickname) add("昵称由“${before.nickname}”改为“${after.nickname}”")
         if (before.gender != after.gender) add("性别设置已修改")
         if (before.defaultPreference != after.defaultPreference) {
-            add("默认偏好改为${profilePreferenceAuditLabel(after.defaultPreference)}")
+            add("默认游玩偏好改为${profilePreferenceAuditLabel(after.defaultPreference)}")
         }
         if (before.qqNumber != after.qqNumber) {
             add("QQ 号已更新")
@@ -750,7 +794,7 @@ fun createPlayerProfileAuditLog(
     }
     return createAuditLogEntry(
         category = AuditLogCategory.PLAYER_PROFILE,
-        title = "编辑玩家资料",
+        title = "玩家资料已修改",
         detail = if (details.isEmpty()) "“${after.nickname}”的资料已保存。" else details.joinToString("；") + "。",
         source = source,
         timestampMillis = timestampMillis
@@ -763,7 +807,7 @@ fun createPlayerProfileDeletionAuditLog(
     timestampMillis: Long = System.currentTimeMillis()
 ): AuditLogEntry = createAuditLogEntry(
     category = AuditLogCategory.PLAYER_PROFILE,
-    title = "删除玩家资料",
+    title = "玩家资料已删除",
     detail = "已删除玩家资料“${profile.nickname}”（玩家编号 ${profile.publicPlayerId ?: "未分配"}）。",
     source = source,
     timestampMillis = timestampMillis
@@ -785,14 +829,13 @@ fun createMachineTransferAuditLog(
         .distinct()
     val details = buildList {
         add(
-            "已将${quotedNames(registrations)}从$sourceMachineLabel 转至$destinationMachineLabel，" +
-                "并加入目标机台的等待顺序末端"
+            "已将${quotedNames(registrations)}从 $sourceMachineLabel 转至 $destinationMachineLabel 的队尾"
         )
         if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
             if (releasedPartnerRegistrations.any {
                     it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
                 }) {
-                add("转入登记不再暂缓，留在原机台的登记仍会暂缓一次")
+                add("转入登记不再暂缓，留在原机台的登记仍将暂缓一次")
             } else {
                 add("转入后不再暂缓")
             }
@@ -801,6 +844,16 @@ fun createMachineTransferAuditLog(
             it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
         }.maxOfOrNull(Registration::temporaryAwaySkippedTurns)?.let { skippedTurns ->
             add("暂时离开状态和已轮空 $skippedTurns 次会在转入后保留")
+        }
+        if (registrations.any { it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN }) {
+            // Arriving at the tail already does what 轮空一次 would.
+            if (releasedPartnerRegistrations.any {
+                    it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN
+                }) {
+                add("转入登记已在队尾，不再轮空，留在原机台的登记仍将轮空一次")
+            } else {
+                add("转入后已在队尾，不再轮空")
+            }
         }
         if (releasedPartnerRegistrations.isNotEmpty()) {
             add("原固定组合已解除，双方均恢复为允许他人加入")
@@ -831,7 +884,7 @@ fun createMachineTransferAuditLog(
     }
     return createAuditLogEntry(
         category = category,
-        title = "登记已转至$destinationMachineLabel",
+        title = "登记已转至 $destinationMachineLabel",
         detail = details.joinToString(separator = "；", postfix = "。"),
         source = source,
         timestampMillis = timestampMillis,
@@ -839,6 +892,143 @@ fun createMachineTransferAuditLog(
         affectedRegistrationKeys = affectedRegistrationKeys
     )
 }
+
+/**
+ * A registration that queues at both machines of a pair was reached first on the other machine
+ * and moved there to play.
+ */
+fun createPairedPlaceArrivalAuditLog(
+    category: AuditLogCategory,
+    sourceMachineLabel: String,
+    destinationMachineLabel: String,
+    registrations: List<Registration>,
+    source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
+    timestampMillis: Long = System.currentTimeMillis()
+): AuditLogEntry? {
+    if (registrations.isEmpty()) return null
+    return createAuditLogEntry(
+        category = category,
+        title = "登记已自动转至 $destinationMachineLabel",
+        detail = "${quotedNames(registrations)}已由 $sourceMachineLabel 自动转至 $destinationMachineLabel " +
+            "并进入游玩位置。",
+        source = source,
+        timestampMillis = timestampMillis,
+        publicEventType = PublicQueueEventType.REGISTRATION_UPDATED,
+        // The player is told when either kind of notice is wanted: the registration was moved,
+        // and it is now in a playing position.
+        notificationCategories = setOf(
+            PublicQueueNotificationCategory.QUEUE_CHANGES,
+            PublicQueueNotificationCategory.PLAYING_POSITION
+        ),
+        affectedRegistrationKeys = registrations.map { it.key }
+    )
+}
+
+/**
+ * The queue to compare a machine's new queue against when writing logs. A registration that
+ * moved between the two machines of a pair is neither an exit nor a new registration: it is
+ * treated as if it had already been waiting on the machine it moved to.
+ */
+internal fun pairedAuditBaseline(
+    machineName: String,
+    beforeQueues: Map<String, MachineQueue>,
+    afterQueues: Map<String, MachineQueue>
+): MachineQueue {
+    val beforeQueue = beforeQueues[machineName] ?: return MachineQueue()
+    val afterQueue = afterQueues[machineName] ?: return beforeQueue
+    val beforeElsewhere = beforeQueues.filterKeys { it != machineName }.values
+        .flatMap { it.allRegistrations }
+        .associateBy { it.key }
+    val afterKeysElsewhere = afterQueues.filterKeys { it != machineName }.values
+        .flatMapTo(mutableSetOf()) { queue -> queue.allRegistrations.map { it.key } }
+    val ownBeforeKeys = beforeQueue.allRegistrations.mapTo(mutableSetOf()) { it.key }
+    val departedKeys = ownBeforeKeys.filterTo(mutableSetOf()) { it in afterKeysElsewhere }
+    // A registration that comes back from the playing position of the other machine was
+    // sent back after not showing up there. That has a log entry of its own, so here it
+    // counts as already waiting where it now stands.
+    val playingElsewhereBefore = beforeQueues.filterKeys { it != machineName }.values
+        .flatMapTo(mutableSetOf()) { queue -> queue.playing.map { it.key } }
+    val returned = afterQueue.waiting
+        .filter { it.key !in ownBeforeKeys && it.key in playingElsewhereBefore }
+    val returnedKeys = returned.mapTo(mutableSetOf()) { it.key }
+    val arrived = afterQueue.allRegistrations
+        .filter { it.key !in ownBeforeKeys && it.key !in returnedKeys }
+        .mapNotNull { beforeElsewhere[it.key] }
+    if (departedKeys.isEmpty() && arrived.isEmpty() && returned.isEmpty()) return beforeQueue
+    val withoutDeparted = beforeQueue.removeAll(departedKeys)
+    val waiting = (withoutDeparted.waiting + arrived).toMutableList()
+    returned.forEach { registration ->
+        waiting.add(
+            afterQueue.waiting.indexOf(registration).coerceIn(0, waiting.size),
+            registration
+        )
+    }
+    return withoutDeparted.copy(waiting = waiting)
+}
+
+/**
+ * Tells the player of a registration that a preview at the other machine of its pair has been
+ * shown for a while, and from when on the registration may be arranged there.
+ */
+fun createPairedArrangementNoticeAuditLog(
+    category: AuditLogCategory,
+    homeMachineLabel: String,
+    pairedMachineLabel: String,
+    registration: Registration,
+    earliestArrangementClockTime: String,
+    timestampMillis: Long = System.currentTimeMillis()
+): AuditLogEntry = createAuditLogEntry(
+    category = category,
+    title = "登记可能自动转至 $pairedMachineLabel",
+    detail = "$pairedMachineLabel 预计能够更早安排${quotedNames(listOf(registration))}游玩，" +
+        "其等待顺序中已显示预览。最早 $earliestArrangementClockTime 之后，这份登记可能由" +
+        "$homeMachineLabel 自动转至 ${pairedMachineLabel}，请合理安排时间。" +
+        "可以在“更改游玩偏好”中取消。",
+    source = AuditLogSource.SYSTEM_AUTOMATIC,
+    timestampMillis = timestampMillis,
+    publicEventType = PublicQueueEventType.REGISTRATION_UPDATED,
+    affectedRegistrationKeys = listOf(registration.key)
+)
+
+/**
+ * Records that registrations the system had arranged to another machine did not show up there
+ * and went back to the machine they came from.
+ */
+fun createPairedArrivalReturnedAuditLog(
+    category: AuditLogCategory,
+    originMachineLabel: String,
+    arrangedMachineLabel: String,
+    registrations: List<Registration>,
+    source: AuditLogSource = AuditLogSource.ON_SITE_TERMINAL,
+    timestampMillis: Long = System.currentTimeMillis()
+): AuditLogEntry? {
+    if (registrations.isEmpty()) return null
+    return createAuditLogEntry(
+        category = category,
+        title = "登记已回到 $originMachineLabel",
+        detail = pairedArrivalReturnedDetail(
+            names = quotedNames(registrations),
+            originMachineLabel = originMachineLabel,
+            arrangedMachineLabel = arrangedMachineLabel
+        ),
+        source = source,
+        timestampMillis = timestampMillis,
+        publicEventType = PublicQueueEventType.REGISTRATION_UPDATED,
+        notificationCategories = setOf(
+            PublicQueueNotificationCategory.QUEUE_CHANGES,
+            PublicQueueNotificationCategory.ABSENCE
+        ),
+        affectedRegistrationKeys = registrations.map { it.key }
+    )
+}
+
+internal fun pairedArrivalReturnedDetail(
+    names: String,
+    originMachineLabel: String,
+    arrangedMachineLabel: String
+): String = "${names}自动转至 $arrangedMachineLabel 后未到场，已回到 $originMachineLabel " +
+    "原来的等待顺序，未到场记录不会增加。已取消系统在 $originMachineLabel 和 $arrangedMachineLabel " +
+    "之间的安排，可以在“更改游玩偏好”中重新开启。"
 
 private fun quotedNames(registrations: List<Registration>): String =
     registrations.joinToString("、") { "“${it.displayId}”" }.ifEmpty { "空" }

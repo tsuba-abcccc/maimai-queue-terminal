@@ -13,6 +13,7 @@ import {
 } from '@lucide/vue'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import MobileProfileSettings from './MobileProfileSettings.vue'
+import PairedQueueTickBox from './PairedQueueTickBox.vue'
 import { formatMiddleDots, normalizeMachineConfiguration } from './machineConfiguration.js'
 
 const props = defineProps({
@@ -53,6 +54,9 @@ const resultDetail = ref('')
 const requestId = ref(createRequestId())
 const rememberedProfileId = ref(readRememberedProfileId())
 const selectedPreference = ref(null)
+// The tick box of this registration: whether the system may arrange it between this machine
+// and the machine paired with it. Unticked unless the player ticks it; no profile stores it.
+const allowsPairedArrangement = ref(false)
 const draftMode = ref(null)
 const completionDraft = reactive(createCompletionDraft())
 const newProfileDraft = reactive(createNewProfileDraft())
@@ -103,6 +107,18 @@ const singlePlayerMachine = computed(() => machineConfiguration.value.capacity =
 const needsCurrentPreference = computed(() => (
   !singlePlayerMachine.value &&
   confirmationProfile.value?.defaultPreference === 'ASK_EVERY_TIME'
+))
+
+// The machine that forms a pair with this session's machine, if the venue has set one up.
+const pairedMachineName = computed(() => {
+  const name = session.value?.paired_machine_name ?? session.value?.pairedMachineName
+  return name ? formatMiddleDots(String(name)) : null
+})
+
+// The tick box is offered only where the system can arrange registrations between this
+// machine and the one paired with it.
+const showsPairedTickBox = computed(() => (
+  session.value?.paired_machine_queueing_available === true && Boolean(pairedMachineName.value)
 ))
 
 const newProfileValid = computed(() => (
@@ -230,6 +246,8 @@ function normalizeProfile(source) {
       notify_machine_status: source.notify_machine_status === true
     },
     setupComplete: source.setup_complete === true,
+    // Whether this profile's player has already been shown the explanation of the tick box.
+    pairedQueueExplanationShown: source.paired_machine_queueing_introduced === true,
     revision: Number(source.profile_revision) || 1,
     usageCount: Number(source.usage_count) || 0,
     lastUsedAt: Number(source.last_used_at) || null
@@ -257,7 +275,7 @@ async function initialize() {
       // The account may belong to another venue or the terminal has not
       // received its latest profile sync. Do not infer identity from QQ or
       // nickname; let the player explicitly choose a local profile instead.
-      errorDetail.value = '当前登录的玩家资料暂未出现在本机厅资料库，请重新登录或手动选择玩家资料。'
+      errorDetail.value = '当前登录的玩家资料暂未出现在当前机厅的玩家资料库中，请重新登录或手动选择玩家资料。'
     }
     const rememberedProfile = accountProfile
       ? null
@@ -340,6 +358,7 @@ async function loadProfiles(query) {
 
 function selectProfile(profile) {
   selectedProfile.value = profile
+  allowsPairedArrangement.value = false
   selectedPreference.value = singlePlayerMachine.value
     ? 'SOLO'
     : profile.defaultPreference === 'ASK_EVERY_TIME'
@@ -362,6 +381,7 @@ function selectProfile(profile) {
 
 function beginNewProfile() {
   selectedProfile.value = null
+  allowsPairedArrangement.value = false
   selectedPreference.value = null
   requestId.value = createRequestId()
   resetDraft(newProfileDraft, createNewProfileDraft())
@@ -419,6 +439,10 @@ async function submitRegistration() {
   const payload = {
     request_id: requestId.value,
     preference
+  }
+  // The tick box belongs to this registration alone. It is sent only where it was offered.
+  if (showsPairedTickBox.value) {
+    payload.also_queues_at_paired_machine = allowsPairedArrangement.value
   }
   if (draftMode.value === 'NEW') {
     payload.new_profile = {
@@ -575,7 +599,7 @@ onBeforeUnmount(() => {
             <div>
               <h1>使用移动设备登记</h1>
               <p v-if="session">{{ sessionMachineName }}</p>
-              <p v-else>连接现场排队终端</p>
+              <p v-else>连接现场终端</p>
             </div>
           </div>
           <button type="button" title="返回队列" aria-label="返回队列" @click="leaveFlow">
@@ -586,7 +610,7 @@ onBeforeUnmount(() => {
         <section v-if="step === 'LOADING' || step === 'SUBMITTING'" class="mobile-registration-result" aria-live="polite">
           <span class="is-progress" aria-hidden="true"><RefreshCw :size="25" /></span>
           <h2>{{ step === 'LOADING' ? '正在读取玩家资料库' : '正在提交登记' }}</h2>
-          <p>{{ step === 'LOADING' ? '请稍候。' : '请保持页面打开，重复提交不会建立多份登记。' }}</p>
+          <p>{{ step === 'LOADING' ? '请稍候。' : '请保持页面打开，重复提交不会创建多份登记。' }}</p>
         </section>
 
         <section v-else-if="step === 'ERROR'" class="mobile-registration-result is-error" aria-live="assertive">
@@ -602,9 +626,9 @@ onBeforeUnmount(() => {
             <div>
               <span>现场登记</span>
               <h2>选择玩家资料</h2>
-              <p>从完整的玩家资料库中选择。本浏览器会记住最后成功使用的资料，下次直接进入确认页面，仍可返回改选其他玩家。</p>
+              <p>从当前机厅的玩家资料库中选择。此浏览器会记住上次成功使用的玩家资料，下次打开时直接进入确认页面，也可以返回选择其他玩家资料。</p>
             </div>
-            <button type="button" @click="beginNewProfile"><UserPlus :size="17" aria-hidden="true" />新建玩家资料</button>
+            <button type="button" @click="beginNewProfile"><UserPlus :size="17" aria-hidden="true" />创建玩家资料</button>
           </section>
           <label class="mobile-search">
             <Search :size="18" aria-hidden="true" />
@@ -625,14 +649,14 @@ onBeforeUnmount(() => {
           </div>
           <div v-else class="mobile-empty">
             <strong>{{ searching ? '正在搜索' : '没有找到玩家资料' }}</strong>
-            <p>{{ searching ? '请稍候。' : '可以更换关键词，或新建一份玩家资料。' }}</p>
+            <p>{{ searching ? '请稍候。' : '可以更换关键词，或创建一份玩家资料。' }}</p>
           </div>
         </template>
 
         <template v-else-if="step === 'NEW'">
           <section class="mobile-step-heading">
             <button type="button" aria-label="返回选择玩家资料" @click="step = 'SELECT'"><ArrowLeft :size="19" /></button>
-            <div><span>新建资料</span><h2>填写玩家资料</h2><p>所有设置会保存到现场玩家资料库。</p></div>
+            <div><span>创建资料</span><h2>填写玩家资料</h2><p>所有设置会保存到现场玩家资料库。</p></div>
           </section>
           <form class="mobile-form" @submit.prevent="continueNewProfile">
             <label><span>玩家昵称</span><input v-model="newProfileDraft.nickname" maxlength="18" autocomplete="off" placeholder="输入现场容易辨认的昵称" /></label>
@@ -655,7 +679,7 @@ onBeforeUnmount(() => {
         <template v-else-if="step === 'COMPLETE'">
           <section class="mobile-step-heading">
             <button type="button" aria-label="返回选择玩家资料" @click="step = 'SELECT'"><ArrowLeft :size="19" /></button>
-            <div><span>补全资料</span><h2>{{ selectedProfile.nickname }}</h2><p>确认新增设置后，才能继续使用这份资料。</p></div>
+            <div><span>补全资料</span><h2>{{ selectedProfile.nickname }}</h2><p>确认 QQ 显示范围和排队通知设置后，才能继续使用这份资料。</p></div>
           </section>
           <form class="mobile-form" @submit.prevent="continueProfileCompletion">
             <label v-if="!selectedProfile.qqPresent"><span>QQ 号</span><input v-model="completionDraft.qq_number" inputmode="numeric" maxlength="12" autocomplete="off" placeholder="5 至 12 位数字" @input="completionDraft.qq_number = completionDraft.qq_number.replace(/\D/g, '').slice(0, 12)" /></label>
@@ -680,18 +704,22 @@ onBeforeUnmount(() => {
               <div><dt>默认游玩偏好</dt><dd>{{ preferenceLabel(confirmationProfile.defaultPreference) }}</dd></div>
               <div v-if="draftMode === 'NEW'"><dt>QQ</dt><dd>{{ confirmationProfile.qqNumber }}</dd></div>
             </dl>
-            <fieldset v-if="needsCurrentPreference">
-              <legend>选择本次游玩偏好</legend>
-              <div class="mobile-preference-cards">
-                <button type="button" :class="{ active: selectedPreference === 'OPEN_TO_JOIN' }" @click="selectedPreference = 'OPEN_TO_JOIN'"><strong>允许他人加入</strong><span>接受系统分配的共同游玩</span></button>
-                <button type="button" :class="{ active: selectedPreference === 'SOLO' }" @click="selectedPreference = 'SOLO'"><strong>单人游玩</strong><span>独自占用一个等待位置</span></button>
+            <fieldset v-if="needsCurrentPreference || showsPairedTickBox">
+              <legend>{{ needsCurrentPreference ? '选择本次游玩偏好' : '本次游玩偏好' }}</legend>
+              <div v-if="needsCurrentPreference" class="mobile-preference-cards">
+                <button type="button" :class="{ active: selectedPreference === 'OPEN_TO_JOIN' }" @click="selectedPreference = 'OPEN_TO_JOIN'"><strong>允许他人加入</strong><span>接受系统分配的共同游玩，通常可以缩短等待时间。</span></button>
+                <button type="button" :class="{ active: selectedPreference === 'SOLO' }" @click="selectedPreference = 'SOLO'"><strong>单人游玩</strong><span>独自占用一个等待位置。</span></button>
               </div>
+              <PairedQueueTickBox v-if="showsPairedTickBox" v-model="allowsPairedArrangement"
+                :paired-machine-name="pairedMachineName"
+                :explanation-shown="draftMode !== 'NEW' && selectedProfile?.pairedQueueExplanationShown === true"
+                :explanation-key="draftMode === 'NEW' ? 'new-profile' : (selectedProfile?.profileId || '')" />
             </fieldset>
             <p v-if="singlePlayerMachine" class="mobile-information">
               <Smartphone :size="17" aria-hidden="true" />
-              该机台仅能容纳一人游玩，本次将使用“单人游玩”。玩家资料中的默认游玩偏好不会改变。
+              {{ sessionMachineName }} 仅能容纳一人游玩，本次将使用“单人游玩”。玩家资料中的默认游玩偏好不会改变。
             </p>
-            <p class="mobile-information"><Smartphone :size="17" aria-hidden="true" />这是在现场扫码建立的普通登记，成功后无需再签到。</p>
+            <p class="mobile-information"><Smartphone :size="17" aria-hidden="true" />这份登记在现场扫码创建，提交成功后无需签到。</p>
             <p v-if="errorDetail" class="mobile-form-error" role="alert">{{ errorDetail }}</p>
             <button class="mobile-primary" type="button" :disabled="needsCurrentPreference && !selectedPreference" @click="submitRegistration">确认并加入排队</button>
           </section>
@@ -700,14 +728,14 @@ onBeforeUnmount(() => {
         <section v-else-if="step === 'PENDING'" class="mobile-registration-result" aria-live="polite">
           <span class="is-progress" aria-hidden="true"><Clock3 :size="25" /></span>
           <h2>正在等待现场终端确认</h2>
-          <p>请保持页面打开。终端会再次检查机台状态、资料版本和重复登记，完成后这里会显示最终结果。</p>
+          <p>请保持页面打开。现场终端会再次检查机台状态、玩家资料和重复登记，完成后会显示最终结果。</p>
         </section>
 
         <section v-else-if="step === 'SUBMIT_ERROR'" class="mobile-registration-result is-error" aria-live="assertive">
           <span aria-hidden="true"><TriangleAlert :size="25" /></span>
           <h2>暂时无法确认提交结果</h2>
           <p>{{ resultDetail }}</p>
-          <p class="mobile-information"><RefreshCw :size="17" aria-hidden="true" />使用同一次请求重新提交，不会建立重复登记。</p>
+          <p class="mobile-information"><RefreshCw :size="17" aria-hidden="true" />重新提交不会创建重复的登记。</p>
           <button class="mobile-primary" type="button" @click="submitRegistration">重新提交</button>
           <button class="mobile-secondary" type="button" @click="leaveFlow">返回队列</button>
         </section>
@@ -724,7 +752,7 @@ onBeforeUnmount(() => {
           <span aria-hidden="true"><CircleCheck :size="26" /></span>
           <h2>已加入排队</h2>
           <p>{{ resultDetail }}</p>
-          <p class="mobile-information"><Smartphone :size="17" aria-hidden="true" />这是现场普通登记，无需在终端再次签到。</p>
+          <p class="mobile-information"><Smartphone :size="17" aria-hidden="true" />这份登记在现场扫码创建，无需签到。</p>
           <button class="mobile-primary" type="button" @click="leaveFlow">查看排队状态</button>
         </section>
 
@@ -732,7 +760,7 @@ onBeforeUnmount(() => {
           <span aria-hidden="true"><TriangleAlert :size="25" /></span>
           <h2>这次登记没有执行</h2>
           <p>{{ resultDetail }}</p>
-          <p class="mobile-information"><Smartphone :size="17" aria-hidden="true" />本次二维码已经结束。如需重新登记，请在现场终端重新打开“使用移动设备登记”。</p>
+          <p class="mobile-information"><Smartphone :size="17" aria-hidden="true" />这次移动设备登记已经结束。如需重新登记，请在现场终端重新打开“使用移动设备登记”。</p>
           <button class="mobile-primary" type="button" @click="leaveFlow">返回队列</button>
         </section>
       </main>

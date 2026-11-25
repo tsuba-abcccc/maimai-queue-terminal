@@ -20,14 +20,23 @@ internal data class ManagementRegistration(
     val temporarilyAway: Boolean,
     val fixedPair: Boolean,
     val fixedPairId: String?,
-    val temporaryAwaySkippedTurns: Int
+    val temporaryAwaySkippedTurns: Int,
+    val alsoQueuesAtPairedMachine: Boolean = false,
+    /** Queues at its own machine only until it has played a round; see the queue engine. */
+    val skipsPairedMachineThisRound: Boolean = false,
+    /** 轮空一次 is set: at its next turn the registration goes to the tail. */
+    val skipsOneTurn: Boolean = false,
+    /** 暂缓一次 was used and the registration has not played since. */
+    val deferOneRoundUsed: Boolean = false
 )
 
 internal data class ManagementWaitingPosition(
     val index: Int,
     val registrations: List<ManagementRegistration>,
     val estimatedWaitMinutes: Int?,
-    val commonPlayPreview: String?
+    val commonPlayPreview: String?,
+    /** The estimate is the earliest time: a move between a pair of machines may change it. */
+    val estimatedWaitUncertain: Boolean = false
 )
 
 internal data class ManagementMachine(
@@ -43,7 +52,9 @@ internal data class ManagementMachine(
     val registrationCount: Int,
     val playingStartedAtMillis: Long?,
     val playing: List<ManagementRegistration>,
-    val waitingPositions: List<ManagementWaitingPosition>
+    val waitingPositions: List<ManagementWaitingPosition>,
+    /** The other machine of the pair whose registrations may queue at both; null otherwise. */
+    val pairedMachineId: String? = null
 ) {
     val waiting: List<ManagementRegistration>
         get() = waitingPositions.flatMap(ManagementWaitingPosition::registrations)
@@ -91,6 +102,8 @@ internal data class ManagementCapabilities(
     val machineConfigurationEdit: Boolean,
     val businessHoursEdit: Boolean,
     val commonPlayPreviewEdit: Boolean,
+    /** Whether the terminal lets the management app choose the machines that share registrations. */
+    val pairedMachineQueueEdit: Boolean = false,
     val profileReadPrivate: Boolean,
     val profileEditAll: Boolean,
     val profileDelete: Boolean,
@@ -116,7 +129,9 @@ internal data class ManagementTerminalSettings(
     val registrationControlOpen: Boolean,
     val businessHours: BusinessHoursSettings,
     val machineGroups: List<MachineGroupConfiguration>,
-    val defaultMachineGroupId: String
+    val defaultMachineGroupId: String,
+    /** Null when the terminal does not report the setting, as one older than the feature. */
+    val pairedMachineQueue: PairedMachineQueueConfiguration? = null
 )
 
 internal data class ManagementOverview(
@@ -161,7 +176,8 @@ internal data class ManagementTerminalActionRequest(
     val startNextWhenPlayingBecomesEmpty: Boolean = true,
     val advanceWhenPlayingEmpty: Boolean = false,
     val expectedPolicyRevision: Long? = null,
-    val reason: String
+    val reason: String,
+    val alsoQueuesAtPairedMachine: Boolean? = null
 )
 
 internal class ManagementApiException(val statusCode: Int, message: String) : Exception(message)
@@ -261,7 +277,7 @@ internal class ManagementApi(
             machineStableId?.let { put("expected_machine_stable_id", it) }
             put("expected_machine_configuration_revision", expectedMachineConfigurationRevision)
             preference?.let { put("preference", it) }
-            put("reason", reason.trim().ifEmpty { "管理后台新建登记" })
+            put("reason", reason.trim().ifEmpty { "管理后台创建登记" })
         }.toString()
         val connection = openConnection(
             managementPath("/api/queue-management/registrations"),
@@ -284,7 +300,7 @@ internal class ManagementApi(
         request: ManagementTerminalActionRequest
     ): ManagementCommandResult = withContext(Dispatchers.IO) {
         val machineStableId = request.machine.stableId
-            ?: throw ManagementApiException(409, "目标机台缺少稳定身份，请刷新后重试")
+            ?: throw ManagementApiException(409, "无法确认目标机台，请刷新后重试。")
         val body = JSONObject().apply {
             put("request_id", java.util.UUID.randomUUID().toString())
             put("expected_queue_id", overview.queueId)
@@ -323,7 +339,7 @@ internal class ManagementApi(
                     target.stableId
                         ?: throw ManagementApiException(
                             409,
-                            "要转入的机台缺少稳定身份，请刷新后重试"
+                            "无法确认要转入的机台，请刷新后重试。"
                         )
                 )
             }
@@ -336,6 +352,7 @@ internal class ManagementApi(
                 put("desired_registration_order", JSONArray(it))
             }
             request.noShowResolution?.let { put("no_show_resolution", it) }
+            request.alsoQueuesAtPairedMachine?.let { put("also_queues_at_paired_machine", it) }
             put(
                 "start_next_when_playing_becomes_empty",
                 request.startNextWhenPlayingBecomesEmpty
@@ -385,6 +402,7 @@ internal class ManagementApi(
                 "expected_absence_status",
                 when {
                     registration.deferredOnce -> "DEFER_ONE_ROUND"
+                    registration.skipsOneTurn -> "SKIP_ONE_TURN"
                     registration.temporarilyAway -> "TEMPORARILY_AWAY"
                     else -> "NONE"
                 }
@@ -428,7 +446,7 @@ internal class ManagementApi(
             put("expected_machine_configuration_revision", machineConfigurationRevision)
             put("expected_registration_order", JSONArray(expectedOrder))
             put("registration_order", JSONArray(desiredOrder))
-            put("reason", "管理后台调整队列顺序")
+            put("reason", "管理后台调整等待顺序")
         }.toString()
         val connection = openConnection(
             managementPath("/api/queue-management/queue-reorders"),
@@ -620,7 +638,8 @@ internal class ManagementApi(
         machineGroups: List<MachineGroupConfiguration>,
         defaultMachineGroupId: String,
         machines: List<ManagementMachine>,
-        reason: String
+        reason: String,
+        pairedMachineQueue: PairedMachineQueueConfiguration? = null
     ): ManagementCommandResult = submitManagementCommand(
         path = "/api/queue-management/terminal-settings",
         body = JSONObject().apply {
@@ -646,6 +665,23 @@ internal class ManagementApi(
                     put(machine.id, machine.toTerminalSettingsJson())
                 }
             })
+            // Left out when the terminal does not report the setting; it then keeps its own.
+            pairedMachineQueue?.let { settings ->
+                put(
+                    "paired_machine_queue_settings",
+                    JSONObject().apply {
+                        put("enabled", settings.enabled)
+                        put(
+                            "pairs",
+                            JSONArray().apply {
+                                settings.pairs.forEach { (first, second) ->
+                                    put(JSONArray().apply { put(first); put(second) })
+                                }
+                            }
+                        )
+                    }
+                )
+            }
             put("reason", reason.trim().ifEmpty { "管理后台更新终端设置" })
         }
     )
@@ -732,7 +768,7 @@ internal class ManagementApi(
             val detail = runCatching { JSONObject(body).optString("error") }
                 .getOrNull()
                 ?.takeIf { it.isNotBlank() }
-                ?: "服务器返回 HTTP $status"
+                ?: "服务器返回错误（HTTP ${status}），请稍后重试。"
             throw ManagementApiException(status, detail)
         }
         return body
@@ -812,7 +848,10 @@ private fun parseOverview(response: String): ManagementOverview {
             defaultMachineGroupId = terminalSettingsSource.optString(
                 "default_machine_group_id",
                 DEFAULT_MACHINE_GROUP_ID
-            )
+            ),
+            pairedMachineQueue = terminalSettingsSource
+                .optJSONObject("paired_machine_queue_settings")
+                ?.let(::parsePairedMachineQueueConfiguration)
         ),
         machines = machines,
         profiles = profiles,
@@ -825,6 +864,7 @@ private fun parseOverview(response: String): ManagementOverview {
             machineConfigurationEdit = capabilities.optBoolean("MACHINE_CONFIGURATION_EDIT", false),
             businessHoursEdit = capabilities.optBoolean("BUSINESS_HOURS_EDIT", false),
             commonPlayPreviewEdit = capabilities.optBoolean("COMMON_PLAY_PREVIEW_EDIT", false),
+            pairedMachineQueueEdit = capabilities.optBoolean("PAIRED_MACHINE_QUEUE_EDIT", false),
             profileReadPrivate = capabilities.optBoolean("PROFILE_READ_PRIVATE", true),
             profileEditAll = capabilities.optBoolean("PROFILE_EDIT_ALL", true),
             profileDelete = capabilities.optBoolean("PROFILE_DELETE", false),
@@ -859,7 +899,11 @@ private fun parseMachines(source: JSONArray): List<ManagementMachine> = buildLis
                                 "estimated_wait_minutes",
                                 -1
                             ).takeIf { it >= 0 },
-                            commonPlayPreview = position.optionalString("common_play_preview")
+                            commonPlayPreview = position.optionalString("common_play_preview"),
+                            estimatedWaitUncertain = position.optBoolean(
+                                "estimated_wait_uncertain",
+                                false
+                            )
                         )
                     )
                 }
@@ -888,7 +932,8 @@ private fun parseMachines(source: JSONArray): List<ManagementMachine> = buildLis
                 ),
                 playingStartedAtMillis = machine.optionalLong("playing_started_at"),
                 playing = playing,
-                waitingPositions = waitingPositions
+                waitingPositions = waitingPositions,
+                pairedMachineId = machine.optionalString("paired_machine_id")
             )
         )
     }
@@ -908,6 +953,20 @@ private fun parseMachineConfiguration(source: JSONObject): MachineConfiguration 
     soloRoundMinutes = source.optInt("solo_round_minutes", DEFAULT_SOLO_ROUND_MINUTES),
     sharedRoundMinutes = source.optInt("shared_round_minutes", DEFAULT_SHARED_ROUND_MINUTES)
 )
+
+private fun parsePairedMachineQueueConfiguration(
+    source: JSONObject
+): PairedMachineQueueConfiguration? = runCatching {
+    val pairs = source.getJSONArray("pairs")
+    PairedMachineQueueConfiguration(
+        enabled = source.getBoolean("enabled"),
+        pairs = List(pairs.length()) { index ->
+            val pair = pairs.getJSONArray(index)
+            check(pair.length() == 2)
+            pair.getString(0) to pair.getString(1)
+        }
+    )
+}.getOrNull()
 
 private fun parseRegistrations(
     source: JSONArray,
@@ -932,7 +991,15 @@ private fun parseRegistrations(
                 fixedPairId = registration.optionalString("fixed_pair_id"),
                 temporaryAwaySkippedTurns = registration.optInt(
                     "temporary_away_skipped_turns", 0
-                ).coerceIn(0, 3)
+                ).coerceIn(0, 3),
+                alsoQueuesAtPairedMachine = registration.optBoolean(
+                    "also_queues_at_paired_machine", false
+                ),
+                skipsPairedMachineThisRound = registration.optBoolean(
+                    "skips_paired_machine_this_round", false
+                ),
+                skipsOneTurn = registration.optBoolean("skips_one_turn", false),
+                deferOneRoundUsed = registration.optBoolean("defer_one_round_used", false)
             )
         )
     }

@@ -70,7 +70,7 @@ internal fun ManagementLogsPage(
         "WEBSITE_REMOTE" to "网页端",
         "MOBILE_DEVICE" to "移动设备",
         "QQ_BOT" to "QQ Bot",
-        "SYSTEM_AUTOMATIC" to "系统"
+        "SYSTEM_AUTOMATIC" to "系统自动"
     )
 
     fun load(reset: Boolean) {
@@ -183,7 +183,7 @@ private fun ManagementLogCard(log: ManagementLogEntry) {
             if (log.machineName != null || log.machineId != null) {
                 Spacer(Modifier.height(5.dp))
                 Text(
-                    listOfNotNull(log.machineName, log.machineId?.let { "机台 $it" }).joinToString("·"),
+                    (log.machineName ?: log.machineId?.let { "机台 $it" }).orEmpty(),
                     color = SecondaryText,
                     style = MaterialTheme.typography.labelSmall
                 )
@@ -191,10 +191,6 @@ private fun ManagementLogCard(log: ManagementLogEntry) {
             if (log.detail.isNotBlank()) {
                 Spacer(Modifier.height(4.dp))
                 Text(log.detail, color = SecondaryText, style = MaterialTheme.typography.bodySmall)
-            }
-            if (log.registrationIds.isNotEmpty()) {
-                Spacer(Modifier.height(4.dp))
-                Text("关联登记：${log.registrationIds.joinToString("、")}", color = TertiaryText, style = MaterialTheme.typography.labelSmall)
             }
         }
     }
@@ -206,6 +202,6 @@ private fun operationSourceLabel(value: String): String = when (value) {
     "WEBSITE_REMOTE" -> "网页端"
     "MOBILE_DEVICE" -> "移动设备"
     "QQ_BOT" -> "QQ Bot"
-    "SYSTEM_AUTOMATIC" -> "系统"
+    "SYSTEM_AUTOMATIC" -> "系统自动"
     else -> value.ifBlank { "未知来源" }
 }
