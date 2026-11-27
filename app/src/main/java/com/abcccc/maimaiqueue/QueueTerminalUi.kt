@@ -22739,10 +22739,7 @@ private fun AppDetailsDialog(
     val install = remember(context) { appInstallDetails(context) }
     val screen = remember(context) {
         val metrics = context.resources.displayMetrics
-        val configuration = context.resources.configuration
-        val scale = terminalScaleFactor(configuration.screenWidthDp, configuration.screenHeightDp)
-        "${maxOf(metrics.widthPixels, metrics.heightPixels)} × ${minOf(metrics.widthPixels, metrics.heightPixels)}" +
-            "·界面缩放 ${(scale * 100).roundToInt()}%"
+        "${maxOf(metrics.widthPixels, metrics.heightPixels)} × ${minOf(metrics.widthPixels, metrics.heightPixels)}"
     }
     val divider = @Composable { HorizontalDivider(color = Separator.copy(alpha = .72f)) }
     ModalSurface(onDismiss, width = 500.dp) {
@@ -22783,7 +22780,11 @@ private fun AppDetailsDialog(
         AppDetailSectionTitle("设备与数据")
         AppDetailRowCompact("设备", deviceDescription())
         divider()
-        AppDetailRowCompact("屏幕", screen)
+        AppDetailScreenRow(
+            screen = screen,
+            selectedLevel = TerminalSizePreference.level.intValue,
+            onSelectLevel = { TerminalSizePreference.set(context, it) }
+        )
         divider()
         AppDetailRowCompact("本机数据", "$playerProfileCount 份玩家资料·$auditLogCount 条操作日志")
         Spacer(Modifier.height(13.dp))
@@ -23392,6 +23393,47 @@ private fun AppDetailRow(label: String, value: String, verticalPadding: Dp = 12.
             textAlign = TextAlign.End,
             modifier = Modifier.weight(1f)
         )
+    }
+}
+
+/**
+ * 屏幕 in 应用详情: the resolution, and the size the terminal is shown at (maintainer, 2026-11-27:
+ * “在app内加入缩放功能，放到应用详情屏幕分辨率那一栏……四个档位左右吧”). 100 % fills the
+ * screen's height; a choice applies at once and stays on this terminal.
+ */
+@Composable
+private fun AppDetailScreenRow(screen: String, selectedLevel: Int, onSelectLevel: (Int) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text("屏幕", color = TertiaryText, fontSize = 12.sp, modifier = Modifier.width(92.dp))
+        Text(screen, color = PrimaryText, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+        Spacer(Modifier.weight(1f))
+        Text("界面大小", color = TertiaryText, fontSize = 12.sp)
+        Spacer(Modifier.width(8.dp))
+        Row(
+            Modifier.height(34.dp).clip(RoundedCornerShape(10.dp))
+                .background(DisabledBackground).padding(3.dp)
+        ) {
+            TERMINAL_SIZE_LEVELS.forEachIndexed { index, level ->
+                val selected = index == selectedLevel
+                Box(
+                    Modifier.fillMaxHeight().clip(RoundedCornerShape(8.dp))
+                        .background(if (selected) CardBackground else Color.Transparent)
+                        .clickable(enabled = !selected) { onSelectLevel(index) }
+                        .padding(horizontal = 9.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "${(level * 100).roundToInt()}%",
+                        color = if (selected) PrimaryText else SecondaryText,
+                        fontSize = 12.sp,
+                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                    )
+                }
+            }
+        }
     }
 }
 

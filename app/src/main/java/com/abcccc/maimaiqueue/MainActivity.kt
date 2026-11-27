@@ -37,6 +37,7 @@ class MainActivity : ComponentActivity() {
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         enableEdgeToEdge()
         hideSystemBars()
+        if (!BuildConfig.MANAGEMENT_APP) TerminalSizePreference.load(this)
         setContent {
             MaimaiQueueTheme(darkTheme = false, dynamicColor = false) {
                 if (BuildConfig.MANAGEMENT_APP) {

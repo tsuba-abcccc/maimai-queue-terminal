@@ -1,8 +1,10 @@
 package com.abcccc.maimaiqueue
 
+import android.content.Context
 import android.content.res.Configuration
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
@@ -13,23 +15,66 @@ internal const val TERMINAL_DESIGN_WIDTH_DP = 1280
 internal const val TERMINAL_DESIGN_HEIGHT_DP = 720
 
 private const val MIN_TERMINAL_SCALE = 0.5f
+
+/**
+ * Fitting the height, the layout may be narrower than the design, down to this width: the
+ * waiting positions scroll sideways anyway, while the height is what the pages need.
+ */
+private const val TERMINAL_MIN_REDUCED_WIDTH_DP = 1100
 private const val MAX_TERMINAL_SCALE = 3f
 
 /**
- * How much the whole terminal is scaled on this screen, so that every screen shows the layout of
- * the design screen. A 1080P or 2K panel whose system density leaves more room is enlarged in
- * proportion. A screen that leaves less room, because the tablet's density is high or the system
- * 显示大小 is set larger, is reduced in proportion: left at its size, the layout made for 1280 ×
- * 720 was crowded and too large there (maintainer, 2026-11-28: “缩放比例不正常，内容过大，缩成
- * 一坨”, on a 1920 × 1168 terminal). Bounded to 0.5–3 against odd values.
+ * The sizes the terminal can be set to on top of fitting the screen's height, chosen in 应用详情
+ * on each terminal (maintainer, 2026-11-27: “以81为100%，最大到90%那么大就好……四个档位左右吧”):
+ * on that terminal 100 % is the height fit (81 %), and 111 % is about 90 %.
  */
-internal fun terminalScaleFactor(screenWidthDp: Int, screenHeightDp: Int): Float {
+internal val TERMINAL_SIZE_LEVELS = listOf(1.00f, 1.04f, 1.07f, 1.11f)
+
+/** The level a terminal starts with: the layout exactly fills the screen's height. */
+internal const val DEFAULT_TERMINAL_SIZE_LEVEL = 0
+
+/**
+ * How much the whole terminal is scaled on this screen. By default the layout fills the height
+ * of the design screen, 720, on every screen, larger or smaller (maintainer, 2026-11-27: “以后
+ * 默认都按720 高度来”), and may then be narrower than 1280, down to
+ * [TERMINAL_MIN_REDUCED_WIDTH_DP]; a screen narrower than that is scaled by its width instead.
+ * Filling 1280 × 720 on a 1920 × 1168 terminal at density 320 (75 %) was too small, and leaving
+ * smaller screens unscaled crowded them (“缩放比例不正常，内容过大，缩成一坨”). [sizeLevel] is one of
+ * [TERMINAL_SIZE_LEVELS]. Bounded to 0.5–3 against odd values.
+ */
+internal fun terminalScaleFactor(
+    screenWidthDp: Int,
+    screenHeightDp: Int,
+    sizeLevel: Int = DEFAULT_TERMINAL_SIZE_LEVEL
+): Float {
     if (screenWidthDp <= 0 || screenHeightDp <= 0) return 1f
-    val proportional = minOf(
-        screenWidthDp / TERMINAL_DESIGN_WIDTH_DP.toFloat(),
-        screenHeightDp / TERMINAL_DESIGN_HEIGHT_DP.toFloat()
+    val fit = minOf(
+        screenHeightDp / TERMINAL_DESIGN_HEIGHT_DP.toFloat(),
+        screenWidthDp / TERMINAL_MIN_REDUCED_WIDTH_DP.toFloat()
     )
-    return proportional.coerceIn(MIN_TERMINAL_SCALE, MAX_TERMINAL_SCALE)
+    val level = TERMINAL_SIZE_LEVELS.getOrElse(sizeLevel) { 1f }
+    return (fit * level).coerceIn(MIN_TERMINAL_SCALE, MAX_TERMINAL_SCALE)
+}
+
+/** The size level chosen on this terminal, kept on the device only (not synced, not managed). */
+internal object TerminalSizePreference {
+    private const val PREFERENCES = "terminal_display"
+    private const val KEY_LEVEL = "size_level"
+
+    val level = mutableIntStateOf(DEFAULT_TERMINAL_SIZE_LEVEL)
+
+    fun load(context: Context) {
+        level.intValue = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+            .getInt(KEY_LEVEL, DEFAULT_TERMINAL_SIZE_LEVEL)
+            .coerceIn(0, TERMINAL_SIZE_LEVELS.lastIndex)
+    }
+
+    fun set(context: Context, value: Int) {
+        val chosen = value.coerceIn(0, TERMINAL_SIZE_LEVELS.lastIndex)
+        level.intValue = chosen
+        context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_LEVEL, chosen).apply()
+    }
 }
 
 /**
@@ -42,7 +87,11 @@ internal fun terminalScaleFactor(screenWidthDp: Int, screenHeightDp: Int): Float
 internal fun TerminalProportionalScale(content: @Composable () -> Unit) {
     val configuration = LocalConfiguration.current
     val density = LocalDensity.current
-    val factor = terminalScaleFactor(configuration.screenWidthDp, configuration.screenHeightDp)
+    val factor = terminalScaleFactor(
+        configuration.screenWidthDp,
+        configuration.screenHeightDp,
+        TerminalSizePreference.level.intValue
+    )
     if (factor == 1f) {
         content()
         return
