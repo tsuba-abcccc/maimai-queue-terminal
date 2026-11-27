@@ -181,6 +181,9 @@ interface BotPlayer {
   estimated_wait_minutes: number | null;
   // As on WaitingPosition: absent or null means false.
   estimated_wait_uncertain?: boolean | null;
+  // The earlier minutes for when the pending online registrations ahead do not check in; only
+  // set where they show earlier than estimated_wait_minutes.
+  wait_minutes_if_online_missing?: number | null;
   co_player_display_ids?: string[];
   common_play_preview_display_id?: string | null;
   preference?: PlayPreference;
@@ -2107,7 +2110,12 @@ async function processNotificationEvent(
   });
   // 作用域首次接入时只重试此前已经创建的投递，不能为历史事件新建
   // 投递，否则切换测试/正式数据会把整段历史重新发送给玩家。
-  if (!deliveries.length && bootstrapScope) return true;
+  // QUEUE_RESET 除外：它是新队列自己的第一条事件，收件人是上一个队列中
+  // 登记被清除的玩家。新队列对 Bot 而言总是首次接入的作用域，若一并跳过，
+  // 这条通知永远不会发出。每个作用域只会首次接入一次，因此不会重复发送。
+  if (
+    !deliveries.length && bootstrapScope && event.type !== "QUEUE_RESET"
+  ) return true;
   if (!deliveries.length) {
     const recipientPreferences = await Promise.all(
       currentRecipients.map(async (qqNumber) => ({
@@ -2542,6 +2550,18 @@ export function formatQueue(queue: QueueStatus): string {
     sections.push(UNCERTAIN_WAIT_ESTIMATE_NOTE);
   }
   return sections.filter(Boolean).join("\n\n");
+}
+
+// Wait estimates count pending online registrations as checking in, as the waiting positions are
+// grouped. When some of those ahead may not, the terminal sends the earlier minutes the
+// registration then has. The sentence is the terminal's and the website's (maintainer,
+// 2026-11-26).
+export function onlineMissingWaitNote(minutes: number | null | undefined): string | null {
+  if (typeof minutes !== "number" || !Number.isFinite(minutes)) return null;
+  const value = Math.max(0, Math.trunc(minutes));
+  return value <= 0
+    ? "前方的线上登记未按时签到时，这份登记可能很快可以游玩。"
+    : `前方的线上登记未按时签到时，这份登记最快约 ${value} 分钟后可以游玩。`;
 }
 
 // Said once in a reply that shows a wait estimate the terminal marked as possibly inaccurate.
@@ -3053,6 +3073,15 @@ export function formatOwnQueue(
         currentPreference ? `游玩偏好：${currentPreference}。` : ""
       }`,
     ];
+    const estimateShown = player.position === "WAITING" &&
+      terminalOnline !== false &&
+      machineOperational !== false &&
+      !player.temporarily_away &&
+      estimatedWaitMinutes !== null;
+    const onlineMissingNote = estimateShown
+      ? onlineMissingWaitNote(player.wait_minutes_if_online_missing)
+      : null;
+    if (onlineMissingNote) lines.push(onlineMissingNote);
     if (player.online_registration_pending_check_in) {
       lines.push(
         machineOperational === false
@@ -3209,7 +3238,12 @@ export function formatNotificationQueueStatus(players: BotPlayer[]): string {
       : estimatedWaitMinutes <= 0
       ? "预计很快可以游玩"
       : `约 ${estimatedWaitMinutes} 分钟后可以游玩`;
-    return `现在，${subject}位于${position}，${estimate}。`;
+    const onlineMissingNote = !player.temporarily_away &&
+        player.machine_operational !== false &&
+        estimatedWaitMinutes !== null
+      ? onlineMissingWaitNote(player.wait_minutes_if_online_missing)
+      : null;
+    return `现在，${subject}位于${position}，${estimate}。${onlineMissingNote ?? ""}`;
   });
   if (showsUncertainEstimate) lines.push(UNCERTAIN_WAIT_ESTIMATE_NOTE);
   return lines.join("\n");

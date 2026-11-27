@@ -41,7 +41,8 @@ internal object PairedMachineQueues {
         state: QueueEngineState,
         policy: QueueEnginePolicy,
         frontReturnedMachineId: String? = null,
-        frontReturnedKeys: Set<Int> = emptySet()
+        frontReturnedKeys: Set<Int> = emptySet(),
+        sentBackKeys: Map<String, Set<Int>> = emptyMap()
     ): QueueEngineState {
         val partners = state.queues.keys.associateWith { activePartner(state, policy, it) }
 
@@ -90,7 +91,9 @@ internal object PairedMachineQueues {
                             frontReturnedKeys
                         } else {
                             emptySet()
-                        }
+                        },
+                        fixedPartners = fixedPartnersOf(queue.waiting),
+                        sentBackKeys = sentBackKeys[machineId].orEmpty()
                     )
                 )
             }
@@ -222,16 +225,26 @@ internal object PairedMachineQueues {
      * ahead of it. Registrations leaving from ahead of it move it forward; reordering among this
      * machine's registrations does not change that count; registrations that arrive later stay
      * behind it. Places taken now go to the end.
+     *
+     * The two registrations of a fixed pair ([fixedPartners], each key to its partner) always
+     * play together, so no place can be reached between them: a place that would stand there,
+     * as when a registration is created for a friend behind it, stands directly behind the pair.
      */
     fun reconcileOrder(
         previousOrder: List<Int>?,
         homeKeys: List<Int>,
         placeKeys: List<Int>,
-        frontReturnedKeys: Set<Int> = emptySet()
+        frontReturnedKeys: Set<Int> = emptySet(),
+        fixedPartners: Map<Int, Int> = emptyMap(),
+        sentBackKeys: Set<Int> = emptySet()
     ): List<Int> {
         val homeSet = homeKeys.toSet()
         val placeSet = placeKeys.toSet()
-        val previous = previousOrder.orEmpty().filter { it in homeSet || it in placeSet }.distinct()
+        // A registration that a round or a rule sent back behind others (see [overtakenKeys])
+        // counts like one that has just arrived: it no longer stands ahead of any place.
+        val previous = previousOrder.orEmpty()
+            .filter { (it in homeSet || it in placeSet) && it !in sentBackKeys }
+            .distinct()
         val previousHome = previous.filterTo(linkedSetOf()) { it in homeSet }
 
         // Surviving home registrations in their new order; a place sits right after the r-th one.
@@ -256,12 +269,54 @@ internal object PairedMachineQueues {
         val known = previous.toSet()
         return buildList {
             placesAfterHomeIndex[-1]?.let(::addAll)
+            // Places kept back until the second registration of a fixed pair has been listed.
+            var heldBack = emptyList<Int>()
             homeKeys.forEachIndexed { index, key ->
                 add(key)
-                placesAfterHomeIndex[index]?.let(::addAll)
+                val places = heldBack + placesAfterHomeIndex[index].orEmpty()
+                val nextIsFixedPartner = fixedPartners[key] != null &&
+                    fixedPartners[key] == homeKeys.getOrNull(index + 1)
+                if (nextIsFixedPartner) {
+                    heldBack = places
+                } else {
+                    addAll(places)
+                    heldBack = emptyList()
+                }
             }
             placeKeys.forEach { key -> if (key !in known) add(key) }
         }
+    }
+
+    /** Every waiting registration of a fixed pair with the key of its partner. */
+    private fun fixedPartnersOf(waiting: List<Registration>): Map<Int, Int> {
+        if (waiting.none { it.fixedPartnerKey != null }) return emptyMap()
+        return buildMap {
+            waiting.forEach { registration ->
+                registration.fixedPartnerKey?.let { put(registration.key, it) }
+            }
+        }
+    }
+
+    /**
+     * The waiting registrations that others overtook between [before] and [after]: those with
+     * a registration now ahead of them that waited behind them before. That is what happens to
+     * a registration that goes to the tail at its turn (轮空一次, 暂时离开), that is moved to the
+     * tail as not present, or that moves back to form a fixed pair.
+     *
+     * A place held by the other machine must not follow such a registration back: the place
+     * would end up behind registrations that began to wait after it (review 2026-11-27).
+     */
+    fun overtakenKeys(before: List<Int>, after: List<Int>): Set<Int> {
+        val formerIndex = before.withIndex().associate { (index, key) -> key to index }
+        val common = after.filter { it in formerIndex }
+        val overtaken = mutableSetOf<Int>()
+        var latestFormerIndexAhead = -1
+        common.forEach { key ->
+            val former = formerIndex.getValue(key)
+            if (former < latestFormerIndexAhead) overtaken += key
+            latestFormerIndexAhead = maxOf(latestFormerIndexAhead, former)
+        }
+        return overtaken
     }
 
     /** A machine queue whose waiting order also contains the places held by the other machine. */
@@ -301,7 +356,8 @@ internal object PairedMachineQueues {
             previousOrder = state.pairedMachineOrders[machineId],
             homeKeys = baseQueue.waiting.map(Registration::key),
             placeKeys = holders.map(Registration::key),
-            frontReturnedKeys = frontReturnedKeys
+            frontReturnedKeys = frontReturnedKeys,
+            fixedPartners = fixedPartnersOf(baseQueue.waiting)
         )
         // A place only takes part once its registration may really be arranged now. One that
         // may not is passed over this time and keeps its position in the order. A full machine
@@ -396,10 +452,12 @@ internal object PairedMachineQueues {
         // Places that were not reached keep the position the round logic left them in; places
         // that were passed over this time are put back where they stood.
         val takingPart = staged.queue.waiting.mapTo(mutableSetOf(), Registration::key)
+        val keptOrder = result.waiting.map(Registration::key)
         val machineOrder = weaveBack(
             previousOrder = staged.fullOrder,
-            keptOrder = result.waiting.map(Registration::key),
-            passedOver = staged.fullOrder.filterNotTo(mutableSetOf()) { it in takingPart }
+            keptOrder = keptOrder,
+            passedOver = staged.fullOrder.filterNotTo(mutableSetOf()) { it in takingPart },
+            sentBack = overtakenKeys(staged.queue.waiting.map(Registration::key), keptOrder)
         )
         // With the announcement rules a registration that was arranged here remembers where it
         // came from, in case it does not show up.
@@ -423,12 +481,14 @@ internal object PairedMachineQueues {
 
     /**
      * [keptOrder] with the keys of [passedOver] put back: each one directly behind the nearest
-     * key that stood ahead of it in [previousOrder] and is still there, or at the front.
+     * key that stood ahead of it in [previousOrder] and is still there, or at the front. A key
+     * of [sentBack] went behind others in this round; nothing is put back behind it.
      */
     private fun weaveBack(
         previousOrder: List<Int>,
         keptOrder: List<Int>,
-        passedOver: Set<Int>
+        passedOver: Set<Int>,
+        sentBack: Set<Int> = emptySet()
     ): List<Int> {
         if (passedOver.isEmpty()) return keptOrder
         val result = keptOrder.toMutableList()
@@ -437,7 +497,7 @@ internal object PairedMachineQueues {
         var insertedAfterAnchor = 0
         previousOrder.forEach { key ->
             when (key) {
-                in kept -> {
+                in kept -> if (key !in sentBack) {
                     anchor = key
                     insertedAfterAnchor = 0
                 }
@@ -481,8 +541,13 @@ internal object PairedMachineQueues {
                 if (activePartner(current, policy, machineId) != origin) return@forEach
                 if (!policy.isOperational(origin)) return@forEach
                 if (originQueue.registrationCount >= policy.maxRegistrationsPerMachine) return@forEach
-                val insertAt = originQueue.waiting
+                val behindAhead = originQueue.waiting
                     .indexOfLast { it.key in record.aheadKeysAtOrigin } + 1
+                // A fixed pair formed there in the meantime stays together: go behind it.
+                val splitsFixedPair = behindAhead in 1 until originQueue.waiting.size &&
+                    originQueue.waiting[behindAhead - 1].fixedPartnerKey ==
+                    originQueue.waiting[behindAhead].key
+                val insertAt = if (splitsFixedPair) behindAhead + 1 else behindAhead
                 val back = registration.copy(
                     alsoQueuesAtPairedMachine = false,
                     skipsPairedMachineThisRound = false
@@ -533,7 +598,15 @@ internal object PairedMachineQueues {
                 current.queues.getValue(machineId),
                 atMillis = atMillis
             ) ?: return current
-            val result = RoundPlanner.enterPlayingPosition(staged.queue).execute(atMillis)
+            // Nobody of this machine can play, and nobody started a round here: a registration
+            // of the other machine only takes the empty playing position. That is not a turn of
+            // the registrations waiting here. Their 暂缓一次, 轮空一次 and 暂时离开 stay as they
+            // are, and a pending online registration keeps its check-in time (maintainer,
+            // 2026-11-27: “另一机台的登记来填空位，不算本机台登记的一轮”).
+            val untouched = current.queues.getValue(machineId).waiting
+                .filterNot { it.canEnterPlayingPosition }
+                .mapTo(mutableSetOf(), Registration::key)
+            val result = RoundPlanner.advance(staged.queue, untouched).execute(atMillis)
             val settled = normalize(settleRound(current, policy, staged, result), policy)
             if (settled == current) return current
             current = settled
@@ -560,6 +633,14 @@ internal object PairedMachineQueues {
             val homeSet = homeKeys.toSet()
             if (order.filter { it in homeSet } != homeKeys) {
                 add("同时排队的顺序必须与本机台的等待顺序一致")
+            }
+            homeKeys.zipWithNext().forEach { (first, second) ->
+                if (
+                    registrationsByKey[first]?.fixedPartnerKey == second &&
+                    order.indexOf(second) - order.indexOf(first) != 1
+                ) {
+                    add("另一机台的位置不能位于固定组合的两份登记之间")
+                }
             }
             order.filterNot { it in homeSet }.forEach { key ->
                 val registration = registrationsByKey[key]

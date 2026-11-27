@@ -409,4 +409,65 @@ class PlayerProfilesTest {
         const val DAY = 24L * 60L * 60L * 1_000L
     }
 
+    @Test
+    fun aNewProfileCannotTakeTheNicknameOfATemporaryRegistration() {
+        val temporary = Registration(key = 1, displayId = "小雨", preference = PlayPreference.OPEN_TO_JOIN)
+        // Neither has a profile id; they are still two players.
+        assertTrue(nicknameConflictsWithRegistrations(" 小雨 ", listOf(temporary), profileId = null))
+        assertTrue(nicknameConflictsWithRegistrations("小雨", listOf(temporary), profileId = "p1"))
+        assertFalse(nicknameConflictsWithRegistrations("青空", listOf(temporary), profileId = null))
+        assertFalse(nicknameConflictsWithRegistrations("  ", listOf(temporary), profileId = null))
+        // The temporary registration that is being claimed is the player's own.
+        assertFalse(
+            nicknameConflictsWithRegistrations(
+                "小雨",
+                listOf(temporary),
+                profileId = null,
+                exceptRegistrationKey = 1
+            )
+        )
+    }
+
+    @Test
+    fun aProfileKeepsItsNicknameWhileItsOwnRegistrationWaits() {
+        val own = Registration(
+            key = 2,
+            displayId = "小雨",
+            preference = PlayPreference.SOLO,
+            isTemporary = false,
+            playerProfileId = "p1"
+        )
+        assertFalse(nicknameConflictsWithRegistrations("小雨", listOf(own), profileId = "p1"))
+        assertFalse(
+            nicknameConflictsWithRegistrations(
+                "小雨",
+                listOf(own),
+                profileId = "p9",
+                equivalentProfileIds = setOf("p1")
+            )
+        )
+        assertTrue(nicknameConflictsWithRegistrations("小雨", listOf(own), profileId = "p2"))
+        assertTrue(nicknameConflictsWithRegistrations("小雨", listOf(own), profileId = null))
+    }
+
+    @Test
+    fun theLibraryFindsTheRegistrationOfAProfileAndSaysWhereItQueues() {
+        val player = profile("p1", "小雨")
+        val byProfile = Registration(
+            key = 3,
+            displayId = "改过的昵称",
+            preference = PlayPreference.SOLO,
+            isTemporary = false,
+            playerProfileId = "p1"
+        )
+        val byNickname = Registration(key = 4, displayId = "小雨", preference = PlayPreference.SOLO)
+        val other = Registration(key = 5, displayId = "青空", preference = PlayPreference.SOLO)
+        assertEquals(byProfile, registrationOfPlayerProfile(player, listOf(other, byProfile)))
+        assertEquals(byNickname, registrationOfPlayerProfile(player, listOf(other, byNickname)))
+        assertNull(registrationOfPlayerProfile(player, listOf(other)))
+        assertNull(registrationOfPlayerProfile(player, listOf(byNickname), exceptKey = 4))
+        assertEquals("排队中·位置 A7", queuedPlayerProfileLine("位置 A7"))
+        assertEquals("排队中·游玩位置 A", queuedPlayerProfileLine("游玩位置 A"))
+        assertEquals("排队中", queuedPlayerProfileLine(null))
+    }
 }

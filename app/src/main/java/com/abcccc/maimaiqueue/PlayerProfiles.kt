@@ -66,7 +66,20 @@ data class PlayerProfile(
      * registration between two machines. A record, not a setting: it only ever turns on, and
      * all it decides is whether the explanation opens by itself the next time.
      */
-    val pairedMachineQueueingIntroduced: Boolean = false
+    val pairedMachineQueueingIntroduced: Boolean = false,
+    /**
+     * The player's last answer to letting the registrations behind pass a 单人游玩 registration
+     * of this profile (solo-pass-plan-2026-11.md). The tick box starts from it the next time
+     * (maintainer, 2026-11-26: "如果是玩家资料的话，这个勾选框记忆上次状态"). It changes whenever
+     * the player answers, when joining or later in 更改游玩偏好, on the terminal or the website.
+     */
+    val lastAllowsPassing: Boolean = false,
+    /**
+     * Whether the player has been shown the explanation of letting others pass (a 单人游玩
+     * registration or a fixed pair). A record like [pairedMachineQueueingIntroduced]: it only
+     * ever turns on and decides whether the explanation opens by itself the next time.
+     */
+    val passingIntroduced: Boolean = false
 ) {
     val hasValidContact: Boolean
         get() = normalizedQqNumber() != null && isValidQqNumber(normalizedQqNumber())
@@ -100,9 +113,14 @@ data class PlayerProfile(
         atMillis: Long = System.currentTimeMillis(),
         preferenceToRemember: PlayPreference? = null,
         /** The explanation was shown where this registration was created, see the field. */
-        pairedMachineQueueingIntroducedNow: Boolean = false
+        pairedMachineQueueingIntroducedNow: Boolean = false,
+        /** The answer to the passing tick box, where it was offered; null keeps the last one. */
+        passingChoice: Boolean? = null
     ): PlayerProfile = copy(
         defaultPreference = preferenceToRemember?.toProfilePlayPreference() ?: defaultPreference,
+        lastAllowsPassing = passingChoice ?: lastAllowsPassing,
+        // The box was ticked where the registration was created, and the explanation shown there.
+        passingIntroduced = passingIntroduced || passingChoice == true,
         pairedMachineQueueingIntroduced =
             pairedMachineQueueingIntroduced || pairedMachineQueueingIntroducedNow,
         usageCount = usageCount + 1,
@@ -115,6 +133,32 @@ data class PlayerProfile(
         updatedAtMillis = atMillis
     )
 }
+
+/** Remembers the answer to the passing tick box given after joining; see [PlayerProfile.lastAllowsPassing]. */
+internal fun PlayerProfile.withPassingChoice(enabled: Boolean, atMillis: Long): PlayerProfile =
+    if (lastAllowsPassing == enabled && (passingIntroduced || !enabled)) {
+        this
+    } else {
+        copy(
+            lastAllowsPassing = enabled,
+            // Wherever the box was ticked, the explanation was shown with it.
+            passingIntroduced = passingIntroduced || enabled,
+            revision = revision + 1L,
+            updatedAtMillis = maxOf(atMillis, updatedAtMillis + 1L)
+        )
+    }
+
+/** Records that the explanation of letting others pass was shown; see [PlayerProfile.passingIntroduced]. */
+internal fun PlayerProfile.withPassingIntroduced(atMillis: Long): PlayerProfile =
+    if (passingIntroduced) {
+        this
+    } else {
+        copy(
+            passingIntroduced = true,
+            revision = revision + 1L,
+            updatedAtMillis = maxOf(atMillis, updatedAtMillis + 1L)
+        )
+    }
 
 internal const val MAX_RECENT_PLAYER_USAGE_EVENTS = 16
 
@@ -207,6 +251,50 @@ internal fun clearAmbiguousQqBindings(
         }
     }
 }
+
+/**
+ * Whether a registration of somebody else already uses [nickname]. Only a registration made from
+ * this profile is the profile's own: a temporary registration has no profile, and neither has a
+ * profile that is still being created, so the two must not be taken for the same player.
+ */
+internal fun nicknameConflictsWithRegistrations(
+    nickname: String,
+    registrations: List<Registration>,
+    profileId: String?,
+    equivalentProfileIds: Set<String> = emptySet(),
+    exceptRegistrationKey: Int? = null
+): Boolean {
+    val normalizedNickname = nickname.trim()
+    if (normalizedNickname.isBlank()) return false
+    return registrations.any { registration ->
+        val registrationProfileId = registration.playerProfileId
+        val ownRegistration = registrationProfileId != null && (
+            registrationProfileId == profileId || registrationProfileId in equivalentProfileIds
+            )
+        registration.key != exceptRegistrationKey &&
+            !ownRegistration &&
+            registration.displayId.trim().equals(normalizedNickname, ignoreCase = true)
+    }
+}
+
+/**
+ * The registration that keeps [profile] from being used for another one: a registration made
+ * from it, or one under its nickname.
+ */
+internal fun registrationOfPlayerProfile(
+    profile: PlayerProfile,
+    registrations: List<Registration>,
+    exceptKey: Int? = null
+): Registration? = registrations.firstOrNull {
+    it.key != exceptKey && (
+        it.playerProfileId == profile.id ||
+            it.displayId.equals(profile.nickname.trim(), ignoreCase = true)
+        )
+}
+
+/** The line of a player profile in the library that cannot be chosen: where it is queueing. */
+internal fun queuedPlayerProfileLine(positionLabel: String?): String =
+    if (positionLabel == null) "排队中" else "排队中·$positionLabel"
 
 internal fun shouldApplyCloudPlayerProfile(
     cloudProfile: PlayerProfile,

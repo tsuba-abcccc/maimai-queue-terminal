@@ -442,4 +442,125 @@ class QueueRiskSequenceTest {
         val moved = apply(state, QueueAction.MarkNoShow("A", setOf(8), NoShowResolution.MOVE_TO_TAIL))
         assertEquals(8, moved.queue("A")!!.waiting.last().key)
     }
+
+    /**
+     * Review 2026-11-27: deferring one of a fixed pair as a group, as a website or API caller may
+     * ask, defers both, as deferring it alone does; it used to split a playing pair.
+     */
+    @Test
+    fun deferringHalfAFixedPairAsAGroupDefersBoth() {
+        val first = registration(21).copy(fixedPartnerKey = 22)
+        val second = registration(22).copy(fixedPartnerKey = 21)
+        val state = QueueEngineState.single(
+            "A",
+            MachineQueue(
+                playing = listOf(first, second),
+                waiting = listOf(registration(23), registration(24)),
+                playingStartedAtMillis = 1_000L
+            )
+        )
+        val deferred = apply(state, QueueAction.MarkNoShow("A", setOf(21), NoShowResolution.DEFER_GROUP_ONE_ROUND)).queue("A")!!
+        val pair = deferred.allRegistrations.filter { it.key == 21 || it.key == 22 }
+        assertEquals(2, pair.size)
+        // Both wait at the front; the next group entering has already used up their 暂缓一次.
+        assertEquals(listOf(21, 22), deferred.waiting.map(Registration::key))
+        assertTrue(deferred.toString(), pair.all { it.deferOneRoundUsed && it.lastNoShowActionWasDefer && it.noShowCount == 1 })
+        assertEquals(22, pair.first { it.key == 21 }.fixedPartnerKey)
+        assertEquals(listOf(23, 24), deferred.playing.map(Registration::key))
+    }
+
+    /**
+     * Maintainer, 2026-11-27: a fixed pair cannot be formed while either registration is 将暂缓一次,
+     * 将轮空一次 or 暂时离开. It used to take over the stricter state: a registration that had used
+     * its 暂缓一次 deferred a second time, and a checked-in online registration that had not played
+     * became 暂时离开, both of which the rules forbid directly.
+     */
+    @Test
+    fun aPostponedRegistrationFormsNoFixedPair() {
+        val context = QueueActionContext(atMillis = 100_000L)
+        fun failureOf(state: QueueEngineState, action: QueueAction) =
+            (QueueEngine.execute(state, action, context) as QueueActionExecution.Rejected).failure.code
+        QueueAbsenceStatus.entries.filter { it != QueueAbsenceStatus.NONE }.forEach { status ->
+            val state = QueueEngineState.single(
+                "A",
+                MachineQueue(
+                    playing = listOf(registration(30, PlayPreference.SOLO)),
+                    waiting = listOf(
+                        registration(31).copy(absenceStatus = status),
+                        registration(32).copy(deferOneRoundUsed = true),
+                        registration(33)
+                    ),
+                    playingStartedAtMillis = 1_000L
+                )
+            )
+            // Whichever of the two is postponed, and also when a new registration is created for it.
+            assertEquals(status.name, QueueActionFailureCode.FIXED_PAIR_WHILE_POSTPONED, failureOf(state, QueueAction.CreateFixedPair("A", 31, 32)))
+            assertEquals(status.name, QueueActionFailureCode.FIXED_PAIR_WHILE_POSTPONED, failureOf(state, QueueAction.CreateFixedPair("A", 32, 31)))
+            assertEquals(
+                status.name,
+                QueueActionFailureCode.FIXED_PAIR_WHILE_POSTPONED,
+                failureOf(state, QueueAction.CreateFixedPairWithRegistration("A", 31, registration(34)))
+            )
+            // The queue's own functions refuse it as well.
+            assertEquals(null, state.queue("A")!!.planFriendPair(31, 32))
+            assertEquals(state.queue("A"), state.queue("A")!!.createFriendPair(31, registration(34)))
+            // Two that are not postponed still pair.
+            val paired = apply(state, QueueAction.CreateFixedPair("A", 32, 33)).queue("A")!!
+            assertEquals(33, paired.waiting.first { it.key == 32 }.fixedPartnerKey)
+            assertEquals(QueueAbsenceStatus.NONE, paired.waiting.first { it.key == 32 }.absenceStatus)
+        }
+    }
+
+    /** 仅结束本轮 leaves the playing position empty on purpose; joining does not end that. */
+    @Test
+    fun aRegistrationThatJoinsDoesNotStartARoundThatWasHeldBack() {
+        val solo = PlayPreference.SOLO
+        var state = QueueEngineState.single(
+            "A",
+            MachineQueue(
+                playing = listOf(registration(1, solo)),
+                waiting = listOf(registration(2, solo), registration(3, solo)),
+                playingStartedAtMillis = 1_000L
+            )
+        )
+        state = apply(state, QueueAction.EndRoundOnly("A"))
+        assertTrue(state.queue("A")!!.playing.isEmpty())
+
+        // Created at the terminal, by a phone or by the management app: it waits at the tail.
+        state = apply(
+            state,
+            QueueAction.AddRegistrations("A", listOf(registration(4, solo)), RegistrationPlacement.ADVANCE_IF_UNAMBIGUOUS)
+        )
+        assertTrue(state.queue("A")!!.playing.isEmpty())
+        assertEquals(listOf(2, 3, 1, 4), state.queue("A")!!.waiting.map(Registration::key))
+
+        // The same when the new registration comes with a friend.
+        state = apply(
+            state,
+            QueueAction.AddRegistrations("A", listOf(registration(5)), RegistrationPlacement.STAGED_WAITING)
+        )
+        state = apply(
+            state,
+            QueueAction.CreateFixedPairWithRegistration("A", 5, registration(6), advanceWhenPlayingEmpty = true)
+        )
+        assertTrue(state.queue("A")!!.playing.isEmpty())
+
+        // The operator starts the round.
+        state = apply(state, QueueAction.EnterPlayingPosition("A"))
+        assertEquals(listOf(2), state.queue("A")!!.playing.map(Registration::key))
+    }
+
+    @Test
+    fun aRegistrationThatJoinsAMachineNobodyWaitsAtStartsToPlay() {
+        var state = QueueEngineState.single("A", MachineQueue())
+        state = apply(
+            state,
+            QueueAction.AddRegistrations(
+                "A",
+                listOf(registration(1, PlayPreference.SOLO)),
+                RegistrationPlacement.ADVANCE_IF_UNAMBIGUOUS
+            )
+        )
+        assertEquals(listOf(1), state.queue("A")!!.playing.map(Registration::key))
+    }
 }

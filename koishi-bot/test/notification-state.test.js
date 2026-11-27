@@ -557,6 +557,60 @@ test('a new queue scope still retries an unfinished delivery without replaying o
   assert.deepEqual(cursor, { queueId: 'queue-new', cursor: 3 })
 })
 
+test('a new queue delivers its reset notification but no other history', async () => {
+  const database = new MemoryDatabase()
+  await database.upsert('maimai_q_state', [{
+    key: 'event-cursor:https://queue.example.test',
+    value: JSON.stringify({ queueId: 'queue-old', cursor: 7 }),
+  }])
+  const sends = []
+  const bot = {
+    platform: 'onebot',
+    selfId: '10000',
+    isActive: true,
+    async sendPrivateMessage(qq, message) { sends.push({ qq, message }) },
+  }
+  const reset = {
+    ...event(1, 'queue-reset', '11111'),
+    machine_id: null,
+    type: 'QUEUE_RESET',
+    title: '已开始新的队列',
+    detail: '未载入上次保存的 1 份登记，已从空队列开始。',
+  }
+  const eventRequests = []
+  const api = {
+    async getEvents(after) {
+      eventRequests.push(after)
+      const events = [reset, event(2, 'history', '22222')]
+        .filter(item => item.cursor > after)
+      return {
+        queue_id: 'queue-new',
+        events,
+        next_cursor: events.at(-1)?.cursor ?? after,
+        latest_cursor: 2,
+        has_more: false,
+      }
+    },
+    async getProfiles(qq) { return profileResponse(qq) },
+    async getPlayers() { return { queue_id: 'queue-new', players: [] } },
+  }
+  const ctx = { database, bots: [bot] }
+
+  await pollNotifications(ctx, api, config(), logger())
+  await pollNotifications(ctx, api, config(), logger())
+
+  assert.deepEqual(sends, [{
+    qq: '11111',
+    message: '【排队通知】\n\n已开始新的队列\n未载入上次保存的 1 份登记，已从空队列开始。',
+  }])
+  assert.deepEqual(eventRequests, [7, 0, 2])
+  assert.equal(database.deliveries.size, 0)
+  const cursor = JSON.parse(database.states.get(
+    'event-cursor:https://queue.example.test',
+  ).value)
+  assert.deepEqual(cursor, { queueId: 'queue-new', cursor: 2 })
+})
+
 test('test notifications use an isolated scope even with the same public queue id', async () => {
   const database = new MemoryDatabase()
   await database.upsert('maimai_q_state', [{

@@ -11,13 +11,18 @@ import {
 // pair. It opens by itself the first time a player turns the tick box on, and then waits
 // [countdownSeconds] before it can be closed; behind the question mark it shows the same
 // content and can be closed at once.
+// The explanation of letting others pass (SoloPassTickBox.vue) works the same way and is shown
+// by this component as well: it hands in its own [title] and [contentBlocks], and no machine.
 const props = defineProps({
-  pairedMachineName: { type: String, required: true },
-  countdownSeconds: { type: Number, default: 0 }
+  pairedMachineName: { type: String, default: '' },
+  countdownSeconds: { type: Number, default: 0 },
+  title: { type: String, default: '' },
+  contentBlocks: { type: Array, default: null }
 })
 const emit = defineEmits(['close'])
 
-const blocks = computed(() => pairedQueueDetailsBlocks({
+const heading = computed(() => props.title || PAIRED_QUEUE_DETAILS_TITLE)
+const blocks = computed(() => props.contentBlocks || pairedQueueDetailsBlocks({
   pairedMachineName: props.pairedMachineName
 }))
 const remainingSeconds = ref(Math.max(0, Math.floor(props.countdownSeconds)))
@@ -28,7 +33,20 @@ function close() {
   emit('close')
 }
 
+// Esc belongs to this explanation while it is open: it waits for the countdown as a click
+// outside does, and then closes only the explanation. Without this, the dialog or panel
+// underneath took the key and closed itself, skipping the countdown and losing the tick
+// (website review W9). Listening on the window in the capture phase comes before their
+// handlers.
+function handleKeydown(event) {
+  if (event.key !== 'Escape') return
+  event.preventDefault()
+  event.stopImmediatePropagation()
+  close()
+}
+
 onMounted(() => {
+  window.addEventListener('keydown', handleKeydown, true)
   if (remainingSeconds.value <= 0) return
   timer = window.setInterval(() => {
     remainingSeconds.value = Math.max(0, remainingSeconds.value - 1)
@@ -40,6 +58,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('keydown', handleKeydown, true)
   if (timer !== null) window.clearInterval(timer)
 })
 </script>
@@ -47,8 +66,8 @@ onBeforeUnmount(() => {
 <template>
   <Teleport to="body">
     <div class="paired-details-backdrop" @click.self="close">
-      <section class="paired-details" role="dialog" aria-modal="true" :aria-label="PAIRED_QUEUE_DETAILS_TITLE">
-        <h2>{{ PAIRED_QUEUE_DETAILS_TITLE }}</h2>
+      <section class="paired-details" role="dialog" aria-modal="true" :aria-label="heading">
+        <h2>{{ heading }}</h2>
         <template v-for="(block, index) in blocks" :key="index">
           <p v-if="typeof block === 'string'">{{ block }}</p>
           <template v-else>

@@ -45,6 +45,61 @@ class AuditLogsTest {
     }
 
     @Test
+    fun theTickForAPairOfMachinesIsDescribed() {
+        val waiting = registration(9, "小明")
+        val ticked = waiting.copy(alsoQueuesAtPairedMachine = true, skipsPairedMachineThisRound = true)
+        val turnedOn = queueLog(MachineQueue(waiting = listOf(waiting)), MachineQueue(waiting = listOf(ticked)))!!
+        assertEquals("机台 A：两台机台之间的安排已更改", turnedOn.title)
+        assertEquals("“小明”已允许系统在两台机台之间安排登记，游玩一轮之后开始安排。", turnedOn.detail)
+        assertEquals(listOf(9), turnedOn.affectedRegistrationKeys)
+
+        val immediately = queueLog(
+            MachineQueue(waiting = listOf(waiting)),
+            MachineQueue(waiting = listOf(waiting.copy(alsoQueuesAtPairedMachine = true)))
+        )!!
+        assertEquals("“小明”已允许系统在两台机台之间安排登记。", immediately.detail)
+
+        val turnedOff = queueLog(
+            MachineQueue(waiting = listOf(ticked)),
+            MachineQueue(waiting = listOf(waiting))
+        )!!
+        assertEquals("“小明”不再由系统在两台机台之间安排，登记留在当前机台。", turnedOff.detail)
+    }
+
+    @Test
+    fun thePassingChoiceIsDescribedOnlyWhenItIsTheChange() {
+        val solo = registration(9, "小王", PlayPreference.SOLO)
+        val ticked = solo.copy(allowsPassing = true)
+        val turnedOn = queueLog(MachineQueue(waiting = listOf(solo)), MachineQueue(waiting = listOf(ticked)))!!
+        assertEquals("“小王”已允许后方的登记越过，与前方的登记共同游玩。", turnedOn.detail)
+        val turnedOff = queueLog(MachineQueue(waiting = listOf(ticked)), MachineQueue(waiting = listOf(solo)))!!
+        assertEquals("“小王”不再允许后方的登记越过。", turnedOff.detail)
+
+        // Choosing 允许他人加入 ends the choice as well; the line about the preference says it.
+        val open = queueLog(
+            MachineQueue(waiting = listOf(ticked)),
+            MachineQueue(waiting = listOf(solo.copy(preference = PlayPreference.OPEN_TO_JOIN)))
+        )!!
+        assertEquals("“小王”的本次游玩偏好已改为“允许他人加入”。", open.detail)
+    }
+
+    @Test
+    fun aChangeWhilePlayingSaysItCountsFromTheNextRound() {
+        val playing = registration(9, "小王")
+        val changed = queueLog(
+            MachineQueue(playing = listOf(playing), playingStartedAtMillis = 1L),
+            MachineQueue(playing = listOf(playing.copy(preference = PlayPreference.SOLO)), playingStartedAtMillis = 1L)
+        )!!
+        assertEquals("“小王”的本次游玩偏好已改为“单人游玩”，本轮游玩结束后生效。", changed.detail)
+        val solo = playing.copy(preference = PlayPreference.SOLO)
+        val passing = queueLog(
+            MachineQueue(playing = listOf(solo), playingStartedAtMillis = 1L),
+            MachineQueue(playing = listOf(solo.copy(allowsPassing = true)), playingStartedAtMillis = 1L)
+        )!!
+        assertEquals("“小王”已允许后方的登记越过，与前方的登记共同游玩，本轮游玩结束后生效。", passing.detail)
+    }
+
+    @Test
     fun arrangedArrivalIsToldUnderEitherKindOfNotice() {
         val entry = createPairedPlaceArrivalAuditLog(
             category = AuditLogCategory.MACHINE_B,
@@ -876,5 +931,65 @@ class AuditLogsTest {
 
         assertTrue(log.detail, log.detail.contains("等待顺序已调整为“青空”、“小雨”"))
         assertFalse(log.detail, log.detail.contains("游玩中"))
+    }
+
+    /** What the management app does to a registration by name is logged as that action. */
+    @Test
+    fun aNamedRemovalOrCancellationIsNotReadAsAnOutcomeOfTheTurn() {
+        val pending = registration(1, "线上玩家").copy(
+            preference = PlayPreference.SOLO,
+            requiresOnSiteCheckIn = true,
+            onSiteCheckInStartedAtMillis = 100L,
+            wasOnlineRegistration = true
+        )
+        val deferred = registration(2, "暂缓玩家").copy(
+            preference = PlayPreference.SOLO,
+            absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+        )
+        val before = MachineQueue(
+            playing = listOf(registration(9, "游玩中")),
+            waiting = listOf(pending, deferred),
+            playingStartedAtMillis = 100L
+        )
+
+        val removal = createQueueAuditLogs(
+            category = AuditLogCategory.MACHINE_A,
+            machineLabel = "机台 A",
+            before = before,
+            after = before.removeAll(setOf(1)),
+            titleOverride = "管理后台：已移除“线上玩家”",
+            source = AuditLogSource.MANAGEMENT_APP,
+            classifyAvailabilityOutcomes = true,
+            semanticAction = QueueAction.RemoveRegistrations("A", setOf(1))
+        )
+        assertEquals(listOf("管理后台：已移除“线上玩家”"), removal.map { it.title })
+        assertTrue(removal.none { it.publicEventType == PublicQueueEventType.ONLINE_CHECK_IN_MISSED })
+
+        val cancelled = createQueueAuditLogs(
+            category = AuditLogCategory.MACHINE_A,
+            machineLabel = "机台 A",
+            before = before,
+            after = before.copy(
+                waiting = listOf(pending, deferred.copy(absenceStatus = QueueAbsenceStatus.NONE))
+            ),
+            titleOverride = "管理后台：已取消“暂缓玩家”的暂缓一次",
+            source = AuditLogSource.MANAGEMENT_APP,
+            classifyAvailabilityOutcomes = true,
+            semanticAction = QueueAction.CancelDeferOneRound("A", 2)
+        )
+        assertEquals(1, cancelled.size)
+        assertFalse(cancelled.single().title, cancelled.single().title.contains("暂缓一次已完成"))
+        assertFalse(cancelled.single().detail, cancelled.single().detail.contains("已跳过本次机会"))
+    }
+
+    @Test
+    fun restoredQueueListsOnlyMachinesWithRegistrations() {
+        assertEquals(
+            "已恢复 机台 A 的 3 份登记，机台 C 的 1 份登记。",
+            restoredQueueSummary(listOf("机台 A" to 3, "机台 B" to 0, "机台 C" to 1))
+        )
+        assertEquals("已恢复 机台 B 的 2 份登记。", restoredQueueSummary(listOf("机台 A" to 0, "机台 B" to 2)))
+        assertEquals("当前没有登记。", restoredQueueSummary(listOf("机台 A" to 0, "机台 B" to 0)))
+        assertEquals("当前没有登记。", restoredQueueSummary(emptyList()))
     }
 }

@@ -288,6 +288,115 @@ class PairedMachineQueueTest {
         )
     }
 
+    @Test
+    fun aPlaceOfTheOtherMachineNeverStandsBetweenTheTwoOfAFixedPair() {
+        // Registration 11 of machine B holds a place at machine A behind registration 2.
+        var state = stateOf(
+            "A" to MachineQueue(
+                playing = listOf(registration(1)),
+                waiting = listOf(registration(2, PlayPreference.OPEN_TO_JOIN)),
+                playingStartedAtMillis = 10_000L
+            ),
+            "B" to MachineQueue(
+                playing = listOf(registration(10)),
+                waiting = listOf(registration(12), registration(11, paired = true)),
+                playingStartedAtMillis = 10_000L
+            )
+        )
+        assertEquals(listOf(2, 11), state.order("A"))
+
+        // 2 creates a registration for a friend. The new registration stands next to 2, and
+        // the place stays behind both of them.
+        state = apply(
+            state,
+            QueueAction.CreateFixedPairWithRegistration(
+                "A",
+                2,
+                registration(3, PlayPreference.OPEN_TO_JOIN)
+            )
+        )
+        assertEquals(listOf(2, 3), state.queue("A")!!.waiting.map(Registration::key))
+        assertEquals(listOf(2, 3, 11), state.order("A"))
+
+        // The round ends as usual and the two play together.
+        state = apply(state, QueueAction.FinishRound("A"))
+        val playing = state.queue("A")!!.playing
+        assertEquals(listOf(2, 3), playing.map(Registration::key))
+        assertEquals(listOf<Int?>(3, 2), playing.map(Registration::fixedPartnerKey))
+        assertEquals(listOf(12, 11), state.queue("B")!!.waiting.map(Registration::key))
+    }
+
+    @Test
+    fun aStoredOrderWithAPlaceBetweenAFixedPairIsPutRight() {
+        val state = QueueEngine.settlePairedMachines(
+            QueueEngineState(
+                queues = linkedMapOf(
+                    "A" to MachineQueue(
+                        playing = listOf(registration(1)),
+                        waiting = listOf(
+                            registration(2, PlayPreference.OPEN_TO_JOIN).copy(fixedPartnerKey = 3),
+                            registration(3, PlayPreference.OPEN_TO_JOIN).copy(fixedPartnerKey = 2)
+                        ),
+                        playingStartedAtMillis = 10_000L
+                    ),
+                    "B" to MachineQueue(
+                        playing = listOf(registration(10)),
+                        waiting = listOf(registration(11, paired = true)),
+                        playingStartedAtMillis = 10_000L
+                    )
+                ),
+                // As an earlier version could leave it behind.
+                pairedMachineOrders = mapOf("A" to listOf(2, 11, 3), "B" to listOf(11))
+            ),
+            pairedPolicy,
+            50_000L
+        )
+        assertConsistent(state)
+        assertEquals(listOf(2, 3, 11), state.order("A"))
+    }
+
+    @Test
+    fun anAbsentArrivalGoesBackBehindAFixedPairFormedWhereItStood() {
+        val announcing = pairedPolicy.copy(pairedArrangementRules = PairedArrangementRules())
+        var state = QueueEngine.settlePairedMachines(
+            QueueEngineState(
+                queues = linkedMapOf(
+                    "A" to MachineQueue(
+                        playing = listOf(registration(1)),
+                        waiting = listOf(
+                            registration(2, PlayPreference.OPEN_TO_JOIN).copy(fixedPartnerKey = 3),
+                            registration(3, PlayPreference.OPEN_TO_JOIN).copy(fixedPartnerKey = 2),
+                            registration(4)
+                        ),
+                        playingStartedAtMillis = 10_000L
+                    ),
+                    "B" to MachineQueue(
+                        playing = listOf(registration(9, paired = true)),
+                        waiting = listOf(registration(5)),
+                        playingStartedAtMillis = 10_000L
+                    )
+                ),
+                // When 9 was arranged to machine B, only 2 stood ahead of it at machine A; 3
+                // was created for a friend of 2 afterwards.
+                pairedArrangements = mapOf(
+                    9 to PairedArrangementRecord(
+                        arrangedFromMachineId = "A",
+                        aheadKeysAtOrigin = listOf(2)
+                    )
+                )
+            ),
+            announcing,
+            50_000L
+        )
+        state = apply(
+            state,
+            QueueAction.MarkNoShow("B", setOf(9), NoShowResolution.MOVE_TO_TAIL),
+            policy = announcing
+        )
+        assertEquals(listOf(2, 3, 9, 4), state.queue("A")!!.waiting.map(Registration::key))
+        assertEquals(listOf(5), state.queue("B")!!.playing.map(Registration::key))
+    }
+
     // ---- shared rounds -------------------------------------------------------------------
 
     @Test
@@ -639,6 +748,164 @@ class PairedMachineQueueTest {
     }
 
     // ---- moving by hand ------------------------------------------------------------------
+
+    @Test
+    fun whoIsNextCountsTheRegistrationOfTheOtherMachineThatTakesTheRound() {
+        // The place of 12 stands ahead of 2 at machine A: ending the round lets 12 in.
+        var state = stateOf(
+            "A" to MachineQueue(playing = listOf(registration(8)), playingStartedAtMillis = 10_000L),
+            "B" to MachineQueue(
+                playing = listOf(registration(10)),
+                waiting = listOf(registration(11), registration(12, paired = true)),
+                playingStartedAtMillis = 10_000L
+            )
+        )
+        state = apply(
+            state,
+            QueueAction.AddRegistrations("A", listOf(registration(2)), RegistrationPlacement.AUTO_ADVANCE)
+        )
+        assertEquals(listOf(12, 2), state.order("A"))
+        assertEquals(
+            listOf(12),
+            QueueEngine.nextWaitingGroup(state, pairedPolicy, "A", 100_000L).map(Registration::key)
+        )
+        // 2 is not next, so it cannot be absent yet nor be moved into the current round.
+        NoShowResolution.entries.filter { it != NoShowResolution.DEFER_GROUP_ONE_ROUND }.forEach { resolution ->
+            assertEquals(
+                QueueActionFailureCode.INVALID_POSITION,
+                failureOf(state, QueueAction.MarkNoShow("A", setOf(2), resolution))
+            )
+        }
+        // The registration that is playing can still be marked as not present.
+        assertNull(failureOf(state, QueueAction.MarkNoShow("A", setOf(8), NoShowResolution.MOVE_TO_TAIL)))
+        state = apply(state, QueueAction.FinishRound("A"))
+        assertEquals(listOf(12), state.queue("A")!!.playing.map(Registration::key))
+    }
+
+    @Test
+    fun aRegistrationThatIsNextOnlyWithTheOtherMachinesArrivalCanBeAbsent() {
+        // At machine A the place of 12 (允许他人加入) stands ahead of 1 (单人游玩, lets others
+        // pass) and 2 (允许他人加入). With 12 arriving, 2 passes 1 and plays with 12; this
+        // machine's own order alone would name 1. 2 is next as the screen shows it, so it can be
+        // recorded as absent (review 2026-11-27: it was refused until it entered).
+        var state = stateOf(
+            "A" to MachineQueue(playing = listOf(registration(8)), playingStartedAtMillis = 10_000L),
+            "B" to MachineQueue(
+                playing = listOf(registration(10)),
+                waiting = listOf(registration(11), registration(12, PlayPreference.OPEN_TO_JOIN, paired = true)),
+                playingStartedAtMillis = 10_000L
+            )
+        )
+        state = apply(
+            state,
+            QueueAction.AddRegistrations(
+                "A",
+                listOf(
+                    registration(1).copy(allowsPassing = true),
+                    registration(2, PlayPreference.OPEN_TO_JOIN)
+                ),
+                RegistrationPlacement.AUTO_ADVANCE
+            )
+        )
+        assertEquals(listOf(12, 1, 2), state.order("A"))
+        assertEquals(listOf(1), state.queue("A")!!.nextWaitingGroup().map(Registration::key))
+        assertEquals(
+            setOf(12, 2),
+            QueueEngine.nextWaitingGroup(state, pairedPolicy, "A", 100_000L).mapTo(mutableSetOf(), Registration::key)
+        )
+        // 1 is not next, as the screen shows it.
+        assertEquals(
+            QueueActionFailureCode.INVALID_POSITION,
+            failureOf(state, QueueAction.MarkNoShow("A", setOf(1), NoShowResolution.MOVE_TO_TAIL))
+        )
+        val moved = apply(state, QueueAction.MarkNoShow("A", setOf(2), NoShowResolution.MOVE_TO_TAIL))
+        val two = moved.queue("A")!!.allRegistrations.single { it.key == 2 }
+        assertEquals(1, two.noShowCount)
+        assertEquals(2, moved.queue("A")!!.waiting.last().key)
+        val deferred = apply(state, QueueAction.MarkNoShow("A", setOf(2), NoShowResolution.DEFER_ONE_ROUND))
+        assertEquals(1, deferred.queue("A")!!.allRegistrations.single { it.key == 2 }.noShowCount)
+    }
+
+    @Test
+    fun aPlaceKeepsItsRankWhenARegistrationAheadOfItGoesToTheTail() {
+        // The place of 12 at machine A stands behind 1 and ahead of 2.
+        var state = stateOf(
+            "A" to MachineQueue(
+                playing = listOf(registration(8)),
+                waiting = listOf(registration(1)),
+                playingStartedAtMillis = 10_000L
+            ),
+            "B" to MachineQueue(
+                playing = listOf(registration(10)),
+                waiting = listOf(registration(11), registration(12, paired = true)),
+                playingStartedAtMillis = 10_000L
+            )
+        )
+        state = apply(
+            state,
+            QueueAction.AddRegistrations("A", listOf(registration(2)), RegistrationPlacement.AUTO_ADVANCE)
+        )
+        assertEquals(listOf(1, 12, 2), state.order("A"))
+
+        // 1 is not present and goes to the tail. 2 began to wait after the place was taken
+        // and stays behind it; it used to move ahead of it.
+        state = apply(state, QueueAction.MarkNoShow("A", setOf(1), NoShowResolution.MOVE_TO_TAIL))
+        assertEquals(listOf(2, 1), state.queue("A")!!.waiting.map(Registration::key))
+        assertEquals(listOf(12, 2, 1), state.order("A"))
+    }
+
+    @Test
+    fun aPlaceDoesNotFollowARegistrationThatMissesItsTurnToTheTail() {
+        val away = registration(1).copy(absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY)
+        var state = stateOf(
+            "A" to MachineQueue(
+                playing = listOf(registration(8)),
+                waiting = listOf(away, registration(2)),
+                playingStartedAtMillis = 10_000L
+            ),
+            "B" to MachineQueue(
+                playing = listOf(registration(10)),
+                waiting = listOf(registration(11), registration(13), registration(12, paired = true)),
+                playingStartedAtMillis = 10_000L
+            )
+        )
+        assertEquals(listOf(1, 2, 12), state.order("A"))
+
+        // 2 plays; 1 misses its turn and goes to the tail behind 8, which has just played.
+        // The place of 12 is now first: both 8 and 1 began to wait after it.
+        state = apply(state, QueueAction.FinishRound("A"))
+        assertEquals(listOf(2), state.queue("A")!!.playing.map(Registration::key))
+        assertEquals(listOf(8, 1), state.queue("A")!!.waiting.map(Registration::key))
+        assertEquals(listOf(12, 8, 1), state.order("A"))
+    }
+
+    @Test
+    fun manualTransferWithinThePairLeavesThePlacesOfOthersWhereTheyStood() {
+        // 2 and 3 of machine A hold places at machine B ahead of 12, which joined later.
+        var state = stateOf(
+            "A" to MachineQueue(
+                playing = listOf(registration(1)),
+                waiting = listOf(registration(2, paired = true), registration(3, paired = true)),
+                playingStartedAtMillis = 10_000L
+            ),
+            "B" to MachineQueue(
+                playing = listOf(registration(10)),
+                waiting = listOf(registration(11)),
+                playingStartedAtMillis = 10_000L
+            )
+        )
+        state = apply(
+            state,
+            QueueAction.AddRegistrations("B", listOf(registration(12)), RegistrationPlacement.AUTO_ADVANCE)
+        )
+        assertEquals(listOf(11, 2, 3, 12), state.order("B"))
+
+        // 2 is moved to machine B by hand and waits at its tail. The place of 3 stays ahead
+        // of 12; it used to fall behind it.
+        state = apply(state, QueueAction.TransferRegistrations("A", "B", setOf(2)))
+        assertEquals(listOf(11, 12, 2), state.queue("B")!!.waiting.map(Registration::key))
+        assertEquals(listOf(11, 3, 12, 2), state.order("B"))
+    }
 
     @Test
     fun manualTransferWithinThePairGoesToTheTailOfBothAndTransferElsewhereEndsTheChoice() {

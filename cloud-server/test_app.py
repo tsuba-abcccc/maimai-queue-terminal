@@ -19,6 +19,30 @@ from app import (
     normalize_avatar_upload,
 )
 
+# What a terminal from 2026-11-26 on declares in supported_queue_operations.
+CURRENT_TERMINAL_QUEUE_OPERATIONS = [
+    "JOIN_QUEUE",
+    "DEFER_ONE_ROUND",
+    "CANCEL_DEFER_ONE_ROUND",
+    "TEMPORARILY_LEAVE",
+    "CANCEL_TEMPORARY_LEAVE",
+    "SKIP_ONE_TURN",
+    "CANCEL_SKIP_ONE_TURN",
+    "TRANSFER_MACHINE",
+    "CHANGE_PLAY_PREFERENCE",
+    "LEAVE_QUEUE",
+    "CHECK_IN",
+    "CREATE_REGISTRATION",
+    "REORDER_QUEUE",
+    "SET_PAIRED_MACHINE_QUEUEING",
+    "SET_ALLOWS_PASSING",
+]
+# And from 2026-11-28 on: 与朋友共同游玩 and 修改登记昵称 from the website.
+ACCOUNT_OPERATION_TERMINAL_QUEUE_OPERATIONS = CURRENT_TERMINAL_QUEUE_OPERATIONS + [
+    "CREATE_FIXED_PAIR",
+    "RENAME_REGISTRATION",
+]
+
 
 class QueueStatusApiTest(unittest.TestCase):
     profile_id = "00000000-0000-0000-0000-000000000901"
@@ -1076,6 +1100,31 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual(201, rebound.status_code)
 
+    def test_a_binding_page_survives_the_terminals_next_upload(self):
+        # Review 2026-11-27: every upload invalidated the open binding sessions of all unbound
+        # profiles, so the QR code died within 30 seconds, before the password could be typed.
+        snapshot = self.remote_ready_snapshot(revision=90, with_registration=True)
+        self.publish(snapshot)
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+        self.assertEqual(201, binding.status_code, binding.get_json())
+        token = binding.get_json()["binding_token"]
+
+        # The terminal uploads again: a heartbeat with the same content, then a queue change.
+        self.publish(self.remote_ready_snapshot(revision=91, with_registration=True))
+        self.publish(self.remote_ready_snapshot(revision=92, with_registration=False))
+
+        opened = self.client.get(f"/api/player-account/bindings/{token}")
+        self.assertEqual(200, opened.status_code, opened.get_json())
+        completed = self.client.post(
+            f"/api/player-account/bindings/{token}/complete",
+            json={"password": "first-password"},
+        )
+        self.assertEqual(201, completed.status_code, completed.get_json())
+
     def test_binding_cleans_an_orphan_account_before_recreating_session(self):
         snapshot = self.remote_ready_snapshot()
         self.assertEqual(
@@ -1626,7 +1675,7 @@ class QueueStatusApiTest(unittest.TestCase):
             headers=self.headers,
         )
         self.assertEqual(503, response.status_code)
-        self.assertIn("公开网站地址", response.get_json()["error"])
+        self.assertIn("网页端地址", response.get_json()["error"])
 
     def test_invalid_token_configuration_fails_closed_but_health_stays_available(self):
         self.app.config["SYNC_TOKEN"] = "s" * 31
@@ -2570,6 +2619,38 @@ class QueueStatusApiTest(unittest.TestCase):
         # A position without an estimate is never marked.
         self.assertEqual((False, False), published_positions(55, True, None))
 
+    def test_wait_if_nobody_is_arranged_is_kept_only_beside_an_uncertain_wait(self):
+        # 系统未在两台机台之间安排登记时 (2026-11-28): the terminal sends the second time only
+        # where it lies far after an uncertain wait; the server keeps it only there.
+        missing = object()
+
+        def published(revision, uncertain, upper, minutes=16):
+            snapshot = self.paired_snapshot(revision=revision)
+            own = snapshot["machines"]["A"]["waiting_positions"][0]
+            paired = snapshot["machines"]["B"]["paired_waiting_positions"][0]
+            for position in (own, paired):
+                position["estimated_wait_minutes"] = minutes
+                position["estimated_wait_uncertain"] = uncertain
+                if upper is not missing:
+                    position["estimated_wait_upper_minutes"] = upper
+            publish = self.client.post("/api/queue-status", json=snapshot, headers=self.headers)
+            self.assertEqual(204, publish.status_code, publish.get_json())
+            machines = self.client.get("/api/queue-status").get_json()["machines"]
+            return machines["A"]["waiting_positions"][0].get("estimated_wait_upper_minutes")
+
+        self.assertEqual(55, published(60, True, 55))
+        # Older terminals leave it out.
+        self.assertIsNone(published(61, True, missing))
+        # Meaningless beside a certain wait, or not later than the shown time.
+        self.assertIsNone(published(62, False, 55))
+        self.assertIsNone(published(63, True, 16))
+        # 可能很快 (0 minutes) may carry it.
+        self.assertEqual(40, published(64, True, 40, minutes=0))
+        bad = self.paired_snapshot(revision=65)
+        bad["machines"]["A"]["waiting_positions"][0]["estimated_wait_upper_minutes"] = "55"
+        refused = self.client.post("/api/queue-status", json=bad, headers=self.headers)
+        self.assertEqual(400, refused.status_code)
+
     def test_wait_estimate_uncertain_flag_reaches_player_account_and_bot(self):
         def published(revision, value):
             snapshot = self.paired_remote_snapshot(
@@ -2589,6 +2670,7 @@ class QueueStatusApiTest(unittest.TestCase):
             if value is not None:
                 own["estimated_wait_uncertain"] = value
                 paired["estimated_wait_uncertain"] = value
+                own["estimated_wait_upper_minutes"] = 30
             snapshot["machines"]["B"]["paired_waiting_positions"] = [paired]
             self.publish(snapshot)
             machines = self.client.get("/api/queue-status").get_json()["machines"]
@@ -2621,6 +2703,7 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual(4, account["estimated_wait_minutes"])
         self.assertIs(True, account["estimated_wait_uncertain"])
+        self.assertEqual(30, account["estimated_wait_upper_minutes"])
         self.assertEqual(4, bot_player["estimated_wait_minutes"])
         self.assertIs(True, bot_player["estimated_wait_uncertain"])
 
@@ -2628,6 +2711,104 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertIs(False, machines["A"]["waiting_positions"][0]["estimated_wait_uncertain"])
         self.assertIs(False, account["estimated_wait_uncertain"])
         self.assertIs(False, bot_player["estimated_wait_uncertain"])
+
+    def test_wait_if_online_missing_reaches_public_page_player_account_and_bot(self):
+        def published(revision, value):
+            snapshot = self.remote_ready_snapshot(revision=revision, with_registration=True)
+            position = snapshot["machines"]["A"]["waiting_positions"][0]
+            position["estimated_wait_minutes"] = 25
+            if value is not None:
+                position["registrations"][0]["wait_minutes_if_online_missing"] = value
+            if value is not None and value < 0:
+                return self.client.post("/api/queue-status", json=snapshot, headers=self.headers), None, None, None
+            self.publish(snapshot)
+            machines = self.client.get("/api/queue-status").get_json()["machines"]
+            account = self.client.get("/api/player-account/queue").get_json()[
+                "registrations"
+            ][0]
+            bot_player = self.client.post(
+                "/api/queue-bot/players",
+                json={"qq": "12345678"},
+                headers=self.bot_headers,
+            ).get_json()["players"][0]
+            return None, machines, account, bot_player
+
+        self.publish(self.remote_ready_snapshot(revision=90, with_registration=True))
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+        completed = self.client.post(
+            f"/api/player-account/bindings/{binding.get_json()['binding_token']}/complete",
+            json={"password": "first-password"},
+        )
+        self.assertEqual(201, completed.status_code, completed.get_json())
+
+        _, machines, account, bot_player = published(91, 10)
+        registration = machines["A"]["waiting_positions"][0]["registrations"][0]
+        self.assertEqual(10, registration["wait_minutes_if_online_missing"])
+        self.assertEqual(10, account["wait_minutes_if_online_missing"])
+        self.assertEqual(10, bot_player["wait_minutes_if_online_missing"])
+
+        _, machines, account, bot_player = published(92, None)
+        registration = machines["A"]["waiting_positions"][0]["registrations"][0]
+        self.assertIsNone(registration["wait_minutes_if_online_missing"])
+        self.assertIsNone(account["wait_minutes_if_online_missing"])
+        self.assertIsNone(bot_player["wait_minutes_if_online_missing"])
+
+        rejected, _, _, _ = published(93, -1)
+        self.assertEqual(400, rejected.status_code)
+
+    def test_own_wait_of_a_registration_reaches_player_account_and_bot(self):
+        # Review 2026-11-27: a position shows the earlier of its two registrations; where that is
+        # the other one's, which may move to the other machine, the terminal sends this one's own.
+        def published(revision, own_minutes):
+            snapshot = self.remote_ready_snapshot(revision=revision, with_registration=True)
+            position = snapshot["machines"]["A"]["waiting_positions"][0]
+            position["estimated_wait_minutes"] = 1
+            position["estimated_wait_uncertain"] = True
+            if own_minutes is not None:
+                position["registrations"][0]["own_estimated_wait_minutes"] = own_minutes
+                position["registrations"][0]["own_estimated_wait_uncertain"] = False
+            self.publish(snapshot)
+            machines = self.client.get("/api/queue-status").get_json()["machines"]
+            account = self.client.get("/api/player-account/queue").get_json()[
+                "registrations"
+            ][0]
+            bot_player = self.client.post(
+                "/api/queue-bot/players",
+                json={"qq": "12345678"},
+                headers=self.bot_headers,
+            ).get_json()["players"][0]
+            return machines, account, bot_player
+
+        self.publish(self.remote_ready_snapshot(revision=90, with_registration=True))
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+        completed = self.client.post(
+            f"/api/player-account/bindings/{binding.get_json()['binding_token']}/complete",
+            json={"password": "first-password"},
+        )
+        self.assertEqual(201, completed.status_code, completed.get_json())
+
+        machines, account, bot_player = published(91, 10)
+        # The position keeps its own minutes; the registration gets its own.
+        self.assertEqual(1, machines["A"]["waiting_positions"][0]["estimated_wait_minutes"])
+        for player in (account, bot_player):
+            self.assertEqual(10, player["estimated_wait_minutes"])
+            self.assertIs(False, player["estimated_wait_uncertain"])
+        # The website keeps this one over the position's time on the queue page.
+        self.assertIs(True, account["estimated_wait_is_own"])
+
+        machines, account, bot_player = published(92, None)
+        for player in (account, bot_player):
+            self.assertEqual(1, player["estimated_wait_minutes"])
+            self.assertIs(True, player["estimated_wait_uncertain"])
+        self.assertIs(False, account["estimated_wait_is_own"])
 
     def test_playing_registration_wait_estimate_is_never_uncertain(self):
         snapshot = self.remote_ready_snapshot(
@@ -3069,6 +3250,44 @@ class QueueStatusApiTest(unittest.TestCase):
             not_a_boolean.get_json()["error"],
         )
 
+    def test_last_passing_answer_of_a_profile_follows_the_terminal(self):
+        # The player's last answer to the passing tick box (2026-11-26). Unlike the record of
+        # the explanation it goes both ways: the newest upload from the terminal decides. The
+        # website's online lookup and the terminal's copy of the profile both carry it.
+        def upload(revision, **fields):
+            # The terminal raises the profile's revision with each answer.
+            snapshot = self.uploaded_profile_snapshot(revision, **fields)
+            profile = snapshot["private_player_profiles"][0]
+            profile["profile_revision"] = revision
+            profile["updated_at"] = profile["created_at"] + revision
+            response = self.client.post(
+                "/api/queue-status", json=snapshot, headers=self.headers
+            )
+            return response.status_code
+
+        def lookup_answer():
+            return self.client.post(
+                "/api/queue-online/profile", json={"qq": "12345678"}
+            ).get_json()["profile"]["last_allows_passing"]
+
+        self.assertEqual(204, upload(50))
+        older_terminal = self.terminal_profile()["last_allows_passing"]
+        self.assertEqual(204, upload(51, last_allows_passing=True))
+        ticked = (self.terminal_profile()["last_allows_passing"], lookup_answer())
+        self.assertEqual(204, upload(52, last_allows_passing=False))
+        unticked = (self.terminal_profile()["last_allows_passing"], lookup_answer())
+        not_a_boolean = self.client.post(
+            "/api/queue-status",
+            json=self.uploaded_profile_snapshot(53, last_allows_passing="yes"),
+            headers=self.headers,
+        )
+
+        self.assertIs(False, older_terminal)
+        self.assertEqual((True, True), ticked)
+        self.assertEqual((False, False), unticked)
+        self.assertEqual(400, not_a_boolean.status_code)
+        self.assertEqual("last_allows_passing 必须是布尔值。", not_a_boolean.get_json()["error"])
+
     def paired_remote_snapshot(
         self,
         revision=60,
@@ -3502,6 +3721,43 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertEqual(1, len(payloads))
         self.assertNotIn("also_queues_at_paired_machine", payloads[0])
         self.assertNotIn("paired_machine_queueing", payloads[0]["profile"])
+
+    def test_mobile_submit_carries_the_passing_answer_where_the_terminal_knows_it(self):
+        # 2026-11-27: the phone page offers 允许后方的登记越过 as the website does.
+        def submit(revision, session_number, request_suffix, *, declared, preference, allows_passing):
+            snapshot = self.remote_ready_snapshot(revision=revision, default_preference=preference)
+            # A later profile revision, so the server takes this default preference.
+            profile_revision = revision - 77
+            snapshot["private_player_profiles"][0]["profile_revision"] = profile_revision
+            if declared:
+                snapshot["supported_queue_operations"] = CURRENT_TERMINAL_QUEUE_OPERATIONS
+            self.publish(snapshot)
+            token = self.open_mobile_session(snapshot, session_number)
+            opened = self.client.get(f"/api/queue-mobile/sessions/{token}").get_json()
+            submitted = self.client.post(
+                f"/api/queue-mobile/sessions/{token}/submit",
+                json={
+                    "request_id": f"00000000-0000-0000-0000-000000000{request_suffix}",
+                    "profile_id": self.profile_id,
+                    "expected_profile_revision": profile_revision,
+                    "allows_passing": allows_passing,
+                },
+            )
+            return opened, submitted
+
+        # Refusals first: each leaves nothing pending for the player.
+        _, old_terminal = submit(81, 71, "871", declared=False, preference="SOLO", allows_passing=True)
+        self.assertEqual(409, old_terminal.status_code, old_terminal.get_json())
+        self.assertEqual("现场终端尚未更新，暂不能使用这项操作。", old_terminal.get_json()["error"])
+
+        _, open_to_join = submit(82, 72, "872", declared=True, preference="OPEN_TO_JOIN", allows_passing=True)
+        self.assertEqual(409, open_to_join.status_code, open_to_join.get_json())
+        self.assertEqual("只有单人游玩的登记可以允许后方的登记越过。", open_to_join.get_json()["error"])
+
+        opened, ticked = submit(83, 73, "873", declared=True, preference="SOLO", allows_passing=True)
+        self.assertIn("SET_ALLOWS_PASSING", opened["capabilities"]["queue_operations"])
+        self.assertEqual(202, ticked.status_code, ticked.get_json())
+        self.assertIs(True, self.pending_command_payloads()[-1]["allows_passing"])
 
     def test_mobile_session_offers_no_tick_box_where_the_venue_has_no_paired_machines(self):
         snapshot = self.remote_ready_snapshot(revision=72, default_preference="SOLO")
@@ -4473,12 +4729,30 @@ class QueueStatusApiTest(unittest.TestCase):
         self.assertTrue(stored_registration["temporarily_away"])
         self.assertEqual(2, stored_registration["temporary_away_skipped_turns"])
 
-        invalid = self.snapshot(revision=5)
-        invalid["machines"]["A"]["playing"][0]["temporary_away_skipped_turns"] = 1
-        rejected = self.client.post(
-            "/api/queue-status", json=invalid, headers=self.headers
+        # Terminals from 2026-11-28 on send the count at all times.
+        retained = self.snapshot(revision=5)
+        retained["machines"]["A"]["playing"][0]["temporary_away_skipped_turns"] = 1
+        accepted = self.client.post(
+            "/api/queue-status", json=retained, headers=self.headers
         )
-        self.assertEqual(400, rejected.status_code)
+        self.assertEqual(204, accepted.status_code, accepted.get_json())
+        stored_registration = self.client.get("/api/queue-status").get_json()["machines"][
+            "A"
+        ]["playing"][0]
+        self.assertFalse(stored_registration["temporarily_away"])
+        self.assertEqual(1, stored_registration["temporary_away_skipped_turns"])
+
+        for revision, count in ((7, 4), (8, -1), (9, "2"), (10, True)):
+            with self.subTest(count=count):
+                invalid = self.snapshot(revision=revision)
+                invalid["machines"]["A"]["playing"][0]["temporary_away_skipped_turns"] = count
+                rejected = self.client.post(
+                    "/api/queue-status", json=invalid, headers=self.headers
+                )
+                self.assertEqual(400, rejected.status_code)
+                self.assertEqual(
+                    "temporary_away_skipped_turns 数值无效。", rejected.get_json()["error"]
+                )
 
         conflicting = self.snapshot(revision=6)
         conflicting_registration = conflicting["machines"]["A"]["playing"][0]
@@ -7647,7 +7921,11 @@ class QueueStatusApiTest(unittest.TestCase):
             headers=self.bot_headers,
         )
         self.assertEqual(409, transfer.status_code)
-        self.assertIn("先解除固定组合", transfer.get_json()["error"])
+        # The same sentence as on the terminal and the website.
+        self.assertEqual(
+            "右侧·机台 B 仅能容纳一人游玩，请先解除固定组合再转入。",
+            transfer.get_json()["error"],
+        )
 
     def test_four_machine_profile_lookup_and_website_join_target_machine_c(self):
         snapshot = self.remote_ready_snapshot(revision=31)
@@ -9361,10 +9639,14 @@ class QueueStatusApiTest(unittest.TestCase):
     # 轮空一次 and the limits on postponing (maintainer, 2026-11-25).
 
     def postponement_snapshot(self, revision=4, pending_check_in=False, **fields):
-        """Remote-ready snapshot whose only registration waits at machine A with [fields]."""
+        """
+        Remote-ready snapshot of a current terminal whose only registration waits at machine A
+        with [fields].
+        """
         snapshot = self.remote_ready_snapshot(
             revision=revision, with_registration=True, pending_check_in=pending_check_in
         )
+        snapshot["supported_queue_operations"] = CURRENT_TERMINAL_QUEUE_OPERATIONS
         snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0].update(fields)
         return snapshot
 
@@ -9425,10 +9707,6 @@ class QueueStatusApiTest(unittest.TestCase):
                 self.postponement_snapshot(revision=8, online_registration_not_played=0),
                 "online_registration_not_played 必须是布尔值。",
             ),
-            "轮空次数不属于暂时离开或将轮空一次": (
-                self.postponement_snapshot(revision=9, temporary_away_skipped_turns=1),
-                "只有暂时离开或将轮空一次的登记才能包含轮空次数。",
-            ),
             "将轮空一次与将暂缓一次": (
                 self.postponement_snapshot(
                     revision=10, skips_one_turn=True, deferred_once=True
@@ -9455,6 +9733,599 @@ class QueueStatusApiTest(unittest.TestCase):
                 )
                 self.assertEqual(400, response.status_code, response.get_json())
                 self.assertEqual(error, response.get_json()["error"])
+
+    def test_skipped_turns_are_kept_and_exposed_without_a_postponement(self):
+        # From 2026-11-28 on the terminal sends the count at all times, so that 轮空一次 and
+        # 暂时离开 can say it before they are confirmed.
+        self.publish(self.postponement_snapshot(temporary_away_skipped_turns=2))
+        self.signed_in_account()
+
+        stored = self.stored_waiting_registration()
+        account = self.client.get("/api/player-account/queue").get_json()["registrations"][0]
+
+        self.assertIs(False, stored["temporarily_away"])
+        self.assertIs(False, stored["skips_one_turn"])
+        self.assertEqual(2, stored["temporary_away_skipped_turns"])
+        self.assertEqual(2, account["temporary_away_skipped_turns"])
+
+        # A command confirms the count it was decided on.
+        stale = self.account_queue_operation(11, "SKIP_ONE_TURN")
+        current = self.account_queue_operation(
+            12, "SKIP_ONE_TURN", expected_temporary_away_skipped_turns=2
+        )
+        self.assertEqual(409, stale.status_code, stale.get_json())
+        self.assertEqual(202, current.status_code, current.get_json())
+        self.assertEqual(
+            2, self.pending_command_payloads()[0]["expected_temporary_away_skipped_turns"]
+        )
+
+    def test_snapshot_keeps_the_checked_in_fact_of_an_online_registration(self):
+        self.publish(self.postponement_snapshot(online_registration_checked_in=True))
+        self.signed_in_account()
+
+        self.assertIs(True, self.stored_waiting_registration()["online_registration_checked_in"])
+        account = self.client.get("/api/player-account/queue").get_json()["registrations"][0]
+        self.assertIs(True, account["online_registration_checked_in"])
+
+        # Older terminals leave it out or send null.
+        for revision, fields in ((5, {}), (6, {"online_registration_checked_in": None})):
+            with self.subTest(fields=fields):
+                self.publish(self.postponement_snapshot(revision=revision, **fields))
+                self.assertIs(
+                    False, self.stored_waiting_registration()["online_registration_checked_in"]
+                )
+                account = self.client.get("/api/player-account/queue").get_json()
+                self.assertIs(
+                    False, account["registrations"][0]["online_registration_checked_in"]
+                )
+
+        # Not kept for a registration that still waits for its check-in.
+        self.publish(
+            self.postponement_snapshot(
+                revision=7, pending_check_in=True, online_registration_checked_in=True
+            )
+        )
+        stored = self.stored_waiting_registration()
+        self.assertIs(True, stored["online_registration_pending_check_in"])
+        self.assertIs(False, stored["online_registration_checked_in"])
+
+        not_a_boolean = self.client.post(
+            "/api/queue-status",
+            json=self.postponement_snapshot(revision=8, online_registration_checked_in=1),
+            headers=self.headers,
+        )
+        self.assertEqual(400, not_a_boolean.status_code)
+        self.assertEqual(
+            "online_registration_checked_in 必须是布尔值。", not_a_boolean.get_json()["error"]
+        )
+
+    # 与朋友共同游玩 with a registration that already waits at the same machine, and 修改登记昵称,
+    # from the signed-in website account (2026-11-28).
+
+    def friend_pair_snapshot(
+        self,
+        revision=4,
+        *,
+        declared=True,
+        own_fields=None,
+        partner_fields=None,
+        partner_machine="A",
+        **fields,
+    ):
+        """
+        Machine A waits as 公开昵称 (the signed-in profile's registration, "a" * 24) and, in a
+        position of its own at [partner_machine], 小林 ("c" * 24). Both allow others to join.
+        """
+        snapshot = self.remote_ready_snapshot(revision=revision, with_registration=True)
+        snapshot["supported_queue_operations"] = (
+            ACCOUNT_OPERATION_TERMINAL_QUEUE_OPERATIONS
+            if declared
+            else CURRENT_TERMINAL_QUEUE_OPERATIONS
+        )
+        own = snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+        own["preference"] = "OPEN_TO_JOIN"
+        own.update(own_fields or {})
+        partner = self.registration("c" * 24, "小林")
+        partner["preference"] = "OPEN_TO_JOIN"
+        partner.update(partner_fields or {})
+        machine = snapshot["machines"][partner_machine]
+        machine["waiting_positions"].append(
+            {
+                "index": len(machine["waiting_positions"]) + 1,
+                "position_id": "e" * 24,
+                "fixed_pair": False,
+                "estimated_wait_minutes": 15,
+                "registrations": [partner],
+            }
+        )
+        machine["registration_count"] += 1
+        machine["waiting_position_count"] += 1
+        snapshot.update(fields)
+        return snapshot
+
+    def test_account_forms_a_fixed_pair_with_a_waiting_registration(self):
+        self.publish(self.friend_pair_snapshot())
+        self.signed_in_account()
+
+        created = self.account_queue_operation(
+            21, "CREATE_FIXED_PAIR", partner_registration_id="c" * 24
+        )
+        repeated = self.account_queue_operation(
+            21, "CREATE_FIXED_PAIR", partner_registration_id="c" * 24
+        )
+        changed = self.account_queue_operation(
+            21, "CREATE_FIXED_PAIR", partner_registration_id="d" * 24
+        )
+        payloads = self.pending_command_payloads()
+
+        self.assertEqual(202, created.status_code, created.get_json())
+        self.assertEqual(200, repeated.status_code, repeated.get_json())
+        # The same request_id with another friend is a different request.
+        self.assertEqual(409, changed.status_code, changed.get_json())
+        self.assertEqual(1, len(payloads))
+        payload = payloads[0]
+        self.assertEqual("CREATE_FIXED_PAIR", payload["operation"])
+        self.assertEqual("WEBSITE_REMOTE", payload["operation_source"])
+        self.assertEqual("a" * 24, payload["registration_id"])
+        self.assertEqual("c" * 24, payload["partner_registration_id"])
+        self.assertEqual("A", payload["machine_id"])
+        self.assertEqual("WAITING", payload["expected_position"])
+        self.assertIs(True, payload["profile_identity_verified"])
+        self.assertNotIn("allows_passing", payload)
+        self.assertNotIn("display_id", payload)
+        self.assertEqual(
+            "c" * 24, created.get_json()["payload"]["partner_registration_id"]
+        )
+
+    def test_fixed_pair_formed_online_can_carry_the_passing_choice(self):
+        self.publish(self.friend_pair_snapshot())
+        self.signed_in_account()
+
+        # Ticked needs a terminal that knows the choice of a fixed pair.
+        refused = self.account_queue_operation(
+            22, "CREATE_FIXED_PAIR", partner_registration_id="c" * 24, allows_passing=True
+        )
+        self.assertEqual(409, refused.status_code, refused.get_json())
+        self.assertEqual(
+            "现场终端尚未更新，暂不能使用这项操作。", refused.get_json()["error"]
+        )
+        self.assertIs(False, self.profile_was_shown_the_passing_explanation())
+
+        # Unticked is carried as it is.
+        unticked = self.account_queue_operation(
+            23, "CREATE_FIXED_PAIR", partner_registration_id="c" * 24, allows_passing=False
+        )
+        self.assertEqual(202, unticked.status_code, unticked.get_json())
+        self.assertIs(False, self.pending_command_payloads()[0]["allows_passing"])
+        self.assertIs(False, self.profile_was_shown_the_passing_explanation())
+        self.complete_command(unticked.get_json()["command_id"], "REJECTED")
+
+        self.publish(self.friend_pair_snapshot(revision=5, fixed_pair_passing_supported=True))
+        ticked = self.account_queue_operation(
+            24, "CREATE_FIXED_PAIR", partner_registration_id="c" * 24, allows_passing=True
+        )
+        self.assertEqual(202, ticked.status_code, ticked.get_json())
+        self.assertIs(True, self.pending_command_payloads()[0]["allows_passing"])
+        # The page showed the explanation before the box could be ticked.
+        self.assertIs(True, self.profile_was_shown_the_passing_explanation())
+
+        not_a_boolean = self.account_queue_operation(
+            25, "CREATE_FIXED_PAIR", partner_registration_id="c" * 24, allows_passing="yes"
+        )
+        self.assertEqual(400, not_a_boolean.status_code)
+
+    def test_fixed_pair_and_rename_need_a_terminal_that_declares_them(self):
+        self.publish(self.friend_pair_snapshot(declared=False))
+        self.signed_in_account()
+
+        capabilities = self.client.get("/api/queue-status").get_json()["capabilities"]
+        self.assertNotIn("CREATE_FIXED_PAIR", capabilities["queue_operations"])
+        self.assertNotIn("RENAME_REGISTRATION", capabilities["queue_operations"])
+        for request_number, operation, fields in (
+            (26, "CREATE_FIXED_PAIR", {"partner_registration_id": "c" * 24}),
+            (27, "RENAME_REGISTRATION", {"display_id": "新昵称"}),
+        ):
+            with self.subTest(operation):
+                response = self.account_queue_operation(request_number, operation, **fields)
+                self.assertEqual(409, response.status_code, response.get_json())
+                self.assertEqual(
+                    "现场终端尚未更新，暂不能使用这项操作。", response.get_json()["error"]
+                )
+        self.assertEqual([], self.pending_command_payloads())
+
+        self.publish(self.friend_pair_snapshot(revision=5))
+        capabilities = self.client.get("/api/queue-status").get_json()["capabilities"]
+        self.assertIn("CREATE_FIXED_PAIR", capabilities["queue_operations"])
+        self.assertIn("RENAME_REGISTRATION", capabilities["queue_operations"])
+
+    def test_fixed_pair_is_refused_in_the_terminals_words_before_a_command_is_queued(self):
+        postponed = "将暂缓一次、将轮空一次或暂时离开的登记不能组成固定组合，请先取消该状态。"
+        other_pair = {"fixed_pair": True, "fixed_pair_id": "9" * 24}
+
+        def single_player_machine(snapshot):
+            self.upgrade_snapshot_to_schema_v6(snapshot, capacities={"A": 1})
+            for registration in (
+                position["registrations"][0]
+                for position in snapshot["machines"]["A"]["waiting_positions"]
+            ):
+                registration["preference"] = "SOLO"
+
+        def own_playing(snapshot):
+            machine = snapshot["machines"]["A"]
+            machine["playing"] = machine["waiting_positions"].pop(0)["registrations"]
+            machine["waiting_positions"][0]["index"] = 1
+            machine["waiting_position_count"] = 1
+            machine["playing_started_at"] = 900_000
+
+        def partner_in_another_pair(snapshot):
+            position = snapshot["machines"]["A"]["waiting_positions"][1]
+            third = self.registration("d" * 24, "小张")
+            third.update(preference="OPEN_TO_JOIN", **other_pair)
+            position["registrations"].append(third)
+            position["fixed_pair"] = True
+            snapshot["machines"]["A"]["registration_count"] += 1
+
+        def already_paired_together(snapshot):
+            machine = snapshot["machines"]["A"]
+            partner = machine["waiting_positions"].pop(1)["registrations"][0]
+            machine["waiting_positions"][0]["registrations"].append(partner)
+            machine["waiting_positions"][0]["fixed_pair"] = True
+            machine["waiting_position_count"] = 1
+
+        def own_in_another_pair(snapshot):
+            machine = snapshot["machines"]["A"]
+            third = self.registration("d" * 24, "小张")
+            third.update(preference="OPEN_TO_JOIN", **other_pair)
+            machine["waiting_positions"][0]["registrations"].append(third)
+            machine["waiting_positions"][0]["fixed_pair"] = True
+            machine["registration_count"] += 1
+
+        cases = [
+            ("机台仅能容纳一人", {}, single_player_machine, "c" * 24, {},
+             "左侧·机台 A 仅能容纳一人游玩，不能组成固定组合。"),
+            ("本人的登记处于游玩位置", {}, own_playing, "c" * 24,
+             {"expected_position": "PLAYING"},
+             "这份登记处于游玩位置。请在本轮结束、这份登记回到等待顺序后，再组成固定组合。"),
+            ("朋友的登记就是本人的登记", {}, None, "a" * 24, {},
+             "未能确定朋友的登记，请重新选择。"),
+            ("朋友的登记不在队列中", {}, None, "d" * 24, {},
+             "朋友的登记已经不在这台机台的等待顺序中，请重新选择。"),
+            ("朋友的登记在另一机台", {"partner_machine": "B"}, None, "c" * 24, {},
+             "朋友的登记已经不在这台机台的等待顺序中，请重新选择。"),
+            ("两份登记已经是固定组合",
+             {"own_fields": other_pair, "partner_fields": other_pair},
+             already_paired_together, "c" * 24, {"expected_fixed_pair_id": "9" * 24},
+             "这两份登记已经组成固定组合。"),
+            ("本人的登记属于其他固定组合", {"own_fields": other_pair}, own_in_another_pair,
+             "c" * 24, {"expected_fixed_pair_id": "9" * 24},
+             "这份登记已经属于固定组合，请先解除固定组合。"),
+            ("朋友的登记属于其他固定组合", {"partner_fields": other_pair},
+             partner_in_another_pair, "c" * 24, {}, "“小林”已经属于固定组合。"),
+            ("朋友的登记待签到",
+             {"partner_fields": {"online_registration_pending_check_in": True}}, None,
+             "c" * 24, {}, "这份线上登记尚未完成现场签到，签到后才能组成固定组合。"),
+            ("本人的登记将暂缓一次", {"own_fields": {"deferred_once": True}}, None, "c" * 24,
+             {"expected_absence_status": "DEFER_ONE_ROUND"}, postponed),
+            ("朋友的登记将轮空一次", {"partner_fields": {"skips_one_turn": True}}, None,
+             "c" * 24, {}, postponed),
+            ("朋友的登记暂时离开", {"partner_fields": {"temporarily_away": True}}, None,
+             "c" * 24, {}, postponed),
+        ]
+        self.publish(self.friend_pair_snapshot())
+        self.signed_in_account()
+        for index, (label, snapshot_fields, adjust, partner_id, fields, error) in enumerate(cases):
+            with self.subTest(label):
+                snapshot = self.friend_pair_snapshot(revision=5 + index, **snapshot_fields)
+                if adjust is not None:
+                    adjust(snapshot)
+                self.publish(snapshot)
+                response = self.account_queue_operation(
+                    30 + index, "CREATE_FIXED_PAIR", partner_registration_id=partner_id, **fields
+                )
+                self.assertEqual(409, response.status_code, response.get_json())
+                self.assertEqual(error, response.get_json()["error"])
+        self.assertEqual([], self.pending_command_payloads())
+
+        # The own registration that still has to check in is refused as for any operation.
+        self.publish(
+            self.friend_pair_snapshot(
+                revision=40, own_fields={"online_registration_pending_check_in": True}
+            )
+        )
+        pending = self.account_queue_operation(
+            50, "CREATE_FIXED_PAIR", partner_registration_id="c" * 24,
+            expected_pending_check_in=True,
+        )
+        self.assertEqual(409, pending.status_code, pending.get_json())
+        self.assertEqual(
+            "线上登记完成现场签到后，才能进行这项操作。", pending.get_json()["error"]
+        )
+
+    def test_fixed_pair_and_rename_requests_are_validated(self):
+        self.publish(self.friend_pair_snapshot())
+        self.signed_in_account()
+
+        cases = [
+            ("没有朋友的登记", "CREATE_FIXED_PAIR", {}, "未能确定朋友的登记，请重新选择。"),
+            ("朋友的登记编号无效", "CREATE_FIXED_PAIR", {"partner_registration_id": "c" * 23},
+             "partner_registration_id 公开编号无效。"),
+            ("组成固定组合不接受昵称", "CREATE_FIXED_PAIR",
+             {"partner_registration_id": "c" * 24, "display_id": "新昵称"},
+             "这项操作不接受 display_id。"),
+            ("没有昵称", "RENAME_REGISTRATION", {}, "display_id 必须是文本。"),
+            ("昵称只有空白", "RENAME_REGISTRATION", {"display_id": "   "},
+             "登记昵称应为 1 至 18 个字符，请重新填写。"),
+            ("昵称超过 18 个字符", "RENAME_REGISTRATION", {"display_id": "昵" * 19},
+             "登记昵称应为 1 至 18 个字符，请重新填写。"),
+            ("昵称包含换行", "RENAME_REGISTRATION", {"display_id": "新\n昵称"},
+             "登记昵称不能包含换行、制表符等控制字符，请重新填写。"),
+            ("修改昵称不接受朋友的登记", "RENAME_REGISTRATION",
+             {"display_id": "新昵称", "partner_registration_id": "c" * 24},
+             "这项操作不接受 partner_registration_id。"),
+            ("修改昵称不接受越过的选择", "RENAME_REGISTRATION",
+             {"display_id": "新昵称", "allows_passing": True}, "这项操作不接受 allows_passing。"),
+            ("其他操作不接受昵称", "LEAVE_QUEUE", {"display_id": "新昵称"},
+             "这项操作不接受 display_id。"),
+            ("其他操作不接受朋友的登记", "LEAVE_QUEUE", {"partner_registration_id": "c" * 24},
+             "这项操作不接受 partner_registration_id。"),
+        ]
+        for index, (label, operation, fields, error) in enumerate(cases):
+            with self.subTest(label):
+                response = self.account_queue_operation(60 + index, operation, **fields)
+                self.assertEqual(400, response.status_code, response.get_json())
+                self.assertEqual(error, response.get_json()["error"])
+
+        # Only the signed-in account of the registration's profile may ask for them.
+        for request_number, operation in ((80, "CREATE_FIXED_PAIR"), (81, "RENAME_REGISTRATION")):
+            with self.subTest(f"Bot {operation}"):
+                by_bot = self.bot_operation(request_number, operation)
+                self.assertEqual(400, by_bot.status_code, by_bot.get_json())
+                self.assertEqual("不支持这项排队操作。", by_bot.get_json()["error"])
+        with_fields = self.bot_operation(
+            82, "RENAME_REGISTRATION", display_id="新昵称"
+        )
+        self.assertEqual(400, with_fields.status_code)
+        self.assertEqual("请求包含不支持的排队操作字段", with_fields.get_json()["error"])
+        self.assertEqual([], self.pending_command_payloads())
+
+    def test_account_renames_its_registration(self):
+        self.publish(self.friend_pair_snapshot())
+        self.signed_in_account()
+
+        # 18 characters are counted as the terminal counts them: by code point.
+        longest = "昵" * 17 + "😀"
+        renamed = self.account_queue_operation(
+            90, "RENAME_REGISTRATION", display_id=f"  {longest}  "
+        )
+        repeated = self.account_queue_operation(
+            90, "RENAME_REGISTRATION", display_id=f"  {longest}  "
+        )
+        changed = self.account_queue_operation(90, "RENAME_REGISTRATION", display_id="另一个")
+        payloads = self.pending_command_payloads()
+
+        self.assertEqual(202, renamed.status_code, renamed.get_json())
+        self.assertEqual(200, repeated.status_code, repeated.get_json())
+        self.assertEqual(409, changed.status_code, changed.get_json())
+        self.assertEqual(1, len(payloads))
+        payload = payloads[0]
+        self.assertEqual("RENAME_REGISTRATION", payload["operation"])
+        self.assertEqual(longest, payload["display_id"])
+        self.assertEqual("a" * 24, payload["registration_id"])
+        self.assertEqual("A", payload["machine_id"])
+        self.assertNotIn("partner_registration_id", payload)
+        self.assertNotIn("preference", payload)
+        self.complete_command(renamed.get_json()["command_id"], "APPLIED")
+
+        # The registration's own nickname in another case is left to the terminal.
+        self.publish(self.friend_pair_snapshot(revision=5, own_fields={"display_id": "Rin"}))
+        own_case = self.account_queue_operation(91, "RENAME_REGISTRATION", display_id="rin")
+        self.assertEqual(202, own_case.status_code, own_case.get_json())
+        self.complete_command(own_case.get_json()["command_id"], "APPLIED")
+
+        # In the playing position as well.
+        playing = self.friend_pair_snapshot(revision=6)
+        machine = playing["machines"]["A"]
+        machine["playing"] = machine["waiting_positions"].pop(0)["registrations"]
+        machine["waiting_positions"][0]["index"] = 1
+        machine["waiting_position_count"] = 1
+        machine["playing_started_at"] = 900_000
+        self.publish(playing)
+        while_playing = self.account_queue_operation(
+            92, "RENAME_REGISTRATION", display_id="游玩中", expected_position="PLAYING"
+        )
+        self.assertEqual(202, while_playing.status_code, while_playing.get_json())
+
+    def test_rename_is_refused_for_a_taken_nickname_and_before_check_in(self):
+        self.publish(self.friend_pair_snapshot(partner_fields={"display_id": "Lin"}))
+        self.signed_in_account()
+
+        for request_number, display_id in ((93, "Lin"), (94, " lin "), (95, "LIN")):
+            with self.subTest(display_id=display_id):
+                taken = self.account_queue_operation(
+                    request_number, "RENAME_REGISTRATION", display_id=display_id
+                )
+                self.assertEqual(409, taken.status_code, taken.get_json())
+                self.assertEqual(
+                    "当前队列中已经有相同昵称的登记。", taken.get_json()["error"]
+                )
+
+        # At another machine as well: the queue is one venue.
+        self.publish(
+            self.friend_pair_snapshot(
+                revision=5, partner_fields={"display_id": "Lin"}, partner_machine="B"
+            )
+        )
+        elsewhere = self.account_queue_operation(96, "RENAME_REGISTRATION", display_id="Lin")
+        self.assertEqual(409, elsewhere.status_code, elsewhere.get_json())
+
+        self.publish(
+            self.friend_pair_snapshot(
+                revision=6, own_fields={"online_registration_pending_check_in": True}
+            )
+        )
+        pending = self.account_queue_operation(
+            97, "RENAME_REGISTRATION", display_id="新昵称", expected_pending_check_in=True
+        )
+        self.assertEqual(409, pending.status_code, pending.get_json())
+        self.assertEqual(
+            "线上登记完成现场签到后，才能进行这项操作。", pending.get_json()["error"]
+        )
+        self.assertEqual([], self.pending_command_payloads())
+
+    # 将本次选择保存为默认游玩偏好，以后不再询问 (2026-11-28).
+
+    def remember_preference_join(self, request_number, **fields):
+        return self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": f"00000000-0000-0000-0000-0000000006{request_number}",
+                "qq": "12345678",
+                "machine_id": "A",
+                **fields,
+            },
+        )
+
+    def test_online_join_refuses_remember_preference(self):
+        # Anyone may join for a QQ number, but not change that profile's default preference: the
+        # website has no such row, and the field is refused rather than ignored (2026-11-28).
+        self.publish(self.remote_ready_snapshot(default_preference="ASK_EVERY_TIME"))
+        for request_number, value in ((10, True), (11, False)):
+            refused = self.remember_preference_join(
+                request_number, preference="SOLO", remember_preference=value
+            )
+            self.assertEqual(400, refused.status_code, refused.get_json())
+            self.assertEqual("请求包含不支持的线上登记字段", refused.get_json()["error"])
+        self.signed_in_account()
+        own = self.remember_preference_join(12, preference="SOLO", remember_preference=True)
+        self.assertEqual(400, own.status_code, own.get_json())
+        self.assertEqual([], self.pending_command_payloads())
+
+        # Only joining on the phone page knows the field.
+        self.publish(self.postponement_snapshot(revision=6))
+        by_bot = self.bot_operation(15, "LEAVE_QUEUE", remember_preference=True)
+        self.assertEqual(400, by_bot.status_code, by_bot.get_json())
+        by_account = self.account_queue_operation(16, "LEAVE_QUEUE", remember_preference=True)
+        self.assertEqual(400, by_account.status_code, by_account.get_json())
+        self.assertEqual(
+            "请求包含不支持的个人排队操作字段。", by_account.get_json()["error"]
+        )
+
+    def test_mobile_registration_carries_remember_preference_only_when_ticked(self):
+        def submit(revision, session_number, request_suffix, default_preference, **fields):
+            snapshot = self.remote_ready_snapshot(
+                revision=revision, default_preference=default_preference
+            )
+            # A later profile revision, so the server takes this default preference.
+            profile_revision = revision - 77
+            snapshot["private_player_profiles"][0]["profile_revision"] = profile_revision
+            self.publish(snapshot)
+            token = self.open_mobile_session(snapshot, session_number)
+            return self.client.post(
+                f"/api/queue-mobile/sessions/{token}/submit",
+                json={
+                    "request_id": f"00000000-0000-0000-0000-000000000{request_suffix}",
+                    "profile_id": self.profile_id,
+                    "expected_profile_revision": profile_revision,
+                    **fields,
+                },
+            )
+
+        def last_payload_and_reject(response):
+            self.assertEqual(202, response.status_code, response.get_json())
+            payload = self.pending_command_payloads()[-1]
+            self.complete_command(response.get_json()["command_id"], "REJECTED")
+            return payload
+
+        not_a_boolean = submit(
+            81, 71, "871", "ASK_EVERY_TIME", preference="SOLO", remember_preference="true"
+        )
+        self.assertEqual(400, not_a_boolean.status_code)
+        self.assertEqual(
+            "remember_preference 必须是布尔值。", not_a_boolean.get_json()["error"]
+        )
+
+        ticked = last_payload_and_reject(
+            submit(82, 72, "872", "ASK_EVERY_TIME", preference="SOLO", remember_preference=True)
+        )
+        self.assertEqual("SOLO", ticked["preference"])
+        self.assertIs(True, ticked["remember_preference"])
+
+        unticked = last_payload_and_reject(
+            submit(83, 73, "873", "ASK_EVERY_TIME", preference="SOLO", remember_preference=False)
+        )
+        self.assertNotIn("remember_preference", unticked)
+
+        # A profile with a fixed default preference is not asked, so nothing is saved.
+        fixed_default = last_payload_and_reject(
+            submit(84, 74, "874", "OPEN_TO_JOIN", remember_preference=True)
+        )
+        self.assertNotIn("remember_preference", fixed_default)
+
+    def test_mobile_registration_of_a_new_profile_carries_remember_preference(self):
+        snapshot = self.remote_ready_snapshot(revision=90)
+        self.publish(snapshot)
+        token = self.open_mobile_session(snapshot, 75)
+        new_profile = self.mobile_new_profile()
+        new_profile["default_preference"] = "ASK_EVERY_TIME"
+
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{token}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000875",
+                "new_profile": new_profile,
+                "preference": "OPEN_TO_JOIN",
+                "remember_preference": True,
+            },
+        )
+
+        self.assertEqual(202, submitted.status_code, submitted.get_json())
+        payload = self.pending_command_payloads()[-1]
+        self.assertEqual("OPEN_TO_JOIN", payload["preference"])
+        self.assertIs(True, payload["remember_preference"])
+        self.assertEqual("ASK_EVERY_TIME", payload["profile"]["profile"]["default_preference"])
+
+    def test_mobile_session_reports_the_waits_and_the_closing_time(self):
+        snapshot = self.paired_remote_snapshot(91)
+        snapshot["machines"]["A"]["new_registration_estimated_wait_minutes"] = 45
+        snapshot["machines"]["B"]["new_registration_estimated_wait_minutes"] = 15
+        snapshot["business_hours"] = {
+            "enabled": True,
+            "outside": False,
+            "closing_soon": True,
+            "closing_grace": False,
+            "closes_at": 2_000_000,
+            "registration_closes_at": None,
+        }
+        self.publish(snapshot)
+        token = self.open_mobile_session(snapshot, 76)
+
+        opened = self.client.get(f"/api/queue-mobile/sessions/{token}").get_json()
+        lookup = self.client.post(
+            "/api/queue-online/profile", json={"qq": "12345678"}
+        ).get_json()
+
+        # Under the names, and with the values, the online join reads.
+        self.assertEqual(lookup["machines"], opened["machines"])
+        self.assertEqual(lookup["business_hours"], opened["business_hours"])
+        machines = {machine["id"]: machine for machine in opened["machines"]}
+        self.assertEqual(45, machines["A"]["estimated_wait_minutes"])
+        self.assertEqual(15, machines["B"]["estimated_wait_minutes"])
+        self.assertEqual("B", machines["A"]["paired_machine_id"])
+        self.assertIs(True, machines["B"]["available"])
+        self.assertEqual(2_000_000, opened["business_hours"]["closes_at"])
+        self.assertEqual("B", opened["session"]["paired_machine_id"])
+
+        # Without business hours the page gets the same empty state as the online join.
+        plain = self.remote_ready_snapshot(revision=92)
+        self.publish(plain)
+        plain_token = self.open_mobile_session(plain, 77)
+        plain_opened = self.client.get(f"/api/queue-mobile/sessions/{plain_token}").get_json()
+        self.assertIs(False, plain_opened["business_hours"]["enabled"])
+        self.assertIsNone(plain_opened["business_hours"]["closes_at"])
+        self.assertEqual(
+            [None, None],
+            [machine["paired_machine_id"] for machine in plain_opened["machines"]],
+        )
 
     def test_fixed_pair_shares_skip_one_turn(self):
         def pair_snapshot(revision, second_skips):
@@ -9581,6 +10452,7 @@ class QueueStatusApiTest(unittest.TestCase):
 
     def test_skip_one_turn_is_refused_for_the_playing_position(self):
         snapshot = self.remote_ready_snapshot(with_registration=True)
+        snapshot["supported_queue_operations"] = CURRENT_TERMINAL_QUEUE_OPERATIONS
         machine = snapshot["machines"]["A"]
         registration = machine["waiting_positions"][0]["registrations"][0]
         machine["playing"] = [registration]
@@ -9637,6 +10509,831 @@ class QueueStatusApiTest(unittest.TestCase):
         # Leaving the queue stays possible.
         leave = self.bot_operation(89, "LEAVE_QUEUE")
         self.assertEqual(202, leave.status_code, leave.get_json())
+
+    # A registration that plays alone may let an open registration behind it pass over it
+    # (maintainer, 2026-11-26).
+
+    def passing_snapshot(self, revision=4, profile_registration="PASSED", **fields):
+        """
+        Machine A waits as 小林, 小王 and 小张 in their real order: 小王 plays alone and allows
+        passing, 小张 passes over 小王 and plays with 小林. The registration of the signed-in
+        profile ("a" * 24) is 小王, or with [profile_registration] "PASSER" 小张.
+        """
+        snapshot = self.remote_ready_snapshot(revision=revision, with_registration=True)
+        snapshot["supported_queue_operations"] = CURRENT_TERMINAL_QUEUE_OPERATIONS
+        profile_id, other_id = "a" * 24, "d" * 24
+        passed_id, passer_id = (
+            (profile_id, other_id)
+            if profile_registration == "PASSED"
+            else (other_id, profile_id)
+        )
+        front = self.registration("c" * 24, "小林")
+        front["preference"] = "OPEN_TO_JOIN"
+        passer = self.registration(passer_id, "小张")
+        passer.update(preference="OPEN_TO_JOIN", passing_over=[passed_id])
+        passed = self.registration(passed_id, "小王")
+        passed["allows_passing"] = True
+        snapshot["machines"]["A"]["waiting_positions"] = [
+            {
+                "index": 1,
+                "position_id": "b" * 24,
+                "fixed_pair": False,
+                "estimated_wait_minutes": 0,
+                "registrations": [front, passer],
+            },
+            {
+                "index": 2,
+                "position_id": "e" * 24,
+                "fixed_pair": False,
+                "estimated_wait_minutes": 15,
+                "registrations": [passed],
+            },
+        ]
+        snapshot["machines"]["A"]["registration_count"] = 3
+        snapshot["machines"]["A"]["waiting_position_count"] = 2
+        snapshot.update(fields)
+        return snapshot
+
+    def signed_in_account(self):
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+        completed = self.client.post(
+            f"/api/player-account/bindings/{binding.get_json()['binding_token']}/complete",
+            json={"password": "first-password"},
+        )
+        self.assertEqual(201, completed.status_code, completed.get_json())
+
+    def account_queue_operation(self, request_number, operation, **fields):
+        queue_payload = self.client.get("/api/player-account/queue").get_json()
+        registration = queue_payload["registrations"][0]
+        queue = queue_payload["queue"]
+        return self.client.post(
+            "/api/player-account/queue-commands",
+            json={
+                "request_id": f"00000000-0000-0000-0000-0000000007{request_number}",
+                "operation": operation,
+                "expected_queue_id": queue["queue_id"],
+                "expected_registration_id": registration["registration_id"],
+                "expected_machine_id": registration["machine_id"],
+                "expected_position": registration["position"],
+                "expected_fixed_pair_id": registration["fixed_pair_id"],
+                "expected_absence_status": "NONE",
+                "expected_temporary_away_skipped_turns": 0,
+                "expected_pending_check_in": False,
+                "expected_machine_configuration_revision": queue[
+                    "machine_configuration_revision"
+                ],
+                "expected_machine_stable_id": registration["machine_stable_id"],
+                **fields,
+            },
+            headers={
+                "X-CSRF-Token": self.client.get_cookie("maimai_q_session_csrf").value
+            },
+        )
+
+    def test_snapshot_keeps_the_passing_fields_and_the_declared_operations(self):
+        self.publish(self.passing_snapshot())
+
+        public = self.client.get("/api/queue-status").get_json()
+        first, second = public["machines"]["A"]["waiting_positions"]
+
+        self.assertEqual(["a" * 24], first["registrations"][1]["passing_over"])
+        self.assertIs(False, first["registrations"][1]["allows_passing"])
+        self.assertEqual([], first["registrations"][0]["passing_over"])
+        self.assertIs(True, second["registrations"][0]["allows_passing"])
+        self.assertEqual([], second["registrations"][0]["passing_over"])
+        self.assertEqual(
+            CURRENT_TERMINAL_QUEUE_OPERATIONS, public["supported_queue_operations"]
+        )
+
+        # Older terminals leave all three out.
+        self.publish(self.remote_ready_snapshot(revision=5, with_registration=True))
+        public = self.client.get("/api/queue-status").get_json()
+        registration = public["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+        self.assertIs(False, registration["allows_passing"])
+        self.assertEqual([], registration["passing_over"])
+        self.assertEqual([], public["supported_queue_operations"])
+        self.assertEqual([], public["capabilities"]["queue_operations"])
+
+        # A name this server does not know yet is dropped, not refused, so a newer terminal
+        # can be installed before the server is deployed.
+        newer = self.remote_ready_snapshot(revision=6, with_registration=True)
+        newer["supported_queue_operations"] = ["SKIP_ONE_TURN", "SOME_FUTURE_OPERATION"]
+        self.publish(newer)
+        public = self.client.get("/api/queue-status").get_json()
+        self.assertEqual(["SKIP_ONE_TURN"], public["supported_queue_operations"])
+
+    def test_passing_is_kept_only_for_a_registration_that_plays_alone(self):
+        snapshot = self.passing_snapshot()
+        passed = snapshot["machines"]["A"]["waiting_positions"][1]["registrations"][0]
+        passed["preference"] = "OPEN_TO_JOIN"
+        snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][1][
+            "passing_over"
+        ] = []
+
+        self.publish(snapshot)
+
+        self.assertIs(
+            False,
+            self.client.get("/api/queue-status").get_json()["machines"]["A"][
+                "waiting_positions"
+            ][1]["registrations"][0]["allows_passing"],
+        )
+
+    def test_a_passed_registration_that_left_is_dropped_not_refused(self):
+        # Review 2026-11-27: the registration that was passed left while the pair that passed it
+        # played; the terminal went on naming it and every upload was refused until the round
+        # ended. The field only decides what is shown, so the unknown id is dropped.
+        snapshot = self.passing_snapshot(revision=6)
+        passer = snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][1]
+        known = list(passer["passing_over"])
+        passer["passing_over"] = known + ["f" * 24]
+
+        self.publish(snapshot)
+
+        public = self.client.get("/api/queue-status").get_json()
+        self.assertEqual(
+            known,
+            public["machines"]["A"]["waiting_positions"][0]["registrations"][1]["passing_over"],
+        )
+
+    def test_snapshot_with_invalid_passing_fields_is_rejected(self):
+        def changed(change):
+            snapshot = self.passing_snapshot(revision=6)
+            change(snapshot)
+            return snapshot
+
+        def passer(snapshot):
+            return snapshot["machines"]["A"]["waiting_positions"][0]["registrations"][1]
+
+        def passed(snapshot):
+            return snapshot["machines"]["A"]["waiting_positions"][1]["registrations"][0]
+
+        cases = (
+            (
+                "allows_passing 不是布尔值",
+                lambda snapshot: passed(snapshot).update(allows_passing="true"),
+                "allows_passing 必须是布尔值。",
+            ),
+            (
+                "passing_over 不是数组",
+                lambda snapshot: passer(snapshot).update(passing_over="a" * 24),
+                "passing_over 必须是最多 20 项的登记编号数组。",
+            ),
+            (
+                "passing_over 超过 20 项",
+                lambda snapshot: passer(snapshot).update(
+                    passing_over=[f"{index:024x}" for index in range(21)]
+                ),
+                "passing_over 必须是最多 20 项的登记编号数组。",
+            ),
+            (
+                "passing_over 包含无效编号",
+                lambda snapshot: passer(snapshot).update(passing_over=["小王"]),
+                "passing_over 中包含无效登记编号。",
+            ),
+            (
+                "passing_over 重复",
+                lambda snapshot: passer(snapshot).update(passing_over=["a" * 24, "a" * 24]),
+                "passing_over 中不能有重复登记编号。",
+            ),
+            (
+                "passing_over 指向自己",
+                lambda snapshot: passer(snapshot).update(passing_over=["d" * 24]),
+                "passing_over 不能包含这份登记本身。",
+            ),
+            (
+                "supported_queue_operations 不是数组",
+                lambda snapshot: snapshot.update(supported_queue_operations="SKIP_ONE_TURN"),
+                "supported_queue_operations 必须是操作名称的数组。",
+            ),
+            (
+                "supported_queue_operations 包含不像操作名称的文本",
+                lambda snapshot: snapshot.update(supported_queue_operations=["skip one turn"]),
+                "supported_queue_operations 必须是操作名称的数组。",
+            ),
+            (
+                "supported_queue_operations 包含非文本",
+                lambda snapshot: snapshot.update(supported_queue_operations=[1]),
+                "supported_queue_operations 必须是操作名称的数组。",
+            ),
+        )
+        for label, change, error in cases:
+            with self.subTest(label):
+                response = self.client.post(
+                    "/api/queue-status", json=changed(change), headers=self.headers
+                )
+                self.assertEqual(400, response.status_code, response.get_json())
+                self.assertEqual(error, response.get_json()["error"])
+
+    def test_passing_fields_reach_player_account_and_bot(self):
+        def published(revision, profile_registration):
+            self.publish(
+                self.passing_snapshot(
+                    revision=revision, profile_registration=profile_registration
+                )
+            )
+            account = self.client.get("/api/player-account/queue").get_json()[
+                "registrations"
+            ][0]
+            bot_player = self.client.post(
+                "/api/queue-bot/players",
+                json={"qq": "12345678"},
+                headers=self.bot_headers,
+            ).get_json()["players"][0]
+            return account, bot_player
+
+        self.publish(self.passing_snapshot(revision=90))
+        self.signed_in_account()
+
+        for label, registration in zip(("account", "bot"), published(91, "PASSED")):
+            with self.subTest(label, side="passed"):
+                self.assertIs(True, registration["allows_passing"])
+                self.assertEqual([], registration["passing_over"])
+        for label, registration in zip(("account", "bot"), published(92, "PASSER")):
+            with self.subTest(label, side="passer"):
+                self.assertIs(False, registration["allows_passing"])
+                self.assertEqual(["d" * 24], registration["passing_over"])
+
+    def test_capabilities_name_the_declared_operations_while_remote_actions_are_possible(self):
+        self.publish(self.passing_snapshot(revision=4))
+        capabilities = self.client.get("/api/queue-status").get_json()["capabilities"]
+        self.assertEqual(CURRENT_TERMINAL_QUEUE_OPERATIONS, capabilities["queue_operations"])
+
+        self.publish(self.passing_snapshot(revision=5, website_remote_enabled=False))
+        capabilities = self.client.get("/api/queue-status").get_json()["capabilities"]
+        self.assertEqual([], capabilities["queue_operations"])
+
+        self.publish(self.passing_snapshot(revision=6))
+        connection = sqlite3.connect(self.database_path)
+        try:
+            connection.execute(
+                "UPDATE queue_snapshot SET received_at = ? WHERE id = 1",
+                (int(time.time()) - 91,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        capabilities = self.client.get("/api/queue-status").get_json()["capabilities"]
+        self.assertEqual([], capabilities["queue_operations"])
+
+    def test_set_allows_passing_is_forwarded_like_the_paired_machine_choice(self):
+        self.publish(self.passing_snapshot())
+
+        missing = self.bot_operation(60, "SET_ALLOWS_PASSING")
+        invalid = self.bot_operation(61, "SET_ALLOWS_PASSING", allows_passing="true")
+        other_operation = self.bot_operation(62, "LEAVE_QUEUE", allows_passing=True)
+        created = self.bot_operation(63, "SET_ALLOWS_PASSING", allows_passing=False)
+        payloads = self.pending_command_payloads()
+
+        self.assertEqual(400, missing.status_code)
+        self.assertEqual("请选择是否允许后方的登记越过这份登记。", missing.get_json()["error"])
+        self.assertEqual(400, invalid.status_code)
+        self.assertEqual(400, other_operation.status_code)
+        self.assertEqual("这项操作不接受 allows_passing。", other_operation.get_json()["error"])
+        self.assertEqual(202, created.status_code, created.get_json())
+        self.assertEqual(1, len(payloads))
+        self.assertEqual("SET_ALLOWS_PASSING", payloads[0]["operation"])
+        self.assertIs(False, payloads[0]["allows_passing"])
+        self.assertEqual("a" * 24, payloads[0]["registration_id"])
+
+    def test_player_account_and_management_can_set_allows_passing(self):
+        self.publish(self.passing_snapshot())
+        self.signed_in_account()
+
+        switched = self.account_queue_operation(
+            40, "SET_ALLOWS_PASSING", allows_passing=True
+        )
+        self.assertEqual(202, switched.status_code, switched.get_json())
+        self.assertIs(True, self.pending_command_payloads()[0]["allows_passing"])
+        self.complete_command(switched.get_json()["command_id"], "APPLIED")
+
+        snapshot, terminal_headers = self.management_schema_eight_snapshot()
+        snapshot.update(
+            {
+                key: value
+                for key, value in self.passing_snapshot(revision=7).items()
+                if key in {"machines", "private_player_contacts", "supported_queue_operations"}
+            }
+        )
+        self.upgrade_snapshot_to_schema_v7(snapshot)
+        snapshot["schema_version"] = 8
+        snapshot["revision"] = 7
+        published = self.client.post(
+            "/api/queue-status", json=snapshot, headers=terminal_headers
+        )
+        self.assertEqual(204, published.status_code, published.get_json())
+        managed = self.client.post(
+            "/api/queue-management/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000975",
+                "profile_id": self.profile_id,
+                "operation": "SET_ALLOWS_PASSING",
+                "allows_passing": False,
+                "expected_queue_id": snapshot["queue_id"],
+                "expected_registration_id": "a" * 24,
+                "expected_machine_id": "A",
+                "expected_position": "WAITING",
+                "expected_fixed_pair_id": None,
+                "expected_absence_status": "NONE",
+                "expected_temporary_away_skipped_turns": 0,
+                "expected_pending_check_in": False,
+                "expected_machine_configuration_revision": 1,
+                "expected_machine_stable_id": snapshot["machines"]["A"]["stable_id"],
+            },
+            headers=self.management_headers,
+        )
+        self.assertEqual(202, managed.status_code, managed.get_json())
+        self.assertEqual("SET_ALLOWS_PASSING", managed.get_json()["payload"]["operation"])
+        self.assertIs(False, managed.get_json()["payload"]["allows_passing"])
+
+    def test_passing_cannot_be_allowed_at_a_machine_for_one_player(self):
+        snapshot = self.remote_ready_snapshot(revision=8, with_registration=True)
+        snapshot["supported_queue_operations"] = CURRENT_TERMINAL_QUEUE_OPERATIONS
+        self.upgrade_snapshot_to_schema_v6(snapshot, capacities={"A": 1})
+        self.publish(snapshot)
+
+        refused = self.bot_operation(64, "SET_ALLOWS_PASSING", allows_passing=True)
+        cleared = self.bot_operation(65, "SET_ALLOWS_PASSING", allows_passing=False)
+
+        self.assertEqual(409, refused.status_code, refused.get_json())
+        self.assertEqual(
+            "当前机台仅能容纳一人游玩，不能设置这项选择。", refused.get_json()["error"]
+        )
+        self.assertEqual(202, cleared.status_code, cleared.get_json())
+
+    def test_online_join_carries_allows_passing_for_a_registration_that_plays_alone(self):
+        def join(request_number, **fields):
+            return self.client.post(
+                "/api/queue-online/join",
+                json={
+                    "request_id": f"00000000-0000-0000-0000-0000000006{request_number}",
+                    "qq": "12345678",
+                    "machine_id": "A",
+                    **fields,
+                },
+            )
+
+        snapshot = self.remote_ready_snapshot(revision=9, default_preference="ASK_EVERY_TIME")
+        snapshot["supported_queue_operations"] = CURRENT_TERMINAL_QUEUE_OPERATIONS
+        self.publish(snapshot)
+
+        open_to_join = join(10, preference="OPEN_TO_JOIN", allows_passing=True)
+        invalid = join(11, preference="SOLO", allows_passing=1)
+        created = join(12, preference="SOLO", allows_passing=True)
+        payloads = self.pending_command_payloads()
+
+        self.assertEqual(400, open_to_join.status_code)
+        self.assertEqual(
+            "只有单人游玩的登记可以允许后方的登记越过。", open_to_join.get_json()["error"]
+        )
+        self.assertEqual(400, invalid.status_code)
+        self.assertEqual(202, created.status_code, created.get_json())
+        self.assertEqual(1, len(payloads))
+        self.assertEqual("SOLO", payloads[0]["preference"])
+        self.assertIs(True, payloads[0]["allows_passing"])
+
+        # A profile that always allows others to join resolves to OPEN_TO_JOIN.
+        snapshot = self.remote_ready_snapshot(revision=10, default_preference="OPEN_TO_JOIN")
+        snapshot["supported_queue_operations"] = CURRENT_TERMINAL_QUEUE_OPERATIONS
+        snapshot["private_player_profiles"][0].update(profile_revision=4, updated_at=960_000)
+        self.complete_command(created.get_json()["command_id"], "REJECTED")
+        self.publish(snapshot)
+        resolved = join(13, allows_passing=True)
+        self.assertEqual(409, resolved.status_code, resolved.get_json())
+        self.assertEqual(
+            "只有单人游玩的登记可以允许后方的登记越过。", resolved.get_json()["error"]
+        )
+
+    def test_operations_a_terminal_has_not_declared_are_refused(self):
+        not_updated = "现场终端尚未更新，暂不能使用这项操作。"
+        # An older terminal sends no list.
+        self.publish(self.remote_ready_snapshot(revision=11, with_registration=True))
+
+        for request_number, operation, fields in (
+            (66, "SKIP_ONE_TURN", {}),
+            (67, "CANCEL_SKIP_ONE_TURN", {}),
+            (68, "SET_ALLOWS_PASSING", {"allows_passing": True}),
+            (69, "SET_ALLOWS_PASSING", {"allows_passing": False}),
+        ):
+            with self.subTest(operation, **fields):
+                response = self.bot_operation(request_number, operation, **fields)
+                self.assertEqual(409, response.status_code, response.get_json())
+                self.assertEqual(not_updated, response.get_json()["error"])
+        management = self.client.post(
+            "/api/queue-management/queue-commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000976",
+                "profile_id": self.profile_id,
+                "operation": "SKIP_ONE_TURN",
+            },
+            headers=self.management_headers,
+        )
+        self.assertEqual(409, management.status_code, management.get_json())
+        self.assertEqual(not_updated, management.get_json()["error"])
+        self.assertEqual([], self.pending_command_payloads())
+
+        # Everything else keeps working as before.
+        deferred = self.bot_operation(70, "DEFER_ONE_ROUND")
+        self.assertEqual(202, deferred.status_code, deferred.get_json())
+        self.complete_command(deferred.get_json()["command_id"], "APPLIED")
+
+        # Joining needs a terminal that knows the choice only when it is turned on.
+        self.publish(self.remote_ready_snapshot(revision=12))
+        join_request = {"qq": "12345678", "machine_id": "A"}
+        ticked = self.client.post(
+            "/api/queue-online/join",
+            json={
+                **join_request,
+                "request_id": "00000000-0000-0000-0000-000000000671",
+                "allows_passing": True,
+            },
+        )
+        self.assertEqual(409, ticked.status_code, ticked.get_json())
+        self.assertEqual(not_updated, ticked.get_json()["error"])
+        unticked = self.client.post(
+            "/api/queue-online/join",
+            json={**join_request, "request_id": "00000000-0000-0000-0000-000000000672"},
+        )
+        self.assertEqual(202, unticked.status_code, unticked.get_json())
+        self.assertNotIn("allows_passing", self.pending_command_payloads()[0])
+
+    def test_each_operation_needs_its_own_declaration(self):
+        snapshot = self.passing_snapshot(revision=13)
+        snapshot["supported_queue_operations"] = [
+            name for name in CURRENT_TERMINAL_QUEUE_OPERATIONS if name != "SET_ALLOWS_PASSING"
+        ]
+        self.publish(snapshot)
+
+        refused = self.bot_operation(71, "SET_ALLOWS_PASSING", allows_passing=False)
+        skipped = self.bot_operation(72, "SKIP_ONE_TURN")
+
+        self.assertEqual(409, refused.status_code, refused.get_json())
+        self.assertEqual(
+            "现场终端尚未更新，暂不能使用这项操作。", refused.get_json()["error"]
+        )
+        self.assertEqual(202, skipped.status_code, skipped.get_json())
+        self.assertNotIn(
+            "SET_ALLOWS_PASSING",
+            self.client.get("/api/queue-status").get_json()["capabilities"][
+                "queue_operations"
+            ],
+        )
+
+    # A fixed pair may let the registrations behind pass as well, one choice for both of its
+    # registrations (maintainer, 2026-11-27; docs/releases/fixed-pair-pass-plan-2026-11.md).
+
+    def fixed_pair_passing_snapshot(
+        self, revision=4, *, supported=True, pair_allows_passing=(True, True), **fields
+    ):
+        """
+        Machine A waits as 小林, the fixed pair of 公开昵称 and 固定搭档, and 小张 in their real
+        order. The pair lets others pass: 小张 passes over both of its registrations and plays
+        with 小林. The registration of the signed-in profile ("a" * 24) is 公开昵称.
+        """
+        snapshot = self.remote_ready_snapshot(revision=revision, with_registration=True)
+        snapshot["supported_queue_operations"] = CURRENT_TERMINAL_QUEUE_OPERATIONS
+        if supported:
+            snapshot["fixed_pair_passing_supported"] = True
+        first = self.registration("a" * 24, "公开昵称")
+        second = self.registration("f" * 24, "固定搭档")
+        for registration, allows_passing in zip((first, second), pair_allows_passing):
+            registration.update(
+                preference="OPEN_TO_JOIN", fixed_pair=True, fixed_pair_id="9" * 24
+            )
+            if allows_passing:
+                registration["allows_passing"] = True
+        front = self.registration("c" * 24, "小林")
+        front["preference"] = "OPEN_TO_JOIN"
+        passer = self.registration("d" * 24, "小张")
+        passer["preference"] = "OPEN_TO_JOIN"
+        if all(pair_allows_passing):
+            passer["passing_over"] = ["a" * 24, "f" * 24]
+        snapshot["machines"]["A"]["waiting_positions"] = [
+            {
+                "index": 1,
+                "position_id": "b" * 24,
+                "fixed_pair": False,
+                "estimated_wait_minutes": 0,
+                "registrations": [front, passer],
+            },
+            {
+                "index": 2,
+                "position_id": "e" * 24,
+                "fixed_pair": True,
+                "estimated_wait_minutes": 15,
+                "registrations": [first, second],
+            },
+        ]
+        snapshot["machines"]["A"]["registration_count"] = 4
+        snapshot["machines"]["A"]["waiting_position_count"] = 2
+        snapshot.update(fields)
+        return snapshot
+
+    def test_fixed_pair_keeps_the_passing_choice_only_when_both_registrations_carry_it(self):
+        def pair(snapshot_payload):
+            return snapshot_payload["machines"]["A"]["waiting_positions"][1]["registrations"]
+
+        self.publish(self.fixed_pair_passing_snapshot(revision=20))
+        public = self.client.get("/api/queue-status").get_json()
+        passer = public["machines"]["A"]["waiting_positions"][0]["registrations"][1]
+        self.assertEqual([True, True], [entry["allows_passing"] for entry in pair(public)])
+        self.assertEqual(["a" * 24, "f" * 24], passer["passing_over"])
+        self.assertIs(True, public["fixed_pair_passing_supported"])
+
+        # The account's own queue and the Bot's list carry the choice as for one that plays
+        # alone.
+        self.signed_in_account()
+        account = self.client.get("/api/player-account/queue").get_json()
+        self.assertIs(True, account["registrations"][0]["allows_passing"])
+        self.assertIs(True, account["registrations"][0]["fixed_pair"])
+        bot_player = self.client.post(
+            "/api/queue-bot/players", json={"qq": "12345678"}, headers=self.bot_headers
+        ).get_json()["players"][0]
+        self.assertIs(True, bot_player["allows_passing"])
+
+        # One choice for the pair: a pair whose registrations disagree is shown without it.
+        self.publish(
+            self.fixed_pair_passing_snapshot(revision=21, pair_allows_passing=(True, False))
+        )
+        public = self.client.get("/api/queue-status").get_json()
+        self.assertEqual([False, False], [entry["allows_passing"] for entry in pair(public)])
+
+    def test_fixed_pair_passing_support_is_reported_where_the_operations_are(self):
+        def reported(snapshot, *, mobile_session=True):
+            self.publish(snapshot)
+            pages = (
+                self.client.get("/api/queue-status").get_json()["capabilities"][
+                    "fixed_pair_passing_supported"
+                ],
+                self.client.get("/api/player-account/queue").get_json()["queue"][
+                    "fixed_pair_passing_supported"
+                ],
+            )
+            if not mobile_session:
+                return pages
+            token = self.open_mobile_session(snapshot, snapshot["revision"])
+            return (
+                *pages,
+                self.client.get(f"/api/queue-mobile/sessions/{token}").get_json()[
+                    "capabilities"
+                ]["fixed_pair_passing_supported"],
+            )
+
+        self.publish(self.fixed_pair_passing_snapshot(revision=30))
+        self.signed_in_account()
+
+        self.assertEqual(
+            (True, True, True), reported(self.fixed_pair_passing_snapshot(revision=31))
+        )
+        # An older terminal leaves the field out.
+        self.assertEqual(
+            (False, False, False),
+            reported(self.fixed_pair_passing_snapshot(revision=32, supported=False)),
+        )
+        # Like queue_operations, only while remote actions are possible; the phone page
+        # cannot be opened then.
+        self.assertEqual(
+            (False, False),
+            reported(
+                self.fixed_pair_passing_snapshot(revision=33, website_remote_enabled=False),
+                mobile_session=False,
+            ),
+        )
+        not_a_boolean = self.client.post(
+            "/api/queue-status",
+            json=self.fixed_pair_passing_snapshot(
+                revision=34, fixed_pair_passing_supported="yes"
+            ),
+            headers=self.headers,
+        )
+        self.assertEqual(400, not_a_boolean.status_code)
+        self.assertEqual(
+            "fixed_pair_passing_supported 必须是布尔值。", not_a_boolean.get_json()["error"]
+        )
+
+    def test_fixed_pair_member_can_set_allows_passing_where_the_terminal_supports_it(self):
+        self.publish(
+            self.fixed_pair_passing_snapshot(revision=40, pair_allows_passing=(False, False))
+        )
+        self.signed_in_account()
+
+        switched = self.account_queue_operation(41, "SET_ALLOWS_PASSING", allows_passing=True)
+        payloads = self.pending_command_payloads()
+
+        self.assertEqual(202, switched.status_code, switched.get_json())
+        self.assertEqual(1, len(payloads))
+        self.assertEqual("SET_ALLOWS_PASSING", payloads[0]["operation"])
+        self.assertIs(True, payloads[0]["allows_passing"])
+        self.assertEqual("a" * 24, payloads[0]["registration_id"])
+        self.assertEqual("9" * 24, payloads[0]["expected_fixed_pair_id"])
+
+        # Turning it off again, here through the Bot.
+        self.complete_command(switched.get_json()["command_id"], "APPLIED")
+        self.publish(self.fixed_pair_passing_snapshot(revision=41))
+        cleared = self.bot_operation(73, "SET_ALLOWS_PASSING", allows_passing=False)
+        self.assertEqual(202, cleared.status_code, cleared.get_json())
+        self.assertIs(False, self.pending_command_payloads()[0]["allows_passing"])
+
+    def test_fixed_pair_member_is_refused_where_the_terminal_does_not_support_it(self):
+        # An older terminal knows SET_ALLOWS_PASSING only for a registration that plays alone.
+        self.publish(
+            self.fixed_pair_passing_snapshot(
+                revision=42, supported=False, pair_allows_passing=(False, False)
+            )
+        )
+        self.signed_in_account()
+
+        by_account = self.account_queue_operation(42, "SET_ALLOWS_PASSING", allows_passing=True)
+        by_bot = self.bot_operation(74, "SET_ALLOWS_PASSING", allows_passing=True)
+
+        for response in (by_account, by_bot):
+            self.assertEqual(409, response.status_code, response.get_json())
+            self.assertEqual(
+                "现场终端尚未更新，暂不能使用这项操作。", response.get_json()["error"]
+            )
+        self.assertEqual([], self.pending_command_payloads())
+        # Refused, so nothing is noted about the explanation either.
+        self.assertIs(False, self.terminal_profile()["passing_introduced"])
+
+        # A registration outside a fixed pair is not affected.
+        self.publish(self.passing_snapshot(revision=43))
+        alone = self.account_queue_operation(43, "SET_ALLOWS_PASSING", allows_passing=True)
+        self.assertEqual(202, alone.status_code, alone.get_json())
+
+    # The explanation of letting others pass, shown the first time a profile turns a passing
+    # tick box on; kept like the explanation of the two machines.
+
+    def profile_was_shown_the_passing_explanation(self):
+        return self.terminal_profile()["passing_introduced"]
+
+    def test_passing_explanation_record_of_a_profile_stays_once_it_is_set(self):
+        def upload(revision, **fields):
+            response = self.client.post(
+                "/api/queue-status",
+                json=self.uploaded_profile_snapshot(revision, **fields),
+                headers=self.headers,
+            )
+            return response.status_code
+
+        def lookup():
+            return self.client.post(
+                "/api/queue-online/profile", json={"qq": "12345678"}
+            ).get_json()["profile"]["passing_introduced"]
+
+        self.assertEqual(204, upload(50))
+        not_yet = (self.profile_was_shown_the_passing_explanation(), lookup())
+        self.assertEqual(204, upload(51, passing_introduced=True))
+        shown = (self.profile_was_shown_the_passing_explanation(), lookup())
+        self.assertEqual(204, upload(52))
+        after_upload_without_the_key = self.profile_was_shown_the_passing_explanation()
+        self.assertEqual(204, upload(53, passing_introduced=False))
+        after_upload_with_false = self.profile_was_shown_the_passing_explanation()
+        not_a_boolean = self.client.post(
+            "/api/queue-status",
+            json=self.uploaded_profile_snapshot(54, passing_introduced=1),
+            headers=self.headers,
+        )
+
+        self.assertEqual((False, False), not_yet)
+        self.assertEqual((True, True), shown)
+        self.assertIs(True, after_upload_without_the_key)
+        self.assertIs(True, after_upload_with_false)
+        self.assertEqual(400, not_a_boolean.status_code)
+        self.assertEqual("passing_introduced 必须是布尔值。", not_a_boolean.get_json()["error"])
+        # The other explanation is a record of its own.
+        self.assertIs(False, self.profile_was_shown_the_explanation())
+
+    def test_account_turning_a_passing_tick_box_on_records_the_explanation(self):
+        def account_record():
+            return self.client.get("/api/player-account").get_json()["account"]["profile"][
+                "passing_introduced"
+            ]
+
+        # A registration that plays alone: turning the box off says nothing, turning it on does.
+        self.publish(self.passing_snapshot(revision=60))
+        self.signed_in_account()
+        before = account_record()
+        cleared = self.account_queue_operation(44, "SET_ALLOWS_PASSING", allows_passing=False)
+        after_clearing = account_record()
+        self.complete_command(cleared.get_json()["command_id"], "APPLIED")
+        ticked = self.account_queue_operation(45, "SET_ALLOWS_PASSING", allows_passing=True)
+
+        self.assertIs(False, before)
+        self.assertEqual(202, cleared.status_code, cleared.get_json())
+        self.assertIs(False, after_clearing)
+        self.assertEqual(202, ticked.status_code, ticked.get_json())
+        self.assertIs(True, account_record())
+        self.assertIs(True, self.profile_was_shown_the_passing_explanation())
+        self.assertIs(False, self.profile_was_shown_the_explanation())
+
+    def test_fixed_pair_member_turning_the_tick_box_on_records_the_explanation(self):
+        self.publish(
+            self.fixed_pair_passing_snapshot(revision=61, pair_allows_passing=(False, False))
+        )
+        self.signed_in_account()
+
+        ticked = self.account_queue_operation(46, "SET_ALLOWS_PASSING", allows_passing=True)
+
+        self.assertEqual(202, ticked.status_code, ticked.get_json())
+        self.assertIs(True, self.profile_was_shown_the_passing_explanation())
+
+    def test_bot_turning_the_passing_tick_box_on_records_nothing(self):
+        # The Bot shows no explanation, so its requests say nothing about one.
+        self.publish(self.passing_snapshot(revision=62))
+
+        ticked = self.bot_operation(76, "SET_ALLOWS_PASSING", allows_passing=True)
+
+        self.assertEqual(202, ticked.status_code, ticked.get_json())
+        self.complete_command(ticked.get_json()["command_id"], "APPLIED")
+        self.assertIs(False, self.profile_was_shown_the_passing_explanation())
+
+    def test_online_join_with_the_passing_tick_box_on_records_the_explanation_once_applied(self):
+        # As for the two machines: an online join only names a QQ number, so only a join the
+        # terminal has carried out is recorded.
+        def join(request_number, allows_passing):
+            return self.client.post(
+                "/api/queue-online/join",
+                json={
+                    "request_id": f"00000000-0000-0000-0000-0000000006{request_number}",
+                    "qq": "12345678",
+                    "machine_id": "A",
+                    "preference": "SOLO",
+                    "allows_passing": allows_passing,
+                },
+            )
+
+        snapshot = self.remote_ready_snapshot(revision=63, default_preference="ASK_EVERY_TIME")
+        snapshot["supported_queue_operations"] = CURRENT_TERMINAL_QUEUE_OPERATIONS
+        self.publish(snapshot)
+
+        refused = join(21, True)
+        after_request = self.profile_was_shown_the_passing_explanation()
+        self.complete_command(refused.get_json()["command_id"], "REJECTED")
+        after_refusal = self.profile_was_shown_the_passing_explanation()
+        applied = join(22, True)
+        self.complete_command(applied.get_json()["command_id"], "APPLIED")
+
+        self.assertEqual(202, refused.status_code, refused.get_json())
+        self.assertIs(False, after_request)
+        self.assertIs(False, after_refusal)
+        self.assertEqual(202, applied.status_code, applied.get_json())
+        self.assertIs(True, self.profile_was_shown_the_passing_explanation())
+        self.assertIs(False, self.profile_was_shown_the_explanation())
+
+    def test_applied_online_join_with_the_passing_tick_box_off_records_nothing(self):
+        snapshot = self.remote_ready_snapshot(revision=67, default_preference="SOLO")
+        snapshot["supported_queue_operations"] = CURRENT_TERMINAL_QUEUE_OPERATIONS
+        self.publish(snapshot)
+
+        applied = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000623",
+                "qq": "12345678",
+                "machine_id": "A",
+                "allows_passing": False,
+            },
+        )
+        self.complete_command(applied.get_json()["command_id"], "APPLIED")
+
+        self.assertEqual(202, applied.status_code, applied.get_json())
+        self.assertIs(False, self.profile_was_shown_the_passing_explanation())
+
+    def test_mobile_submit_with_the_passing_tick_box_on_records_the_explanation(self):
+        def submit(revision, session_number, request_suffix, allows_passing):
+            snapshot = self.remote_ready_snapshot(revision=revision, default_preference="SOLO")
+            profile_revision = revision - 60
+            snapshot["private_player_profiles"][0]["profile_revision"] = profile_revision
+            snapshot["supported_queue_operations"] = CURRENT_TERMINAL_QUEUE_OPERATIONS
+            self.publish(snapshot)
+            token = self.open_mobile_session(snapshot, session_number)
+            opened = self.client.get(f"/api/queue-mobile/sessions/{token}").get_json()
+            submitted = self.client.post(
+                f"/api/queue-mobile/sessions/{token}/submit",
+                json={
+                    "request_id": f"00000000-0000-0000-0000-000000000{request_suffix}",
+                    "profile_id": self.profile_id,
+                    "expected_profile_revision": profile_revision,
+                    "allows_passing": allows_passing,
+                },
+            )
+            return opened, submitted
+
+        opened, unticked = submit(64, 74, "874", False)
+        self.assertIs(False, opened["profiles"][0]["passing_introduced"])
+        self.assertEqual(202, unticked.status_code, unticked.get_json())
+        self.assertIs(False, self.profile_was_shown_the_passing_explanation())
+        self.complete_command(unticked.get_json()["command_id"], "REJECTED")
+
+        _, ticked = submit(65, 75, "875", True)
+        self.assertEqual(202, ticked.status_code, ticked.get_json())
+        self.assertIs(True, self.profile_was_shown_the_passing_explanation())
+        reopened, _ = submit(66, 76, "876", False)
+        self.assertIs(True, reopened["profiles"][0]["passing_introduced"])
 
     def test_management_app_may_postpone_despite_the_player_limits(self):
         snapshot, terminal_headers = self.management_schema_eight_snapshot(
@@ -11065,6 +12762,446 @@ class QueueStatusApiTest(unittest.TestCase):
         )
         self.assertEqual(409, response.status_code)
         self.assertEqual("REQUEST_ID_CONFLICT", response.get_json()["code"])
+
+    # Review of 2026-11-27: the pending-command guards of the management app, request bodies
+    # that cannot be stored, names with control characters and the event of a new queue.
+
+    def management_two_player_snapshot(self):
+        """Machine A holds the registration of the stored profile, machine B a temporary one."""
+        snapshot, terminal_headers = self.management_control_snapshot(with_registration=True)
+        temporary = self.registration("c" * 24, "临时登记")
+        temporary["registration_type"] = "TEMPORARY"
+        snapshot["machines"]["B"]["waiting_positions"] = [
+            {
+                "index": 1,
+                "position_id": "d" * 24,
+                "fixed_pair": False,
+                "estimated_wait_minutes": 0,
+                "registrations": [temporary],
+            }
+        ]
+        snapshot["machines"]["B"]["registration_count"] = 1
+        snapshot["machines"]["B"]["waiting_position_count"] = 1
+        published = self.client.post(
+            "/api/queue-status", json=snapshot, headers=terminal_headers
+        )
+        self.assertEqual(204, published.status_code, published.get_json())
+        return snapshot
+
+    def management_leave_command(
+        self, snapshot, request_number, registration_id, machine_id, **fields
+    ):
+        return self.client.post(
+            "/api/queue-management/queue-commands",
+            json={
+                "request_id": f"00000000-0000-0000-0000-0000000006{request_number}",
+                "operation": "LEAVE_QUEUE",
+                "expected_queue_id": snapshot["queue_id"],
+                "expected_registration_id": registration_id,
+                "expected_machine_id": machine_id,
+                "expected_position": "WAITING",
+                "expected_fixed_pair_id": None,
+                "expected_absence_status": "NONE",
+                "expected_temporary_away_skipped_turns": 0,
+                "expected_pending_check_in": False,
+                "expected_machine_configuration_revision": 1,
+                **fields,
+            },
+            headers=self.management_headers,
+        )
+
+    def test_management_queue_commands_for_different_players_do_not_block_each_other(self):
+        # Every management command carries an empty actor_qq; it used to be compared, so the
+        # second command got 409 while any first one was pending.
+        snapshot = self.management_two_player_snapshot()
+
+        other_player = self.management_leave_command(snapshot, 10, "c" * 24, "B")
+        this_player = self.management_leave_command(
+            snapshot, 11, "a" * 24, "A", profile_id=self.profile_id
+        )
+        same_registration = self.management_leave_command(snapshot, 12, "a" * 24, "A")
+        same_profile = self.management_leave_command(
+            snapshot, 13, "a" * 24, "A", profile_id=self.profile_id
+        )
+
+        self.assertEqual(202, other_player.status_code, other_player.get_json())
+        self.assertEqual(202, this_player.status_code, this_player.get_json())
+        self.assertEqual("", this_player.get_json()["payload"]["actor_qq"])
+        for refused in (same_registration, same_profile):
+            self.assertEqual(409, refused.status_code, refused.get_json())
+            self.assertEqual("已有一项操作正在等待终端处理。", refused.get_json()["error"])
+        self.assertEqual(
+            ["c" * 24, "a" * 24],
+            [payload["registration_id"] for payload in self.pending_command_payloads()],
+        )
+
+    def test_management_command_by_profile_waits_for_one_that_targets_its_registration(self):
+        snapshot = self.management_two_player_snapshot()
+
+        by_registration = self.management_leave_command(snapshot, 20, "a" * 24, "A")
+        by_profile = self.management_leave_command(
+            snapshot, 21, "a" * 24, "A", profile_id=self.profile_id
+        )
+
+        self.assertEqual(202, by_registration.status_code, by_registration.get_json())
+        self.assertEqual(409, by_profile.status_code, by_profile.get_json())
+        self.assertEqual("已有一项操作正在等待终端处理。", by_profile.get_json()["error"])
+
+    def test_management_profile_update_is_not_blocked_by_a_command_for_another_player(self):
+        snapshot = self.management_two_player_snapshot()
+
+        def update(request_number, nickname):
+            return self.client.patch(
+                f"/api/queue-management/profiles/{self.profile_id}",
+                json={
+                    "request_id": f"00000000-0000-0000-0000-0000000006{request_number}",
+                    "nickname": nickname,
+                },
+                headers=self.management_headers,
+            )
+
+        other_player = self.management_leave_command(snapshot, 30, "c" * 24, "B")
+        first_update = update(31, "管理昵称")
+        second_update = update(32, "另一昵称")
+
+        self.assertEqual(202, other_player.status_code, other_player.get_json())
+        self.assertEqual(202, first_update.status_code, first_update.get_json())
+        self.assertEqual(409, second_update.status_code, second_update.get_json())
+        self.assertEqual("已有一项操作正在等待终端处理。", second_update.get_json()["error"])
+
+    def test_management_action_for_a_profile_with_a_pending_action_is_refused(self):
+        # One pending command of a type per profile (terminal_command_one_pending_profile).
+        # The check of this endpoint is per machine, so the same profile submitted for the
+        # other machine used to fail on the index with an unhandled error.
+        snapshot, terminal_headers = self.management_control_snapshot()
+        self.assertEqual(
+            204,
+            self.client.post(
+                "/api/queue-status", json=snapshot, headers=terminal_headers
+            ).status_code,
+        )
+
+        def add_registration(request_number, machine_id):
+            body = self.management_terminal_action_body(
+                snapshot,
+                request_number,
+                action="ADD_PROFILE_REGISTRATION",
+                profile_id=self.profile_id,
+            )
+            body["machine_id"] = machine_id
+            body["expected_machine_stable_id"] = snapshot["machines"][machine_id]["stable_id"]
+            return self.client.post(
+                "/api/queue-management/terminal-actions",
+                json=body,
+                headers=self.management_headers,
+            )
+
+        at_machine_a = add_registration(40, "A")
+        at_machine_b = add_registration(41, "B")
+
+        self.assertEqual(202, at_machine_a.status_code, at_machine_a.get_json())
+        self.assertEqual(409, at_machine_b.status_code, at_machine_b.get_json())
+        self.assertEqual(
+            "这名玩家已有一项操作正在等待终端处理。", at_machine_b.get_json()["error"]
+        )
+        self.assertEqual(
+            ["A"], [payload["machine_id"] for payload in self.pending_command_payloads()]
+        )
+
+    def test_management_check_in_waits_for_the_pending_join_of_the_same_profile(self):
+        # The terminal may publish the new registration before it reports the result of the
+        # join that created it. The join names the profile but no registration, so the check
+        # by registration did not see it and the insert failed on the index.
+        snapshot, terminal_headers = self.management_control_snapshot()
+        self.client.post("/api/queue-status", json=snapshot, headers=terminal_headers)
+        joined = self.client.post(
+            "/api/queue-online/join",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000650",
+                "qq": "12345678",
+                "machine_id": "A",
+            },
+        )
+        with_registration, _ = self.management_control_snapshot(with_registration=True)
+        with_registration["revision"] = snapshot["revision"] + 1
+        waiting_position = with_registration["machines"]["A"]["waiting_positions"][0]
+        waiting_position["registrations"][0]["online_registration_pending_check_in"] = True
+        waiting_position["estimated_wait_minutes"] = None
+        published = self.client.post(
+            "/api/queue-status", json=with_registration, headers=terminal_headers
+        )
+
+        check_in = self.client.post(
+            "/api/queue-management/commands",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000651",
+                "operation": "CHECK_IN",
+                "registration_id": "a" * 24,
+                "expected_queue_id": with_registration["queue_id"],
+                "expected_machine_id": "A",
+                "expected_position": "WAITING",
+                "expected_pending_check_in": True,
+                "expected_machine_configuration_revision": 1,
+            },
+            headers=self.management_headers,
+        )
+
+        self.assertEqual(202, joined.status_code, joined.get_json())
+        self.assertEqual(204, published.status_code, published.get_json())
+        self.assertEqual(409, check_in.status_code, check_in.get_json())
+        self.assertEqual(
+            "这份登记已有一项操作正在等待终端处理。", check_in.get_json()["error"]
+        )
+        self.assertEqual(
+            ["JOIN_QUEUE"],
+            [payload["operation"] for payload in self.pending_command_payloads()],
+        )
+
+    def test_request_json_that_the_database_cannot_store_is_refused(self):
+        # JSON allows integers of any size and lone surrogates; SQLite stores neither.
+        snapshot = self.remote_ready_snapshot(with_registration=True)
+        self.publish(snapshot)
+        too_large = 2**63
+        lone_surrogate = chr(0xD800)
+
+        def changed_snapshot(change):
+            changed = copy.deepcopy(snapshot)
+            changed["revision"] = snapshot["revision"] + 1
+            change(changed)
+            return self.client.post("/api/queue-status", json=changed, headers=self.headers)
+
+        def set_event_time(changed):
+            changed["recent_events"] = [
+                self.event("00000000-0000-0000-0000-000000000661", "OTHER", too_large)
+            ]
+
+        def set_profile_time(changed):
+            changed["private_player_profiles"][0]["last_used_at"] = too_large
+
+        def set_registration_name(changed):
+            registration = changed["machines"]["A"]["waiting_positions"][0]["registrations"][0]
+            registration["display_id"] = "昵称" + lone_surrogate
+
+        def set_event_detail(changed):
+            event = self.event("00000000-0000-0000-0000-000000000662", "OTHER", 1_000_100)
+            event["detail"] = lone_surrogate
+            changed["recent_events"] = [event]
+
+        responses = {
+            "event time": changed_snapshot(set_event_time),
+            "profile time": changed_snapshot(set_profile_time),
+            "registration name": changed_snapshot(set_registration_name),
+            "event detail": changed_snapshot(set_event_detail),
+            "bot cursor": self.client.post(
+                "/api/queue-bot/events", json={"after": too_large}, headers=self.bot_headers
+            ),
+            "bot nickname": self.client.patch(
+                f"/api/queue-bot/profiles/{self.profile_id}",
+                json={
+                    "request_id": "00000000-0000-0000-0000-000000000663",
+                    "actor_qq": "12345678",
+                    "nickname": "昵称" + lone_surrogate,
+                },
+                headers=self.bot_headers,
+            ),
+            "management nickname": self.client.patch(
+                f"/api/queue-management/profiles/{self.profile_id}",
+                json={
+                    "request_id": "00000000-0000-0000-0000-000000000664",
+                    "nickname": lone_surrogate,
+                },
+                headers=self.management_headers,
+            ),
+            "key": self.client.post(
+                "/api/queue-online/profile", json={"qq": "12345678", lone_surrogate: 1}
+            ),
+            "nested": self.client.post(
+                "/api/queue-online/profile", json={"qq": [{"value": -too_large - 1}]}
+            ),
+        }
+
+        for label, response in responses.items():
+            with self.subTest(label=label):
+                self.assertEqual(400, response.status_code, response.get_json())
+                self.assertEqual(
+                    "请求内容包含超出范围的整数或无效字符。", response.get_json()["error"]
+                )
+        # Nothing of the refused requests was kept.
+        self.assertEqual(
+            snapshot["revision"], self.client.get("/api/queue-status").get_json()["revision"]
+        )
+        self.assertEqual([], self.pending_command_payloads())
+        # The largest and smallest integers SQLite stores are still read as before.
+        largest = self.client.post(
+            "/api/queue-bot/events", json={"after": too_large - 1}, headers=self.bot_headers
+        )
+        self.assertEqual(200, largest.status_code, largest.get_json())
+        self.assertEqual([], largest.get_json()["events"])
+
+    def test_cursor_in_the_query_string_beyond_the_database_range_is_refused(self):
+        self.publish(self.remote_ready_snapshot())
+        too_large = 2**63
+
+        bot_events = self.client.get(
+            f"/api/queue-bot/events?after={too_large}", headers=self.bot_headers
+        )
+        public_logs = self.client.get(f"/api/queue-logs?before={too_large}")
+        largest_cursor = self.client.get(f"/api/queue-logs?before={too_large - 1}")
+
+        self.assertEqual(400, bot_events.status_code, bot_events.get_json())
+        self.assertEqual("after 或 limit 数值无效。", bot_events.get_json()["error"])
+        self.assertEqual(400, public_logs.status_code, public_logs.get_json())
+        self.assertEqual("before 数值无效。", public_logs.get_json()["error"])
+        self.assertEqual(200, largest_cursor.status_code, largest_cursor.get_json())
+
+    def test_nickname_with_a_line_break_or_control_character_is_refused(self):
+        snapshot, terminal_headers = self.management_schema_eight_snapshot()
+        self.client.post("/api/queue-status", json=snapshot, headers=terminal_headers)
+        nicknames = (
+            "甲\n乙", "甲\r乙", "甲\t乙", "甲\x00乙", "甲\x1b乙", "甲\x7f乙", "甲\x85乙",
+            "甲 乙", "甲 乙",
+        )
+
+        for index, nickname in enumerate(nicknames):
+            with self.subTest(nickname=ascii(nickname)):
+                by_management = self.client.patch(
+                    f"/api/queue-management/profiles/{self.profile_id}",
+                    json={
+                        "request_id": f"00000000-0000-0000-0000-00000000067{index}",
+                        "nickname": nickname,
+                    },
+                    headers=self.management_headers,
+                )
+                by_bot = self.client.patch(
+                    f"/api/queue-bot/profiles/{self.profile_id}",
+                    json={
+                        "request_id": f"00000000-0000-0000-0000-00000000068{index}",
+                        "actor_qq": "12345678",
+                        "nickname": nickname,
+                    },
+                    headers=self.bot_headers,
+                )
+                for response in (by_management, by_bot):
+                    self.assertEqual(400, response.status_code, response.get_json())
+                    self.assertEqual("昵称不能包含换行、制表符等控制字符，请重新填写。", response.get_json()["error"])
+        self.assertEqual([], self.pending_command_payloads())
+
+        # White space around a name is trimmed as before, and the length rule is unchanged.
+        trimmed = self.client.patch(
+            f"/api/queue-management/profiles/{self.profile_id}",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000690",
+                "nickname": "\n 一二三四五六七八九十一二三四五六七八 \t",
+            },
+            headers=self.management_headers,
+        )
+        self.assertEqual(202, trimmed.status_code, trimmed.get_json())
+        self.assertEqual(
+            "一二三四五六七八九十一二三四五六七八", trimmed.get_json()["payload"]["nickname"]
+        )
+
+    def test_web_and_mobile_forms_refuse_a_nickname_with_a_control_character(self):
+        snapshot = self.paired_remote_snapshot(76)
+        self.publish(snapshot)
+
+        creation_token = self.open_profile_creation(71)
+        created = self.client.post(
+            f"/api/player-profile-creation/sessions/{creation_token}/complete",
+            json=self.profile_creation_body(nickname="网页\n玩家"),
+        )
+        mobile_token = self.open_mobile_session(snapshot, 72)
+        submitted = self.client.post(
+            f"/api/queue-mobile/sessions/{mobile_token}/submit",
+            json={
+                "request_id": "00000000-0000-0000-0000-000000000691",
+                "new_profile": self.mobile_new_profile(nickname="移动\r玩家"),
+            },
+        )
+        binding = self.client.post(
+            "/api/queue-terminal/player-bindings",
+            json={"profile_id": self.profile_id},
+            headers=self.headers,
+        )
+        account = self.client.post(
+            f"/api/player-account/bindings/{binding.get_json()['binding_token']}/complete",
+            json={"password": "first-password"},
+        )
+        updated = self.client.patch(
+            "/api/player-account/profile",
+            json={
+                "expected_profile_revision": account.get_json()["account"]["profile"][
+                    "profile_revision"
+                ],
+                "nickname": "网页\t昵称",
+            },
+            headers={"X-CSRF-Token": self.client.get_cookie("maimai_q_session_csrf").value},
+        )
+
+        self.assertEqual(201, account.status_code, account.get_json())
+        for response in (created, submitted, updated):
+            self.assertEqual(400, response.status_code, response.get_json())
+            self.assertEqual("昵称不能包含换行、制表符等控制字符，请重新填写。", response.get_json()["error"])
+        self.assertEqual([], self.pending_command_payloads())
+        self.assertEqual("公开昵称", self.terminal_profile()["nickname"])
+
+    def test_new_queue_reset_event_only_reaches_players_whose_registration_it_cleared(self):
+        # The contacts of a queue keep players who left it earlier. Only those whose
+        # registration was still in the last snapshot of the old queue are told of the new one.
+        staying = self.registration("a" * 24, "公开昵称")
+        leaving = self.registration("e" * 24, "已经退出")
+        leaving_profile = self.player_profile()
+        leaving_profile.update(
+            profile_id="00000000-0000-0000-0000-000000000902",
+            nickname="已经退出",
+            qq_number="87654321",
+        )
+        profiles = [self.player_profile(), leaving_profile]
+
+        def old_queue(revision, playing):
+            snapshot = self.snapshot(revision=revision)
+            snapshot["schema_version"] = 3
+            snapshot["machines"]["A"] = self.machine(name="左侧 · 机台 A", playing=playing)
+            snapshot["private_player_profiles"] = profiles
+            snapshot["private_player_contacts"] = [
+                {
+                    "registration_id": registration["registration_id"],
+                    "profile_id": profile["profile_id"],
+                    "qq_number": profile["qq_number"],
+                }
+                for registration, profile in zip((staying, leaving), profiles)
+                if registration in playing
+            ]
+            return snapshot
+
+        new_queue = self.snapshot(queue_id="00000000-0000-0000-0000-000000000002", revision=6)
+        new_queue["schema_version"] = 3
+        new_queue["machines"]["A"] = self.machine(name="左侧 · 机台 A")
+        new_queue["private_player_profiles"] = profiles
+        new_queue["private_player_contacts"] = []
+        reset_event = self.event(
+            "00000000-0000-0000-0000-000000000196", "QUEUE_RESET", 1_000_200
+        )
+        reset_event.update(
+            machine_id=None,
+            title="已开始新的队列",
+            detail="未载入上次保存的 1 份登记，已从空队列开始。",
+            registration_ids=[],
+        )
+        new_queue["recent_events"] = [reset_event]
+
+        for snapshot in (old_queue(4, [staying, leaving]), old_queue(5, [staying]), new_queue):
+            self.publish(snapshot)
+        events = self.client.post(
+            "/api/queue-bot/events", json={"after": 0}, headers=self.bot_headers
+        ).get_json()["events"]
+        public_logs = self.client.get("/api/queue-logs").get_json()["logs"]
+
+        self.assertEqual(["QUEUE_RESET"], [event["type"] for event in events])
+        self.assertEqual(
+            ["12345678"],
+            [player["qq_number"] for player in events[0]["affected_players"]],
+        )
+        self.assertEqual([staying["registration_id"]], public_logs[0]["registration_ids"])
 
     def remote_ready_snapshot(
         self,

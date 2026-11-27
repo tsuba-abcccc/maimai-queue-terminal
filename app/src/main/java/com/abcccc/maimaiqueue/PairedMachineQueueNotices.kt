@@ -206,6 +206,18 @@ internal fun pairedMachineArrangementStatus(
 internal fun pairedMachineArrangementTileNotice(pairedMachineName: String): String =
     "可能转至 $pairedMachineName"
 
+/**
+ * Whether the tile of a waiting registration says so. Not while the count of the announcement is
+ * paused (a round has run over): the other machine shows no preview then, and nothing is
+ * arranged before the count goes on.
+ */
+internal fun announcesPairedArrangement(
+    registration: Registration,
+    record: PairedArrangementRecord?
+): Boolean = registration.alsoQueuesAtPairedMachine &&
+    record?.previewSinceMillis != null &&
+    record.previewPausedAtMillis == null
+
 /** What the grey entry that stands for a registration of the other machine explains. */
 internal const val PAIRED_MACHINE_PREVIEW_TITLE = "另一机台登记的预览"
 

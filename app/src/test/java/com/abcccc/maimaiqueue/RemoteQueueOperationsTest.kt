@@ -34,7 +34,7 @@ class RemoteQueueOperationsTest {
 
         assertTrue(result is ManagementQueueActionDecision.Reject)
         assertEquals(
-            "终端敏感策略已经更新，请刷新管理后台后再操作。",
+            "由管理后台接管的设置已经更新，请刷新管理后台后再操作。",
             (result as ManagementQueueActionDecision.Reject).detail
         )
         assertTrue(current.queues.values.all { it.allRegistrations.isEmpty() })
@@ -760,6 +760,68 @@ class RemoteQueueOperationsTest {
         assertEquals("登记已取消轮空一次。", cancelled.detail)
     }
 
+    /**
+     * Review 2026-11-27: a cancel that arrives just after the 轮空一次 or 暂缓一次 was carried out
+     * used to be answered as already cancelled, although the player was already at the tail.
+     */
+    @Test
+    fun aCancelAfterTheSkipOrDeferralWasCarriedOutIsRefused() {
+        val player = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = profile().id
+        )
+        // The player saw 将轮空一次 with no turn skipped yet; meanwhile the round ended.
+        val skipCarriedOut = state(
+            machineA = MachineQueue(
+                playing = listOf(registration(3, "其他玩家")),
+                waiting = listOf(registration(1, "游玩过"), player.copy(temporaryAwaySkippedTurns = 1)),
+                playingStartedAtMillis = 3_000L
+            ),
+            nextKey = 4
+        )
+        val lateSkipCancel = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.CANCEL_SKIP_ONE_TURN, player).copy(
+                expectedPosition = RemoteRegistrationPosition.WAITING,
+                expectedAbsenceStatus = QueueAbsenceStatus.SKIP_ONE_TURN,
+                expectedTemporaryAwaySkippedTurns = 0,
+                expectedPendingCheckIn = false
+            ),
+            skipCarriedOut
+        )
+        assertEquals(
+            "这份登记已轮空一次并移至队尾，无法再取消。",
+            (lateSkipCancel as RemoteQueueOperationDecision.Reject).detail
+        )
+        // Cancelled by someone else before: still answered as done.
+        val repeatedSkipCancel = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.CANCEL_SKIP_ONE_TURN, player).copy(
+                expectedPosition = RemoteRegistrationPosition.WAITING,
+                expectedAbsenceStatus = QueueAbsenceStatus.SKIP_ONE_TURN,
+                expectedTemporaryAwaySkippedTurns = 1,
+                expectedPendingCheckIn = false
+            ),
+            skipCarriedOut
+        )
+        assertTrue(repeatedSkipCancel is RemoteQueueOperationDecision.AlreadyApplied)
+
+        val deferCarriedOut = state(
+            machineA = MachineQueue(
+                playing = listOf(registration(3, "其他玩家")),
+                waiting = listOf(player.copy(deferOneRoundUsed = true)),
+                playingStartedAtMillis = 3_000L
+            ),
+            nextKey = 4
+        )
+        val lateDeferCancel = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND, player),
+            deferCarriedOut
+        )
+        assertEquals(
+            "这份登记的暂缓一次已完成，无法再取消。",
+            (lateDeferCancel as RemoteQueueOperationDecision.Reject).detail
+        )
+    }
+
     @Test
     fun aUsedDeferralIsRefusedButSkippingIsNot() {
         val player = registration(2, "资料玩家").copy(
@@ -898,13 +960,13 @@ class RemoteQueueOperationsTest {
     @Test
     fun missedTurnsKeptAfterComingBackDoNotMakeRemoteCommandsLookStale() {
         // The player came back after two missed turns; the terminal keeps that count until
-        // the registration has played, but tells the server nothing of it.
+        // the registration has played, and tells the server so (since 2026-11-28).
         val player = registration(2, "资料玩家").copy(
             isTemporary = false,
             playerProfileId = profile().id,
             temporaryAwaySkippedTurns = 2
         )
-        assertEquals(0, player.publishedTemporaryAwaySkippedTurns)
+        assertEquals(2, player.publishedTemporaryAwaySkippedTurns)
         assertEquals(
             2,
             player.copy(absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY)
@@ -923,7 +985,7 @@ class RemoteQueueOperationsTest {
             operationCommand(RemoteQueueOperation.TEMPORARILY_LEAVE, player).copy(
                 expectedPosition = RemoteRegistrationPosition.WAITING,
                 expectedAbsenceStatus = QueueAbsenceStatus.NONE,
-                expectedTemporaryAwaySkippedTurns = 0,
+                expectedTemporaryAwaySkippedTurns = 2,
                 expectedPendingCheckIn = false
             ),
             current,
@@ -1267,6 +1329,270 @@ class RemoteQueueOperationsTest {
             join(true, RemoteQueueOperationSource.QQ_BOT)
                 .updatedProfile!!.pairedMachineQueueingIntroduced
         )
+    }
+
+    @Test
+    fun theProfileRemembersTheLastAnswerToThePassingTickBox() {
+        fun join(
+            allowsPassing: Boolean?,
+            preference: PlayPreference = PlayPreference.SOLO,
+            remembered: Boolean = false
+        ) = decideRemoteQueueOperation(
+            joinCommand().copy(preference = preference, allowsPassing = allowsPassing),
+            state().copy(
+                playerProfiles = listOf(
+                    profile().copy(
+                        defaultPreference = ProfilePlayPreference.ASK_EVERY_TIME,
+                        lastAllowsPassing = remembered
+                    )
+                )
+            )
+        ).applied()
+
+        val ticked = join(true)
+        assertTrue(ticked.updatedProfile!!.lastAllowsPassing)
+        assertTrue(ticked.state.queues.getValue("A").waiting.single().allowsPassing)
+        assertFalse(join(false, remembered = true).updatedProfile!!.lastAllowsPassing)
+        // A client that did not offer the box, such as the Bot, leaves the answer as it was,
+        // and so does choosing 允许他人加入.
+        assertTrue(join(null, remembered = true).updatedProfile!!.lastAllowsPassing)
+        assertTrue(
+            join(false, PlayPreference.OPEN_TO_JOIN, remembered = true).updatedProfile!!.lastAllowsPassing
+        )
+
+        // Answered again later in 更改游玩偏好.
+        val solo = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = PROFILE_ID,
+            preference = PlayPreference.SOLO
+        )
+        val waiting = state(
+            machineA = MachineQueue(
+                playing = listOf(registration(1, "机台甲玩家")),
+                waiting = listOf(solo),
+                playingStartedAtMillis = 1_000L
+            )
+        )
+        val turnedOn = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.SET_ALLOWS_PASSING, solo).copy(allowsPassing = true),
+            waiting
+        ).applied()
+        assertTrue(turnedOn.updatedProfile!!.lastAllowsPassing)
+        assertTrue(turnedOn.updatedProfile!!.revision > profile().revision)
+
+        // Review 2026-11-27: the queue was saved but the profile write failed; the retry finds
+        // the choice already set and still remembers it.
+        val retried = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.SET_ALLOWS_PASSING, solo).copy(allowsPassing = true),
+            turnedOn.state
+        ) as RemoteQueueOperationDecision.AlreadyApplied
+        assertTrue(retried.updatedProfile!!.lastAllowsPassing)
+        // Once remembered, nothing more to write.
+        val again = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.SET_ALLOWS_PASSING, solo).copy(allowsPassing = true),
+            turnedOn.state.copy(playerProfiles = listOf(retried.updatedProfile!!))
+        ) as RemoteQueueOperationDecision.AlreadyApplied
+        assertEquals(null, again.updatedProfile)
+    }
+
+    @Test
+    fun aMemberOfAFixedPairSetsTheChoiceToLetOthersPassForBoth() {
+        val own = registration(2, "资料玩家").copy(
+            isTemporary = false,
+            playerProfileId = PROFILE_ID,
+            preference = PlayPreference.OPEN_TO_JOIN,
+            fixedPartnerKey = 3
+        )
+        val friend = registration(3, "朋友").copy(preference = PlayPreference.OPEN_TO_JOIN, fixedPartnerKey = 2)
+        val waiting = state(
+            machineA = MachineQueue(
+                playing = listOf(registration(1, "机台甲玩家")),
+                waiting = listOf(own, friend),
+                playingStartedAtMillis = 1_000L
+            )
+        )
+        val turnedOn = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.SET_ALLOWS_PASSING, own).copy(allowsPassing = true),
+            waiting
+        ).applied()
+        assertEquals("已允许后方的登记越过这组固定组合与前方的登记共同游玩。", turnedOn.detail)
+        assertEquals(
+            listOf(true, true),
+            turnedOn.state.queues.getValue("A").waiting.map(Registration::allowsPassing)
+        )
+        // The choice of two is not remembered as the player's own answer for 单人游玩; the
+        // profile only records that the explanation was shown.
+        assertFalse(turnedOn.updatedProfile!!.lastAllowsPassing)
+        assertTrue(turnedOn.updatedProfile!!.passingIntroduced)
+
+        val turnedOff = decideRemoteQueueOperation(
+            operationCommand(
+                RemoteQueueOperation.SET_ALLOWS_PASSING,
+                turnedOn.state.queues.getValue("A").waiting.first()
+            ).copy(allowsPassing = false),
+            turnedOn.state
+        ).applied()
+        assertEquals("这组固定组合不再允许后方的登记越过。", turnedOff.detail)
+        assertTrue(turnedOff.state.queues.getValue("A").waiting.none(Registration::allowsPassing))
+    }
+
+    // ---- 与朋友共同游玩 and 修改登记昵称 from the website (2026-11-28) -------------------------
+
+    private fun ownWaiting(key: Int = 2) = registration(key, "资料玩家").copy(
+        isTemporary = false,
+        playerProfileId = PROFILE_ID,
+        preference = PlayPreference.OPEN_TO_JOIN
+    )
+
+    private fun pairCommand(own: Registration, partner: Registration, allowsPassing: Boolean? = null) =
+        operationCommand(RemoteQueueOperation.CREATE_FIXED_PAIR, own).copy(
+            partnerRegistrationId = publicRegistrationId(QUEUE_ID, partner.key),
+            allowsPassing = allowsPassing
+        )
+
+    @Test
+    fun aFixedPairIsFormedWithARegistrationWaitingAtTheSameMachine() {
+        val own = ownWaiting()
+        val friend = registration(3, "朋友").copy(preference = PlayPreference.OPEN_TO_JOIN)
+        val waiting = state(
+            machineA = MachineQueue(
+                playing = listOf(registration(1, "机台甲玩家")),
+                waiting = listOf(own, friend),
+                playingStartedAtMillis = 1_000L
+            )
+        )
+        val formed = decideRemoteQueueOperation(pairCommand(own, friend), waiting).applied()
+        assertEquals("“资料玩家”与“朋友”已组成固定组合。", formed.detail)
+        val pair = formed.state.queues.getValue("A").waiting
+        assertEquals(listOf<Int?>(3, 2), pair.map(Registration::fixedPartnerKey))
+        assertTrue(pair.none(Registration::allowsPassing))
+
+        // With the pair's tick box: one choice for both, and the explanation counts as shown.
+        val passing = decideRemoteQueueOperation(pairCommand(own, friend, allowsPassing = true), waiting).applied()
+        assertEquals(
+            "“资料玩家”与“朋友”已组成固定组合。已允许后方的登记越过这组固定组合与前方的登记共同游玩。",
+            passing.detail
+        )
+        assertTrue(passing.state.queues.getValue("A").waiting.all(Registration::allowsPassing))
+        assertTrue(passing.updatedProfile!!.passingIntroduced)
+
+        // Asked again, it has already happened.
+        val again = decideRemoteQueueOperation(pairCommand(own, friend), formed.state)
+        assertEquals(
+            "这两份登记已经组成固定组合。",
+            (again as RemoteQueueOperationDecision.AlreadyApplied).detail
+        )
+    }
+
+    @Test
+    fun aFixedPairThatWouldMoveBackSaysWhere() {
+        val own = ownWaiting()
+        val solo = registration(3, "单人玩家").copy(preference = PlayPreference.SOLO)
+        val friend = registration(4, "朋友").copy(preference = PlayPreference.OPEN_TO_JOIN)
+        val formed = decideRemoteQueueOperation(
+            pairCommand(own, friend),
+            state(
+                machineA = MachineQueue(
+                    playing = listOf(registration(1, "机台甲玩家")),
+                    waiting = listOf(own, solo, friend),
+                    playingStartedAtMillis = 1_000L
+                )
+            )
+        ).applied()
+        assertEquals(
+            "“资料玩家”与“朋友”已组成固定组合。为避免延后其他玩家，“资料玩家”已后移至位置 A2。",
+            formed.detail
+        )
+        assertEquals(listOf(3, 2, 4), formed.state.queues.getValue("A").waiting.map(Registration::key))
+    }
+
+    @Test
+    fun aFixedPairIsRefusedWithTheReason() {
+        val own = ownWaiting()
+        fun refusal(waiting: List<Registration>, partner: Registration, playing: List<Registration> = listOf(registration(1, "机台甲玩家"))) =
+            (
+                decideRemoteQueueOperation(
+                    pairCommand(own, partner),
+                    state(machineA = MachineQueue(playing = playing, waiting = waiting, playingStartedAtMillis = 1_000L))
+                ) as RemoteQueueOperationDecision.Reject
+                ).detail
+
+        val pending = registration(3, "线上玩家").copy(
+            requiresOnSiteCheckIn = true,
+            onSiteCheckInStartedAtMillis = 1_000L,
+            wasOnlineRegistration = true
+        )
+        assertEquals(
+            "这份线上登记尚未完成现场签到，签到后才能组成固定组合。",
+            refusal(listOf(own, pending), pending)
+        )
+        val deferred = registration(4, "暂缓玩家").copy(absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND)
+        assertEquals(FIXED_PAIR_WHILE_POSTPONED_REASON, refusal(listOf(own, deferred), deferred))
+        val gone = registration(5, "已离开")
+        assertEquals("朋友的登记已经不在这台机台的等待顺序中，请重新选择。", refusal(listOf(own), gone))
+        val friend = registration(6, "朋友")
+        assertEquals(
+            "这份登记处于游玩位置。请在本轮结束、这份登记回到等待顺序后，再组成固定组合。",
+            refusal(listOf(friend), friend, playing = listOf(own))
+        )
+    }
+
+    @Test
+    fun aRegistrationIsRenamedWithoutTouchingTheProfile() {
+        val own = ownWaiting()
+        val other = registration(3, "小林")
+        val waiting = state(
+            machineA = MachineQueue(
+                playing = listOf(registration(1, "机台甲玩家")),
+                waiting = listOf(own, other),
+                playingStartedAtMillis = 1_000L
+            )
+        )
+        fun rename(name: String) = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.RENAME_REGISTRATION, own).copy(displayId = name),
+            waiting
+        )
+        val renamed = rename("  新昵称 ").applied()
+        assertEquals("登记昵称已改为“新昵称”。玩家资料中的昵称没有改变。", renamed.detail)
+        assertEquals("新昵称", renamed.state.queues.getValue("A").waiting.first().displayId)
+        assertEquals(null, renamed.updatedProfile)
+
+        assertEquals(
+            "当前队列中已经有相同昵称的登记。",
+            (rename("小林") as RemoteQueueOperationDecision.Reject).detail
+        )
+        assertEquals(
+            "登记昵称应为 1 至 18 个字符，请重新填写。",
+            (rename("很长".repeat(10)) as RemoteQueueOperationDecision.Reject).detail
+        )
+        assertTrue(rename("资料玩家") is RemoteQueueOperationDecision.AlreadyApplied)
+    }
+
+    @Test
+    fun joiningCanSaveTheChosenPreferenceAsTheDefault() {
+        fun join(remember: Boolean) = decideRemoteQueueOperation(
+            joinCommand().copy(preference = PlayPreference.SOLO, rememberPreference = remember),
+            state().copy(
+                playerProfiles = listOf(profile().copy(defaultPreference = ProfilePlayPreference.ASK_EVERY_TIME))
+            )
+        ).applied()
+        assertEquals(ProfilePlayPreference.SOLO, join(true).updatedProfile!!.defaultPreference)
+        assertEquals(ProfilePlayPreference.ASK_EVERY_TIME, join(false).updatedProfile!!.defaultPreference)
+    }
+
+    @Test
+    fun aPreferenceChangedWhilePlayingIsSaidToCountFromTheNextRound() {
+        val playing = registration(2, "资料玩家").copy(isTemporary = false, playerProfileId = PROFILE_ID)
+        val decision = decideRemoteQueueOperation(
+            operationCommand(RemoteQueueOperation.CHANGE_PLAY_PREFERENCE, playing, preference = PlayPreference.SOLO),
+            state(machineA = MachineQueue(playing = listOf(playing), playingStartedAtMillis = 1_000L))
+        ).applied()
+        assertEquals(
+            "本次游玩偏好已改为“单人游玩”，本轮游玩结束后生效。玩家资料中的默认游玩偏好没有改变。",
+            decision.detail
+        )
+        // The playing position itself stays as it is.
+        assertEquals(listOf(2), decision.state.queues.getValue("A").playing.map(Registration::key))
     }
 
     @Test
@@ -1763,6 +2089,54 @@ class RemoteQueueOperationsTest {
     }
 
     /** Machines A and B form a pair unless [paired] is false. */
+    /**
+     * Found 2026-11-27: the management app sees the waiting positions of the snapshot, which are
+     * those of the home screen (a deferred registration where it will next play, a pending online
+     * registration as if it checks in). The terminal compared them with the real grouping, so
+     * every management command on such a machine was refused as “现场队列位置已经变化”.
+     */
+    @Test
+    fun aManagementCommandKnowsThePositionsAsTheSnapshotShowsThem() {
+        val deferred = registration(2, "暂缓玩家").copy(
+            preference = PlayPreference.SOLO,
+            absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND
+        )
+        val queue = MachineQueue(
+            playing = listOf(registration(1, "游玩中")),
+            waiting = listOf(deferred, registration(3, "第三位"), registration(4, "第四位")),
+            playingStartedAtMillis = 1_000L
+        )
+        val shown = queue.waitingProjection(includeCommonPlayPreview = false).positions
+            .map { position -> position.registrations.map { it.key } }
+        // The screen and the snapshot show the deferred registration after the pair that passes it.
+        assertEquals(listOf(listOf(3, 4), listOf(2)), shown)
+        assertEquals(listOf(listOf(2), listOf(3, 4)), queue.waitingPositions().map { p -> p.map { it.key } })
+        val stableIds = mapOf(
+            "A" to "10000000000000000000000000000001",
+            "B" to "10000000000000000000000000000002"
+        )
+        val current = state(machineA = queue, nextKey = 5).copy(machineStableIds = stableIds)
+        val decision = decideManagementQueueAction(
+            ManagementQueueActionCommand(
+                commandId = "00000000-0000-0000-0000-000000000483",
+                createdAtMillis = 2_000L,
+                queueId = QUEUE_ID,
+                queueRevision = 1L,
+                machineConfigurationRevision = current.machineConfigurationRevision,
+                action = ManagementQueueAction.CANCEL_DEFER_ONE_ROUND,
+                machineId = "A",
+                machineStableId = current.machineStableIds.getValue("A"),
+                expectedPlayingRegistrationIds = listOf(publicRegistrationId(QUEUE_ID, 1)),
+                expectedWaitingPositionRegistrationIds = shown.map { position ->
+                    position.map { publicRegistrationId(QUEUE_ID, it) }
+                },
+                registrationIds = listOf(publicRegistrationId(QUEUE_ID, 2))
+            ),
+            current
+        )
+        assertTrue(decision.toString(), decision is ManagementQueueActionDecision.Apply)
+    }
+
     private fun pairedState(
         machineA: MachineQueue = MachineQueue(),
         machineB: MachineQueue = MachineQueue(),
@@ -1779,6 +2153,10 @@ class RemoteQueueOperationsTest {
             machinePartners = partners
         )
     }
+
+    private fun RemoteQueueOperationDecision.applied(): RemoteQueueOperationDecision.Apply =
+        this as? RemoteQueueOperationDecision.Apply
+            ?: error("not applied: ${(this as? RemoteQueueOperationDecision.Reject)?.detail ?: this}")
 
     private fun state(
         machineA: MachineQueue = MachineQueue(),

@@ -247,6 +247,7 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                     put("preference", registration.preference.name)
                     put("absenceStatus", registration.absenceStatus.name)
                     put("temporaryAwaySkippedTurns", registration.temporaryAwaySkippedTurns)
+                    put("skippedTurnsCarriedFromPartner", registration.skippedTurnsCarriedFromPartner)
                     put("isTemporary", registration.isTemporary)
                     put("createdAtMillis", registration.createdAtMillis)
                     put("lastPlayedAtMillis", registration.lastPlayedAtMillis ?: JSONObject.NULL)
@@ -273,6 +274,12 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                     }
                     if (registration.skipsPairedMachineThisRound) {
                         put("skipsPairedMachineThisRound", true)
+                    }
+                    if (registration.allowsPassing) {
+                        put("allowsPassing", true)
+                    }
+                    if (registration.passedOverKeys.isNotEmpty()) {
+                        put("passedOverKeys", JSONArray(registration.passedOverKeys))
                     }
                 }
             )
@@ -425,6 +432,8 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                 absenceStatus = absenceStatus,
                 // Kept after the player came back, until the registration has played a round.
                 temporaryAwaySkippedTurns = item.optInt("temporaryAwaySkippedTurns").coerceIn(0, 3),
+                // Absent in files saved by earlier versions: nothing was carried.
+                skippedTurnsCarriedFromPartner = item.optInt("skippedTurnsCarriedFromPartner").coerceIn(0, 3),
                 isTemporary = item.optBoolean("isTemporary", true),
                 createdAtMillis = item.optLong("createdAtMillis").takeIf { it > 0L }
                     ?: return null,
@@ -451,7 +460,11 @@ class LocalQueueStateRepository(context: Context) : QueueStateRepository {
                     ?.takeIf { value -> runCatching { java.util.UUID.fromString(value) }.isSuccess },
                 alsoQueuesAtPairedMachine = item.optBoolean("alsoQueuesAtPairedMachine", false),
                 skipsPairedMachineThisRound = item.optBoolean("skipsPairedMachineThisRound", false),
-                wasOnlineRegistration = item.optBoolean("wasOnlineRegistration", false)
+                wasOnlineRegistration = item.optBoolean("wasOnlineRegistration", false),
+                allowsPassing = item.optBoolean("allowsPassing", false),
+                passedOverKeys = item.optJSONArray("passedOverKeys")?.let { keys ->
+                    (0 until keys.length()).mapNotNull { index -> keys.optInt(index, -1).takeIf { it >= 0 } }
+                }.orEmpty()
             )
         }
         return registrations

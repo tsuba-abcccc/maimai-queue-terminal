@@ -64,7 +64,10 @@
 - `management_settings_supported`（0.13.2 加入，缺省为 `false`）：终端声明支持管理后台的设置类命令；未声明时管理接口不会为它创建这类命令。为 `true` 时以下四项必填：`management_settings_revision`（不小于 `0` 的整数）、`show_common_play_preview`（是否显示共同游玩预览）、`registration_control_open`（登记排队开关本身的状态）和 `business_hours_settings`（完整营业时间表，结构与机厅营业时间接口的 `business_hours` 相同）。为 `false` 时服务端保存 `management_settings_revision: 0`、`show_common_play_preview: true`、`business_hours_settings: null`，`registration_control_open` 取 `registration_open` 的值。
 - 玩家资料字段 `recent_usage_at`：只要出现就会读取，每份资料最多 `16` 条。
 - 同时在两台机台排队的六个字段：登记字段 `also_queues_at_paired_machine`（布尔值，缺省为 `false`）、登记字段 `skips_paired_machine_this_round`（布尔值，缺省为 `false`，终端只在为 `true` 时发送）、登记字段 `paired_arrangement_announced`（布尔值，缺省为 `false`，终端只在为 `true` 时发送）、登记字段 `paired_arrangement_not_before`（毫秒时间戳，缺省为 `null`，只与前一项同时出现）、机台字段 `paired_machine_id`（缺省为 `null`）和机台字段 `paired_waiting_positions`（缺省为 `null`）。六者都缺省时与没有这项功能的终端完全相同。含义和校验规则见“当前队列”。
+- 登记字段 `wait_minutes_if_online_missing`（非负整数，缺省为 `null`，2026-11-26 加入）：等待中的登记在前方待签到的线上登记都未按时签到时的等待分钟数。等待时间本身按线上登记都会签到计算；终端只在这个时间显示得比所在位置的 `estimated_wait_minutes` 更早时发送。含义和校验规则见“当前队列”。
+- 登记字段 `own_estimated_wait_minutes`（非负整数）和 `own_estimated_wait_uncertain`（布尔值），均可缺省（2026-11-27 加入）：两份登记共用一个等待位置时，位置显示两者中较早的时间；较早的那份可能被安排到一对机台中的另一台时，另一份自己的等待时间可能更晚。终端只在它与位置的 `estimated_wait_minutes` 不同时发送。含义见“当前队列”。
 - 等待位置字段 `estimated_wait_uncertain`（布尔值，缺省为 `false`）：`waiting_positions` 和 `paired_waiting_positions` 的每个位置都可以带有，表示这个位置的等待时间可能不准确。含义和校验规则见“当前队列”。
+- 单人游玩的登记允许后方的登记越过（2026-11-26 加入）的三个字段：登记字段 `allows_passing`（布尔值，缺省为 `false`，终端只在为 `true` 时发送）、登记字段 `passing_over`（登记编号的数组，缺省为空数组）和顶层字段 `supported_queue_operations`（操作名称的数组，缺省为空数组，旧版终端不发送）。含义和校验规则见“当前队列”和“单人游玩的登记允许后方的登记越过”。
 - 轮空一次与延后登记的限制（2026-11 加入）的三个登记字段：`skips_one_turn`（将轮空一次）、`defer_one_round_used`（暂缓一次已经使用、此后尚未游玩一轮）和 `online_registration_not_played`（已签到的线上登记尚未游玩一轮），都是布尔值，缺省为 `false`。`skips_one_turn` 为 `true` 时 `temporary_away_skipped_turns` 也可以不为 `0`。含义和校验规则见“当前队列”。
 
 终端在版本 7 和版本 8 的请求体中都发送上述两组管理字段，`recent_usage_at` 只在版本 8 中发送。
@@ -709,6 +712,107 @@ Bot（`POST /api/queue-bot/queue-commands`）、网页账户（`POST /api/player
 
 `GET /api/player-account/queue` 的 `registrations` 每一项增加 `also_queues_at_paired_machine`、`skips_paired_machine_this_round`、`paired_arrangement_announced`、`paired_arrangement_not_before`（没有时为 `null`）、`paired_machine_id`（登记所在机台的另一机台，没有时为 `null`）和 `estimated_wait_uncertain`（见“当前队列”）；`queue.machines` 每一项增加 `paired_machine_id`。网站据此在本人登记下写明预览已经显示，以及最早何时之后可能自动转至另一机台；时刻按浏览器所在设备的本地时间显示为 `HH:mm`，已经过去时改为说明随时可能自动转至另一机台。
 
+## 单人游玩的登记允许后方的登记越过
+
+这一节汇总这项功能（2026-11-26 加入）在快照以外增加的内容。快照字段 `allows_passing` 和 `passing_over` 见“当前队列”。所有新增内容都没有提升协议版本号，旧版终端、旧版服务端和旧版客户端不发送也不读取它们。设计和界面文字见 `docs/releases/solo-pass-plan-2026-11.md` 第十一、十二节。
+
+这项选择属于单份登记。界面上是“单人游玩”选项里的一个勾选框；改为允许他人加入、组成固定组合或转入仅能容纳一人游玩的机台时，终端自动取消它。
+
+### 玩家资料记住上一次的选择
+
+临时登记的勾选框默认不勾。玩家资料的勾选框从这名玩家上一次的选择开始（维护者，2026-11-26）：
+
+- 资料字段 `last_allows_passing`：布尔值，缺省为 `false`。与 `paired_machine_queueing_introduced` 不同，它可以在两个值之间来回变化，以终端为准。
+- 终端在 `private_player_profiles` 的每份资料中都上传它；服务端随资料的其他字段一起按资料版本覆盖保存（资料版本更新时才写入），不做“或”合并。旧版终端不发送，按 `false` 处理。
+- 服务端在各个资料对象里返回它：账户对象的 `profile`、`GET /api/queue-terminal/profiles`、`POST /api/queue-online/profile` 的 `profile` 和移动设备登记会话的 `profiles`。终端同步云端资料时读取它，因此网页修改资料后不会丢失这项记录。
+- 终端更新它的时刻：
+  - 在终端用玩家资料加入排队，选了单人游玩且机台能容纳两人时，记下勾选框的状态；
+  - 执行网站的 `JOIN_QUEUE`，命令带有 `allows_passing`（`true` 或 `false`）且本次为单人游玩时，记下这个值；
+  - 在终端的“更改游玩偏好”里勾选或取消，或执行 `SET_ALLOWS_PASSING`，登记属于某份玩家资料时，记下新值。
+- 改为允许他人加入、组成固定组合，或 Bot、管理后台创建的登记，都不改变这项记录。
+- 网站线上登记在提供勾选框时，无论勾选与否都在 `JOIN_QUEUE` 中带上 `allows_passing`；不提供时（终端未声明 `SET_ALLOWS_PASSING`）不带。
+
+### 终端声明的操作：`supported_queue_operations`
+
+终端在快照顶层上报可选字段 `supported_queue_operations`，列出它能执行的远程操作名称。当前终端发送 `JOIN_QUEUE`、`DEFER_ONE_ROUND`、`CANCEL_DEFER_ONE_ROUND`、`TEMPORARILY_LEAVE`、`CANCEL_TEMPORARY_LEAVE`、`SKIP_ONE_TURN`、`CANCEL_SKIP_ONE_TURN`、`TRANSFER_MACHINE`、`CHANGE_PLAY_PREFERENCE`、`LEAVE_QUEUE`、`CHECK_IN`、`CREATE_REGISTRATION`、`REORDER_QUEUE`、`SET_PAIRED_MACHINE_QUEUEING` 和 `SET_ALLOWS_PASSING`。服务端的校验：必须是最多 64 项的数组，每一项都必须是形如操作名称的文本（大写字母开头，只含大写字母、数字和下划线，最长 64 个字符），否则拒绝整份上传，错误为 `supported_queue_operations 必须是操作名称的数组。`。服务端不认识的名称直接略去、不报错，这样新版终端声明的新操作不会使旧版服务端拒绝上传，终端可以先于服务端更新；重复的名称只保留一次。省略或为 `null` 时保存为空数组。它会进入公开快照。
+
+旧版终端读不懂新操作，会直接丢弃这条命令，玩家只能等到命令超时，期间本人的其他操作都被拒绝（网站审查 W2）。因此服务端在生成以下 `QUEUE_OPERATION` 命令前，检查当前快照的 `supported_queue_operations` 是否含有对应的名称：
+
+- `SKIP_ONE_TURN` 和 `CANCEL_SKIP_ONE_TURN`；
+- `SET_ALLOWS_PASSING`，开启和取消都是如此；
+- 带 `allows_passing: true` 的 `JOIN_QUEUE`，对应的名称是 `SET_ALLOWS_PASSING`。
+
+不含时返回 `409`，提示为 `现场终端尚未更新，暂不能使用这项操作。`，不创建命令。网站、QQ Bot 和管理后台的排队操作（`POST /api/queue-management/queue-commands`）都受这项检查保护。这项检查排在终端是否在线、是否开启同步之后。其他操作不检查这个列表：旧版终端不发送列表，它们照旧可以执行。管理后台的终端队列操作（`POST /api/queue-management/terminal-actions`）不受影响。
+
+`GET /api/queue-status` 的 `capabilities.queue_operations` 在 `remote_actions` 为 `true` 时原样给出这个列表，否则为空数组。网站只在其中含有 `SKIP_ONE_TURN` 时提供轮空一次，否则那张卡片显示为灰色，原因写“现场终端尚未更新，暂不能使用轮空一次。”；只在其中含有 `SET_ALLOWS_PASSING` 时显示允许越过的勾选框。
+
+### 创建登记时的勾选
+
+`POST /api/queue-online/join`（网站线上登记）和 Bot 的 `JOIN_QUEUE` 接受可选的布尔字段 `allows_passing`：
+
+- 字段缺省或为 `false` 时，登记不允许越过。网站只在勾选时提交它。
+- 为 `true` 时，确定后的 `preference` 必须是 `SOLO`：请求的 `preference` 是 `OPEN_TO_JOIN` 时返回 `400`，按玩家资料的默认游玩偏好确定为 `OPEN_TO_JOIN` 时返回 `409`，提示都是 `只有单人游玩的登记可以允许后方的登记越过。`；所选机台仅能容纳一人游玩时返回 `409`，提示为 `当前机台仅能容纳一人游玩，不能设置这项选择。`。
+- 为 `true` 时还要求终端声明了 `SET_ALLOWS_PASSING`，见上一小节。
+
+通过校验的字段原样写入命令的 `payload.allows_passing`，缺省时命令中没有这个键。字段参与 `request_id` 的幂等判断。移动设备登记和管理后台的 `ADD_PROFILE_REGISTRATION` 不接受这个字段。
+
+### 修改已有登记：`SET_ALLOWS_PASSING`
+
+Bot（`POST /api/queue-bot/queue-commands`）、网页账户（`POST /api/player-account/queue-commands`）和管理后台（`POST /api/queue-management/queue-commands`）的排队操作都增加 `SET_ALLOWS_PASSING`，请求必须带布尔字段 `allows_passing`，表示修改后的状态。缺少该字段返回 `400`，提示为 `请选择是否允许后方的登记越过这份登记。`；其他操作（`JOIN_QUEUE` 除外）带有该字段返回 `400`。
+
+服务端在生成命令前检查：终端没有声明 `SET_ALLOWS_PASSING` 时返回 `409`；开启时登记所在机台仅能容纳一人游玩的返回 `409`，提示为 `当前机台仅能容纳一人游玩，不能设置这项选择。`。登记是否单人游玩、是否属于固定组合由终端检查：网站在更改游玩偏好后紧接着发送这条命令，服务端此时的快照可能还没有反映新的游玩偏好。其余检查（确认状态、机台是否停止使用、待签到）与其他操作相同。通过校验的字段写入命令的 `payload.allows_passing`。
+
+终端执行时，登记已经处于所请求的状态则按已执行处理；开启时登记既不是单人游玩、也不属于固定组合的，终端拒绝，提示为 `只有单人游玩的登记或固定组合可以允许后方的登记越过。`（固定组合见下一节）。取消时，已排定、还没开始的越过立即撤销并重新分组；正在游玩的那一组不受影响。网站在本人登记的“更改游玩偏好”里提供这个勾选框：更改游玩偏好和勾选是两条命令，先发送 `CHANGE_PLAY_PREFERENCE`，终端执行后再发送 `SET_ALLOWS_PASSING`，与 `SET_PAIRED_MACHINE_QUEUEING` 相同。
+
+## 固定组合允许后方的登记越过、越过的首次说明
+
+2026-11-28 加入，没有提升协议版本号。设计、界面文字和实施情况见 `docs/releases/fixed-pair-pass-plan-2026-11.md`。
+
+### 固定组合的选择
+
+固定组合可以像单人游玩的登记一样允许后方的登记越过。这是两份登记共同的一项选择：
+
+- 快照的登记字段 `allows_passing` 对固定组合的两份登记同时为 `true`。服务端保留这个字段；两份登记不一致时把两份都当作 `false`，不拒绝上传。`passing_over` 可以同时列出一组固定组合的两份登记。
+- 快照顶层新增可选的布尔字段 `fixed_pair_passing_supported`：终端支持这项选择、并接受针对固定组合成员的 `SET_ALLOWS_PASSING` 时为 `true`。旧版终端不发送，按 `false` 处理；值不是布尔值时拒绝上传（`400`）。
+- 服务端把它交给客户端：`GET /api/queue-status` 的 `capabilities.fixed_pair_passing_supported`、移动设备登记会话的 `capabilities.fixed_pair_passing_supported`、`GET /api/player-account/queue` 的 `queue.fixed_pair_passing_supported`，以及公开快照的同名顶层字段。前两个接口和账户接口只在终端在线且允许远程操作时给出 `true`。
+- `SET_ALLOWS_PASSING` 针对固定组合成员时：快照没有声明 `fixed_pair_passing_supported` 的返回 `409` `现场终端尚未更新，暂不能使用这项操作。`（开启和取消、网页账户、Bot、管理后台都一样）；声明了的照常生成命令。终端把它同时作用于两份登记，回答为 `已允许后方的登记越过这组固定组合与前方的登记共同游玩。` 或 `这组固定组合不再允许后方的登记越过。`，固定组合正在游玩时句号前加“，本轮游玩结束后生效”。
+- `JOIN_QUEUE` 的 `allows_passing` 不变，只用于单人游玩。线上不能组成固定组合。
+- 固定组合的选择不记入资料的 `last_allows_passing`：它由两个人共同决定。固定组合解除时终端把两份登记的 `allows_passing` 都改回 `false`。
+- 网站只在登记属于固定组合、机台能容纳两人、终端同时声明了 `SET_ALLOWS_PASSING` 和 `fixed_pair_passing_supported` 时，在“更改游玩偏好”里显示这个勾选框；只改这个勾选框时只发送一条 `SET_ALLOWS_PASSING`，不发送游玩偏好的命令。
+
+### 资料字段 `passing_introduced`
+
+玩家是否已经看过“允许后方的登记越过”的说明（单人游玩的和固定组合的共用一份）。与 `paired_machine_queueing_introduced` 相同，它是一条记录而不是设置，只会由 `false` 变为 `true`：
+
+- 终端在 `private_player_profiles` 中只在为 `true` 时发送；服务端按“或”合并，资料的其他字段没有更新时也会写入，之后不再清除。
+- 服务端在各个资料对象里返回它：账户对象的 `profile`、`GET /api/queue-terminal/profiles`、`POST /api/queue-online/profile` 的 `profile` 和移动设备登记会话的 `profiles`。终端同步云端资料时读取，同样只会把本机的记录由假变真。
+- 服务端自己记为 `true` 的时刻，与两台机台之间安排的说明相同：登录的网页账户提交带 `allows_passing: true` 的 `JOIN_QUEUE` 或 `SET_ALLOWS_PASSING` 并被接受时；移动设备登记用已有资料提交 `allows_passing: true` 并被接受时；按 QQ 的线上登记在终端回报已执行之后。Bot 和管理后台的请求不记录。固定组合只记录发出请求的那份资料。
+- 终端自己记为 `true` 的时刻：在终端第一次勾选任何一个越过的勾选框并弹出说明时；执行带 `allows_passing: true` 的远程命令时。
+- 界面：这份资料第一次勾选时自动弹出说明，5 秒后才能关闭；此后只能从勾选框旁的入口打开，不倒计时。临时登记每次勾选都弹出。
+
+## 2026-11-28 新增的操作和字段
+
+终端、服务端和网站都已实现。终端一侧：
+
+- 操作 `CREATE_FIXED_PAIR`：命令 `payload` 带 `partner_registration_id`（朋友那份登记的公开编号，必须与本人的登记在同一台机台的等待顺序中）和可选的布尔值 `allows_passing`（这组固定组合允许后方的登记越过）。终端按现场同样的条件检查：机台能容纳两人；两份登记都在等待、都不是待签到、都不属于其他固定组合、都没有将暂缓一次、将轮空一次或暂时离开；组成后不会让其他登记晚一轮。回答示例：`“甲”与“乙”已组成固定组合。为避免延后其他玩家，“甲”已后移至位置 A2。已允许后方的登记越过这组固定组合与前方的登记共同游玩。`
+- 操作 `RENAME_REGISTRATION`：命令 `payload` 带 `display_id`（1 至 18 个字符）。只改这份登记显示的昵称；与任何机台上的其他登记重名时拒绝（`当前队列中已经有相同昵称的登记。`）。待签到的登记不能改。回答：`登记昵称已改为“X”。玩家资料中的昵称没有改变。`
+- 移动设备登记的命令（以及现场终端自己的加入排队）可以带 `remember_preference: true`：终端把本次游玩偏好记为资料的默认游玩偏好（仅能容纳一人的机台除外）。
+- 登记字段 `temporary_away_skipped_turns` 现在始终是真实的已轮空次数，不再只在暂时离开或将轮空一次时给出。**此前的服务端会拒绝这样的快照，必须先更新服务端再更新终端。**
+- 登记新增可缺省的布尔字段 `online_registration_checked_in`：线上登记已经完成现场签到。
+- 位置新增可缺省的 `estimated_wait_upper_minutes`，登记新增可缺省的 `own_estimated_wait_upper_minutes`：“最快”的时间与系统未在两台机台之间安排登记时的时间相差 24 分钟以上时，后者的分钟数；客户端在“最快约 N 分钟后可以游玩”下面另起一行写“系统未在两台机台之间安排登记时，这份登记约 M 分钟后可以游玩。”，不写成范围。见 `docs/releases/wait-estimate-2026-11.md` 第十二节。
+- 游玩位置空缺时，远程操作让下一组直接进入的，回答末尾追加 `现在由“X”进入游玩位置 A。`。
+- 回答里的机台名称改用现场设置的名称（如 `右侧·机台 B`）。
+
+服务端和网站一侧：
+
+- **`POST /api/player-account/queue-commands`**（仅登录的网页账户；QQ Bot 发送这两项操作时返回 `400` `不支持这项排队操作。`）：
+  - `operation: "CREATE_FIXED_PAIR"`，带 `partner_registration_id`（24 位公开编号）和可选布尔值 `allows_passing`。仅当快照的 `supported_queue_operations` 含 `CREATE_FIXED_PAIR` 时受理；`allows_passing: true` 还要求 `fixed_pair_passing_supported`。服务端先按快照核对（机台容量、本人登记不在游玩位置、朋友登记在同一机台等待、双方都不属于其他固定组合、朋友不是待签到、双方都没有延后状态），句子与终端相同；终端再次核对并决定顺序。
+  - `operation: "RENAME_REGISTRATION"`，带 `display_id`（去除首尾空白后 1 至 18 个字符，按码点计）。仅当 `supported_queue_operations` 含 `RENAME_REGISTRATION` 时受理；待签到的登记和任何机台上已有的昵称被拒绝。
+  - 命令载荷带 `partner_registration_id`、`allows_passing`（仅当请求带了）和 `display_id`（已去除空白）。其他操作带这些字段时返回 `400`（`这项操作不接受 …。`）。
+- **`remember_preference`**：只有 `POST /api/queue-mobile/sessions/<token>/submit`（手机扫码页，在现场使用）接受可选布尔值；只在为 `true`、资料的默认游玩偏好为每次询问、机台能容纳两人时以 `remember_preference: true` 写入命令载荷。网站要求终端声明了 `RENAME_REGISTRATION`（同一终端版本）才显示这一行。`POST /api/queue-online/join` 不接受这个字段，带上即返回 `400` `请求包含不支持的线上登记字段`：任何人都可以为一个 QQ 号加入排队，但不能改这份资料的默认游玩偏好，网站上也没有这一行（维护者 2026-11-28：“忽略不好吧，干脆把这一行去掉都没事”）。其他操作带这个字段时返回 `400`。
+- **快照**：`temporary_away_skipped_turns`（0–3）任何时候都接受，固定组合两份登记的值仍须一致；`online_registration_checked_in` 为可缺省的布尔值（待签到时强制为 `false`，非布尔值拒绝），公开队列和 `GET /api/player-account/queue` 都返回；`estimated_wait_upper_minutes`、`own_estimated_wait_upper_minutes` 只在旁边的估计标为可能不准确、且数值晚于显示的时间时保存，公开队列的位置和 `GET /api/player-account/queue` 的登记（`estimated_wait_upper_minutes`，已按“本人等待时间优先”取值）返回。QQ Bot 的接口不返回第二个时间。
+- **`GET /api/queue-mobile/sessions/<token>`** 新增顶层 `machines`（与 `/api/queue-online/profile` 相同，含 `estimated_wait_minutes`、`paired_machine_id`、`available`）和 `business_hours`（含 `closes_at`），手机页面据此显示新登记预计等待和闭店提醒。
+
 ## 公开接口
 
 ### 通用约定
@@ -716,6 +820,10 @@ Bot（`POST /api/queue-bot/queue-commands`）、网页账户（`POST /api/player
 本节接口不需要令牌；只有查询网页账户命令的结果时需要玩家会话，见“网站线上登记”。除头像文件外，响应体都是 JSON。
 
 错误响应的格式为 `{"ok": false, "error": "<说明>"}`，部分错误另带稳定的 `code`。本节只有四个 `code`，都出现在网站线上登记接口：`PROFILE_NOT_FOUND`、`PROFILE_SYNC_PENDING`、`QUEUE_CONTEXT_CHANGED` 和 `PLAYER_OPERATION_SYNCING`；其余错误只能按 HTTP 状态码区分。健康检查使用独立的响应格式。请求体超过 `1 MiB` 时返回 `413`。
+
+所有读取 JSON 请求体的接口（包括私有 Bot 接口、管理后台接口和终端接口）在解析后统一检查一次：整数超出有符号 64 位范围，或字符串、键名不能编码为 UTF-8（例如单独的代理字符）时，返回 `400` `请求内容包含超出范围的整数或无效字符。`。这项检查在各接口读取请求体时才进行，不改变鉴权和其他检查的先后。查询参数中的游标同样有上限：公开日志的 `before`、Bot 通知事件的 `after` 超过 `2^63−1` 时分别返回 `400` `before 数值无效。`、`after 或 limit 数值无效。`。
+
+经由服务端提交的昵称（网站建档、网页账户修改资料、手机扫码新建资料、Bot 和管理后台修改资料）不能包含控制字符，包括换行、回车、制表符以及 U+2028、U+2029；含有时返回 `400` `nickname 长度或内容无效。`。首尾空白照旧去除，长度规则不变。终端上传的快照中的昵称不做这项检查：拒绝会使整份快照无法上传。
 
 所有时间字段都是毫秒时间戳。服务端生成的时间精确到秒，包括 `received_at`、`terminal.last_seen_at`、`checked_at`、版本状态的 `updated_at` 以及命令的 `created_at`、`claimed_at` 和 `completed_at`；终端生成的 `captured_at`、事件的 `occurred_at` 和登记的 `created_at` 原样返回。
 
@@ -751,11 +859,12 @@ Vary: Origin
 - `website_remote_enabled`、`onebot_sync_enabled`：现场终端是否开启与服务端同步和 QQ Bot 联动。终端在与服务端同步关闭时上传的 `onebot_sync_enabled` 也是 `false`。
 - `queue_rules`：`allow_defer_one_round`、`allow_temporary_leave` 和 `allow_online_registration` 三个布尔值。
 - `business_hours`：六个营业时间计算结果。
-- `management_policy_supported`、`management_app_bound`、`management_policy_revision`、`management_policy`：管理后台接管终端敏感策略的状态。
+- `management_policy_supported`、`management_app_bound`、`management_policy_revision`、`management_policy`：管理后台接管设置的状态。
 - `management_settings_supported`、`management_settings_revision`、`show_common_play_preview`、`registration_control_open`、`business_hours_settings`：可由管理后台接管的终端设置。
 - `terminal`、`venue`：现场终端和机厅。
 - `machine_groups`、`default_machine_group_id`、`machines`：机台分组和各机台的队列。`machines` 是以机台编号 `A` 至 `J` 为键的对象。
 - `test_data`：这份快照是否来自测试同步。
+- `supported_queue_operations`：终端声明可以执行的远程操作，见“单人游玩的登记允许后方的登记越过”。旧版终端上传的快照为空数组。
 - `capabilities`：服务端按当前状态计算的能力标记。
 
 响应不包含 `recent_events`、`private_player_contacts` 和 `private_player_profiles`。下面只列出由服务端写入的字段，其余从略：
@@ -786,6 +895,7 @@ Vary: Origin
     "registration_qq": true,
     "remote_actions": true,
     "online_registration": true,
+    "queue_operations": ["JOIN_QUEUE", "SKIP_ONE_TURN", "CANCEL_SKIP_ONE_TURN", "SET_ALLOWS_PASSING"],
     "transport": "polling"
   }
 }
@@ -795,7 +905,7 @@ Vary: Origin
 
 `venue` 在每次读取时取自服务端当前的机厅记录，版本 8 之前的终端上传的快照同样带有该字段。`id` 是机厅 ID，`code` 是 8 位机厅编号，`name` 是机厅名称，尚未设置时为 `null`，`registered` 固定为 `true`。终端上传的快照只携带机厅 ID。
 
-`capabilities` 中 `public_logs`、`local_self_marking` 和 `registration_qq` 固定为 `true`，`transport` 固定为 `polling`。终端在线且 `website_remote_enabled` 为 `true` 时 `remote_actions` 为 `true`。`online_registration` 在此基础上还要求 `registration_open` 为 `true`、`queue_rules.allow_online_registration` 不为 `false`，并且不处于闭店收尾。网站只在 `online_registration` 为 `true` 时开放“加入排队”入口。
+`capabilities` 中 `public_logs`、`local_self_marking` 和 `registration_qq` 固定为 `true`，`transport` 固定为 `polling`。终端在线且 `website_remote_enabled` 为 `true` 时 `remote_actions` 为 `true`。`online_registration` 在此基础上还要求 `registration_open` 为 `true`、`queue_rules.allow_online_registration` 不为 `false`，并且不处于闭店收尾。网站只在 `online_registration` 为 `true` 时开放“加入排队”入口。`queue_operations`（2026-11-26 加入）在 `remote_actions` 为 `true` 时原样给出快照的 `supported_queue_operations`，否则为空数组；示例只列出其中一部分。网站据此决定是否提供轮空一次和允许越过的勾选框，见“单人游玩的登记允许后方的登记越过”。旧版服务端没有这一项，网站按空数组处理。
 
 `management_policy_*` 和 `management_settings_*` 字段由终端声明，没有提升协议版本。`management_policy` 包含 `allow_online_registration`、`allow_defer_one_round`、`allow_temporary_leave` 和 `onebot_sync_enabled`。终端没有声明 `management_policy_supported` 时，服务端写入 `management_app_bound: false` 和 `management_policy_revision: 0`，`management_policy` 取 `queue_rules` 和 `onebot_sync_enabled` 的当前值。终端没有声明 `management_settings_supported` 时，`management_settings_revision` 为 `0`，`show_common_play_preview` 为 `true`，`registration_control_open` 等于 `registration_open`，`business_hours_settings` 为 `null`。
 
@@ -810,6 +920,12 @@ Vary: Origin
 登记的 `skips_paired_machine_this_round` 为 `true` 表示这份登记已经放弃另一机台的位置，在下一次进入游玩位置之前只在当前机台排队；`also_queues_at_paired_machine` 仍然保留玩家的选择，游玩一轮后恢复同时在两台机台排队。终端在以下情况设置它：等待顺序被调整或队列位置被移动时被移动的登记，以及从游玩位置撤回等待顺序的登记；登记进入游玩位置时清除。服务端只校验它是布尔值，不由任何命令设置。
 
 登记的 `paired_arrangement_announced` 为 `true` 表示另一机台的等待顺序中正在显示这份登记的预览，预告它可能被安排过去；`paired_arrangement_not_before` 是它最早可能被安排过去的时刻（毫秒时间戳）。终端只对等待中、在另一机台持有位置的登记发送这两个字段：预览开始显示时发送 `paired_arrangement_announced: true`，预览持续显示至少 12 分钟后登记才可能被安排，`paired_arrangement_not_before` 即预览开始的时刻加上这段时间，暂停计时的时间顺延。任一机台本轮游玩超出正常时长期间终端暂停计时，这时只发送 `paired_arrangement_announced`，不发送时刻；预览中断后两者都不再发送，再次显示时重新计时。时刻已经过去而登记仍在等待，表示另一机台一旦轮到它就会安排。服务端的校验：`paired_arrangement_announced` 必须是布尔值；`paired_arrangement_not_before` 必须是非负整数，并且只能与 `paired_arrangement_announced: true` 同时出现，否则拒绝整份上传。登记的 `also_queues_at_paired_machine` 不为 `true` 时这两个字段没有意义，服务端不保留，分别按 `false` 和 `null` 处理。保存后的快照中每份登记都带有这两个键。它们只用于显示，不由任何命令设置，也不参与任何操作的确认。
+
+登记的 `wait_minutes_if_online_missing` 是前方待签到的线上登记都未按时签到时，这份登记的等待分钟数（按显示规则向下取整）。终端估算等待时间时把待签到的线上登记都算作会签到，与画面的分组一致；另外按都不签到推演一遍，只有某份登记因此提前至少 5 分钟、并且显示的分钟数小于所在位置的 `estimated_wait_minutes` 时才发送。服务端的校验：必须是 0 至 100000 的整数，否则拒绝整份上传；缺省按 `null` 保存。它随公开快照、`GET /api/player-account/queue` 的 `registrations` 和 Bot 的玩家列表原样提供，网站和 QQ Bot 据此写出“前方的线上登记未按时签到时，这份登记最快约 N 分钟后可以游玩。”。它只用于显示。
+
+登记的 `own_estimated_wait_minutes` 是这份登记自己的等待分钟数，与终端登记菜单显示的一致；`own_estimated_wait_uncertain` 表示它是否可能不准确。等待位置显示的是位置中最早游玩的那份登记的时间；两份登记共用一个位置、其中一份可能被安排到一对机台中的另一台时，另一份并不会因此提前，终端就为它另外发送这两个字段（2026-11-27 审查发现：网站“我的登记”和 QQ Bot 曾把搭档在另一机台的时间当作这份登记的时间）。终端只在分钟数与位置的 `estimated_wait_minutes` 不同时发送。服务端的校验：必须是 0 至 100000 的整数，否则拒绝整份上传；缺少分钟数时不保留 `own_estimated_wait_uncertain`。`GET /api/player-account/queue` 的 `registrations` 和 Bot 的玩家列表在有这个字段时，用它作为这份登记的 `estimated_wait_minutes` 和 `estimated_wait_uncertain`；公开快照里位置的等待时间不变。`GET /api/player-account/queue` 的登记另有布尔值 `estimated_wait_is_own`，表示这个时间是登记自己的：网站账户对话框平时按队列页（含另一机台预览的编号）显示位置的时间，遇到它为 `true` 时保留登记自己的时间。较早版本的服务端忽略这两个字段。
+
+登记的 `allows_passing` 为 `true` 表示这份单人游玩的登记允许后方的登记越过它，与前方的登记共同游玩：前方一份允许他人加入的登记本来要独自占用一个等待位置时，它后方第一份允许他人加入的登记可以越过它，与前方那一份组成一个等待位置。真实的等待顺序不变，只是位置的分组不同。终端只对单人游玩、不属于固定组合的登记在为 `true` 时发送。登记的 `passing_over` 是这份登记越过的登记编号，按真实顺序排列：等待中的登记是终端推演出的、画面上已经排定的越过；游玩位置里的登记是这一轮实际发生的越过，本轮结束后不再发送。被越过的一方由此反查：出现在某份等待中登记的 `passing_over` 里，就是“将越过”；出现在游玩位置里某份登记的 `passing_over` 里，就是“正在”。服务端的校验：`allows_passing` 必须是布尔值；`passing_over` 必须是最多 `20` 项、不重复的登记编号数组，不能包含这份登记本身，否则拒绝整份上传。不在同一份快照中的登记编号会被服务端丢弃而不是拒绝（2026-11-27 起：被越过的登记在那一轮期间退出时，旧做法会让整份上传被拒绝直到该轮结束）。两者都可以省略，省略或为 `null` 时分别按 `false` 和空数组处理，旧版终端不发送。`preference` 不是 `SOLO` 或属于固定组合的登记，服务端把 `allows_passing` 保存为 `false`。保存后的快照中每份登记都带有这两个键；它们随公开快照、`GET /api/player-account/queue` 的 `registrations`、私有 Bot 接口“查询玩家”和管理总览中的每份登记原样提供。它们只用于显示，不参与任何操作的确认。
 
 `paired_waiting_positions` 只在终端预计另一机台的登记会先在本机台游玩、并且已经为它显示预览时出现，其余情况为 `null`。它是本机台此时应当显示的完整等待顺序：本机台等待中的全部登记，加上预计先在本机台游玩的另一机台登记。每个位置包含 `index`、`position_id`、`estimated_wait_minutes`、`estimated_wait_uncertain`、`registrations` 和 `common_play_preview`，`index` 由服务端从 `1` 开始编号。`registrations` 的每一项只有 `registration_id` 和 `paired_place_preview` 两个字段，登记的其余内容按 `registration_id` 在两台机台的 `waiting_positions` 中查找。`paired_place_preview` 为 `true` 的项是另一机台的登记，仅表示预测：它不计入本机台的登记数，不能用于身份匹配或队列操作，显示时应与真实登记区分。这份顺序的分组可能与 `waiting_positions` 不同，因为另一机台的登记可能与本机台的登记处于同一位置。该字段不为 `null` 时，客户端用它代替 `waiting_positions` 显示等待顺序；为 `null` 时照常使用 `waiting_positions`。
 
@@ -1074,6 +1190,7 @@ Vary: Origin
 - `expected_queue_id`、`expected_machine_configuration_revision`：查询玩家资料时得到的队列批次和机台配置修订号，必须同时提供或同时省略。
 - `expected_machine_stable_id`：查询时所选机台的 `stable_id`，可以省略，只能与前两个字段一起提供。
 - `also_queues_at_paired_machine`：布尔值，可以省略。创建登记时是否勾选“允许系统在两台机台之间安排登记”，规则见“自动在两台机台之间安排登记”。网站在所选机台属于一对机台时总是提交它。
+- `allows_passing`：布尔值，可以省略。创建单人游玩的登记时是否允许后方的登记越过，规则见“单人游玩的登记允许后方的登记越过”。网站只在勾选时提交它。
 
 请求体出现其他字段时返回 `400`。三个 `expected_*` 字段按键是否出现判断，值为 `null` 也视为已提供。网站会提交全部三个字段；旧版本服务端以 `400` 拒绝 `expected_machine_stable_id` 时，网站去掉它重试一次。
 
@@ -1240,7 +1357,7 @@ Vary: Origin
 }
 ```
 
-`binding_url` 是 `QUEUE_PLAYER_ACCOUNT_SITE_URL` 加上 `account_binding` 查询参数；该变量为空时使用 `QUEUE_PUBLIC_SITE_URL`，后者也为空时使用 `<QUEUE_CORS_ORIGIN>/queue-status`，三者都为空时返回 `503` 和 `PLAYER_ACCOUNT_SITE_NOT_CONFIGURED`。会话有效期由 `QUEUE_PLAYER_BINDING_TTL_SECONDS` 决定，默认 `600` 秒，最短 `60` 秒。绑定完成之前，终端上传的快照只要包含这份仍未绑定的资料，服务端就会作废它尚未使用的绑定会话，此后读取和完成绑定都返回 `410` 和 `PLAYER_BINDING_EXPIRED`，见“账户与会话失效”。服务端只保存令牌的 SHA-256 摘要。
+`binding_url` 是 `QUEUE_PLAYER_ACCOUNT_SITE_URL` 加上 `account_binding` 查询参数；该变量为空时使用 `QUEUE_PUBLIC_SITE_URL`，后者也为空时使用 `<QUEUE_CORS_ORIGIN>/queue-status`，三者都为空时返回 `503` 和 `PLAYER_ACCOUNT_SITE_NOT_CONFIGURED`。会话有效期由 `QUEUE_PLAYER_BINDING_TTL_SECONDS` 决定，默认 `600` 秒，最短 `60` 秒。绑定完成之前，终端照常上传快照不会影响这次绑定（2026-11-27 修正：此前每次上传都会作废未绑定资料尚未使用的绑定会话，二维码在终端下一次上传时就失效）。只有这份资料在服务端残留着账户记录时，上传才会撤销该账户的会话、作废它尚未使用的绑定会话并删除账户。服务端只保存令牌的 SHA-256 摘要。
 
 服务端依次检查：
 
@@ -1553,7 +1670,7 @@ QQ 格式无效、密码不是字符串、QQ 没有可登录的账户和密码�
 }
 ```
 
-示例省略了 `machines` 的内容；每一项包含 `id`、`stable_id`、`group_id`、`name`、`operational`、`registration_count`、`estimated_wait_minutes`、`configuration`、`capacity`、`available` 和 `unavailable_reason`。`terminal_online` 表示最新快照的接收时间在 `QUEUE_ONLINE_TIMEOUT_SECONDS`（默认 `90` 秒）以内；`remote_actions` 表示终端在线且快照的 `website_remote_enabled` 为 `true`，为 `false` 时网站不提供操作入口。登记的 `position` 为 `PLAYING` 或 `WAITING`，处于游玩位置时 `position_index` 为 `null`。登记的 `estimated_wait_minutes` 和 `estimated_wait_uncertain` 与私有 Bot 接口“查询玩家”中的同名字段取值相同。`skips_one_turn`、`defer_one_round_used` 和 `online_registration_not_played` 取自公开快照中的登记，旧快照中没有时为 `false`，含义见“当前队列”。
+示例省略了 `machines` 的内容；每一项包含 `id`、`stable_id`、`group_id`、`name`、`operational`、`registration_count`、`estimated_wait_minutes`、`configuration`、`capacity`、`available` 和 `unavailable_reason`。`terminal_online` 表示最新快照的接收时间在 `QUEUE_ONLINE_TIMEOUT_SECONDS`（默认 `90` 秒）以内；`remote_actions` 表示终端在线且快照的 `website_remote_enabled` 为 `true`，为 `false` 时网站不提供操作入口。登记的 `position` 为 `PLAYING` 或 `WAITING`，处于游玩位置时 `position_index` 为 `null`。登记的 `estimated_wait_minutes` 和 `estimated_wait_uncertain` 与私有 Bot 接口“查询玩家”中的同名字段取值相同。`skips_one_turn`、`defer_one_round_used` 和 `online_registration_not_played` 取自公开快照中的登记，旧快照中没有时为 `false`，含义见“当前队列”。`allows_passing` 和 `passing_over` 同样取自公开快照，旧快照中没有时分别为 `false` 和空数组。这个接口只返回本人的登记；判断本人的登记是否正被越过，要在公开快照中查找其他登记的 `passing_over`，网站的账户对话框使用队列页已经读取的公开快照。
 
 本人登记按账户所属资料的 UUID 与当前登记绑定匹配，不按 QQ 或昵称匹配。服务端还没有队列快照时返回 `200`，`queue` 为 `null`，`registrations` 为空数组，并附带 `error` 说明。
 
@@ -1580,7 +1697,7 @@ QQ 格式无效、密码不是字符串、QQ 没有可登录的账户和密码�
 }
 ```
 
-`request_id` 是命令编号和幂等键。`operation` 可以是 `DEFER_ONE_ROUND`、`CANCEL_DEFER_ONE_ROUND`、`SKIP_ONE_TURN`、`CANCEL_SKIP_ONE_TURN`、`TEMPORARILY_LEAVE`、`CANCEL_TEMPORARY_LEAVE`、`TRANSFER_MACHINE`、`CHANGE_PLAY_PREFERENCE`、`LEAVE_QUEUE` 或 `SET_PAIRED_MACHINE_QUEUEING`（需要 `also_queues_at_paired_machine`，见“自动在两台机台之间安排登记”）；这个接口不接受 `JOIN_QUEUE` 和 `CHECK_IN`。`TRANSFER_MACHINE` 需要 `target_machine_id`，`CHANGE_PLAY_PREFERENCE` 需要 `preference`（`SOLO` 或 `OPEN_TO_JOIN`）。
+`request_id` 是命令编号和幂等键。`operation` 可以是 `DEFER_ONE_ROUND`、`CANCEL_DEFER_ONE_ROUND`、`SKIP_ONE_TURN`、`CANCEL_SKIP_ONE_TURN`、`TEMPORARILY_LEAVE`、`CANCEL_TEMPORARY_LEAVE`、`TRANSFER_MACHINE`、`CHANGE_PLAY_PREFERENCE`、`LEAVE_QUEUE`、`SET_PAIRED_MACHINE_QUEUEING`（需要 `also_queues_at_paired_machine`，见“自动在两台机台之间安排登记”）或 `SET_ALLOWS_PASSING`（需要 `allows_passing`，见“单人游玩的登记允许后方的登记越过”）；这个接口不接受 `JOIN_QUEUE` 和 `CHECK_IN`。`TRANSFER_MACHINE` 需要 `target_machine_id`，`CHANGE_PLAY_PREFERENCE` 需要 `preference`（`SOLO` 或 `OPEN_TO_JOIN`）。
 
 确认状态字段 `expected_queue_id`、`expected_registration_id`、`expected_machine_id`、`expected_position`、`expected_fixed_pair_id`、`expected_absence_status`、`expected_temporary_away_skipped_turns` 和 `expected_pending_check_in` 必须全部提交或全部省略。`expected_machine_configuration_revision` 和 `expected_machine_stable_id` 只能与完整的确认状态一起提交，`expected_target_machine_stable_id` 还只能用于 `TRANSFER_MACHINE`。`expected_absence_status` 为 `NONE`、`DEFER_ONE_ROUND`、`SKIP_ONE_TURN` 或 `TEMPORARILY_AWAY`，`expected_temporary_away_skipped_turns` 为 `0` 至 `3`。这些值取自本人排队状态；网站始终提交完整的确认状态、机台配置修订号和机台稳定身份。
 
@@ -1622,7 +1739,7 @@ QQ 格式无效、密码不是字符串、QQ 没有可登录的账户和密码�
 
 - 退出登录撤销当前会话。
 - 玩家修改密码撤销该账户的其他会话；管理后台重置密码撤销该账户的全部会话。
-- 终端上传的资料被服务端认定为未绑定或首次出现时，服务端撤销该资料残留账户的全部会话，作废尚未使用的绑定会话，并删除账户。
+- 终端上传的资料被服务端认定为未绑定或首次出现、并且服务端残留着它的账户记录时，服务端撤销该账户的全部会话，作废尚未使用的绑定会话，并删除账户。没有残留账户时不作任何处理，正在进行的绑定不受影响（2026-11-27 修正）。
 - 资料在 QQ 冲突中被更高版本的资料取代，或作为历史重复资料被合并时，其账户按同样方式删除。
 - 管理后台删除玩家资料完成后，服务端删除该资料的账户、绑定会话、建档会话和待同步索引，并撤销其会话。
 
@@ -1871,7 +1988,7 @@ Koishi 在连接 OneBot 后上报实际登录 QQ，并定期刷新：每 `30` �
 - `notification_scope_id`：事件所属的数据范围。正式数据等于 `queue_id`，测试数据为 `test:<终端 X-Device-ID>:<queue_id>`。Koishi 按这个值分别保存游标和投递记录，测试数据与正式数据使用同一个 `queue_id` 时不会互相补发历史消息；旧版本服务端没有这个字段时，Koishi 改用 `queue_id`。
 - `capabilities`：三个值固定为示例中的内容。
 
-`affected_players` 是事件第一次保存时固定下来的收件人。服务器对事件涉及的每份带有登记绑定的登记，按对应玩家资料当时的通知设置过滤后建立收件关系，QQ 取终端当时随登记绑定上传的值；之后资料设置或 QQ 发生变化，已有的收件关系不会改写。`QUEUE_RESET` 事件的收件人是上一个队列批次的登记绑定。没有收件人的事件同样返回，`affected_players` 为空数组。每条事件的 `affected_players` 会包含当时固定的全部 QQ 收件人，因此该响应属于私有数据，不能转发到群聊或公开日志。
+`affected_players` 是事件第一次保存时固定下来的收件人。服务器对事件涉及的每份带有登记绑定的登记，按对应玩家资料当时的通知设置过滤后建立收件关系，QQ 取终端当时随登记绑定上传的值；之后资料设置或 QQ 发生变化，已有的收件关系不会改写。`QUEUE_RESET` 事件的收件人是上一个队列批次最后一份快照中仍然存在的登记的绑定，即被新队列清除的那些登记；此前已经离开那个队列的玩家不在其中。上一个批次与新批次一个是测试数据、一个不是时，没有收件人。QQ Bot 第一次进入一个队列批次时把此前的事件当作历史、不发送，但 `QUEUE_RESET` 是这个批次自己的第一条事件，照常发送。没有收件人的事件同样返回，`affected_players` 为空数组。每条事件的 `affected_players` 会包含当时固定的全部 QQ 收件人，因此该响应属于私有数据，不能转发到群聊或公开日志。
 
 每条事件带有 `notification_categories`，其取值与资料字段的映射固定如下：
 
@@ -2005,7 +2122,7 @@ Koishi 创建命令后每秒查询一次，直到状态不再是 `PENDING`，或
 
 - `request_id`：UUID，同时作为命令编号。
 - `actor_qq`：发起操作的玩家 QQ，`5` 至 `12` 位数字的字符串。
-- `operation`：`JOIN_QUEUE`（线上加入）、`LEAVE_QUEUE`（退出排队）、`DEFER_ONE_ROUND`（暂缓一次）、`CANCEL_DEFER_ONE_ROUND`（取消暂缓一次）、`SKIP_ONE_TURN`（轮空一次）、`CANCEL_SKIP_ONE_TURN`（取消轮空一次）、`TEMPORARILY_LEAVE`（暂时离开）、`CANCEL_TEMPORARY_LEAVE`（取消暂时离开）、`TRANSFER_MACHINE`（转至其他机台）、`CHANGE_PLAY_PREFERENCE`（更改本次游玩偏好）或 `SET_PAIRED_MACHINE_QUEUEING`（修改是否同时在两台机台排队，需要 `also_queues_at_paired_machine`，见“自动在两台机台之间安排登记”）。`JOIN_QUEUE` 也可以带 `also_queues_at_paired_machine`。
+- `operation`：`JOIN_QUEUE`（线上加入）、`LEAVE_QUEUE`（退出排队）、`DEFER_ONE_ROUND`（暂缓一次）、`CANCEL_DEFER_ONE_ROUND`（取消暂缓一次）、`SKIP_ONE_TURN`（轮空一次）、`CANCEL_SKIP_ONE_TURN`（取消轮空一次）、`TEMPORARILY_LEAVE`（暂时离开）、`CANCEL_TEMPORARY_LEAVE`（取消暂时离开）、`TRANSFER_MACHINE`（转至其他机台）、`CHANGE_PLAY_PREFERENCE`（更改本次游玩偏好）、`SET_PAIRED_MACHINE_QUEUEING`（修改是否同时在两台机台排队，需要 `also_queues_at_paired_machine`，见“自动在两台机台之间安排登记”）或 `SET_ALLOWS_PASSING`（修改是否允许后方的登记越过，需要 `allows_passing`，见“单人游玩的登记允许后方的登记越过”）。`JOIN_QUEUE` 也可以带 `also_queues_at_paired_machine` 和 `allows_passing`。终端没有声明的 `SKIP_ONE_TURN`、`CANCEL_SKIP_ONE_TURN` 和 `SET_ALLOWS_PASSING` 返回 `409`，见同一节。
 - `machine_id`、`target_machine_id`：加入排队和转至其他机台的目标机台编号。服务端去掉首尾空白并转为大写。
 - `preference`：`SOLO` 或 `OPEN_TO_JOIN`。
 
@@ -2077,7 +2194,7 @@ Authorization: Bearer <QUEUE_MANAGEMENT_TOKEN>
 - 服务端还没有队列快照时返回 `404` `排队终端暂未同步。`。
 - 终端离线时返回 `503`。在线指最新快照的接收时间在 `QUEUE_ONLINE_TIMEOUT_SECONDS`（默认 `90` 秒）以内。管理总览、管理日志、查询命令和重置网页账户密码不检查终端是否在线。
 - 请求回传的上下文与当前快照不一致时返回 `409`，此时应重新读取管理总览后再提交。
-- 同一对象已有待处理的命令时返回 `409`，范围见各接口。
+- 同一对象已有待处理的命令时返回 `409`，范围见各接口。管理后台的命令不带操作者 QQ，判断是否“同一对象”时不比较它：针对不同玩家、不同登记的命令互不阻塞。同一份玩家资料同一类型的命令同时只能有一条待处理：终端队列操作对一份资料已有待处理的同类命令（即使针对另一台机台）时返回 `409` `这名玩家已有一项操作正在等待终端处理。`；登记排队操作在创建这份登记的加入命令尚未处理完时返回 `409` `这份登记已有一项操作正在等待终端处理。`。
 - 管理接口不检查快照的 `website_remote_enabled`。
 
 命令对象包含 `command_id`、`type`、`payload`、`status`、`created_at`、`claimed_at`、`claimed_terminal`、`claimed_instance`、`completed_at`、`result_source`、`result_detail` 和 `result_registration_id`，各字段的含义与“网站线上登记”中的命令对象相同。`command_id` 就是请求的 `request_id`。管理接口的响应带有 `payload`，即交给终端的命令内容：其中 `operation_source` 固定为 `MANAGEMENT_APP`，`_request` 是用于幂等比较的规范化请求。
@@ -2086,11 +2203,11 @@ Authorization: Bearer <QUEUE_MANAGEMENT_TOKEN>
 
 绑定指管理后台接管现场终端的敏感设置，界面和提示文本中称为“接管”。接管状态只由快照顶层的 `management_app_bound` 表示，没有配对密钥，也不记录是哪一台管理设备：任何持有管理令牌的调用方都可以建立或解除接管。它与 `X-Queue-Sync-Mode: takeover`（接管同步，即一台终端取代另一台终端成为权威终端，见“权威终端与同步方式”）无关。
 
-`management_app_bound` 只会因终端应用一条 `UPDATE_TERMINAL_POLICY` 命令而改变，也就是只能通过“终端敏感策略”接口建立或解除；现场终端本机没有修改它的入口。
+`management_app_bound` 只会因终端应用一条 `UPDATE_TERMINAL_POLICY` 命令而改变，也就是只能通过“由管理后台接管的设置”接口建立或解除；现场终端本机没有修改它的入口。
 
 管理接口依据快照中的以下字段判断终端状态。字段的格式和缺省值见“协议版本”；它们属于公开快照，`GET /api/queue-status` 也会返回。管理总览把它们整理为 `queue.terminal_policy`、`queue.terminal_settings` 和 `queue.registration_open`。
 
-- `management_policy_supported`：终端声明可以执行策略命令。“终端敏感策略”和“删除玩家资料”要求它为 `true`。
+- `management_policy_supported`：终端声明可以执行策略命令。“由管理后台接管的设置”和“删除玩家资料”要求它为 `true`。
 - `management_app_bound`：是否已被接管。
 - `management_policy_revision`：策略修订号。终端每应用一条策略命令加 `1`，本机操作不会改变它。请求以 `expected_policy_revision` 或 `expected_management_policy_revision` 回传。
 - `management_policy`：`allow_online_registration`、`allow_defer_one_round`、`allow_temporary_leave` 和 `onebot_sync_enabled` 四个开关的当前值。
@@ -2110,9 +2227,9 @@ Authorization: Bearer <QUEUE_MANAGEMENT_TOKEN>
 各接口对接管状态的要求：
 
 - 要求已接管：终端设置、登记排队开关、机台状态和删除玩家资料。未接管时返回 `409` `请先绑定并接管现场终端设置。`，不带 `code`。终端执行这四类命令时会再检查一次，接管已被解除的命令被拒绝。
-- 不要求接管：管理总览、管理日志、查询命令、终端敏感策略、终端队列操作、立即签到、登记排队操作、调整登记顺序、新建登记、修改玩家资料和重置网页账户密码。
+- 不要求接管：管理总览、管理日志、查询命令、由管理后台接管的设置、终端队列操作、立即签到、登记排队操作、调整登记顺序、新建登记、修改玩家资料和重置网页账户密码。
 
-因此接管只限制现场终端的本机修改，并作为上述四个接口的前提。四个策略开关在未接管时同样可以通过“终端敏感策略”修改，队列操作也不需要接管。
+因此接管只限制现场终端的本机修改，并作为上述四个接口的前提。四个策略开关在未接管时同样可以通过“由管理后台接管的设置”接口修改，队列操作也不需要接管。
 
 终端队列操作、立即签到、登记排队操作、调整登记顺序和新建登记不检查终端声明的能力。终端版本过旧、不认识对应命令时不会回执，命令在超时后被服务端拒绝。
 
@@ -2232,7 +2349,7 @@ Authorization: Bearer <QUEUE_MANAGEMENT_TOKEN>
 
 管理后台每 `30` 秒读取一次管理总览，并在每次命令请求成功返回后再读取一次；请求失败时和重置网页账户密码之后不会额外读取。
 
-### 终端敏感策略
+### 由管理后台接管的设置
 
 `PATCH /api/queue-management/terminal-policy`
 
@@ -2246,11 +2363,11 @@ Authorization: Bearer <QUEUE_MANAGEMENT_TOKEN>
   "allow_defer_one_round": true,
   "allow_temporary_leave": false,
   "onebot_sync_enabled": true,
-  "reason": "管理后台接管终端敏感策略"
+  "reason": "管理后台接管设置"
 }
 ```
 
-建立或解除接管，并设置四个敏感策略开关：是否允许线上登记、暂缓一次和暂时离开，以及 QQ Bot 联动。除 `reason` 外的字段全部必填，请求总是整体提交五个值；只想改变其中一项时，其余各项按管理总览中的当前值填写。`expected_policy_revision` 取 `queue.terminal_policy.revision`。`reason` 的默认值为 `管理后台更新终端敏感策略`。
+建立或解除接管，并设置四个敏感策略开关：是否允许线上登记、暂缓一次和暂时离开，以及 QQ Bot 联动。除 `reason` 外的字段全部必填，请求总是整体提交五个值；只想改变其中一项时，其余各项按管理总览中的当前值填写。`expected_policy_revision` 取 `queue.terminal_policy.revision`。`reason` 的默认值为 `管理后台更新接管的设置`。
 
 服务端创建 `UPDATE_TERMINAL_POLICY` 命令，其中带有终端应写入的新策略修订号（当前值加 `1`）。这个接口不要求已接管，它本身就是建立接管的途径；四个开关也可以在 `management_app_bound` 为 `false` 的请求中修改，终端应用后保持未接管。
 
@@ -2263,7 +2380,7 @@ Authorization: Bearer <QUEUE_MANAGEMENT_TOKEN>
 - `409` 和 `TERMINAL_POLICY_CONTEXT_CHANGED`：`expected_policy_revision` 与快照的 `management_policy_revision` 不一致。
 - `409` `终端已有策略修改正在等待处理`：该终端已有一条待处理的策略命令。
 
-终端核对队列批次和策略修订号后写入五个值，把 `management_policy_revision` 设为新修订号，并回执 `终端敏感策略已由管理后台更新并接管。` 或 `终端敏感策略已解除管理后台接管。`。提交的值与当前完全相同时，命令同样会被应用，策略修订号照常加 `1`。
+终端核对队列批次和策略修订号后写入五个值，把 `management_policy_revision` 设为新修订号，并回执 `由管理后台接管的设置已更新。` 或 `管理后台已解除对设置的接管。`。提交的值与当前完全相同时，命令同样会被应用，策略修订号照常加 `1`。
 
 ### 终端设置
 
@@ -2570,7 +2687,7 @@ Authorization: Bearer <QUEUE_MANAGEMENT_TOKEN>
 
 与玩家接口的差别：
 
-- `operation` 为 `DEFER_ONE_ROUND`、`CANCEL_DEFER_ONE_ROUND`、`SKIP_ONE_TURN`、`CANCEL_SKIP_ONE_TURN`、`TEMPORARILY_LEAVE`、`CANCEL_TEMPORARY_LEAVE`、`TRANSFER_MACHINE`、`CHANGE_PLAY_PREFERENCE`、`LEAVE_QUEUE` 或 `SET_PAIRED_MACHINE_QUEUEING`（需要 `also_queues_at_paired_machine`，见“自动在两台机台之间安排登记”），不接受 `JOIN_QUEUE` 和 `CHECK_IN`。
+- `operation` 为 `DEFER_ONE_ROUND`、`CANCEL_DEFER_ONE_ROUND`、`SKIP_ONE_TURN`、`CANCEL_SKIP_ONE_TURN`、`TEMPORARILY_LEAVE`、`CANCEL_TEMPORARY_LEAVE`、`TRANSFER_MACHINE`、`CHANGE_PLAY_PREFERENCE`、`LEAVE_QUEUE`、`SET_PAIRED_MACHINE_QUEUEING`（需要 `also_queues_at_paired_machine`，见“自动在两台机台之间安排登记”）或 `SET_ALLOWS_PASSING`（需要 `allows_passing`，见“单人游玩的登记允许后方的登记越过”），不接受 `JOIN_QUEUE` 和 `CHECK_IN`。
 - 不受 `defer_one_round_used` 和 `online_registration_not_played` 的限制：已暂缓过一次的登记可以再次暂缓一次，已签到但尚未游玩一轮的线上登记也可以暂缓一次、轮空一次或暂时离开。
 - 请求不带 `actor_qq`，命令中的 `actor_qq` 是空字符串。
 - 目标登记有两种指定方式。提供 `profile_id` 时，服务端按该资料的当前登记绑定查找，资料必须恰好有一份登记。不提供 `profile_id`（省略、`null` 或空字符串）时，目标就是 `expected_registration_id` 指向的登记，可以是没有关联玩家资料的临时登记；这种方式下确认状态字段实际上必须全部提交。
@@ -2960,6 +3077,7 @@ Authorization: Bearer <QUEUE_MANAGEMENT_TOKEN>
 - 针对已有登记的操作：另有 `registration_id` 和确认时的登记状态 `expected_position`（`WAITING` 或 `PLAYING`）、`expected_fixed_pair_id`（固定组合编号或 `null`）、`expected_absence_status`（`NONE`、`DEFER_ONE_ROUND`、`SKIP_ONE_TURN` 或 `TEMPORARILY_AWAY`）、`expected_temporary_away_skipped_turns`（`0` 至 `3`）和 `expected_pending_check_in`。服务端总是按创建命令时的快照填写这五项；`expected_position` 出现时，后三项必须同时出现。
 - `TRANSFER_MACHINE`：另有 `target_machine_id` 和 `target_machine_stable_id`，不含 `preference`。`CHANGE_PLAY_PREFERENCE`：另有 `preference`。`CHECK_IN`：`expected_position` 必须是 `WAITING`。
 - `SET_PAIRED_MACHINE_QUEUEING`：另有布尔值 `also_queues_at_paired_machine`，其余字段与上面几项操作相同。`JOIN_QUEUE` 和移动设备登记命令在请求带有选择时也有 `also_queues_at_paired_machine`，没有时不含这个键。见“自动在两台机台之间安排登记”。
+- `SET_ALLOWS_PASSING`：另有布尔值 `allows_passing`，其余字段与上面几项操作相同。`JOIN_QUEUE` 在请求带有这项选择时也有 `allows_passing`，没有时不含这个键。见“单人游玩的登记允许后方的登记越过”。
 - `REORDER_QUEUE`：`expected_registration_order` 和 `registration_order`，各是最多 `20` 个不重复的登记编号，两者包含的登记必须相同；不含 `profile_id`、`registration_id` 和确认状态。
 - `CHECK_IN`、`CREATE_REGISTRATION` 和 `REORDER_QUEUE` 还带有 `management_reason` 和固定为 `management-app` 的 `management_actor_id`，终端不读取。
 
@@ -3272,7 +3390,7 @@ Authorization: Bearer <QUEUE_MANAGEMENT_TOKEN>
 ### 网站与 QQ Bot
 
 - 网站未登录时只开放查看队列、查看公开日志和创建线上登记。线上登记接口不要求登录，只凭提交的 QQ 找到玩家资料；这样建立的登记带有待签到状态，需要到现场签到，见“网站线上登记”。
-- 登录网页账户后，可以管理账户所属玩家资料的本人登记，包括暂缓一次、轮空一次、暂时离开、取消对应状态、转至其他机台、修改本次偏好和退出排队。登记按资料 UUID 匹配，请求不能自行指定 QQ。登录后加入排队仍使用线上登记接口。
+- 登录网页账户后，可以管理账户所属玩家资料的本人登记，包括暂缓一次、轮空一次、暂时离开、取消对应状态、转至其他机台、修改本次偏好、与朋友组成固定组合（选择同一机台上已有的登记）、修改登记昵称和退出排队。登记按资料 UUID 匹配，请求不能自行指定 QQ。登录后加入排队仍使用线上登记接口。
 - QQ Bot 可以为 `actor_qq` 对应的玩家创建线上登记，对其本人登记执行与网页账户相同的操作，并请求修改该 QQ 对应的玩家资料。服务端只按 Bot 提交的 `actor_qq` 认定操作者，不另行验证玩家身份，见“私有 Bot 接口”。
 - 使用移动设备登记由现场终端发起：玩家扫描终端显示的二维码，在手机上选择或填写玩家资料，由终端建立不带待签到状态的普通现场登记。
 - 玩家在网页上对本人玩家资料的修改不是命令，直接保存在服务端，不要求终端在线，见“网页修改回流终端”。
@@ -3381,3 +3499,13 @@ QUEUE_SYNC_TOKEN=<终端令牌>
 `X-Device-ID` 会作为 `terminal.id` 出现在公开快照中，不是凭据。需要限制可以同步的终端时，在服务端配置 `QUEUE_DEVICE_ID`，见“终端请求头”。
 
 QQ 与玩家资料通过 HTTPS 传输并存入私有数据库，现场终端只接受 HTTPS 地址。数据库及其备份和三个令牌都应限制读取权限。玩家头像文件不做鉴权，只依赖地址不可猜测，见“玩家头像”。
+
+## 网站提交后网络中断（2026-11-28，审查 W-L7）
+
+服务端没有改动：三个提交接口（`/api/player-account/queue-commands`、`/api/queue-online/join`、`/api/queue-mobile/sessions/<token>/submit`）都先按 `request_id` 查找，同样的内容返回 `200` 和已有的命令，内容不同返回 `409`；命令编号就是 `request_id`。网站据此：
+
+- 提交请求没有回应、超时（15 秒）或服务端返回 5xx 时，用同一个 `request_id`、同样的内容重发，间隔 1、2、4、8、15、30 秒；网络断开时等到恢复再发（最多 5 分钟），页面重新可见或网络恢复时提前重试。
+- 查询命令结果时没有回应同样重试，不算入等待次数。
+- 重试用完仍无法确认时，结果标为“暂时无法确认操作结果”，不再写“操作未完成”。线上加入和手机扫码页提供“重新提交”，发送的是同一个请求，不会重复登记。
+- 实现：`public-site/src/queue/commandDelivery.js`、`queueCommandChain.js`。
+

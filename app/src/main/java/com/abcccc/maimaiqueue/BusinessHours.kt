@@ -203,6 +203,60 @@ internal fun isActiveClosingGracePeriod(
 ): Boolean = status.closingGracePeriod &&
     hasUnhandledClosingOccurrence(status, lastHandledOccurrenceId)
 
+/** Without business hours, a day of the venue is taken to begin at this local time. */
+internal const val QUEUE_DAY_START_MINUTES_WITHOUT_BUSINESS_HOURS = 5 * 60
+
+/**
+ * Whether a queue saved at [savedAtMillis] belongs to an earlier day of the venue than
+ * [nowMillis]. Such a queue is not continued when nobody answers the restore dialog; a new
+ * queue starts instead (maintainer, 2026-11-27: a tablet switched off before closing and on
+ * again the next day “开启新队列”).
+ *
+ * With business hours, one of two things happened after the save:
+ * - a business day ended together with its grace period; or
+ * - a business day began, and the save lay in the first half of the closed hours before it.
+ *   A queue saved in the second half, such as registrations taken a few minutes before the
+ *   doors open, belongs to the day that then begins (review 2026-11-27: saved at 9:55 and
+ *   restarted at 10:02 it was dropped).
+ * Without business hours: [QUEUE_DAY_START_MINUTES_WITHOUT_BUSINESS_HOURS] passed after the
+ * save. All of this leans towards “the same day”, since wrongly starting a new queue would
+ * drop the queue still in use.
+ */
+internal fun savedQueueIsFromEarlierDay(
+    settings: BusinessHoursSettings,
+    savedAtMillis: Long,
+    nowMillis: Long,
+    zoneId: ZoneId = ZoneId.systemDefault()
+): Boolean {
+    if (nowMillis <= savedAtMillis) return false
+    val saved = Instant.ofEpochMilli(savedAtMillis).atZone(zoneId)
+    val now = Instant.ofEpochMilli(nowMillis).atZone(zoneId)
+    // Saved more than a week ago: certainly another day, and no need to walk every day.
+    if (saved.toLocalDate().plusDays(8).isBefore(now.toLocalDate())) return true
+    fun passedSinceSave(moment: ZonedDateTime) = moment.isAfter(saved) && !moment.isAfter(now)
+    val normalized = settings.normalized()
+    var date = saved.toLocalDate().minusDays(1)
+    while (!date.isAfter(now.toLocalDate())) {
+        if (settings.enabled) {
+            val interval = businessInterval(normalized, date, zoneId)
+            if (passedSinceSave(interval.closing.plusMinutes(CLOSING_GRACE_MINUTES))) return true
+            if (passedSinceSave(interval.opening)) {
+                val previousClosing = businessInterval(normalized, date.minusDays(1), zoneId).closing
+                // Open round the clock: no closed hours, so no new day begins.
+                if (previousClosing.isBefore(interval.opening)) {
+                    val closedMillis = java.time.Duration.between(previousClosing, interval.opening).toMillis()
+                    val middleOfClosedHours = previousClosing.plusNanos(closedMillis / 2 * 1_000_000L)
+                    if (saved.isBefore(middleOfClosedHours)) return true
+                }
+            }
+        } else if (passedSinceSave(date.atTime(minutesToLocalTime(QUEUE_DAY_START_MINUTES_WITHOUT_BUSINESS_HOURS)).atZone(zoneId))) {
+            return true
+        }
+        date = date.plusDays(1)
+    }
+    return false
+}
+
 internal fun formatBusinessTime(minutes: Int): String {
     val normalized = minutes.coerceIn(0, MINUTES_PER_DAY - 1)
     return "%02d:%02d".format(normalized / 60, normalized % 60)

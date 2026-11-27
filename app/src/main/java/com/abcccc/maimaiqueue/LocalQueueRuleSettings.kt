@@ -197,6 +197,74 @@ internal fun QueueRuleSettings.managementControlledContent(): QueueRuleSettings 
         managementSettingsRevision = 0L
     )
 
+/**
+ * The settings page's draft after the saved settings changed underneath it, for example by a
+ * management command, while the page was open (review T-C12, 2026-11-28). [base] is what the
+ * draft started from, [draft] holds the operator's edits, [remote] is what is saved now.
+ *
+ * A setting the operator has not touched takes the saved value; one they changed keeps their
+ * edit. The machine layout (machines, their configurations, groups and pairs) is one unit, so
+ * that a merge can never mix two layouts. Revisions always follow the saved settings. When the
+ * management app holds the sensitive settings, its changes win for all of them, as the terminal
+ * could not save an edit of those anyway.
+ */
+internal fun mergeRemoteSettingsIntoDraft(
+    base: QueueRuleSettings,
+    draft: QueueRuleSettings,
+    remote: QueueRuleSettings
+): QueueRuleSettings {
+    if (draft == base) return remote
+    fun <T> pick(of: (QueueRuleSettings) -> T): T = if (of(draft) == of(base)) of(remote) else of(draft)
+    val layout: (QueueRuleSettings) -> List<Any> = {
+        listOf(
+            it.configuredMachineCount,
+            it.machineConfigurations,
+            it.machineStableIds,
+            it.machineGroupAssignments,
+            it.machineGroups,
+            it.defaultMachineGroupId,
+            it.pairedMachineStableIds
+        )
+    }
+    val layoutSource = if (layout(draft) == layout(base)) remote else draft
+    val merged = QueueRuleSettings(
+        allowDeferOneRound = pick { it.allowDeferOneRound },
+        allowTemporaryLeave = pick { it.allowTemporaryLeave },
+        allowOnlineRegistration = pick { it.allowOnlineRegistration },
+        showCommonPlayPreview = pick { it.showCommonPlayPreview },
+        websiteSyncEnabled = pick { it.websiteSyncEnabled },
+        oneBotSyncEnabled = pick { it.oneBotSyncEnabled },
+        syncMode = pick { it.syncMode },
+        queueSyncEndpoint = pick { it.queueSyncEndpoint },
+        queueSyncToken = pick { it.queueSyncToken },
+        configuredMachineCount = layoutSource.configuredMachineCount,
+        machineConfigurations = layoutSource.machineConfigurations,
+        machineStableIds = layoutSource.machineStableIds,
+        machineGroupAssignments = layoutSource.machineGroupAssignments,
+        machineGroups = layoutSource.machineGroups,
+        defaultMachineGroupId = layoutSource.defaultMachineGroupId,
+        machineConfigurationRevision = remote.machineConfigurationRevision,
+        businessHours = pick { it.businessHours },
+        managementAppBound = remote.managementAppBound,
+        managementPolicyRevision = remote.managementPolicyRevision,
+        managementSettingsRevision = remote.managementSettingsRevision,
+        pairedMachineQueueEnabled = pick { it.pairedMachineQueueEnabled },
+        pairedMachineStableIds = layoutSource.pairedMachineStableIds
+    )
+    val managementChanged =
+        remote.managementControlledContent() != base.managementControlledContent()
+    return if (remote.managementAppBound && managementChanged) {
+        remote.copy(
+            websiteSyncEnabled = merged.websiteSyncEnabled,
+            syncMode = merged.syncMode,
+            queueSyncEndpoint = merged.queueSyncEndpoint,
+            queueSyncToken = merged.queueSyncToken
+        )
+    } else {
+        merged
+    }
+}
+
 data class PendingSyncDisableSnapshot(
     val endpoint: String,
     val token: String,

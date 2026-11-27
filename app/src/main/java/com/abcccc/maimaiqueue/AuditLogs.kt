@@ -247,6 +247,12 @@ fun createQueueAuditLog(
     beforeByKey.keys.intersect(afterByKey.keys).forEach { key ->
         val old = beforeByKey.getValue(key)
         val new = afterByKey.getValue(key)
+        // Changed while it plays: this round stays as it is (maintainer, 2026-11-26).
+        val fromNextRound = if (before.playing.any { it.key == key } && after.playing.any { it.key == key }) {
+            "，本轮游玩结束后生效"
+        } else {
+            ""
+        }
         if (old.displayId != new.displayId) {
             affectedRegistrationKeys += key
             changeKinds += "renamed"
@@ -260,7 +266,44 @@ fun createQueueAuditLog(
         if (old.preference != new.preference) {
             affectedRegistrationKeys += key
             changeKinds += "preference"
-            details += "“${new.displayId}”的本次游玩偏好已改为“${queuePreferenceLabel(new)}”"
+            details += "“${new.displayId}”的本次游玩偏好已改为“${queuePreferenceLabel(new)}”$fromNextRound"
+        }
+        if (old.alsoQueuesAtPairedMachine != new.alsoQueuesAtPairedMachine) {
+            affectedRegistrationKeys += key
+            changeKinds += "paired_machine"
+            // Worded without a subject who did it: the choice also ends by itself, for example
+            // when a fixed pair is formed.
+            details += when {
+                !new.alsoQueuesAtPairedMachine ->
+                    "“${new.displayId}”不再由系统在两台机台之间安排，登记留在当前机台"
+                new.skipsPairedMachineThisRound ->
+                    "“${new.displayId}”已允许系统在两台机台之间安排登记，游玩一轮之后开始安排"
+                else -> "“${new.displayId}”已允许系统在两台机台之间安排登记"
+            }
+        }
+        // The choice belongs to 单人游玩 outside a fixed pair: when it ends because the
+        // preference changed or a pair was formed, the line about that change says it all.
+        if (
+            old.allowsPassing != new.allowsPassing &&
+            old.preference == new.preference &&
+            old.fixedPartnerKey == new.fixedPartnerKey
+        ) {
+            affectedRegistrationKeys += key
+            changeKinds += "passing"
+            val partner = new.fixedPartnerKey?.let(afterByKey::get)
+            when {
+                partner == null -> details += if (new.allowsPassing) {
+                    "“${new.displayId}”已允许后方的登记越过，与前方的登记共同游玩$fromNextRound"
+                } else {
+                    "“${new.displayId}”不再允许后方的登记越过$fromNextRound"
+                }
+                // A fixed pair has one choice: said once, for both.
+                key < partner.key -> details += if (new.allowsPassing) {
+                    "“${new.displayId}”和“${partner.displayId}”的固定组合已允许后方的登记越过，与前方的登记共同游玩$fromNextRound"
+                } else {
+                    "“${new.displayId}”和“${partner.displayId}”的固定组合不再允许后方的登记越过$fromNextRound"
+                }
+            }
         }
         if (old.fixedPartnerKey != new.fixedPartnerKey) {
             affectedRegistrationKeys += key
@@ -268,10 +311,12 @@ fun createQueueAuditLog(
             details += when {
                 old.fixedPartnerKey == null && new.fixedPartnerKey != null -> {
                     val partnerName = afterByKey[new.fixedPartnerKey]?.displayId
+                    // The answer given while the pair was formed belongs to the same sentence.
+                    val passing = if (new.allowsPassing) "，并允许后方的登记越过" else ""
                     if (partnerName == null) {
-                        "“${new.displayId}”已组成固定组合"
+                        "“${new.displayId}”已组成固定组合$passing"
                     } else {
-                        "“${new.displayId}”已与“${partnerName}”组成固定组合"
+                        "“${new.displayId}”已与“${partnerName}”组成固定组合$passing"
                     }
                 }
                 old.fixedPartnerKey != null && new.fixedPartnerKey == null ->
@@ -416,9 +461,12 @@ fun createQueueAuditLog(
             "profile" in changeKinds -> "登记资料已更新"
             "no_show" in changeKinds -> "未到场状态已更新"
             "check_in" in changeKinds -> "线上登记签到状态已更新"
-            "absence" in changeKinds -> "暂缓一次或暂时离开状态已更新"
+            "absence" in changeKinds -> "暂缓一次、轮空一次或暂时离开状态已更新"
             "pair" in changeKinds -> "固定组合已修改"
             "preference" in changeKinds -> "游玩偏好已更改"
+            "paired_machine" in changeKinds -> "两台机台之间的安排已更改"
+            // The choice belongs to the play preference.
+            "passing" in changeKinds -> "游玩偏好已更改"
             "playing" in changeKinds -> "游玩位置已更新"
             "order" in changeKinds -> "等待顺序已调整"
             "timer" in changeKinds -> "本轮计时已重置"
@@ -500,14 +548,33 @@ fun createQueueAuditLogs(
         emptySet()
     }
     val removed = before.allRegistrations.filter { it.key !in afterByKey }
+    // What somebody did to a registration by name is that action. It is not an outcome of the
+    // registration's turn: one that is removed while its check-in is pending did not miss the
+    // check-in, and a postponement that is cancelled was not completed (review 2026-11-27).
+    val namedKeys: Set<Int> = when (semanticAction) {
+        is QueueAction.RemoveRegistrations -> semanticAction.registrationKeys
+        is QueueAction.LeaveQueue -> setOf(semanticAction.registrationKey)
+        is QueueAction.TransferRegistrations -> semanticAction.registrationKeys
+        is QueueAction.ClearRegistrations -> beforeByKey.keys
+        is QueueAction.CancelDeferOneRound -> setOf(semanticAction.registrationKey)
+        is QueueAction.CancelSkipOneTurn -> setOf(semanticAction.registrationKey)
+        is QueueAction.CancelTemporaryLeave -> setOf(semanticAction.registrationKey)
+        else -> emptySet()
+    }.let { keys ->
+        // A fixed pair is postponed and released together.
+        keys + keys.mapNotNull { beforeByKey[it]?.fixedPartnerKey }
+    }
     val pendingCheckInRemoved = if (classifyAvailabilityOutcomes) {
-        removed.filter { it.requiresOnSiteCheckIn && it.key !in noShowKeys }
+        removed.filter {
+            it.requiresOnSiteCheckIn && it.key !in noShowKeys && it.key !in namedKeys
+        }
     } else {
         emptyList()
     }
     val temporaryAwayExpired = if (classifyAvailabilityOutcomes) {
         removed.filter {
             it.key !in noShowKeys &&
+                it.key !in namedKeys &&
                 it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
                 it.temporaryAwaySkippedTurns >= 3
         }
@@ -518,6 +585,7 @@ fun createQueueAuditLogs(
     val skipExpired = if (classifyAvailabilityOutcomes) {
         removed.filter {
             it.key !in noShowKeys &&
+                it.key !in namedKeys &&
                 it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN &&
                 it.temporaryAwaySkippedTurns >= 3
         }
@@ -528,6 +596,7 @@ fun createQueueAuditLogs(
         after.allRegistrations.filter { registration ->
             val old = beforeByKey[registration.key]
             registration.key !in noShowKeys &&
+                registration.key !in namedKeys &&
                 old?.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN &&
                 registration.absenceStatus == QueueAbsenceStatus.NONE &&
                 registration.temporaryAwaySkippedTurns > old.temporaryAwaySkippedTurns
@@ -538,6 +607,7 @@ fun createQueueAuditLogs(
     val deferredCompleted = if (classifyAvailabilityOutcomes) {
         after.allRegistrations.filter { registration ->
             registration.key !in noShowKeys &&
+                registration.key !in namedKeys &&
                 beforeByKey[registration.key]?.absenceStatus ==
                 QueueAbsenceStatus.DEFER_ONE_ROUND &&
                 registration.absenceStatus == QueueAbsenceStatus.NONE
@@ -1050,4 +1120,16 @@ private fun profilePreferenceAuditLabel(preference: ProfilePlayPreference): Stri
     ProfilePlayPreference.SOLO -> "单人游玩"
     ProfilePlayPreference.OPEN_TO_JOIN -> "允许他人加入"
     ProfilePlayPreference.ASK_EVERY_TIME -> "每次询问"
+}
+
+/**
+ * What the log entry and the banner “上次队列已恢复” say: the machines that had registrations,
+ * by name and count. A machine without any is left out (“……的 0 份登记”).
+ */
+internal fun restoredQueueSummary(machineRegistrationCounts: List<Pair<String, Int>>): String {
+    val restored = machineRegistrationCounts.filter { (_, count) -> count > 0 }
+    if (restored.isEmpty()) return "当前没有登记。"
+    return restored.joinToString(separator = "，", prefix = "已恢复 ", postfix = "。") { (machineName, count) ->
+        "$machineName 的 $count 份登记"
+    }
 }

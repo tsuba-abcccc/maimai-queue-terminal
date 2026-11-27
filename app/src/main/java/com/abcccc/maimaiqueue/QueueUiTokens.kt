@@ -54,6 +54,8 @@ internal val JoinCardOutlineColor = Color(0xFF9CC3F5)
 
 /** A selected row or the recommended choice: lighter than [SoftBlue] (mockup #F5F9FF). */
 internal val SelectedRowBackground = Color(0xFFF5F9FF)
+/** The hairline inside a selected row, above the choice nested in it. */
+internal val SelectedRowDivider = Color(0xFFE1E8F3)
 
 /** Placeholder text inside a field. */
 internal val PlaceholderText = Color(0xFFAEAEB2)
@@ -73,7 +75,25 @@ internal const val INSTALLATION_IDENTITY_REFRESH_INTERVAL_MILLIS = 30_000L
 internal const val LEGACY_INSTALLATION_REPROBE_INTERVAL_MILLIS = 5 * 60_000L
 internal const val CLOUD_PROFILE_REFRESH_INTERVAL_MILLIS = 30_000L
 internal const val INACTIVITY_TIMEOUT_MILLIS = 30_000L
+/** While a form is being filled in or a QR code is being scanned (maintainer, 2026-11-26). */
+internal const val INACTIVITY_FORM_TIMEOUT_MILLIS = 90_000L
 internal const val INACTIVITY_WARNING_MILLIS = 5_000L
+
+internal fun inactivityTimeoutFor(fillingForm: Boolean, scanningQrCode: Boolean): Long =
+    if (fillingForm || scanningQrCode) INACTIVITY_FORM_TIMEOUT_MILLIS else INACTIVITY_TIMEOUT_MILLIS
+
+/** The seconds left that a form counts down before the terminal returns home; null before that. */
+internal fun inactivityWarningSecondsLeft(
+    elapsedMillis: Long,
+    timeoutMillis: Long,
+    fillingForm: Boolean
+): Int? = if (fillingForm && elapsedMillis >= timeoutMillis - INACTIVITY_WARNING_MILLIS) {
+    ((timeoutMillis - elapsedMillis + 999L) / 1_000L)
+        .coerceIn(1L, INACTIVITY_WARNING_MILLIS / 1_000L)
+        .toInt()
+} else {
+    null
+}
 internal const val NEW_REGISTRATION_FEEDBACK_MILLIS = 8_000L
 internal const val HOME_OPERATION_FEEDBACK_MILLIS = 6_000L
 internal const val HOME_WARNING_FEEDBACK_MILLIS = 10_000L

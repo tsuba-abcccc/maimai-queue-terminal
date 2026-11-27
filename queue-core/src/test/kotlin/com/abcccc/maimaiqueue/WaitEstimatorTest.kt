@@ -44,6 +44,51 @@ class WaitEstimatorTest {
 
     private fun minutes(millis: Long?) = millis?.let { it / MINUTE.toDouble() }
 
+    /**
+     * Reported 2026-11-26: with a pair of machines on, every position after A1 showed the same
+     * 15 minutes. A registration near the back that may be arranged to machine B had its own
+     * early time there, which became its position's time and, as no position is shown later than
+     * the one behind it, the time of every position before it.
+     */
+    /** Found by the random check of 2026-11-27: nobody playing, one registration set to 暂缓一次. */
+    @Test
+    fun aLoneDeferredRegistrationStillGetsAWait() {
+        val result = estimate(
+            singleState(
+                MachineQueue(waiting = listOf(registration(1, absence = QueueAbsenceStatus.DEFER_ONE_ROUND)))
+            )
+        )
+        assertNotNull(result.registrations[1])
+    }
+
+    @Test
+    fun aRegistrationThatMayMoveDoesNotPullTheWaitsBeforeItDown() {
+        val open = PlayPreference.OPEN_TO_JOIN
+        val a = MachineQueue(
+            playing = listOf(registration(1, open)),
+            waiting = (2..8).map { registration(it, open) } + registration(9, open, paired = true),
+            playingStartedAtMillis = NOW
+        )
+        val b = MachineQueue(
+            playing = listOf(registration(50, open)),
+            waiting = listOf(registration(51, open), registration(52, open)),
+            playingStartedAtMillis = NOW
+        )
+        val result = estimate(pairedState(a, b), paired)
+        val positions = a.waitingProjection(includeCommonPlayPreview = false).positions
+            .map { position -> position.registrations.map(Registration::key) }
+        val shown = WaitEstimator.displayMinutesInOrder(
+            positions.map(result::estimate),
+            positions.map(result::hereEstimate)
+        )
+        // The positions before it keep their own, growing waits...
+        shown.dropLast(1).zipWithNext().forEach { (earlier, later) -> assertTrue("$shown", earlier!! < later!!) }
+        // ...while its own position tells the earlier time it may have at machine B.
+        assertTrue("$shown", shown.last()!! < shown[shown.size - 2]!!)
+        // The registration itself may still play earlier at machine B.
+        assertTrue(result.registrations.getValue(9).waitMillis < result.here.getValue(9).waitMillis)
+    }
+
     @Test
     fun theNextRegistrationIsShownSlightlyBeforeThePlannedEnd() {
         val result = estimate(
@@ -137,8 +182,8 @@ class WaitEstimatorTest {
     }
 
     @Test
-    fun aPendingOnlineRegistrationMakesTheOnesBehindItEarlier() {
-        fun waitOfThird(pending: Boolean) = estimate(
+    fun aPendingOnlineRegistrationCountsAsCheckingInAndTheEarlierCaseIsToldApart() {
+        fun estimateWith(pending: Boolean) = estimate(
             singleState(
                 MachineQueue(
                     playing = listOf(registration(1)),
@@ -146,13 +191,40 @@ class WaitEstimatorTest {
                     playingStartedAtMillis = NOW
                 )
             )
-        ).registrations
+        )
 
-        val withPending = waitOfThird(pending = true)
-        val checkedIn = waitOfThird(pending = false)
-        assertTrue(withPending.getValue(3).waitMillis < checkedIn.getValue(3).waitMillis)
+        val withPending = estimateWith(pending = true)
+        val checkedIn = estimateWith(pending = false)
+        // The positions on screen assume the online registration checks in; so does the estimate.
+        assertEquals(checkedIn.registrations.getValue(3), withPending.registrations.getValue(3))
         // The pending registration itself is told its turn for when it does check in.
-        assertNotNull(withPending[2])
+        assertNotNull(withPending.registrations[2])
+        // If it does not, the one behind plays about a round earlier, and that is told apart.
+        val earlier = withPending.earlierIfOnlineMissing.getValue(3)
+        val difference = withPending.registrations.getValue(3).waitMillis - earlier
+        assertTrue("${minutes(difference)}", difference in 9 * MINUTE..16 * MINUTE)
+        assertFalse(2 in withPending.earlierIfOnlineMissing)
+        assertTrue(checkedIn.earlierIfOnlineMissing.isEmpty())
+    }
+
+    @Test
+    fun aSmallDifferenceIsNotToldAsAnEarlierCase() {
+        // The pending registration and the one behind it share a round either way: if the
+        // pending one does not come, the other still plays in the same round.
+        val result = estimate(
+            singleState(
+                MachineQueue(
+                    playing = listOf(registration(1)),
+                    waiting = listOf(
+                        registration(2, preference = PlayPreference.OPEN_TO_JOIN),
+                        registration(3, preference = PlayPreference.OPEN_TO_JOIN, pendingCheckIn = true),
+                        registration(4)
+                    ),
+                    playingStartedAtMillis = NOW
+                )
+            )
+        )
+        assertFalse(2 in result.earlierIfOnlineMissing)
     }
 
     @Test
@@ -306,28 +378,115 @@ class WaitEstimatorTest {
     @Test
     fun minutesAreRoundedByTheMaintainersSteps() {
         fun shown(minutes: Double, down: Boolean) = WaitEstimator.displayMinutes((minutes * MINUTE).toLong(), down)
+        // 2026-11-28: 1 up to 45, 5 below 90, 10 up to 120, above that 2 小时以上.
         assertEquals(0L, shown(0.4, false))
-        assertEquals(30L, shown(29.6, false))
-        assertEquals(29L, shown(29.6, true))
-        assertEquals(30L, shown(31.0, false))
-        assertEquals(35L, shown(33.0, false))
-        assertEquals(30L, shown(33.0, true))
-        assertEquals(100L, shown(101.0, false))
-        assertEquals(110L, shown(106.0, false))
-        assertEquals(100L, shown(106.0, true))
+        assertEquals(44L, shown(43.6, false))
+        assertEquals(43L, shown(43.6, true))
+        assertEquals(45L, shown(44.6, false))
+        assertEquals(45L, shown(46.0, false))
+        assertEquals(50L, shown(48.0, false))
+        assertEquals(45L, shown(48.0, true))
+        assertEquals(90L, shown(89.0, false))
+        assertEquals(90L, shown(94.0, false))
+        assertEquals(100L, shown(96.0, false))
+        assertEquals(90L, shown(96.0, true))
+        assertEquals(120L, shown(118.0, false))
+        assertEquals(120L, shown(120.0, true))
+        // Above 120 minutes the value stays above 120, whatever the direction.
+        assertTrue(shown(120.5, true) > WaitEstimator.LONG_WAIT_MINUTES)
+        assertTrue(shown(146.0, false) > WaitEstimator.LONG_WAIT_MINUTES)
     }
 
     @Test
     fun aPositionIsNeverShownLaterThanOneBehindIt() {
         val shown = WaitEstimator.displayMinutesInOrder(
             listOf(
-                WaitEstimator.Estimate((32.6 * MINUTE).toLong(), uncertain = false),
-                WaitEstimator.Estimate(34 * MINUTE, uncertain = true),
+                // In the 5-minute band (2026-11-28 steps): 47.6 would read 50, 49 as an
+                // earliest time 45.
+                WaitEstimator.Estimate((47.6 * MINUTE).toLong(), uncertain = false),
+                WaitEstimator.Estimate(49 * MINUTE, uncertain = true),
                 null,
-                WaitEstimator.Estimate(50 * MINUTE, uncertain = false)
+                WaitEstimator.Estimate(55 * MINUTE, uncertain = false)
             )
         )
-        assertEquals(listOf(30L, 30L, null, 50L), shown)
+        assertEquals(listOf(45L, 45L, null, 55L), shown)
+    }
+
+    @Test
+    fun anEarliestTimeBehindDoesNotPullThePositionsAheadDown() {
+        // The last registration may play in 16 minutes if the one in the second position moves
+        // to the other machine; the positions between them keep their own times.
+        val shown = WaitEstimator.displayMinutesInOrder(
+            listOf(
+                WaitEstimator.Estimate(4 * MINUTE, uncertain = false),
+                WaitEstimator.Estimate(15 * MINUTE, uncertain = true),
+                WaitEstimator.Estimate(31 * MINUTE, uncertain = false),
+                WaitEstimator.Estimate(46 * MINUTE, uncertain = true),
+                WaitEstimator.Estimate(16 * MINUTE, uncertain = true)
+            )
+        )
+        assertEquals(listOf(4L, 15L, 31L, 45L, 16L), shown)
+    }
+
+    @Test
+    fun aShorterTimeBehindDoesNotPullThePositionsAheadDownEvenWhenItIsCertain() {
+        // The registration in the fifth position is taken to leave for certain; the one behind
+        // it then shares a round with the third and plays in 25 minutes. The fourth and fifth
+        // keep their own 40 minutes.
+        val shown = WaitEstimator.displayMinutesInOrder(
+            listOf(
+                WaitEstimator.Estimate(10 * MINUTE, uncertain = false),
+                WaitEstimator.Estimate(25 * MINUTE, uncertain = false),
+                WaitEstimator.Estimate(25 * MINUTE, uncertain = false),
+                WaitEstimator.Estimate((40.4 * MINUTE).toLong(), uncertain = false),
+                WaitEstimator.Estimate((40.6 * MINUTE).toLong(), uncertain = true),
+                WaitEstimator.Estimate((25.1 * MINUTE).toLong(), uncertain = false)
+            )
+        )
+        assertEquals(listOf(10L, 25L, 25L, 40L, 40L, 25L), shown)
+    }
+
+    @Test
+    fun anUncertainWaitFarFromTheTimeIfNobodyMovesIsShownAsARange() {
+        // 最快 16 分钟, 55 minutes if nobody is moved: far apart, so a range.
+        assertEquals(55L, WaitEstimator.rangeUpperMinutes(16L, uncertain = true, waitIfNobodyMovesMillis = 55 * MINUTE))
+        // Exactly 24 minutes apart, as shown, counts; less does not (37 minutes is shown as 35).
+        assertEquals(40L, WaitEstimator.rangeUpperMinutes(16L, uncertain = true, waitIfNobodyMovesMillis = 40 * MINUTE))
+        assertEquals(null, WaitEstimator.rangeUpperMinutes(16L, uncertain = true, waitIfNobodyMovesMillis = 37 * MINUTE))
+        // A certain wait is one number; so is "可能很快可以游玩".
+        assertEquals(null, WaitEstimator.rangeUpperMinutes(16L, uncertain = false, waitIfNobodyMovesMillis = 55 * MINUTE))
+        // 可能很快 with a far later time if nobody is moved: that time is shown too.
+        assertEquals(55L, WaitEstimator.rangeUpperMinutes(0L, uncertain = true, waitIfNobodyMovesMillis = 55 * MINUTE))
+        assertEquals(null, WaitEstimator.rangeUpperMinutes(0L, uncertain = true, waitIfNobodyMovesMillis = 20 * MINUTE))
+        assertEquals(null, WaitEstimator.rangeUpperMinutes(16L, uncertain = true, waitIfNobodyMovesMillis = null))
+    }
+
+    @Test
+    fun theTimeIfNobodyMovesIsGivenForUncertainEstimatesOnly() {
+        val open = PlayPreference.OPEN_TO_JOIN
+        val a = MachineQueue(
+            playing = listOf(registration(1, open)),
+            waiting = (2..8).map { registration(it, open) } + registration(9, open, paired = true),
+            playingStartedAtMillis = NOW
+        )
+        val b = MachineQueue(
+            playing = listOf(registration(50, open)),
+            waiting = listOf(registration(51, open), registration(52, open)),
+            playingStartedAtMillis = NOW
+        )
+        val result = estimate(pairedState(a, b), paired)
+        result.registrations.forEach { (key, estimate) ->
+            val other = result.ifNobodyMoves[key]
+            if (estimate.uncertain) {
+                assertTrue("registration $key", other != null && other >= estimate.waitMillis - MINUTE)
+            } else {
+                assertEquals("registration $key", null, other)
+            }
+        }
+        // 9 may play much earlier at machine B. While that is uncertain, the time if it is
+        // not moved is its turn at machine A, which is later.
+        val nine = result.registrations.getValue(9)
+        if (nine.uncertain) assertTrue(result.ifNobodyMoves.getValue(9) > nine.waitMillis)
     }
 
     @Test

@@ -56,6 +56,99 @@ class FriendPairOrderTest {
     }
 
     @Test
+    fun twoRegistrationsSharingAPositionAcrossAPassedOneBecomeAPairWhereTheyAreShown() {
+        val queue = MachineQueue(
+            playing = listOf(registration(10, solo)),
+            waiting = listOf(
+                registration(1, open),
+                registration(2, solo).copy(allowsPassing = true),
+                registration(3, open),
+                registration(4, solo)
+            ),
+            playingStartedAtMillis = 1L
+        )
+        assertEquals(listOf(listOf(1, 3), listOf(2), listOf(4)), queue.positionKeys())
+
+        // This used to change nothing at all: the two were taken to wait side by side.
+        val result = queue.paired(1, 3)
+
+        assertEquals(listOf(1, 3, 2, 4), result.waiting.map(Registration::key))
+        assertEquals(listOf(listOf(1, 3), listOf(2), listOf(4)), result.positionKeys())
+        assertEquals(listOf<Int?>(3, 1), result.waiting.take(2).map(Registration::fixedPartnerKey))
+        assertTrue(result.invariantViolations().joinToString(), result.invariantViolations().isEmpty())
+    }
+
+    @Test
+    fun aPairDoesNotCostAPostponedRegistrationBetweenThemARound() {
+        // 2 lets one group go first: 1 and 3 play together, then 2.
+        val queue = MachineQueue(
+            playing = listOf(registration(10, solo)),
+            waiting = listOf(
+                registration(1, open),
+                registration(2, open).copy(absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND),
+                registration(3, open),
+                registration(4, solo)
+            ),
+            playingStartedAtMillis = 1L
+        )
+        val plan = queue.planFriendPair(1, 3)!!
+        assertTrue(plan.delayedOtherRegistrations.isEmpty())
+        assertTrue("两人的游玩轮次不变", plan.movedBackRegistrations.isEmpty())
+
+        // Side by side ahead of 2 they would play, and 2 would then let yet another group
+        // go first. The pair stands behind 2, which is passed by it exactly as before.
+        val result = queue.paired(1, 3)
+        assertEquals(listOf(2, 1, 3, 4), result.waiting.map(Registration::key))
+        val first = result.finishRound(2_000_000L)
+        assertEquals(listOf(1, 3), first.playing.map(Registration::key))
+        val second = first.finishRound(3_000_000L)
+        assertEquals(listOf(2), second.playing.map(Registration::key))
+    }
+
+    @Test
+    fun aPairIsNeverPlacedBetweenTheTwoOfAnotherPair() {
+        val random = Random(20261127)
+        repeat(3_000) {
+            val waiting = mutableListOf<Registration>()
+            var key = 1
+            while (waiting.size < 9) {
+                if (random.nextInt(4) == 0 && waiting.size <= 7) {
+                    waiting += registration(key, open).copy(fixedPartnerKey = key + 1)
+                    waiting += registration(key + 1, open).copy(fixedPartnerKey = key)
+                    key += 2
+                } else {
+                    val absence = when (random.nextInt(8)) {
+                        0 -> QueueAbsenceStatus.DEFER_ONE_ROUND
+                        1 -> QueueAbsenceStatus.SKIP_ONE_TURN
+                        else -> QueueAbsenceStatus.NONE
+                    }
+                    val preference = if (random.nextBoolean()) open else solo
+                    waiting += registration(key++, preference).copy(
+                        absenceStatus = absence,
+                        allowsPassing = preference == solo && random.nextBoolean()
+                    )
+                }
+            }
+            val queue = MachineQueue(waiting = waiting)
+            val candidates = waiting.filter { it.absenceStatus == QueueAbsenceStatus.NONE }
+            if (candidates.size < 2) return@repeat
+            val (a, b) = candidates.shuffled(random)
+            val plan = queue.planFriendPair(a.key, b.key) ?: return@repeat
+            val pairKeys = setOf(a.key, b.key)
+            waiting.filter { it.fixedPartnerKey != null && it.key !in pairKeys && it.fixedPartnerKey !in pairKeys }
+                .forEach { member ->
+                    val index = plan.waiting.indexOfFirst { it.key == member.key }
+                    val partnerIndex = plan.waiting.indexOfFirst { it.key == member.fixedPartnerKey }
+                    assertEquals(
+                        "${waiting.map { it.key to it.fixedPartnerKey }} + pair $pairKeys",
+                        1,
+                        kotlin.math.abs(index - partnerIndex)
+                    )
+                }
+        }
+    }
+
+    @Test
     fun registrationsThatLoseTheirPartnerToThePairAreGroupedAgainInTheirOwnOrder() {
         val queue = MachineQueue(
             waiting = (1..4).map { registration(it, open) }

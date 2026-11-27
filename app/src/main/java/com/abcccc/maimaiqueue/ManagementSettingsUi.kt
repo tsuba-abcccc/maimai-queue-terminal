@@ -215,7 +215,7 @@ internal fun ManagementSettingsPage(
                         Text(
                             when {
                                 !terminalSettings.supported -> "当前终端版本不支持管理后台接管。"
-                                !overview.terminalPolicy.managementAppBound -> "请先绑定并接管终端敏感策略。"
+                                !overview.terminalPolicy.managementAppBound -> "请先在管理后台接管这些设置。"
                                 else -> "修改后由现场终端执行。"
                             },
                             color = SecondaryText,
@@ -510,7 +510,7 @@ private fun ManagementTerminalPolicyCard(
 ) {
     if (!policy.supported) {
         SurfaceLikeSettingsCard {
-            Text("终端敏感策略", color = PrimaryText, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("由管理后台接管的设置", color = PrimaryText, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(4.dp))
             Text("当前终端版本不支持管理后台接管。", color = SecondaryText, style = MaterialTheme.typography.bodySmall)
         }
@@ -520,7 +520,7 @@ private fun ManagementTerminalPolicyCard(
     val changed = draft != policy
     SurfaceLikeSettingsCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("终端敏感策略", color = PrimaryText, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("由管理后台接管的设置", color = PrimaryText, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.weight(1f))
             Text(if (policy.managementAppBound) "已接管" else "未接管", color = if (policy.managementAppBound) OnlineRegistrationStatusColor else TertiaryText, style = MaterialTheme.typography.labelSmall)
         }

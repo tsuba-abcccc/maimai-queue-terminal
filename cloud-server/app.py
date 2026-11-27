@@ -6,6 +6,7 @@ import re
 import secrets
 import sqlite3
 import time
+import unicodedata
 import warnings
 from contextlib import contextmanager
 from io import BytesIO
@@ -105,7 +106,55 @@ QUEUE_OPERATIONS = {
     "LEAVE_QUEUE",
     "CHECK_IN",
     "SET_PAIRED_MACHINE_QUEUEING",
+    "SET_ALLOWS_PASSING",
+    "CREATE_FIXED_PAIR",
+    "RENAME_REGISTRATION",
 }
+# The remote operations a terminal may name in supported_queue_operations: those above and the
+# two that reach it as other commands (mobile registration and the management order).
+KNOWN_TERMINAL_QUEUE_OPERATIONS = QUEUE_OPERATIONS | {"CREATE_REGISTRATION", "REORDER_QUEUE"}
+# Operations that terminals older than 2026-11-26 cannot carry out (the last two: older than
+# 2026-11-28). An older terminal drops a command it cannot read, which leaves the player waiting
+# until the command times out, so these are sent only to a terminal whose snapshot names them in
+# supported_queue_operations. Older terminals send no such list; everything else keeps working
+# for them as before.
+TERMINAL_DECLARED_QUEUE_OPERATIONS = {
+    "SKIP_ONE_TURN",
+    "CANCEL_SKIP_ONE_TURN",
+    "SET_ALLOWS_PASSING",
+    "CREATE_FIXED_PAIR",
+    "RENAME_REGISTRATION",
+}
+# 与朋友共同游玩 with a registration that already waits at the same machine, and 修改登记昵称
+# (2026-11-28). Only the signed-in website account of the registration's profile may ask for
+# them; the management app has its own actions of the same names.
+ACCOUNT_ONLY_QUEUE_OPERATIONS = {"CREATE_FIXED_PAIR", "RENAME_REGISTRATION"}
+# The terminal's own sentences for these two (RemoteQueueOperations.kt). It checks everything
+# again; the server says them before a command is queued.
+FIXED_PAIR_PARTNER_UNKNOWN_REFUSAL = "未能确定朋友的登记，请重新选择。"
+FIXED_PAIR_PARTNER_NOT_WAITING_REFUSAL = (
+    "朋友的登记已经不在这台机台的等待顺序中，请重新选择。"
+)
+FIXED_PAIR_PLAYING_POSITION_REFUSAL = (
+    "这份登记处于游玩位置。请在本轮结束、这份登记回到等待顺序后，再组成固定组合。"
+)
+FIXED_PAIR_ALREADY_FORMED_REFUSAL = "这两份登记已经组成固定组合。"
+FIXED_PAIR_OWN_ALREADY_PAIRED_REFUSAL = "这份登记已经属于固定组合，请先解除固定组合。"
+FIXED_PAIR_PARTNER_PENDING_CHECK_IN_REFUSAL = (
+    "这份线上登记尚未完成现场签到，签到后才能组成固定组合。"
+)
+FIXED_PAIR_WHILE_POSTPONED_REFUSAL = (
+    "将暂缓一次、将轮空一次或暂时离开的登记不能组成固定组合，请先取消该状态。"
+)
+REGISTRATION_DISPLAY_ID_LENGTH_REFUSAL = "登记昵称应为 1 至 18 个字符，请重新填写。"
+REGISTRATION_DISPLAY_ID_TAKEN_REFUSAL = "当前队列中已经有相同昵称的登记。"
+TERMINAL_NOT_UPDATED_DETAIL = "现场终端尚未更新，暂不能使用这项操作。"
+MAX_SUPPORTED_QUEUE_OPERATIONS = 64
+QUEUE_OPERATION_NAME_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+# The terminal's own words for a machine for one player, where passing has no meaning.
+SINGLE_PLAYER_MACHINE_PASSING_REFUSAL = "当前机台仅能容纳一人游玩，不能设置这项选择。"
+SOLO_ONLY_PASSING_REFUSAL = "只有单人游玩的登记可以允许后方的登记越过。"
+MAX_PASSING_OVER = 20
 MANAGEMENT_QUEUE_ACTIONS = {
     "ADD_TEMPORARY_REGISTRATION",
     "ADD_PROFILE_REGISTRATION",
@@ -303,6 +352,8 @@ REQUIRED_DATABASE_COLUMNS = {
         "visited_venues_public",
         "web_profile_revision",
         "paired_machine_queueing_introduced",
+        "last_allows_passing",
+        "passing_introduced",
     },
     "player_account": {
         "account_id",
@@ -397,12 +448,66 @@ REQUIRED_DATABASE_COLUMNS = {
 }
 
 
+SQLITE_INTEGER_MINIMUM = -(2**63)
+SQLITE_INTEGER_MAXIMUM = 2**63 - 1
+UNSTORABLE_REQUEST_JSON_DETAIL = "请求内容包含超出范围的整数或无效字符。"
+
+
+class UnstorableRequestJson(Exception):
+    """Request JSON that holds something SQLite cannot store; see request_json_is_storable."""
+
+
+def request_json_is_storable(value: Any) -> bool:
+    """
+    Whether every integer of a parsed request body fits SQLite's 64-bit INTEGER and every
+    string, keys included, is valid Unicode. JSON allows integers of any size, and an escape
+    for one half of a surrogate pair decodes to a lone surrogate, which cannot be encoded as
+    UTF-8; either would otherwise end the request with an unhandled error where it reaches
+    the database.
+    """
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            if not item.isascii():
+                try:
+                    item.encode("utf-8")
+                except UnicodeEncodeError:
+                    return False
+        elif isinstance(item, bool):
+            continue
+        elif isinstance(item, int):
+            if not SQLITE_INTEGER_MINIMUM <= item <= SQLITE_INTEGER_MAXIMUM:
+                return False
+        elif isinstance(item, dict):
+            pending.extend(item)
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return True
+
+
 class QueueRequest(Request):
+    _json_storable_checked = False
+
     @property
     def max_content_length(self) -> int:
         if self.path == "/api/player-account/avatar":
             return MAX_AVATAR_REQUEST_BYTES
         return MAX_PAYLOAD_BYTES
+
+    def get_json(self, force: bool = False, silent: bool = False, cache: bool = True) -> Any:
+        """
+        The parsed body, checked once per request: every endpoint reads its JSON here, so a
+        body that cannot be stored is refused with 400 before any field of it is used
+        (register_routes answers UnstorableRequestJson).
+        """
+        value = super().get_json(force=force, silent=silent, cache=cache)
+        if not self._json_storable_checked:
+            if not request_json_is_storable(value):
+                raise UnstorableRequestJson()
+            self._json_storable_checked = True
+        return value
 
 
 class ValidationError(ValueError):
@@ -959,6 +1064,8 @@ def initialize_database(database_path: str, *, profile_scope_id: str = "default"
                 visited_venues_public INTEGER NOT NULL DEFAULT 1,
                 web_profile_revision INTEGER NOT NULL DEFAULT 0,
                 paired_machine_queueing_introduced INTEGER NOT NULL DEFAULT 0,
+                last_allows_passing INTEGER NOT NULL DEFAULT 0,
+                passing_introduced INTEGER NOT NULL DEFAULT 0,
                 received_at INTEGER NOT NULL,
                 PRIMARY KEY(device_id, profile_id)
             )
@@ -985,6 +1092,8 @@ def initialize_database(database_path: str, *, profile_scope_id: str = "default"
             ("web_profile_revision", "INTEGER NOT NULL DEFAULT 0"),
             ("recent_usage_at", "TEXT NOT NULL DEFAULT '[]'"),
             ("paired_machine_queueing_introduced", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_allows_passing", "INTEGER NOT NULL DEFAULT 0"),
+            ("passing_introduced", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column_name not in player_profile_columns:
                 connection.execute(
@@ -1406,6 +1515,10 @@ def register_routes(app: Flask) -> None:
             else "队列数据超过大小限制。"
         )
         return jsonify({"ok": False, "error": message}), 413
+
+    @app.errorhandler(UnstorableRequestJson)
+    def unstorable_request_json(_error):
+        return jsonify({"ok": False, "error": UNSTORABLE_REQUEST_JSON_DETAIL}), 400
 
     @app.get("/healthz")
     def health():
@@ -1875,8 +1988,15 @@ def invalidate_player_account_for_profile(
     profile_scope_id: str,
     profile_id: str,
     now: int,
+    only_with_account: bool = False,
 ) -> None:
     """Invalidate stale web credentials when a profile is no longer bound.
+
+    With ``only_with_account`` nothing happens unless an account row exists.
+    Every snapshot upload passes it for each unbound profile: without it the
+    upload also invalidated a binding session that had just been opened, so the
+    QR code died at the terminal's next upload, at most 30 seconds later
+    (review 2026-11-27).
 
     A profile can be imported from another terminal or database snapshot with
     ``web_account_bound`` cleared while the account tables still contain the
@@ -1892,6 +2012,8 @@ def invalidate_player_account_for_profile(
         (profile_scope_id, profile_id),
     ).fetchall()
     account_ids = [row["account_id"] for row in account_rows]
+    if only_with_account and not account_ids:
+        return
     if account_ids:
         connection.executemany(
             """
@@ -2154,6 +2276,7 @@ def current_player_account_session(
                profile.web_account_bound, profile.terminal_editing_allowed,
                profile.visited_venues_public, profile.web_profile_revision,
                profile.paired_machine_queueing_introduced,
+               profile.last_allows_passing, profile.passing_introduced,
                profile.profile_updated_at, venue.venue_id, venue.venue_code,
                venue.display_name AS venue_name
         FROM player_account AS account
@@ -2224,6 +2347,8 @@ def serialize_player_account(account: sqlite3.Row) -> dict[str, Any]:
             "paired_machine_queueing_introduced": bool(
                 account["paired_machine_queueing_introduced"]
             ),
+            "last_allows_passing": bool(account["last_allows_passing"]),
+            "passing_introduced": bool(account["passing_introduced"]),
             "updated_at": account["profile_updated_at"],
         },
         "venue": {
@@ -2852,7 +2977,7 @@ def complete_player_profile_creation_session(session_token: str):
             {"ok": False, "error": "请填写完整的网页玩家资料和账户密码。"}
         ), 400
     try:
-        nickname = read_string(source, "nickname", maximum_length=18)
+        nickname = read_player_name(source, "nickname", maximum_length=18)
         gender = read_choice(source, "gender", PLAYER_GENDERS)
         default_preference = read_choice(
             source, "default_preference", PROFILE_PREFERENCES
@@ -3096,6 +3221,7 @@ def current_player_account_session_for_id(
                profile.web_account_bound, profile.terminal_editing_allowed,
                profile.visited_venues_public, profile.web_profile_revision,
                profile.paired_machine_queueing_introduced,
+               profile.last_allows_passing, profile.passing_introduced,
                profile.profile_updated_at, venue.venue_id, venue.venue_code,
                venue.display_name AS venue_name
         FROM player_account AS account
@@ -3320,7 +3446,9 @@ def update_current_player_account_profile():
         )
         requested: dict[str, Any] = {}
         if "nickname" in source:
-            requested["nickname"] = read_string(source, "nickname", maximum_length=18)
+            requested["nickname"] = read_player_name(
+                source, "nickname", maximum_length=18
+            )
         if "gender" in source:
             requested["gender"] = read_choice(source, "gender", PLAYER_GENDERS)
         if "default_preference" in source:
@@ -3845,6 +3973,19 @@ def read_current_player_account_queue():
                 "position_index": context["position_index"],
                 "estimated_wait_minutes": context["estimated_wait_minutes"],
                 "estimated_wait_uncertain": context["estimated_wait_uncertain"],
+                # The wait if the system arranges nobody between the two machines, shown on its
+                # own line; absent from older terminals.
+                "estimated_wait_upper_minutes": context.get("estimated_wait_upper_minutes"),
+                # The registration's own wait rather than its position's (see
+                # own_estimated_wait_minutes): the website keeps it where it would otherwise
+                # show the position's time from the queue page.
+                "estimated_wait_is_own": bool(context.get("estimated_wait_is_own", False)),
+                "wait_minutes_if_online_missing": registration.get(
+                    "wait_minutes_if_online_missing"
+                ),
+                # Passing over a registration that plays alone; older terminals leave both out.
+                "allows_passing": bool(registration.get("allows_passing", False)),
+                "passing_over": list(registration.get("passing_over") or []),
                 "preference": registration["preference"],
                 "fixed_pair": registration["fixed_pair"],
                 "fixed_pair_id": registration["fixed_pair_id"],
@@ -3862,6 +4003,10 @@ def read_current_player_account_queue():
                 ),
                 "online_registration_pending_check_in": registration.get(
                     "online_registration_pending_check_in", False
+                ),
+                # 线上登记，已签到; snapshots stored before the field existed leave it out.
+                "online_registration_checked_in": bool(
+                    registration.get("online_registration_checked_in", False)
                 ),
                 "also_queues_at_paired_machine": registration.get(
                     "also_queues_at_paired_machine", False
@@ -3892,6 +4037,10 @@ def read_current_player_account_queue():
                 "received_at": snapshot_row["received_at"] * 1000,
                 "terminal_online": terminal_online,
                 "remote_actions": remote_actions,
+                # As capabilities.fixed_pair_passing_supported of the status API.
+                "fixed_pair_passing_supported": bool(
+                    remote_actions and fixed_pair_passing_supported(snapshot)
+                ),
                 "queue_rules": snapshot.get("queue_rules")
                 or normalize_public_queue_rules(None),
                 "machines": list(machines.values()),
@@ -3911,6 +4060,10 @@ def create_player_account_queue_operation_command():
         "target_machine_id",
         "preference",
         "also_queues_at_paired_machine",
+        "allows_passing",
+        # CREATE_FIXED_PAIR and RENAME_REGISTRATION (2026-11-28).
+        "partner_registration_id",
+        "display_id",
         "expected_queue_id",
         "expected_registration_id",
         "expected_machine_id",
@@ -3929,7 +4082,7 @@ def create_player_account_queue_operation_command():
         ), 400
     if source.get("operation") == "JOIN_QUEUE":
         return jsonify(
-            {"ok": False, "error": "加入排队请使用网站上的“加入排队”入口。"}
+            {"ok": False, "error": "加入排队请使用网页端的“加入排队”入口。"}
         ), 400
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -4274,6 +4427,10 @@ def publish_snapshot():
             and current["queue_id"] != queue_id
             and current_is_test == incoming_is_test
         ):
+            # The contacts of a queue also keep players who left it earlier, for events
+            # that are replayed. A new queue clears the registrations that were still in the
+            # last snapshot of the old one, and only their players are told so.
+            cleared_registration_ids = set(snapshot_registration_ids(current_payload))
             previous_queue_contacts = {
                 row["registration_id"]: row
                 for row in connection.execute(
@@ -4284,6 +4441,7 @@ def publish_snapshot():
                     """,
                     (current_queue_storage_id,),
                 ).fetchall()
+                if row["registration_id"] in cleared_registration_ids
             }
         retired = connection.execute(
             "SELECT 1 FROM retired_queue WHERE queue_id = ?", (queue_storage_id,)
@@ -4929,6 +5087,7 @@ def upsert_player_profiles(
                     profile_scope_id=profile_scope_id,
                     profile_id=profile["profile_id"],
                     now=max(received_at, int(time.time())),
+                    only_with_account=True,
                 )
             connection.execute(
                 """
@@ -4941,6 +5100,11 @@ def upsert_player_profiles(
                 # Not tied to the profile's revision: that the player has been shown the
                 # explanation can only ever be added, whichever copy is otherwise newer.
                 mark_paired_machine_queueing_introduced(
+                    connection, profile_scope_id, profile["profile_id"]
+                )
+            if profile["passing_introduced"]:
+                # The same for the explanation of letting others pass.
+                mark_passing_introduced(
                     connection, profile_scope_id, profile["profile_id"]
                 )
             if (
@@ -5020,6 +5184,7 @@ def upsert_player_profiles(
                 profile_scope_id=profile_scope_id,
                 profile_id=profile["profile_id"],
                 now=max(received_at, int(time.time())),
+                only_with_account=True,
             )
 
         qq_number = profile["qq_number"]
@@ -5108,8 +5273,9 @@ def upsert_player_profiles(
                  public_player_id, avatar_reference, web_account_bound,
                  terminal_editing_allowed,
                  visited_venues_public, web_profile_revision,
-                 paired_machine_queueing_introduced, received_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 paired_machine_queueing_introduced, last_allows_passing,
+                 passing_introduced, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id, profile_id) DO UPDATE SET
                 nickname = excluded.nickname,
                 gender = excluded.gender,
@@ -5149,6 +5315,14 @@ def upsert_player_profiles(
                     player_profile.paired_machine_queueing_introduced,
                     excluded.paired_machine_queueing_introduced
                 ),
+                -- The player's last answer to the passing tick box, kept by the terminal.
+                last_allows_passing = excluded.last_allows_passing,
+                -- Whether the player has been shown the explanation of letting others
+                -- pass: kept like paired_machine_queueing_introduced, once set it stays.
+                passing_introduced = MAX(
+                    player_profile.passing_introduced,
+                    excluded.passing_introduced
+                ),
                 received_at = excluded.received_at
             """,
             (
@@ -5179,6 +5353,8 @@ def upsert_player_profiles(
                 int(profile["visited_venues_public"]),
                 profile["web_profile_revision"],
                 int(profile["paired_machine_queueing_introduced"]),
+                int(profile["last_allows_passing"]),
+                int(profile["passing_introduced"]),
                 received_at,
             ),
         )
@@ -5628,7 +5804,7 @@ def read_queue_versions():
                     terminal_updated_at,
                 ),
                 "website": build_version_component(
-                    "队列网站",
+                    "网页端",
                     identity["website_version"] if identity is not None else None,
                     current_app.config.get("LATEST_WEBSITE_VERSION"),
                     identity["website_version_updated_at"]
@@ -5763,7 +5939,7 @@ def read_queue_logs():
             before = int(before_text)
         except ValueError:
             return jsonify({"ok": False, "error": "before 数值无效。"}), 400
-        if before <= 0:
+        if not 0 < before <= SQLITE_INTEGER_MAXIMUM:
             return jsonify({"ok": False, "error": "before 数值无效。"}), 400
 
     with open_database() as connection:
@@ -5919,6 +6095,13 @@ def read_bot_players():
                 "preference": context["registration"]["preference"],
                 "fixed_pair": context["registration"]["fixed_pair"],
                 "fixed_pair_id": context["registration"]["fixed_pair_id"],
+                "wait_minutes_if_online_missing": context["registration"].get(
+                    "wait_minutes_if_online_missing"
+                ),
+                "allows_passing": bool(
+                    context["registration"].get("allows_passing", False)
+                ),
+                "passing_over": list(context["registration"].get("passing_over") or []),
                 "registration_type": context["registration"]["registration_type"],
                 "created_at": context["registration"]["created_at"],
                 "online_check_in_started_at": context["registration"][
@@ -5999,7 +6182,7 @@ def read_bot_events():
         limit = int(limit_text)
     except ValueError:
         return jsonify({"ok": False, "error": "after 或 limit 数值无效。"}), 400
-    if after < 0 or not 1 <= limit <= MAX_LOG_PAGE_SIZE:
+    if not 0 <= after <= SQLITE_INTEGER_MAXIMUM or not 1 <= limit <= MAX_LOG_PAGE_SIZE:
         return jsonify({"ok": False, "error": "after 或 limit 数值无效。"}), 400
 
     with open_database() as connection:
@@ -6214,7 +6397,7 @@ def read_synced_profiles(*, allow_qq_filter: bool):
                    public_player_id, avatar_reference, web_account_bound,
                    terminal_editing_allowed, visited_venues_public,
                    web_profile_revision, paired_machine_queueing_introduced,
-                   received_at
+                   last_allows_passing, passing_introduced, received_at
             FROM player_profile
             WHERE device_id = ?
             ORDER BY nickname, profile_id
@@ -6288,6 +6471,8 @@ def read_synced_profiles(*, allow_qq_filter: bool):
                     "paired_machine_queueing_introduced": bool(
                         row["paired_machine_queueing_introduced"]
                     ),
+                    "last_allows_passing": bool(row["last_allows_passing"]),
+                    "passing_introduced": bool(row["passing_introduced"]),
                     "setup_version": row["setup_version"],
                     "profile_revision": row["profile_revision"],
                     "created_at": row["created_at"],
@@ -6425,10 +6610,15 @@ def create_website_join_command():
         "machine_id",
         "preference",
         "also_queues_at_paired_machine",
+        "allows_passing",
         "expected_queue_id",
         "expected_machine_configuration_revision",
         "expected_machine_stable_id",
     }
+    # No remember_preference (将本次选择保存为默认游玩偏好): anyone may join for a QQ number, but a
+    # profile's default preference is not theirs to change, and it is refused rather than
+    # ignored (maintainer, 2026-11-28: “忽略不好吧，干脆把这一行去掉都没事”). The phone page,
+    # used on site, keeps it.
     if set(source) - allowed_fields:
         return jsonify({"ok": False, "error": "请求包含不支持的线上登记字段"}), 400
     normalized = dict(source)
@@ -6449,6 +6639,7 @@ def create_bot_queue_operation_command():
         "target_machine_id",
         "preference",
         "also_queues_at_paired_machine",
+        "allows_passing",
         "expected_queue_id",
         "expected_registration_id",
         "expected_machine_id",
@@ -6885,6 +7076,21 @@ def create_management_terminal_queue_action():
         if pending is not None:
             connection.rollback()
             return jsonify({"ok": False, "error": "这台机台已有管理操作正在等待终端处理。"}), 409
+        # terminal_command_one_pending_profile allows one pending command of a type per
+        # profile. The check above is per machine, so the same profile submitted for another
+        # machine has to be refused here; it used to fail on the index.
+        if profile_id is not None and connection.execute(
+            """
+            SELECT 1 FROM terminal_command
+            WHERE status = 'PENDING' AND device_id = ?
+              AND command_type = ?
+              AND json_extract(payload, '$.profile_id') = ?
+            LIMIT 1
+            """,
+            (snapshot_row["device_id"], MANAGEMENT_QUEUE_ACTION_COMMAND, profile_id),
+        ).fetchone() is not None:
+            connection.rollback()
+            return jsonify({"ok": False, "error": "这名玩家已有一项操作正在等待终端处理。"}), 409
 
         queue_storage_id, _ = snapshot_storage_context(snapshot_row, snapshot)
         payload = {
@@ -6954,6 +7160,7 @@ def create_management_queue_operation_command():
         "target_machine_id",
         "preference",
         "also_queues_at_paired_machine",
+        "allows_passing",
         "expected_queue_id",
         "expected_registration_id",
         "expected_machine_id",
@@ -6987,6 +7194,7 @@ def create_management_queue_operation_command():
                 "CHANGE_PLAY_PREFERENCE",
                 "LEAVE_QUEUE",
                 "SET_PAIRED_MACHINE_QUEUEING",
+                "SET_ALLOWS_PASSING",
             },
         )
     except (ValidationError, ValueError) as error:
@@ -7258,7 +7466,7 @@ def create_management_terminal_policy_command():
         allow_temporary_leave = read_boolean(source, "allow_temporary_leave")
         onebot_sync_enabled = read_boolean(source, "onebot_sync_enabled")
         reason = read_optional_string(source, "reason", maximum_length=200) or (
-            "管理后台更新终端敏感策略"
+            "管理后台更新接管的设置"
         )
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
@@ -7301,7 +7509,7 @@ def create_management_terminal_policy_command():
         snapshot = json.loads(snapshot_row["payload"])
         if not snapshot_is_online(snapshot_row):
             connection.rollback()
-            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能更新终端敏感策略。"}), 503
+            return jsonify({"ok": False, "error": "现场终端暂时离线，暂不能更新由管理后台接管的设置。"}), 503
         if expected_queue_id != snapshot_row["queue_id"]:
             connection.rollback()
             return jsonify(
@@ -7309,7 +7517,7 @@ def create_management_terminal_policy_command():
             ), 409
         if not snapshot.get("management_policy_supported", False):
             connection.rollback()
-            return jsonify({"ok": False, "error": "当前现场终端不支持管理后台接管终端敏感策略。"}), 409
+            return jsonify({"ok": False, "error": "当前现场终端不支持管理后台接管设置。"}), 409
         current_revision = int(snapshot.get("management_policy_revision", 0))
         if expected_revision != current_revision:
             connection.rollback()
@@ -7317,7 +7525,7 @@ def create_management_terminal_policy_command():
                 {
                     "ok": False,
                     "code": "TERMINAL_POLICY_CONTEXT_CHANGED",
-                    "error": "终端敏感策略已经更新，请刷新后再提交。",
+                    "error": "由管理后台接管的设置已经更新，请刷新后再提交。",
                 }
             ), 409
         pending = connection.execute(
@@ -7331,7 +7539,7 @@ def create_management_terminal_policy_command():
         ).fetchone()
         if pending is not None:
             connection.rollback()
-            return jsonify({"ok": False, "error": "终端敏感策略已有修改正在等待处理。"}), 409
+            return jsonify({"ok": False, "error": "由管理后台接管的设置已有修改正在等待处理。"}), 409
 
         payload = {
             "queue_id": snapshot_row["queue_id"],
@@ -7577,7 +7785,7 @@ def create_management_terminal_settings_command():
         current_policy_revision = int(snapshot.get("management_policy_revision", 0))
         if expected_policy_revision != current_policy_revision:
             connection.rollback()
-            return jsonify({"ok": False, "code": "TERMINAL_POLICY_CONTEXT_CHANGED", "error": "终端敏感策略已经更新，请刷新后重试。"}), 409
+            return jsonify({"ok": False, "code": "TERMINAL_POLICY_CONTEXT_CHANGED", "error": "由管理后台接管的设置已经更新，请刷新后重试。"}), 409
         current_machine_revision = int(snapshot.get("machine_configuration_revision", 1))
         if expected_machine_revision != current_machine_revision:
             connection.rollback()
@@ -7775,7 +7983,7 @@ def create_management_registration_availability_command():
             != int(snapshot.get("management_policy_revision", 0))
         ):
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "终端接管策略已经更新，请刷新后再提交。"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "由管理后台接管的设置已经更新，请刷新后再提交。"}), 409
         if expected_registration_open != bool(
             snapshot.get(
                 "registration_control_open",
@@ -7936,7 +8144,7 @@ def create_management_machine_status_command():
             != int(snapshot.get("management_policy_revision", 0))
         ):
             connection.rollback()
-            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "终端接管策略已经更新，请刷新后再提交。"}), 409
+            return jsonify({"ok": False, "code": "QUEUE_CONTEXT_CHANGED", "error": "由管理后台接管的设置已经更新，请刷新后再提交。"}), 409
         machine = (snapshot.get("machines") or {}).get(machine_id)
         if not isinstance(machine, dict) or machine.get("stable_id") != machine_stable_id:
             connection.rollback()
@@ -8066,6 +8274,8 @@ def read_management_overview():
             "paired_arrangement_not_before": registration.get(
                 "paired_arrangement_not_before"
             ),
+            "allows_passing": bool(registration.get("allows_passing", False)),
+            "passing_over": list(registration.get("passing_over") or []),
             "profile_nickname": profile["nickname"] if profile is not None else None,
         }
 
@@ -8086,6 +8296,10 @@ def read_management_overview():
                     "estimated_wait_uncertain": bool(
                         waiting_position.get("estimated_wait_uncertain", False)
                         and waiting_position.get("estimated_wait_minutes") is not None
+                    ),
+                    # Snapshots stored before it existed leave it out.
+                    "estimated_wait_upper_minutes": waiting_position.get(
+                        "estimated_wait_upper_minutes"
                     ),
                     "common_play_preview": waiting_position.get("common_play_preview"),
                     "registrations": [
@@ -8380,15 +8594,27 @@ def create_management_queue_command():
         if profile is None or not profile["qq_number"]:
             return jsonify({"ok": False, "error": "玩家资料尚未完成 QQ 关联。"}), 409
 
+        # By profile as well: the join that created this registration names the profile but
+        # no registration, and may still be waiting for the terminal's result when the
+        # snapshot already shows the registration. terminal_command_one_pending_profile
+        # allows one pending command of a type per profile; this used to fail on it.
         pending = connection.execute(
             """
             SELECT 1 FROM terminal_command
             WHERE status = 'PENDING' AND device_id = ?
               AND command_type = ?
-              AND json_extract(payload, '$.registration_id') = ?
+              AND (
+                  json_extract(payload, '$.registration_id') = ?
+                  OR json_extract(payload, '$.profile_id') = ?
+              )
             LIMIT 1
             """,
-            (snapshot_row["device_id"], QUEUE_OPERATION_COMMAND, registration_id),
+            (
+                snapshot_row["device_id"],
+                QUEUE_OPERATION_COMMAND,
+                registration_id,
+                profile["profile_id"],
+            ),
         ).fetchone()
         if pending is not None:
             return jsonify({"ok": False, "error": "这份登记已有一项操作正在等待终端处理。"}), 409
@@ -8545,6 +8771,54 @@ def create_queue_operation_command(
                 raise ValidationError("请选择是否允许系统在两台机台之间安排登记。")
         elif operation != "JOIN_QUEUE" and also_queues_at_paired_machine is not None:
             raise ValidationError("这项操作不接受 also_queues_at_paired_machine。")
+        # Whether the registration lets an open registration behind it pass over it. Like the
+        # choice above, None means the request does not mention it.
+        allows_passing = (
+            read_boolean(source, "allows_passing") if "allows_passing" in source else None
+        )
+        if operation == "SET_ALLOWS_PASSING":
+            if allows_passing is None:
+                raise ValidationError("请选择是否允许后方的登记越过这份登记。")
+        # A fixed pair formed online may be given its passing choice in the same request.
+        elif (
+            operation not in {"JOIN_QUEUE", "CREATE_FIXED_PAIR"}
+            and allows_passing is not None
+        ):
+            raise ValidationError("这项操作不接受 allows_passing。")
+        if operation in ACCOUNT_ONLY_QUEUE_OPERATIONS and not (
+            operation_source == "WEBSITE_REMOTE" and actor_profile_id is not None
+        ):
+            raise ValidationError("不支持这项排队操作。")
+        # The friend's registration of CREATE_FIXED_PAIR, as its public id.
+        partner_registration_id = None
+        if operation == "CREATE_FIXED_PAIR":
+            if source.get("partner_registration_id") is None:
+                raise ValidationError(FIXED_PAIR_PARTNER_UNKNOWN_REFUSAL)
+            partner_registration_id = read_public_id(source, "partner_registration_id")
+        elif "partner_registration_id" in source:
+            raise ValidationError("这项操作不接受 partner_registration_id。")
+        # The new nickname of RENAME_REGISTRATION.
+        display_id = None
+        if operation == "RENAME_REGISTRATION":
+            display_id = read_registration_display_id(source, "display_id")
+        elif "display_id" in source:
+            raise ValidationError("这项操作不接受 display_id。")
+        # 将本次选择保存为默认游玩偏好，以后不再询问: only while joining. None means the request does
+        # not mention it.
+        remember_preference = (
+            read_boolean(source, "remember_preference")
+            if "remember_preference" in source
+            else None
+        )
+        if operation != "JOIN_QUEUE" and remember_preference is not None:
+            raise ValidationError("这项操作不接受 remember_preference。")
+        if (
+            operation == "JOIN_QUEUE"
+            and allows_passing
+            and preference is not None
+            and preference != "SOLO"
+        ):
+            raise ValidationError(SOLO_ONLY_PASSING_REFUSAL)
         expected_field_names = {
             "expected_queue_id",
             "expected_registration_id",
@@ -8673,6 +8947,14 @@ def create_queue_operation_command(
     # matches the identity stored with its command.
     if also_queues_at_paired_machine is not None:
         request_identity["also_queues_at_paired_machine"] = also_queues_at_paired_machine
+    if allows_passing is not None:
+        request_identity["allows_passing"] = allows_passing
+    if partner_registration_id is not None:
+        request_identity["partner_registration_id"] = partner_registration_id
+    if display_id is not None:
+        request_identity["display_id"] = display_id
+    if remember_preference:
+        request_identity["remember_preference"] = True
 
     with open_database() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -8749,6 +9031,8 @@ def create_queue_operation_command(
         if availability_error is not None:
             detail, status_code = availability_error
             return jsonify({"ok": False, "error": detail}), status_code
+        if not terminal_declares_queue_operation(snapshot, operation, allows_passing):
+            return jsonify({"ok": False, "error": TERMINAL_NOT_UPDATED_DETAIL}), 409
 
         profile = (
             find_player_profile_by_id(connection, actor_profile_id)
@@ -8837,6 +9121,10 @@ def create_queue_operation_command(
             target_machine_id=target_machine_id,
             preference=preference,
             also_queues_at_paired_machine=also_queues_at_paired_machine,
+            allows_passing=allows_passing,
+            partner_registration_id=partner_registration_id,
+            display_id=display_id,
+            remember_preference=remember_preference is True,
             expected_context=expected_context,
             registration_contexts=registration_contexts,
             request_identity=request_identity,
@@ -8867,20 +9155,19 @@ def create_queue_operation_command(
                 ),
             ).fetchone()
         else:
-            pending = connection.execute(
-                """
-                SELECT 1 FROM terminal_command
-                WHERE status = 'PENDING' AND device_id = ? AND (
-                    json_extract(payload, '$.actor_qq') = ?
-                    OR json_extract(payload, '$.profile_id') = ?
-                )
-                """,
-                (
-                    snapshot_row["device_id"],
-                    actor_qq,
-                    profile["profile_id"],
+            pending = pending_player_command(
+                connection,
+                snapshot_row["device_id"],
+                actor_qq=actor_qq,
+                profile_id=profile["profile_id"],
+                # A management command that names the profile also waits for one that
+                # targets the same registration without naming its profile.
+                registration_id=(
+                    desired.get("registration_id")
+                    if operation_source == "MANAGEMENT_APP"
+                    else None
                 ),
-            ).fetchone()
+            )
         if pending is not None:
             return jsonify({"ok": False, "error": "已有一项操作正在等待终端处理。"}), 409
 
@@ -8895,6 +9182,19 @@ def create_queue_operation_command(
             # names a QQ number needs no sign-in and anybody can send it, so it records
             # nothing here; see complete_terminal_command.
             mark_paired_machine_queueing_introduced(
+                connection,
+                snapshot_storage_context(snapshot_row, snapshot)[1],
+                profile["profile_id"],
+            )
+        if (
+            operation_source == "WEBSITE_REMOTE"
+            and actor_profile_id is not None
+            and allows_passing is True
+            and operation in {"JOIN_QUEUE", "SET_ALLOWS_PASSING", "CREATE_FIXED_PAIR"}
+        ):
+            # The same for the explanation of letting others pass. For a fixed pair it is
+            # noted for the profile that turned the tick box on, not for its partner.
+            mark_passing_introduced(
                 connection,
                 snapshot_storage_context(snapshot_row, snapshot)[1],
                 profile["profile_id"],
@@ -8920,6 +9220,43 @@ def create_queue_operation_command(
     return jsonify(serialize_command(created)), 202
 
 
+def pending_player_command(
+    connection: sqlite3.Connection,
+    device_id: str,
+    *,
+    actor_qq: str,
+    profile_id: str,
+    registration_id: str | None = None,
+):
+    """
+    A command of this player that still waits for the terminal, or None.
+
+    A player is told by the QQ that acts and by the profile. The management app names no QQ:
+    every command it sends carries an empty actor_qq, which identifies nobody, so it is left
+    out of the comparison (commands for different players used to block each other on it).
+    With [registration_id], a queue operation that targets the same registration counts as
+    well, whether or not it names the profile.
+    """
+    conditions = ["json_extract(payload, '$.profile_id') = ?"]
+    parameters: list[Any] = [device_id, profile_id]
+    if actor_qq:
+        conditions.append("json_extract(payload, '$.actor_qq') = ?")
+        parameters.append(actor_qq)
+    if registration_id is not None:
+        conditions.append(
+            "(command_type = ? AND json_extract(payload, '$.registration_id') = ?)"
+        )
+        parameters.extend([QUEUE_OPERATION_COMMAND, registration_id])
+    return connection.execute(
+        f"""
+        SELECT 1 FROM terminal_command
+        WHERE status = 'PENDING' AND device_id = ? AND ({" OR ".join(conditions)})
+        LIMIT 1
+        """,
+        parameters,
+    ).fetchone()
+
+
 def build_queue_operation_payload(
     *,
     snapshot: dict[str, Any],
@@ -8935,6 +9272,10 @@ def build_queue_operation_payload(
     registration_contexts: list[dict[str, Any]],
     request_identity: dict[str, Any],
     also_queues_at_paired_machine: bool | None = None,
+    allows_passing: bool | None = None,
+    partner_registration_id: str | None = None,
+    display_id: str | None = None,
+    remember_preference: bool = False,
 ):
     payload = {
         "queue_id": queue_id,
@@ -8970,6 +9311,8 @@ def build_queue_operation_payload(
             return None, (f"{machine['name']} 已停止使用，暂不能加入。", 409)
         if machine.get("registration_count", 0) >= MAX_REGISTRATIONS_PER_MACHINE:
             return None, (f"{machine['name']} 的登记已满，请选择其他机台。", 409)
+        # Whether the preference was asked for: only then can it be saved as the default.
+        preference_was_asked = False
         if machine_capacity(machine) == 1:
             resolved_preference = "SOLO"
         else:
@@ -8980,6 +9323,7 @@ def build_queue_operation_payload(
                 if preference not in PREFERENCES:
                     return None, ("请选择本次游玩偏好。", 400)
                 resolved_preference = preference
+                preference_was_asked = True
             else:
                 if preference is not None and preference != default_preference:
                     return None, ("这份玩家资料使用固定的默认游玩偏好。", 409)
@@ -8990,12 +9334,25 @@ def build_queue_operation_payload(
                 "preference": resolved_preference,
             }
         )
+        # The terminal then stores the chosen preference as the profile's default. Sent only
+        # when ticked, and only where the terminal offers the tick row itself: the profile
+        # asks every time and the machine takes two players. Elsewhere it means nothing and
+        # is left out, as the terminal ignores it there.
+        if remember_preference and preference_was_asked:
+            payload["remember_preference"] = True
         if also_queues_at_paired_machine is not None:
             # The tick box on the page decides for this registration alone; a profile
             # carries no setting for it.
             if machine.get("paired_machine_id") is None:
                 return None, (f"{machine['name']} 不属于一对机台，不能自动在两台机台之间安排登记。", 409)
             payload["also_queues_at_paired_machine"] = also_queues_at_paired_machine
+        if allows_passing is not None:
+            # Like the tick box above, for this registration alone.
+            if allows_passing and machine_capacity(machine) == 1:
+                return None, (SINGLE_PLAYER_MACHINE_PASSING_REFUSAL, 409)
+            if allows_passing and resolved_preference != "SOLO":
+                return None, (SOLO_ONLY_PASSING_REFUSAL, 409)
+            payload["allows_passing"] = allows_passing
         return payload, None
 
     if len(registration_contexts) != 1:
@@ -9100,7 +9457,7 @@ def build_queue_operation_payload(
         ):
             return None, ("确认期间要转入的机台已经变化，请重新选择。", 409)
         if machine_capacity(target_machine) == 1 and registration.get("fixed_pair"):
-            return None, (f"{target_machine['name']} 仅能容纳一人游玩，请先解除固定组合。", 409)
+            return None, (f"{target_machine['name']} 仅能容纳一人游玩，请先解除固定组合再转入。", 409)
         payload["target_machine_id"] = target_machine_id
         payload["target_machine_stable_id"] = target_machine_stable_id
     elif operation == "CHANGE_PLAY_PREFERENCE":
@@ -9117,6 +9474,70 @@ def build_queue_operation_payload(
         if also_queues_at_paired_machine and registration.get("fixed_pair"):
             return None, ("固定组合只能在当前机台游玩。", 409)
         payload["also_queues_at_paired_machine"] = bool(also_queues_at_paired_machine)
+    elif operation == "SET_ALLOWS_PASSING":
+        if allows_passing and machine_capacity(source_machine) == 1:
+            return None, (SINGLE_PLAYER_MACHINE_PASSING_REFUSAL, 409)
+        # A member of a fixed pair sets the choice for both registrations of the pair. An
+        # older terminal knows the operation only for a registration that plays alone and
+        # would refuse; it is told apart by fixed_pair_passing_supported.
+        if registration.get("fixed_pair") and not fixed_pair_passing_supported(snapshot):
+            return None, (TERMINAL_NOT_UPDATED_DETAIL, 409)
+        # Whether a registration outside a fixed pair plays alone is left to the terminal:
+        # the website sends this right after CHANGE_PLAY_PREFERENCE, and the snapshot here
+        # may not show the new preference yet.
+        payload["allows_passing"] = bool(allows_passing)
+    elif operation == "RENAME_REGISTRATION":
+        # A registration that still has to check in was refused above. The terminal answers
+        # a nickname that is the registration's own already; one that another registration
+        # of the queue carries is refused, at any machine, as on the terminal.
+        folded_display_id = (display_id or "").casefold()
+        if any(
+            other["registration_id"] != registration["registration_id"]
+            and str(other.get("display_id", "")).strip().casefold() == folded_display_id
+            for machine in snapshot.get("machines", {}).values()
+            for other in all_machine_registrations(machine)
+        ):
+            return None, (REGISTRATION_DISPLAY_ID_TAKEN_REFUSAL, 409)
+        payload["display_id"] = display_id
+    elif operation == "CREATE_FIXED_PAIR":
+        # In the terminal's order and words. The terminal decides the order of the pair: it
+        # may move the pair back, or refuse because somebody else would play later.
+        if machine_capacity(source_machine) == 1:
+            return None, (f"{source_machine['name']} 仅能容纳一人游玩，不能组成固定组合。", 409)
+        if context["position"] == "PLAYING":
+            return None, (FIXED_PAIR_PLAYING_POSITION_REFUSAL, 409)
+        if partner_registration_id == registration["registration_id"]:
+            return None, (FIXED_PAIR_PARTNER_UNKNOWN_REFUSAL, 409)
+        partner_context = index_snapshot_registrations(snapshot).get(
+            partner_registration_id or ""
+        )
+        if (
+            partner_context is None
+            or partner_context["machine_id"] != context["machine_id"]
+            or partner_context["position"] != "WAITING"
+        ):
+            return None, (FIXED_PAIR_PARTNER_NOT_WAITING_REFUSAL, 409)
+        partner = partner_context["registration"]
+        if registration.get("fixed_pair"):
+            if registration.get("fixed_pair_id") == partner.get("fixed_pair_id"):
+                return None, (FIXED_PAIR_ALREADY_FORMED_REFUSAL, 409)
+            return None, (FIXED_PAIR_OWN_ALREADY_PAIRED_REFUSAL, 409)
+        if partner.get("fixed_pair"):
+            return None, (f"“{partner['display_id']}”已经属于固定组合。", 409)
+        if partner.get("online_registration_pending_check_in", False):
+            return None, (FIXED_PAIR_PARTNER_PENDING_CHECK_IN_REFUSAL, 409)
+        if (
+            registration_absence_status(registration) != "NONE"
+            or registration_absence_status(partner) != "NONE"
+        ):
+            return None, (FIXED_PAIR_WHILE_POSTPONED_REFUSAL, 409)
+        payload["partner_registration_id"] = partner_registration_id
+        if allows_passing is not None:
+            # The pair lets others pass from the start: only a terminal that knows the
+            # choice of a fixed pair can take it.
+            if allows_passing and not fixed_pair_passing_supported(snapshot):
+                return None, (TERMINAL_NOT_UPDATED_DETAIL, 409)
+            payload["allows_passing"] = allows_passing
     elif operation != "LEAVE_QUEUE":
         return None, ("不支持这项排队操作。", 400)
 
@@ -9134,6 +9555,36 @@ def build_queue_operation_payload(
         }
     )
     return payload, None
+
+
+def terminal_declares_queue_operation(
+    snapshot: dict[str, Any], operation: str, allows_passing: bool | None
+) -> bool:
+    """
+    Whether the terminal of the snapshot can carry out the operation, as far as that has to be
+    asked; see TERMINAL_DECLARED_QUEUE_OPERATIONS. Joining with the passing choice turned on
+    needs a terminal that knows the choice.
+    """
+    required = (
+        "SET_ALLOWS_PASSING"
+        if operation == "JOIN_QUEUE" and allows_passing is True
+        else operation
+    )
+    if required not in TERMINAL_DECLARED_QUEUE_OPERATIONS:
+        return True
+    declared = snapshot.get("supported_queue_operations")
+    return isinstance(declared, list) and required in declared
+
+
+def fixed_pair_passing_supported(snapshot: Any) -> bool:
+    """
+    Whether the terminal of the snapshot lets a fixed pair allow the registrations behind to
+    pass (2026-11-27), and so accepts SET_ALLOWS_PASSING for a member of one, as one choice
+    for both registrations. The terminal says so at the top of its snapshot; the operation
+    itself is older, so its name in supported_queue_operations does not tell. Older terminals
+    leave the field out.
+    """
+    return isinstance(snapshot, dict) and snapshot.get("fixed_pair_passing_supported") is True
 
 
 def registration_absence_status(registration: dict[str, Any]) -> str:
@@ -9172,22 +9623,49 @@ def mark_paired_machine_queueing_introduced(
     )
 
 
+def mark_passing_introduced(
+    connection: sqlite3.Connection, profile_scope_id: str, profile_id: str
+) -> None:
+    """Notes that the player of this profile has been shown the explanation of letting the
+    registrations behind pass (2026-11-27).
+
+    Recorded on the same occasions as mark_paired_machine_queueing_introduced, for a request
+    that turns the passing tick box on: of a registration that plays alone, or of a fixed
+    pair, where it counts for the profile that sent the request. Once set it stays set.
+    """
+    connection.execute(
+        """
+        UPDATE player_profile
+        SET passing_introduced = 1
+        WHERE device_id = ? AND profile_id = ?
+          AND passing_introduced = 0
+        """,
+        (profile_scope_id, profile_id),
+    )
+
+
 def record_explanation_shown_for_applied_command(
     connection: sqlite3.Connection, command: sqlite3.Row
 ) -> None:
-    """Records the explanation for a website request the terminal has carried out.
+    """Records the explanations for a website request the terminal has carried out.
 
-    See mark_paired_machine_queueing_introduced. A request the terminal refuses, or never
-    answers, leaves the profile as it was.
+    See mark_paired_machine_queueing_introduced and mark_passing_introduced. A request the
+    terminal refuses, or never answers, leaves the profile as it was.
     """
     payload = json.loads(command["payload"])
     profile_id = payload.get("profile_id")
-    if (
-        payload.get("operation_source") != "WEBSITE_REMOTE"
-        or payload.get("also_queues_at_paired_machine") is not True
-        or payload.get("operation") not in {"JOIN_QUEUE", "SET_PAIRED_MACHINE_QUEUEING"}
-        or not isinstance(profile_id, str)
-    ):
+    if payload.get("operation_source") != "WEBSITE_REMOTE" or not isinstance(profile_id, str):
+        return
+    operation = payload.get("operation")
+    paired_machine_queueing_shown = payload.get(
+        "also_queues_at_paired_machine"
+    ) is True and operation in {"JOIN_QUEUE", "SET_PAIRED_MACHINE_QUEUEING"}
+    passing_shown = payload.get("allows_passing") is True and operation in {
+        "JOIN_QUEUE",
+        "SET_ALLOWS_PASSING",
+        "CREATE_FIXED_PAIR",
+    }
+    if not paired_machine_queueing_shown and not passing_shown:
         return
     # The command was made for the data set of the snapshot it was checked against: the
     # test data of a terminal keep their own profiles.
@@ -9196,7 +9674,10 @@ def record_explanation_shown_for_applied_command(
     profile_scope_id = current_app.config["PROFILE_SCOPE_ID"]
     if isinstance(queue_storage_id, str) and queue_storage_id.startswith(f"test:{device_id}:"):
         profile_scope_id = f"{profile_scope_id}:test:{device_id}"
-    mark_paired_machine_queueing_introduced(connection, profile_scope_id, profile_id)
+    if paired_machine_queueing_shown:
+        mark_paired_machine_queueing_introduced(connection, profile_scope_id, profile_id)
+    if passing_shown:
+        mark_passing_introduced(connection, profile_scope_id, profile_id)
 
 
 def paired_machine_queueing_available(snapshot: Any) -> bool:
@@ -9291,7 +9772,7 @@ def create_mobile_registration_session():
         return jsonify(
             {
                 "ok": False,
-                "error": "服务端尚未配置公开网站地址，暂不能生成移动设备登记二维码。",
+                "error": "服务端尚未配置网页端地址，暂不能生成移动设备登记二维码。",
             }
         ), 503
 
@@ -9493,7 +9974,8 @@ def read_mobile_registration_session(session_token: str):
                    notify_playing_position, notify_online_check_in,
                    notify_absence, notify_machine_status, setup_version,
                    profile_revision, public_player_id,
-                   paired_machine_queueing_introduced, received_at
+                   paired_machine_queueing_introduced, last_allows_passing,
+                   passing_introduced, received_at
             FROM player_profile
             WHERE device_id = ?
             ORDER BY usage_count DESC, COALESCE(last_used_at, 0) DESC,
@@ -9568,6 +10050,17 @@ def read_mobile_registration_session(session_token: str):
                     snapshot
                 ),
             },
+            # For 新登记预计等待 and the warning that a new registration may not play before
+            # closing time, under the names the online join reads them by
+            # (read_online_profile): every machine with the wait of a new registration
+            # (estimated_wait_minutes) and its paired machine, and the business hours with
+            # closes_at.
+            "business_hours": snapshot.get("business_hours")
+            or normalize_public_business_hours(None),
+            "machines": [
+                serialize_remote_machine(machine_id, machine)
+                for machine_id, machine in snapshot.get("machines", {}).items()
+            ],
             "profiles": [
                 serialize_mobile_profile(
                     row,
@@ -9584,6 +10077,10 @@ def read_mobile_registration_session(session_token: str):
                 "complete_profile": True,
                 "edit_complete_profile": False,
                 "terminal_is_source_of_truth": True,
+                # What the terminal can carry out, as for the status page: the phone page
+                # offers 允许后方的登记越过 only when it names SET_ALLOWS_PASSING.
+                "queue_operations": list(snapshot.get("supported_queue_operations") or []),
+                "fixed_pair_passing_supported": fixed_pair_passing_supported(snapshot),
             },
         }
     )
@@ -9632,6 +10129,16 @@ def serialize_mobile_profile(
         "paired_machine_queueing_introduced": (
             "paired_machine_queueing_introduced" in profile.keys()
             and bool(profile["paired_machine_queueing_introduced"])
+        ),
+        # Where the passing tick box starts for this profile (the player's last answer).
+        "last_allows_passing": (
+            "last_allows_passing" in profile.keys()
+            and bool(profile["last_allows_passing"])
+        ),
+        # Whether this profile's player has been shown the explanation of letting others pass.
+        "passing_introduced": (
+            "passing_introduced" in profile.keys()
+            and bool(profile["passing_introduced"])
         ),
     }
 
@@ -9714,7 +10221,7 @@ def normalize_mobile_profile_settings(
     if require_identity_fields:
         settings.update(
             {
-                "nickname": read_string(source, "nickname", maximum_length=18),
+                "nickname": read_player_name(source, "nickname", maximum_length=18),
                 "gender": read_choice(source, "gender", PLAYER_GENDERS),
                 "default_preference": read_choice(
                     source, "default_preference", PROFILE_PREFERENCES
@@ -9753,6 +10260,9 @@ def submit_mobile_registration_session(session_token: str):
         "new_profile",
         "preference",
         "also_queues_at_paired_machine",
+        "allows_passing",
+        # 将本次选择保存为默认游玩偏好 (2026-11-28).
+        "remember_preference",
     }
     if set(source) - allowed_fields:
         return jsonify({"ok": False, "error": "请求包含不支持的移动设备登记字段。"}), 400
@@ -9763,6 +10273,16 @@ def submit_mobile_registration_session(session_token: str):
             read_boolean(source, "also_queues_at_paired_machine")
             if "also_queues_at_paired_machine" in source
             else None
+        )
+        # The answer to 允许后方的登记越过 (2026-11-27); None when the page did not offer it.
+        allows_passing = (
+            read_boolean(source, "allows_passing") if "allows_passing" in source else None
+        )
+        # 将本次选择保存为默认游玩偏好，以后不再询问 (2026-11-28); absent means not ticked.
+        remember_preference = (
+            read_boolean(source, "remember_preference")
+            if "remember_preference" in source
+            else False
         )
     except ValidationError as error:
         return jsonify({"ok": False, "error": str(error)}), 400
@@ -9884,6 +10404,7 @@ def submit_mobile_registration_session(session_token: str):
                     )
                 )
                 nickname = profile["nickname"]
+                profile_default_preference = profile["default_preference"]
                 command_profile = {
                     "mode": "EXISTING",
                     "profile_id": profile_id,
@@ -9909,6 +10430,7 @@ def submit_mobile_registration_session(session_token: str):
                     )
                 )
                 profile_id = str(uuid4())
+                profile_default_preference = profile_settings["default_preference"]
                 command_profile = {
                     "mode": "NEW",
                     "profile_id": profile_id,
@@ -9922,6 +10444,20 @@ def submit_mobile_registration_session(session_token: str):
                     "error": str(error) or "玩家资料编号无效。",
                 }
             ), 400
+
+        if allows_passing is True:
+            if not terminal_declares_queue_operation(snapshot, "JOIN_QUEUE", True):
+                return jsonify(
+                    {"ok": False, "code": "TERMINAL_NOT_UPDATED", "error": TERMINAL_NOT_UPDATED_DETAIL}
+                ), 409
+            if single_player_machine:
+                return jsonify(
+                    {"ok": False, "code": "SINGLE_PLAYER_MACHINE", "error": SINGLE_PLAYER_MACHINE_PASSING_REFUSAL}
+                ), 409
+            if resolved_preference != "SOLO":
+                return jsonify(
+                    {"ok": False, "code": "PASSING_NEEDS_SOLO", "error": SOLO_ONLY_PASSING_REFUSAL}
+                ), 409
 
         if also_queues_at_paired_machine is not None:
             # The tick box on the page decides for this registration alone; a profile
@@ -10056,11 +10592,24 @@ def submit_mobile_registration_session(session_token: str):
         }
         if also_queues_at_paired_machine is not None:
             payload["also_queues_at_paired_machine"] = also_queues_at_paired_machine
+        if allows_passing is not None:
+            payload["allows_passing"] = allows_passing
+        # As for an online join (build_queue_operation_payload): sent only when ticked and
+        # only where the preference was asked for.
+        if (
+            remember_preference
+            and not single_player_machine
+            and profile_default_preference == "ASK_EVERY_TIME"
+        ):
+            payload["remember_preference"] = True
         if also_queues_at_paired_machine is True and profile_id_value is not None:
             # The phone page showed the explanation before the player could send this. A
             # profile that this very command creates does not exist here yet; the terminal
             # reports it together with the profile.
             mark_paired_machine_queueing_introduced(connection, profile_scope_id, profile_id)
+        if allows_passing is True and profile_id_value is not None:
+            # The same for the explanation of letting others pass.
+            mark_passing_introduced(connection, profile_scope_id, profile_id)
         connection.execute(
             """
             INSERT INTO terminal_command
@@ -10172,7 +10721,8 @@ def find_player_profile_by_id(
                profile_revision, created_at, profile_updated_at,
                public_player_id, web_account_bound, terminal_editing_allowed,
                visited_venues_public, web_profile_revision,
-               paired_machine_queueing_introduced, received_at
+               paired_machine_queueing_introduced, last_allows_passing,
+               passing_introduced, received_at
         FROM player_profile
         WHERE device_id = ? AND profile_id = ?
         """,
@@ -10193,7 +10743,8 @@ def find_player_profile_by_qq(connection: sqlite3.Connection, qq_number: str):
                profile_revision, created_at, profile_updated_at,
                public_player_id, web_account_bound, terminal_editing_allowed,
                visited_venues_public, web_profile_revision,
-               paired_machine_queueing_introduced, received_at
+               paired_machine_queueing_introduced, last_allows_passing,
+               passing_introduced, received_at
         FROM player_profile
         WHERE device_id = ?
         """,
@@ -10266,6 +10817,16 @@ def serialize_player_profile(profile: sqlite3.Row) -> dict[str, Any]:
         "paired_machine_queueing_introduced": (
             "paired_machine_queueing_introduced" in profile.keys()
             and bool(profile["paired_machine_queueing_introduced"])
+        ),
+        # Where the passing tick box starts for this profile (the player's last answer).
+        "last_allows_passing": (
+            "last_allows_passing" in profile.keys()
+            and bool(profile["last_allows_passing"])
+        ),
+        # Whether this profile's player has been shown the explanation of letting others pass.
+        "passing_introduced": (
+            "passing_introduced" in profile.keys()
+            and bool(profile["passing_introduced"])
         ),
     }
 
@@ -10459,7 +11020,7 @@ def create_profile_update_command(
     try:
         requested_update = {}
         if "nickname" in source:
-            requested_update["nickname"] = read_string(
+            requested_update["nickname"] = read_player_name(
                 source, "nickname", maximum_length=18
             )
         if "gender" in source:
@@ -10615,16 +11176,12 @@ def create_profile_update_command(
         if duplicate_nickname is not None:
             return jsonify({"ok": False, "error": "这个昵称已经用于其他玩家资料。"}), 409
 
-        pending = connection.execute(
-            """
-            SELECT 1 FROM terminal_command
-            WHERE device_id = ? AND status = 'PENDING' AND (
-                json_extract(payload, '$.actor_qq') = ?
-                OR json_extract(payload, '$.profile_id') = ?
-            )
-            """,
-            (snapshot["device_id"], actor_qq, profile_id),
-        ).fetchone()
+        pending = pending_player_command(
+            connection,
+            snapshot["device_id"],
+            actor_qq=actor_qq,
+            profile_id=profile_id,
+        )
         if pending is not None:
             return jsonify({"ok": False, "error": "已有一项操作正在等待终端处理。"}), 409
 
@@ -11532,10 +12089,32 @@ def index_snapshot_registrations(snapshot: dict[str, Any]) -> dict[str, dict[str
                 "position_index": None,
                 "estimated_wait_minutes": 0 if machine["operational"] else None,
                 "estimated_wait_uncertain": False,
+                "estimated_wait_upper_minutes": None,
                 **machine_context,
             }
         for waiting_position in machine.get("waiting_positions", []):
             for registration in waiting_position.get("registrations", []):
+                # The registration's own wait where the terminal sent one that differs from
+                # its position's; snapshots stored before it existed leave it out.
+                own_minutes = registration.get("own_estimated_wait_minutes")
+                if own_minutes is not None:
+                    estimated_wait_minutes = own_minutes
+                    estimated_wait_uncertain = bool(
+                        registration.get("own_estimated_wait_uncertain", False)
+                    )
+                    estimated_wait_upper_minutes = registration.get(
+                        "own_estimated_wait_upper_minutes"
+                    )
+                else:
+                    estimated_wait_minutes = waiting_position["estimated_wait_minutes"]
+                    # Snapshots stored before the flag existed leave it out.
+                    estimated_wait_uncertain = bool(
+                        waiting_position.get("estimated_wait_uncertain", False)
+                        and estimated_wait_minutes is not None
+                    )
+                    estimated_wait_upper_minutes = waiting_position.get(
+                        "estimated_wait_upper_minutes"
+                    )
                 indexed[registration["registration_id"]] = {
                     "registration": registration,
                     "position_registrations": waiting_position.get("registrations", []),
@@ -11545,14 +12124,10 @@ def index_snapshot_registrations(snapshot: dict[str, Any]) -> dict[str, dict[str
                     "machine_id": machine_id,
                     "position": "WAITING",
                     "position_index": waiting_position["index"],
-                    "estimated_wait_minutes": waiting_position[
-                        "estimated_wait_minutes"
-                    ],
-                    # Snapshots stored before the flag existed leave it out.
-                    "estimated_wait_uncertain": bool(
-                        waiting_position.get("estimated_wait_uncertain", False)
-                        and waiting_position["estimated_wait_minutes"] is not None
-                    ),
+                    "estimated_wait_minutes": estimated_wait_minutes,
+                    "estimated_wait_uncertain": estimated_wait_uncertain,
+                    "estimated_wait_upper_minutes": estimated_wait_upper_minutes,
+                    "estimated_wait_is_own": own_minutes is not None,
                     **machine_context,
                 }
     return indexed
@@ -11572,12 +12147,24 @@ def public_capabilities(
         and snapshot.get("registration_open", True)
         and online_registration_allowed(snapshot)
     )
+    # The remote operations the terminal has declared, while the website may send any; the
+    # website offers 轮空一次 and the passing tick box only where they are named. Older
+    # servers leave this out.
+    queue_operations = (
+        list(snapshot.get("supported_queue_operations") or []) if remote_actions else []
+    )
     return {
         "public_logs": True,
         "local_self_marking": True,
         "registration_qq": True,
         "remote_actions": remote_actions,
         "online_registration": online_registration,
+        "queue_operations": queue_operations,
+        # Whether a member of a fixed pair may send SET_ALLOWS_PASSING; the website shows the
+        # pair's tick box only then. Like queue_operations, only while it can be acted on.
+        "fixed_pair_passing_supported": bool(
+            remote_actions and fixed_pair_passing_supported(snapshot)
+        ),
         "transport": "polling",
     }
 
@@ -11909,6 +12496,25 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
     ]
     if len(registration_ids) != len(set(registration_ids)):
         raise ValidationError("登记公开编号不能重复。")
+    known_registration_ids = set(registration_ids)
+    # passing_over only decides what is shown. An id that is not in this snapshot (the passed
+    # registration left while the pair that passed it played) is dropped; refusing the whole
+    # upload for it once kept the queue page out of date until the round ended (review
+    # 2026-11-27).
+    for machine in machines.values():
+        for registration in all_machine_registrations(machine):
+            registration["passing_over"] = [
+                passed_id
+                for passed_id in registration["passing_over"]
+                if passed_id in known_registration_ids
+            ]
+    supported_queue_operations = normalize_supported_queue_operations(
+        payload.get("supported_queue_operations")
+    )
+    # Whether the terminal lets a fixed pair allow passing; see fixed_pair_passing_supported.
+    snapshot_fixed_pair_passing_supported = read_optional_flag(
+        payload, "fixed_pair_passing_supported"
+    )
     validate_paired_machines(machines)
     paired_machine_queue_settings = normalize_snapshot_paired_machine_queue_settings(
         payload.get("paired_machine_queue_settings"), machines
@@ -11963,6 +12569,8 @@ def normalize_snapshot(payload: dict[str, Any], device_id: str) -> dict[str, Any
         "default_machine_group_id": default_machine_group_id,
         "machines": machines,
         "paired_machine_queue_settings": paired_machine_queue_settings,
+        "supported_queue_operations": supported_queue_operations,
+        "fixed_pair_passing_supported": snapshot_fixed_pair_passing_supported,
         "recent_events": recent_events,
         "private_player_contacts": private_player_contacts,
         "private_player_profiles": private_player_profiles,
@@ -12056,6 +12664,18 @@ def normalize_private_profiles(
             read_boolean(value, "paired_machine_queueing_introduced")
             if "paired_machine_queueing_introduced" in value else False
         )
+        # The player's last answer to the passing tick box (2026-11-26); older terminals
+        # leave it out.
+        last_allows_passing = (
+            read_boolean(value, "last_allows_passing")
+            if "last_allows_passing" in value else False
+        )
+        # Whether the player has been shown the explanation of letting others pass
+        # (2026-11-27). Like paired_machine_queueing_introduced, sent only when true.
+        passing_introduced = (
+            read_boolean(value, "passing_introduced")
+            if "passing_introduced" in value else False
+        )
         last_used_at = read_optional_integer(value, "last_used_at", minimum=1)
         recent_usage_at = normalize_recent_usage_history(
             value.get("recent_usage_at") if "recent_usage_at" in value else None,
@@ -12091,6 +12711,8 @@ def normalize_private_profiles(
                 "visited_venues_public": visited_venues_public,
                 "web_profile_revision": web_profile_revision,
                 "paired_machine_queueing_introduced": paired_machine_queueing_introduced,
+                "last_allows_passing": last_allows_passing,
+                "passing_introduced": passing_introduced,
                 "legacy_revision": schema_version < 5,
                 "created_at": read_integer(value, "created_at", minimum=1),
                 "updated_at": read_integer(value, "updated_at", minimum=1),
@@ -13282,18 +13904,23 @@ def normalize_paired_waiting_positions(
             minimum=0,
             maximum=MAX_ESTIMATED_WAIT_MINUTES,
         )
-        positions.append(
-            {
-                "index": index + 1,
-                "position_id": position_id,
-                "estimated_wait_minutes": estimated_wait_minutes,
-                "estimated_wait_uncertain": read_estimated_wait_uncertain(
-                    position_source, estimated_wait_minutes
-                ),
-                "registrations": entries,
-                "common_play_preview": common_play_preview,
-            }
+        position = {
+            "index": index + 1,
+            "position_id": position_id,
+            "estimated_wait_minutes": estimated_wait_minutes,
+            "estimated_wait_uncertain": read_estimated_wait_uncertain(
+                position_source, estimated_wait_minutes
+            ),
+            "registrations": entries,
+            "common_play_preview": common_play_preview,
+        }
+        # Stored only where the terminal sent it, so older positions keep their shape.
+        upper_minutes = read_estimated_wait_upper_minutes(
+            position_source, "estimated_wait_upper_minutes", estimated_wait_minutes
         )
+        if upper_minutes is not None:
+            position["estimated_wait_upper_minutes"] = upper_minutes
+        positions.append(position)
 
     position_ids = [position["position_id"] for position in positions]
     if len(position_ids) != len(set(position_ids)):
@@ -13429,6 +14056,9 @@ def normalize_waiting_position(machine_id: str, index: int, source: Any) -> dict
         "estimated_wait_uncertain": read_estimated_wait_uncertain(
             source, estimated_wait_minutes
         ),
+        "estimated_wait_upper_minutes": read_estimated_wait_upper_minutes(
+            source, "estimated_wait_upper_minutes", estimated_wait_minutes
+        ),
         "registrations": registrations,
         "common_play_preview": normalize_common_play_preview(
             source.get("common_play_preview")
@@ -13466,6 +14096,9 @@ def normalize_registration(source: Any, label: str) -> dict[str, Any]:
     # 将轮空一次: at its next turn the registration goes to the tail, which counts one skipped
     # turn in temporary_away_skipped_turns, and the state ends. Older terminals leave it out.
     skips_one_turn = read_optional_flag(source, "skips_one_turn")
+    # The turns the registration has missed since it last played. Terminals from 2026-11-28
+    # on send the count at all times, so that 轮空一次 and 暂时离开 can say it before they are
+    # confirmed; older ones send it only while one of the two states is set.
     temporary_away_skipped_turns = source.get("temporary_away_skipped_turns", 0)
     if (
         type(temporary_away_skipped_turns) is not int
@@ -13473,8 +14106,6 @@ def normalize_registration(source: Any, label: str) -> dict[str, Any]:
         or temporary_away_skipped_turns > 3
     ):
         raise ValidationError("temporary_away_skipped_turns 数值无效。")
-    if not (temporarily_away or skips_one_turn) and temporary_away_skipped_turns != 0:
-        raise ValidationError("只有暂时离开或将轮空一次的登记才能包含轮空次数。")
     deferred_once = read_boolean(source, "deferred_once")
     if sum((deferred_once, skips_one_turn, temporarily_away)) > 1:
         raise ValidationError("登记最多只能处于将暂缓一次、将轮空一次和暂时离开中的一种状态。")
@@ -13503,6 +14134,13 @@ def normalize_registration(source: Any, label: str) -> dict[str, Any]:
         deferred_once or skips_one_turn or temporarily_away
     ):
         raise ValidationError("待签到的线上登记不能处于将暂缓一次、将轮空一次或暂时离开状态。")
+    # 线上登记，已签到: an online registration that has completed its on-site check-in
+    # (2026-11-28). It only decides what is shown, so it is not kept for a registration that
+    # still waits for its check-in rather than refused. Older terminals leave it out.
+    online_registration_checked_in = (
+        read_optional_flag(source, "online_registration_checked_in")
+        and not online_registration_pending_check_in
+    )
     also_queues_at_paired_machine = source.get("also_queues_at_paired_machine", False)
     if type(also_queues_at_paired_machine) is not bool:
         raise ValidationError("also_queues_at_paired_machine 必须是布尔值。")
@@ -13540,15 +14178,52 @@ def normalize_registration(source: Any, label: str) -> dict[str, Any]:
     if not also_queues_at_paired_machine:
         paired_arrangement_announced = False
         paired_arrangement_not_before = None
+    # The wait estimate counts pending online registrations as checking in. When some of those
+    # ahead may not, this is the earlier wait the registration then has (maintainer,
+    # 2026-11-26); the terminal sends it only when it is shown earlier. Older terminals leave it
+    # out.
+    wait_minutes_if_online_missing = read_optional_integer(
+        source, "wait_minutes_if_online_missing", minimum=0, maximum=100_000
+    )
+    # A waiting position shows the earlier of its two registrations. Where that is the other
+    # one's, which may be arranged to the other machine of a pair, this is this registration's
+    # own wait as the terminal shows it to it (review 2026-11-27); sent only where it differs.
+    # Older terminals leave both out.
+    own_estimated_wait_minutes = read_optional_integer(
+        source, "own_estimated_wait_minutes", minimum=0, maximum=100_000
+    )
+    own_estimated_wait_uncertain = (
+        read_optional_flag(source, "own_estimated_wait_uncertain")
+        and own_estimated_wait_minutes is not None
+    )
+    own_estimated_wait_upper_minutes = read_estimated_wait_upper_minutes(
+        source, "own_estimated_wait_upper_minutes", own_estimated_wait_minutes
+    )
+    # A registration that plays alone may let an open registration behind it pass over it and
+    # play with the open registration ahead of it (maintainer, 2026-11-26), and so may a fixed
+    # pair (2026-11-27), whose two registrations then both carry the choice; see
+    # validate_registration_group. The terminal sends the choice only while it applies; it is
+    # not kept for any other registration. passing_over names the registrations that allow
+    # this and that this one passes over: while it waits, as the terminal plans it; in the
+    # playing position, as it happened in this round. Whether the ids belong to this snapshot
+    # is checked in normalize_snapshot. Older terminals leave both out.
+    preference = read_choice(source, "preference", PREFERENCES)
+    allows_passing = read_optional_flag(source, "allows_passing")
+    if preference != "SOLO" and not fixed_pair:
+        allows_passing = False
+    passing_over = read_passing_over(source)
+    registration_id = read_public_id(source, "registration_id")
+    if registration_id in passing_over:
+        raise ValidationError("passing_over 不能包含这份登记本身。")
     created_at = read_integer(source, "created_at", minimum=1)
     online_check_in_started_at = source.get("online_check_in_started_at", created_at)
     if type(online_check_in_started_at) is not int or online_check_in_started_at < 1:
         raise ValidationError("online_check_in_started_at 数值无效。")
 
     return {
-        "registration_id": read_public_id(source, "registration_id"),
+        "registration_id": registration_id,
         "display_id": read_string(source, "display_id", maximum_length=18),
-        "preference": read_choice(source, "preference", PREFERENCES),
+        "preference": preference,
         "deferred_once": deferred_once,
         "skips_one_turn": skips_one_turn,
         "temporarily_away": temporarily_away,
@@ -13560,15 +14235,59 @@ def normalize_registration(source: Any, label: str) -> dict[str, Any]:
         "no_show_count": no_show_count,
         "last_no_show_action_was_defer": last_no_show_action_was_defer,
         "online_registration_pending_check_in": online_registration_pending_check_in,
+        "online_registration_checked_in": online_registration_checked_in,
         "also_queues_at_paired_machine": also_queues_at_paired_machine,
         "skips_paired_machine_this_round": skips_paired_machine_this_round,
         "paired_arrangement_announced": paired_arrangement_announced,
         "paired_arrangement_not_before": paired_arrangement_not_before,
+        "wait_minutes_if_online_missing": wait_minutes_if_online_missing,
+        "own_estimated_wait_minutes": own_estimated_wait_minutes,
+        "own_estimated_wait_uncertain": own_estimated_wait_uncertain,
+        "own_estimated_wait_upper_minutes": own_estimated_wait_upper_minutes,
+        "allows_passing": allows_passing,
+        "passing_over": passing_over,
         "registration_type": registration_type,
         "created_at": created_at,
         "online_check_in_started_at": online_check_in_started_at,
         "last_played_at": read_optional_integer(source, "last_played_at", minimum=1),
     }
+
+
+def read_passing_over(source: dict[str, Any]) -> list[str]:
+    """The registration ids of passing_over; absent or null means none."""
+    value = source.get("passing_over")
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_PASSING_OVER:
+        raise ValidationError("passing_over 必须是最多 20 项的登记编号数组。")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or PUBLIC_ID_PATTERN.fullmatch(item) is None:
+            raise ValidationError("passing_over 中包含无效登记编号。")
+        if item in result:
+            raise ValidationError("passing_over 中不能有重复登记编号。")
+        result.append(item)
+    return result
+
+
+def normalize_supported_queue_operations(source: Any) -> list[str]:
+    """
+    The remote operations the terminal can carry out, in the order it names them. Older
+    terminals leave the list out, which means none of TERMINAL_DECLARED_QUEUE_OPERATIONS.
+    A name this server does not know is dropped rather than refused, so that a newer terminal
+    can declare a new operation before the server that handles it is deployed.
+    """
+    if source is None:
+        return []
+    if not isinstance(source, list) or len(source) > MAX_SUPPORTED_QUEUE_OPERATIONS:
+        raise ValidationError("supported_queue_operations 必须是操作名称的数组。")
+    result: list[str] = []
+    for item in source:
+        if not isinstance(item, str) or QUEUE_OPERATION_NAME_PATTERN.fullmatch(item) is None:
+            raise ValidationError("supported_queue_operations 必须是操作名称的数组。")
+        if item in KNOWN_TERMINAL_QUEUE_OPERATIONS and item not in result:
+            result.append(item)
+    return result
 
 
 def validate_registration_group(registrations: list[dict[str, Any]], label: str) -> None:
@@ -13592,6 +14311,14 @@ def validate_registration_group(registrations: list[dict[str, Any]], label: str)
     }
     if len(absence_states) != 1:
         raise ValidationError(f"{label}的固定组合可用状态不一致。")
+    # Letting others pass is one choice for the pair: it counts only when both registrations
+    # carry it. Like passing_over it only decides what is shown, so a pair that disagrees is
+    # shown without the choice rather than refused.
+    pair_allows_passing = all(
+        registration["allows_passing"] for registration in fixed_registrations
+    )
+    for registration in fixed_registrations:
+        registration["allows_passing"] = pair_allows_passing
 
 
 def all_machine_registrations(machine: dict[str, Any]):
@@ -13623,6 +14350,55 @@ def read_string(source: dict[str, Any], key: str, maximum_length: int) -> str:
     if not value or len(value) > maximum_length:
         raise ValidationError(f"{key} 长度无效。")
     return value
+
+
+def contains_control_characters(value: str) -> bool:
+    """
+    Whether the text holds a C0 or C1 control character, which includes tab, line feed and
+    carriage return, or one of the Unicode line and paragraph separators.
+    """
+    return any(
+        unicodedata.category(character) in {"Cc", "Zl", "Zp"} for character in value
+    )
+
+
+# How a refused nickname is named to the player, by field (2026-11-28: the field name itself,
+# “nickname 长度或内容无效。”, used to reach players).
+PLAYER_NAME_LABELS = {"nickname": "昵称", "display_id": "登记昵称"}
+
+
+def read_player_name(source: dict[str, Any], key: str, maximum_length: int) -> str:
+    """
+    A nickname that a player, the Bot or the management app submits: read_string, and no
+    line breaks or control characters inside it. The length rule is that of read_string; both
+    refusals are sentences a player can act on.
+    """
+    label = PLAYER_NAME_LABELS.get(key)
+    value = source.get(key)
+    if label is not None and isinstance(value, str):
+        if not 1 <= len(value.strip()) <= maximum_length:
+            raise ValidationError(f"{label}应为 1 至 {maximum_length} 个字符，请重新填写。")
+    value = read_string(source, key, maximum_length)
+    if contains_control_characters(value):
+        if label is not None:
+            raise ValidationError(f"{label}不能包含换行、制表符等控制字符，请重新填写。")
+        raise ValidationError(f"{key} 长度或内容无效。")
+    return value
+
+
+def read_registration_display_id(source: dict[str, Any], key: str) -> str:
+    """
+    The nickname of one registration as RENAME_REGISTRATION submits it: trimmed, 1 to 18
+    characters counted as the terminal counts them (code points), and nothing a player
+    nickname may not hold (read_player_name). A wrong length is answered in the terminal's
+    own sentence.
+    """
+    value = source.get(key)
+    if not isinstance(value, str):
+        raise ValidationError(f"{key} 必须是文本。")
+    if not 1 <= len(value.strip()) <= 18:
+        raise ValidationError(REGISTRATION_DISPLAY_ID_LENGTH_REFUSAL)
+    return read_player_name(source, key, maximum_length=18)
 
 
 def read_optional_string(
@@ -13696,6 +14472,25 @@ def read_optional_integer(
     if source.get(key) is None:
         return None
     return read_integer(source, key, minimum, maximum)
+
+
+def read_estimated_wait_upper_minutes(
+    source: dict[str, Any], key: str, estimated_wait_minutes: int | None
+) -> int | None:
+    """
+    For an uncertain wait: the wait if the system arranges no registration between the two
+    machines of a pair, which the terminal sends only where it lies 24 minutes or more after
+    the shown time (2026-11-28). Clients show it on its own line with its condition:
+    系统未在两台机台之间安排登记时，……约 M 分钟后可以游玩。 Kept only beside an uncertain
+    estimate; older terminals leave it out.
+    """
+    value = read_optional_integer(source, key, minimum=0, maximum=MAX_ESTIMATED_WAIT_MINUTES)
+    if value is None or estimated_wait_minutes is None:
+        return None
+    uncertain_key = key.replace("_upper_minutes", "_uncertain")
+    if source.get(uncertain_key) is not True or value <= estimated_wait_minutes:
+        return None
+    return value
 
 
 def read_estimated_wait_uncertain(

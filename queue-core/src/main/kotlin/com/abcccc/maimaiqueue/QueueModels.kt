@@ -87,6 +87,14 @@ data class Registration(
      * cleared once the registration has played a round.
      */
     val temporaryAwaySkippedTurns: Int = 0,
+    /**
+     * How many of [temporaryAwaySkippedTurns] are not this registration's own: a fixed pair
+     * shares one count, the larger of the two, and this is what the registration took over
+     * from its partner when the pair formed. When the pair is released the registration goes
+     * back to its own count (review 2026-11-27: a player with three missed turns left them
+     * with a partner who had none, and that partner was then removed at the first 轮空一次).
+     */
+    val skippedTurnsCarriedFromPartner: Int = 0,
     val isTemporary: Boolean = true,
     val createdAtMillis: Long = System.currentTimeMillis(),
     val lastPlayedAtMillis: Long? = null,
@@ -118,10 +126,29 @@ data class Registration(
      * [requiresOnSiteCheckIn]; this stays, so that the first turn of such a registration can
      * still be told apart, see [mustBeRemovedWhenAbsent].
      */
-    val wasOnlineRegistration: Boolean = false
+    val wasOnlineRegistration: Boolean = false,
+    /**
+     * A 单人游玩 registration, or the two registrations of a fixed pair, let the registrations
+     * around them pass: an open registration ahead that has no partner may pair with the first
+     * open registration behind (docs/releases/solo-pass-plan-2026-11.md and
+     * fixed-pair-pass-plan-2026-11.md). The real waiting order does not change; only the
+     * grouping into positions does. A fixed pair has one choice: both registrations carry the
+     * same value. It means nothing for an open registration on its own, see [letsOthersPass].
+     */
+    val allowsPassing: Boolean = false,
+    /**
+     * While this registration is in the playing position: the registrations it passed over to
+     * play in this round, in their real order (see [allowsPassing]). Set when the round
+     * starts and cleared when the registration leaves the playing position.
+     */
+    val passedOverKeys: List<Int> = emptyList()
 ) {
     val canEnterPlayingPosition: Boolean
         get() = absenceStatus == QueueAbsenceStatus.NONE && !requiresOnSiteCheckIn
+
+    /** Whether the registrations around this one (and its fixed partner) may pair across it. */
+    val letsOthersPass: Boolean
+        get() = allowsPassing && (fixedPartnerKey != null || preference == PlayPreference.SOLO)
 
     /**
      * Anybody on site can check an online registration in, so the check-in alone does not show
@@ -222,6 +249,13 @@ data class MachineQueue(
         position.all { it.canEnterPlayingPosition }
     }.takeIf { it >= 0 }
 
+    /**
+     * Who enters the playing position next, as [RoundPlanner] decides it (empty when nobody
+     * can). Use this, not an entry of [waitingPositions], wherever it matters who is next: a
+     * pass the check before it refuses is still shown in [waitingPositions].
+     */
+    fun nextWaitingGroup(): List<Registration> = RoundPlanner.nextWaitingGroup(this)
+
     fun nextPlayingPositionPreview(): NextPlayingPositionPreview? {
         return RoundPlanner.enterPlayingPosition(this).preview
     }
@@ -234,13 +268,20 @@ data class MachineQueue(
     fun nextPlayingPositionPreviewAfterCurrentRoundRemoved(): NextPlayingPositionPreview? =
         RoundPlanner.removeCurrentRoundAndStartNext(this).preview
 
-    fun canMarkNoShow(registrationKey: Int): Boolean {
+    /**
+     * Whether [registrationKey] may be recorded as absent: it plays now, or it is in the next
+     * group to enter. [nextGroupKeys] is that group as the engine sees it on a machine of a pair
+     * (QueueEngine.nextWaitingGroup), where a registration may be arranged away or arrive; this
+     * machine's waiting order alone would then name another group and refuse the one the screen
+     * shows as next (review 2026-11-27, fixed 2026-11-28). Null: this machine's own next group.
+     */
+    fun canMarkNoShow(registrationKey: Int, nextGroupKeys: Set<Int>? = null): Boolean {
         val registration = allRegistrations.firstOrNull { it.key == registrationKey }
             ?: return false
         if (!registration.canEnterPlayingPosition) return false
-        return playing.any { it.key == registrationKey } ||
-            waitingPositions().getOrNull(firstAvailableWaitingPositionIndex() ?: -1)
-                ?.any { it.key == registrationKey } == true
+        if (playing.any { it.key == registrationKey }) return true
+        return nextGroupKeys?.contains(registrationKey)
+            ?: nextWaitingGroup().any { it.key == registrationKey }
     }
 
     fun join(registration: Registration): MachineQueue =
@@ -304,10 +345,12 @@ data class MachineQueue(
             it.copy(
                 absenceStatus = QueueAbsenceStatus.NONE,
                 temporaryAwaySkippedTurns = 0,
+                skippedTurnsCarriedFromPartner = 0,
                 noShowCount = 0,
                 lastNoShowActionWasDefer = false,
                 deferOneRoundUsed = false,
-                lastPlayedAtMillis = atMillis
+                lastPlayedAtMillis = atMillis,
+                passedOverKeys = emptyList()
             )
         }
         return copy(
@@ -357,22 +400,25 @@ data class MachineQueue(
     /** Corrects a missing player in an ongoing round without restarting the round timer. */
     fun moveFirstWaitingRegistrationIntoCurrentRound(registrationKey: Int): MachineQueue {
         val currentPlayer = playing.singleOrNull() ?: return this
-        val firstWaitingPosition = waitingPositions()
-            .getOrNull(firstAvailableWaitingPositionIndex() ?: -1)
-            ?: return this
-        val joiningPlayer = firstWaitingPosition.firstOrNull { it.key == registrationKey } ?: return this
+        val joiningPlayer = nextWaitingGroup().firstOrNull { it.key == registrationKey } ?: return this
         if (!joiningPlayer.canEnterPlayingPosition) return this
         val remainingWaiting = sanitizeFriendPairs(waiting.filterNot { it.key == registrationKey })
         return copy(
             playing = listOf(
+                // Both now share the round as 允许他人加入; the choice to let others pass belongs
+                // to 单人游玩 and ends with it, as when the preference is changed by hand.
                 currentPlayer.copy(
                     preference = PlayPreference.OPEN_TO_JOIN,
-                    fixedPartnerKey = null
+                    fixedPartnerKey = null,
+                    allowsPassing = false,
+                    // It now plays with somebody it did not pass anyone for.
+                    passedOverKeys = emptyList()
                 ),
                 joiningPlayer.copy(
                     preference = PlayPreference.OPEN_TO_JOIN,
                     absenceStatus = QueueAbsenceStatus.NONE,
-                    fixedPartnerKey = null
+                    fixedPartnerKey = null,
+                    allowsPassing = false
                 )
             ),
             waiting = remainingWaiting
@@ -522,8 +568,19 @@ data class MachineQueue(
         val partnerKey = allRegistrations.firstOrNull { it.key == registrationKey }?.fixedPartnerKey
         val transform: (Registration) -> Registration = {
             when (it.key) {
-                registrationKey -> it.copy(preference = preference, fixedPartnerKey = null)
-                partnerKey -> it.copy(preference = PlayPreference.OPEN_TO_JOIN, fixedPartnerKey = null)
+                registrationKey -> it.copy(
+                    preference = preference,
+                    fixedPartnerKey = null,
+                    // The choice belongs to 单人游玩; choosing anything else ends it. The choice
+                    // of a fixed pair was made by two and ends with the pair.
+                    allowsPassing = it.allowsPassing && preference == PlayPreference.SOLO &&
+                        partnerKey == null
+                )
+                partnerKey -> it.copy(
+                    preference = PlayPreference.OPEN_TO_JOIN,
+                    fixedPartnerKey = null,
+                    allowsPassing = false
+                )
                 else -> it
             }
         }
@@ -541,6 +598,11 @@ data class MachineQueue(
         val firstOriginal = waiting.firstOrNull { it.key == firstKey } ?: return null
         val secondOriginal = waiting.firstOrNull { it.key == secondKey } ?: return null
         if (firstOriginal.requiresOnSiteCheckIn || secondOriginal.requiresOnSiteCheckIn) return null
+        // Not while either is postponed (QueueActionFailureCode.FIXED_PAIR_WHILE_POSTPONED).
+        if (
+            firstOriginal.absenceStatus != QueueAbsenceStatus.NONE ||
+            secondOriginal.absenceStatus != QueueAbsenceStatus.NONE
+        ) return null
         val firstPosition = originalPositionByKey[firstKey] ?: return null
         val secondPosition = originalPositionByKey[secondKey] ?: return null
         val pairKeys = setOf(firstKey, secondKey)
@@ -562,66 +624,57 @@ data class MachineQueue(
                 registration
             }
         }
-        val pairAbsenceStatus = when {
-            listOf(firstOriginal, secondOriginal).any {
-                it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY
-            } -> QueueAbsenceStatus.TEMPORARILY_AWAY
-            listOf(firstOriginal, secondOriginal).any {
-                it.absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN
-            } -> QueueAbsenceStatus.SKIP_ONE_TURN
-            listOf(firstOriginal, secondOriginal).any {
-                it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND
-            } -> QueueAbsenceStatus.DEFER_ONE_ROUND
-            else -> QueueAbsenceStatus.NONE
-        }
-        // A fixed pair shares one count of missed turns, whether or not it is away right now.
-        val pairSkippedTurns =
-            maxOf(firstOriginal.temporaryAwaySkippedTurns, secondOriginal.temporaryAwaySkippedTurns)
+        // A fixed pair shares one count of missed turns: the larger of the two own counts.
+        // Each remembers how much of it came from the other, for when the pair is released.
+        val firstOwnSkippedTurns = firstOriginal.ownSkippedTurns
+        val secondOwnSkippedTurns = secondOriginal.ownSkippedTurns
+        val pairSkippedTurns = maxOf(firstOwnSkippedTurns, secondOwnSkippedTurns)
         val first = clearedWaiting.first { it.key == firstKey }.copy(
-            absenceStatus = pairAbsenceStatus,
             temporaryAwaySkippedTurns = pairSkippedTurns,
-            fixedPartnerKey = secondKey
+            skippedTurnsCarriedFromPartner = pairSkippedTurns - firstOwnSkippedTurns,
+            fixedPartnerKey = secondKey,
+            allowsPassing = false
         )
         val second = clearedWaiting.first { it.key == secondKey }.copy(
-            absenceStatus = pairAbsenceStatus,
             temporaryAwaySkippedTurns = pairSkippedTurns,
-            fixedPartnerKey = firstKey
+            skippedTurnsCarriedFromPartner = pairSkippedTurns - secondOwnSkippedTurns,
+            fixedPartnerKey = firstKey,
+            allowsPassing = false
         )
-        val orderedPair = if (firstPosition <= secondPosition) listOf(first, second) else listOf(second, first)
-        if (firstPosition == secondPosition) {
-            val fixedWaiting = clearedWaiting.map {
-                when (it.key) {
-                    firstKey -> first
-                    secondKey -> second
-                    else -> it
-                }
-            }
-            return FriendPairPlan(
-                originalWaiting = waiting,
-                waiting = fixedWaiting,
-                firstRegistration = firstOriginal,
-                secondRegistration = secondOriginal,
-                pairPositionIndex = firstPosition,
-                movedBackRegistrations = emptyList(),
-                delayedOtherRegistrations = emptyList()
-            )
+        val firstIndex = waiting.indexOfFirst { it.key == firstKey }
+        val secondIndex = waiting.indexOfFirst { it.key == secondKey }
+        val samePosition = firstPosition == secondPosition
+        val orderedPair = when {
+            samePosition -> if (firstIndex < secondIndex) listOf(first, second) else listOf(second, first)
+            firstPosition < secondPosition -> listOf(first, second)
+            else -> listOf(second, first)
         }
 
         // Everybody else keeps the order they wait in. The pair takes the place of whichever of
-        // the two waits further back; where that would make somebody else play in a later
-        // round, it takes the first place behind it at which nobody does. Registrations that
-        // lose a partner to the pair are grouped again by the ordinary rules, which never reach
-        // across a solo registration or a fixed pair.
+        // the two waits further back (two that already share a position: the place of the one
+        // further ahead, where the position is shown); where that would make somebody else
+        // play in a later round, it takes the first place behind it at which nobody does.
+        // Registrations that lose a partner to the pair are grouped again by the ordinary
+        // rules, which never reach across a solo registration or a fixed pair.
         val others = clearedWaiting.filterNot { it.key in pairKeys }
-        val laterKey = if (firstPosition > secondPosition) firstKey else secondKey
-        val earliestInsertion = waiting
-            .take(waiting.indexOfFirst { it.key == laterKey })
-            .count { it.key !in pairKeys }
+        val anchorIndex = when {
+            samePosition -> minOf(firstIndex, secondIndex)
+            firstPosition > secondPosition -> firstIndex
+            else -> secondIndex
+        }
+        val earliestInsertion = waiting.take(anchorIndex).count { it.key !in pairKeys }
+
+        // "Later" is judged twice. By the positions as they wait; and by the round in which
+        // each registration will really play, which also knows about postponed turns, pending
+        // check-ins and registrations that let others pass: a pair that no longer pairs with a
+        // registration around it can add a round to the queue without moving anybody.
+        val originalRounds = RoundPlanner.firstPlayingRounds(this)
 
         data class Placement(
             val waiting: List<Registration>,
             val pairPositionIndex: Int,
-            val delayedOthers: List<Registration>
+            val delayedOthers: List<Registration>,
+            val rounds: Map<Int, Int>
         )
 
         fun placementAt(insertion: Int): Placement {
@@ -631,23 +684,43 @@ data class MachineQueue(
                     registrations.forEach { put(it.key, positionIndex) }
                 }
             }
+            val rounds = RoundPlanner.firstPlayingRounds(copy(waiting = candidate))
             return Placement(
                 waiting = candidate,
                 pairPositionIndex = positionByKey.getValue(firstKey),
                 delayedOthers = others.filter { registration ->
                     positionByKey.getValue(registration.key) >
-                        (originalPositionByKey[registration.key] ?: Int.MAX_VALUE)
-                }
+                        (originalPositionByKey[registration.key] ?: Int.MAX_VALUE) ||
+                        (rounds[registration.key] ?: Int.MAX_VALUE) >
+                        (originalRounds[registration.key] ?: Int.MAX_VALUE)
+                },
+                rounds = rounds
             )
         }
 
+        // Never between the two registrations of another fixed pair.
+        fun splitsAnotherPair(insertion: Int): Boolean =
+            insertion in 1 until others.size &&
+                others[insertion - 1].fixedPartnerKey == others[insertion].key
+
         val placement = (earliestInsertion..others.size).asSequence()
+            .filterNot(::splitsAnotherPair)
             .map(::placementAt)
             .firstOrNull { it.delayedOthers.isEmpty() }
-            ?: placementAt(earliestInsertion)
+            ?: placementAt(
+                (earliestInsertion..others.size).first { !splitsAnotherPair(it) }
+            )
         val pairPositionIndex = placement.pairPositionIndex
+        // Moved back is whoever of the two now plays in a later round; where the rounds do
+        // not tell (neither can play for now), whoever waits in a later position.
         val movedBack = orderedPair.filter { registration ->
-            pairPositionIndex > (originalPositionByKey[registration.key] ?: pairPositionIndex)
+            val before = originalRounds[registration.key]
+            val after = placement.rounds[registration.key]
+            if (before != null && after != null) {
+                after > before
+            } else {
+                pairPositionIndex > (originalPositionByKey[registration.key] ?: pairPositionIndex)
+            }
         }
         return FriendPairPlan(
             originalWaiting = waiting,
@@ -673,7 +746,9 @@ data class MachineQueue(
                 preference = planned.preference,
                 absenceStatus = planned.absenceStatus,
                 temporaryAwaySkippedTurns = planned.temporaryAwaySkippedTurns,
-                fixedPartnerKey = planned.fixedPartnerKey
+                skippedTurnsCarriedFromPartner = planned.skippedTurnsCarriedFromPartner,
+                fixedPartnerKey = planned.fixedPartnerKey,
+                allowsPassing = planned.allowsPassing && planned.fixedPartnerKey == null
             )
         }
         return copy(waiting = sanitizeFriendPairs(rebasedWaiting))
@@ -682,28 +757,35 @@ data class MachineQueue(
     fun createFriendPair(registrationKey: Int, friend: Registration): MachineQueue {
         val registration = waiting.firstOrNull { it.key == registrationKey } ?: return this
         if (registration.requiresOnSiteCheckIn) return this
+        if (registration.absenceStatus != QueueAbsenceStatus.NONE) return this
         val normalizedFriendId = friend.displayId.trim()
         if (normalizedFriendId.isBlank() || containsId(normalizedFriendId)) return this
         val previousPartnerKey = registration.fixedPartnerKey
         val remaining = waiting.filterNot { it.key == registrationKey }.map {
             if (it.key == previousPartnerKey) {
-                it.copy(preference = PlayPreference.OPEN_TO_JOIN, fixedPartnerKey = null)
+                it.copy(preference = PlayPreference.OPEN_TO_JOIN, fixedPartnerKey = null, allowsPassing = false)
             } else {
                 it
             }
         }
+        // The friend's registration is new: the whole shared count is the first one's own.
+        val ownSkippedTurns = registration.ownSkippedTurns
         val first = registration.copy(
             preference = PlayPreference.OPEN_TO_JOIN,
             absenceStatus = registration.absenceStatus,
-            temporaryAwaySkippedTurns = registration.temporaryAwaySkippedTurns,
-            fixedPartnerKey = friend.key
+            temporaryAwaySkippedTurns = ownSkippedTurns,
+            skippedTurnsCarriedFromPartner = 0,
+            fixedPartnerKey = friend.key,
+            allowsPassing = false
         )
         val second = friend.copy(
             displayId = normalizedFriendId,
             preference = PlayPreference.OPEN_TO_JOIN,
             absenceStatus = registration.absenceStatus,
-            temporaryAwaySkippedTurns = registration.temporaryAwaySkippedTurns,
-            fixedPartnerKey = registration.key
+            temporaryAwaySkippedTurns = ownSkippedTurns,
+            skippedTurnsCarriedFromPartner = ownSkippedTurns,
+            fixedPartnerKey = registration.key,
+            allowsPassing = false
         )
         return copy(waiting = remaining + first + second)
     }
@@ -844,12 +926,13 @@ data class MachineQueue(
     fun markNoShowDeferOneRound(
         registrationKey: Int,
         startNextWhenPlayingBecomesEmpty: Boolean = true,
-        atMillis: Long = System.currentTimeMillis()
+        atMillis: Long = System.currentTimeMillis(),
+        nextGroupKeys: Set<Int>? = null
     ): MachineQueue {
         val affectedKeys = fixedGroupKeys(registrationKey)
         if (
             affectedKeys.isEmpty() ||
-            affectedKeys.any { !canMarkNoShow(it) } ||
+            affectedKeys.any { !canMarkNoShow(it, nextGroupKeys) } ||
             mustRemoveWhenAbsent(affectedKeys)
         ) return this
         val updated = copy(
@@ -881,11 +964,12 @@ data class MachineQueue(
     fun markNoShowMoveToEnd(
         registrationKeys: Set<Int>,
         startNextWhenPlayingBecomesEmpty: Boolean = true,
-        atMillis: Long = System.currentTimeMillis()
+        atMillis: Long = System.currentTimeMillis(),
+        nextGroupKeys: Set<Int>? = null
     ): MachineQueue {
         if (
             registrationKeys.isEmpty() ||
-            registrationKeys.any { !canMarkNoShow(it) } ||
+            registrationKeys.any { !canMarkNoShow(it, nextGroupKeys) } ||
             mustRemoveWhenAbsent(registrationKeys)
         ) {
             return this
@@ -922,18 +1006,21 @@ data class MachineQueue(
     fun markNoShowGroupDeferOneRound(
         registrationKeys: Set<Int>,
         startNextWhenPlayingBecomesEmpty: Boolean = true,
-        atMillis: Long = System.currentTimeMillis()
+        atMillis: Long = System.currentTimeMillis(),
+        nextGroupKeys: Set<Int>? = null
     ): MachineQueue {
+        // Deferring one of a fixed pair defers both, as markNoShowDeferOneRound does; the
+        // terminal always names the whole position, a website or API caller may not
+        // (review 2026-11-27).
+        val affectedKeys = registrationKeys.flatMapTo(mutableSetOf(), ::fixedGroupKeys)
         if (
             registrationKeys.isEmpty() ||
-            registrationKeys.any { !canMarkNoShow(it) } ||
-            mustRemoveWhenAbsent(registrationKeys.flatMapTo(mutableSetOf(), ::fixedGroupKeys))
+            affectedKeys.isEmpty() ||
+            affectedKeys.any { !canMarkNoShow(it, nextGroupKeys) } ||
+            mustRemoveWhenAbsent(affectedKeys)
         ) {
             return this
         }
-        val affectedKeys = registrationKeys
-            .filterTo(mutableSetOf()) { key -> allRegistrations.any { it.key == key } }
-        if (affectedKeys.isEmpty()) return this
         val updated = transformRegistrations(affectedKeys) {
             it.copy(
                 noShowCount = it.noShowCount + 1,
@@ -951,9 +1038,10 @@ data class MachineQueue(
     fun markNoShowAndRemove(
         registrationKeys: Set<Int>,
         startNextWhenPlayingBecomesEmpty: Boolean = true,
-        atMillis: Long = System.currentTimeMillis()
+        atMillis: Long = System.currentTimeMillis(),
+        nextGroupKeys: Set<Int>? = null
     ): MachineQueue {
-        if (registrationKeys.isEmpty() || registrationKeys.any { !canMarkNoShow(it) }) {
+        if (registrationKeys.isEmpty() || registrationKeys.any { !canMarkNoShow(it, nextGroupKeys) }) {
             return this
         }
         val updated = removeAll(registrationKeys)
@@ -990,6 +1078,50 @@ data class MachineQueue(
         }
     }
 
+    /**
+     * Records whether this 单人游玩 registration, or the fixed pair it belongs to, lets the
+     * registrations around it pass. A fixed pair has one choice for both.
+     */
+    fun setAllowsPassing(registrationKey: Int, enabled: Boolean): MachineQueue =
+        transformRegistrations(fixedGroupKeys(registrationKey)) {
+            if (it.allowsPassing == enabled) it else it.copy(allowsPassing = enabled)
+        }
+
+    /**
+     * The passes the waiting positions on screen show: for each registration that is shown
+     * with a registration ahead of it in real order across one or more registrations that let
+     * others pass, those passed registrations in their real order. The passes of the playing
+     * position are in [Registration.passedOverKeys].
+     */
+    fun projectedPasses(): Map<Int, List<Int>> {
+        if (waiting.none(Registration::letsOthersPass)) return emptyMap()
+        val indexByKey = waiting.mapIndexed { index, registration -> registration.key to index }.toMap()
+        val passes = mutableMapOf<Int, List<Int>>()
+        val shown = waitingProjection(includeCommonPlayPreview = false).positions
+        val shownIndexByKey = buildMap {
+            shown.forEachIndexed { positionIndex, position ->
+                position.registrations.forEach { put(it.key, positionIndex) }
+            }
+        }
+        shown.forEachIndexed { positionIndex, position ->
+            if (position.registrations.size != 2) return@forEachIndexed
+            val (first, second) = position.registrations
+                .sortedBy { indexByKey[it.key] ?: Int.MAX_VALUE }
+            val from = indexByKey[first.key] ?: return@forEachIndexed
+            val to = indexByKey[second.key] ?: return@forEachIndexed
+            // Passed is only a registration that plays after the two. One that is shown ahead
+            // of them, because the registration in front of it postponed its turn, plays first.
+            val passed = waiting.subList(from + 1, to)
+                .filter { between ->
+                    isShownAsPassedOver(between) &&
+                        (shownIndexByKey[between.key] ?: Int.MAX_VALUE) > positionIndex
+                }
+                .map(Registration::key)
+            if (passed.isNotEmpty()) passes[second.key] = passed
+        }
+        return passes
+    }
+
     /** Records whether this registration also queues at the paired machine. */
     fun setPairedMachineQueueing(registrationKey: Int, enabled: Boolean): MachineQueue =
         transformRegistrations(setOf(registrationKey)) {
@@ -1005,29 +1137,180 @@ data class MachineQueue(
         return copy(
             playing = sanitizeFriendPairs(remainingPlaying.map {
                 if (it.fixedPartnerKey?.let { partnerKey -> partnerKey in registrationKeys } == true) {
-                    it.copy(preference = PlayPreference.OPEN_TO_JOIN, fixedPartnerKey = null)
+                    it.copy(preference = PlayPreference.OPEN_TO_JOIN, fixedPartnerKey = null, allowsPassing = false)
                 } else it
             }),
             waiting = sanitizeFriendPairs(waiting.filterNot { it.key in registrationKeys }.map {
                 if (it.fixedPartnerKey?.let { partnerKey -> partnerKey in registrationKeys } == true) {
-                    it.copy(preference = PlayPreference.OPEN_TO_JOIN, fixedPartnerKey = null)
+                    it.copy(preference = PlayPreference.OPEN_TO_JOIN, fixedPartnerKey = null, allowsPassing = false)
                 } else it
             }),
             playingStartedAtMillis = if (remainingPlaying.isEmpty()) null else playingStartedAtMillis
         )
     }
 
+    /**
+     * Moves the registrations of one waiting position in front of the position at
+     * [destinationIndex] (or behind it when moving later). Only the moved registrations change
+     * place: every other registration keeps its real order. Positions are not written back one
+     * after another, because a position need not be a contiguous stretch of the real order: two
+     * open registrations pair across a registration that cannot play now (将暂缓一次 and the
+     * like), and writing the positions back would quietly move that registration too.
+     */
     fun moveWaitingPosition(sourceIndex: Int, destinationIndex: Int): MachineQueue {
-        val positions = waitingPositions().toMutableList()
+        val positions = waitingPositions()
         if (
             sourceIndex !in positions.indices ||
             destinationIndex !in positions.indices ||
             sourceIndex == destinationIndex
         ) return this
+        return moveWaitingRegistrations(
+            movedKeys = positions[sourceIndex].mapTo(mutableSetOf(), Registration::key),
+            targetKeys = positions[destinationIndex].mapTo(mutableSetOf(), Registration::key),
+            beforeTarget = destinationIndex < sourceIndex
+        )
+    }
 
-        val movedPosition = positions.removeAt(sourceIndex)
-        positions.add(destinationIndex, movedPosition)
-        return copy(waiting = positions.flatten())
+    /**
+     * Moves the waiting registrations [movedKeys] together, in their order, to just before the
+     * first of [targetKeys] or just after the last of them. The home screen drags the positions
+     * it shows, which need not be those of [waitingPositions]: a pending online registration is
+     * shown as if it checks in, a pass that the check refuses is not shown, and the previews of
+     * the other machine of a pair regroup the registrations around them (reported 2026-11-27:
+     * such positions could not be dragged).
+     */
+    fun moveWaitingRegistrations(
+        movedKeys: Set<Int>,
+        targetKeys: Set<Int>,
+        beforeTarget: Boolean
+    ): MachineQueue {
+        if (movedKeys.isEmpty() || targetKeys.isEmpty() || movedKeys.any { it in targetKeys }) return this
+        val moved = waiting.filter { it.key in movedKeys }
+        if (moved.size != movedKeys.size) return this
+        val others = waiting.filterNot { it.key in movedKeys }
+        val insertAt = if (beforeTarget) {
+            others.indexOfFirst { it.key in targetKeys }
+        } else {
+            others.indexOfLast { it.key in targetKeys } + 1
+        }
+        if (insertAt < 0 || (!beforeTarget && insertAt == 0)) return this
+        return copy(waiting = others.take(insertAt) + moved + others.drop(insertAt))
+    }
+
+    /**
+     * The waiting positions as the home screen and the snapshot show them, as sets of keys in
+     * the order shown. This is what a management app or a server knows of this machine.
+     */
+    fun shownWaitingPositionKeys(): List<List<Int>> =
+        waitingProjection(includeCommonPlayPreview = false).positions.map { position ->
+            position.registrations.map(Registration::key)
+        }
+
+    /**
+     * Moves one of [positions] (the waiting registrations grouped as the home screen shows them,
+     * in the order it lists them) from [sourceIndex] to [destinationIndex] in the real waiting
+     * order. The positions it jumps over decide where it goes: moved forward, its registrations
+     * go to just before the first of theirs; moved back, those of its registrations that stand
+     * before the last of theirs go to just behind it, and the others stay where they are.
+     * Nobody else moves. The shown positions are not always runs of the real order: a
+     * registration that passes a 单人游玩 one is shown with its partner while the one it passes
+     * stays between them, and keeps that place (found 2026-11-27 by the random test: moving a
+     * position as one block took such places away).
+     */
+    fun withShownPositionMoved(
+        positions: List<Set<Int>>,
+        sourceIndex: Int,
+        destinationIndex: Int
+    ): MachineQueue {
+        if (
+            sourceIndex !in positions.indices ||
+            destinationIndex !in positions.indices ||
+            sourceIndex == destinationIndex
+        ) return this
+        val moved = positions[sourceIndex]
+        val backward = destinationIndex > sourceIndex
+        val jumped = if (backward) {
+            positions.subList(sourceIndex + 1, destinationIndex + 1)
+        } else {
+            positions.subList(destinationIndex, sourceIndex)
+        }.flatMapTo(mutableSetOf()) { it }
+        val boundary = if (backward) {
+            waiting.indexOfLast { it.key in jumped }
+        } else {
+            waiting.indexOfFirst { it.key in jumped }
+        }
+        if (boundary < 0) return this
+        val boundaryKey = waiting[boundary].key
+        val moving = waiting.filterIndexed { index, registration ->
+            registration.key in moved && if (backward) index < boundary else index > boundary
+        }
+        if (moving.isEmpty()) return this
+        val movingKeys = moving.mapTo(mutableSetOf(), Registration::key)
+        val others = waiting.filterNot { it.key in movingKeys }
+        val insertAt = others.indexOfFirst { it.key == boundaryKey } + if (backward) 1 else 0
+        return copy(waiting = others.take(insertAt) + moving + others.drop(insertAt))
+    }
+
+    /**
+     * Applies a new order of the positions as shown, [desired] (the positions of
+     * [shownWaitingPositionKeys], rearranged), to the real waiting order: the positions that
+     * keep their order among themselves stay, and each of the others is moved to its new place
+     * with [withShownPositionMoved]. So a management app that rearranges what it sees does not
+     * write the shown order back as the real one, which silently took away the place of a
+     * registration that is passed over or deferred (found 2026-11-27). Returns null when
+     * [desired] is not a rearrangement of the positions shown.
+     */
+    fun withShownPositionsReordered(desired: List<List<Int>>): MachineQueue? =
+        reorderedAsShown(shownWaitingPositionKeys().map { it.toSet() }, desired.map { it.toSet() })
+
+    /**
+     * [withShownPositionsReordered] for a new order of the registrations themselves, as shown:
+     * [desiredKeys] holds every waiting registration once.
+     */
+    fun withShownRegistrationOrder(desiredKeys: List<Int>): MachineQueue? =
+        reorderedAsShown(shownWaitingPositionKeys().flatten().map(::setOf), desiredKeys.map(::setOf))
+
+    private fun reorderedAsShown(shown: List<Set<Int>>, wanted: List<Set<Int>>): MachineQueue? {
+        if (wanted.size != shown.size || wanted.toSet() != shown.toSet() || wanted.toSet().size != wanted.size) return null
+        if (wanted == shown) return this
+        // The positions left where they are: a longest run that both orders share.
+        val lengths = Array(shown.size + 1) { IntArray(wanted.size + 1) }
+        for (i in shown.indices.reversed()) {
+            for (j in wanted.indices.reversed()) {
+                lengths[i][j] = if (shown[i] == wanted[j]) {
+                    lengths[i + 1][j + 1] + 1
+                } else {
+                    maxOf(lengths[i + 1][j], lengths[i][j + 1])
+                }
+            }
+        }
+        val kept = mutableSetOf<Set<Int>>()
+        var i = 0
+        var j = 0
+        while (i < shown.size && j < wanted.size) {
+            when {
+                shown[i] == wanted[j] -> {
+                    kept += shown[i]
+                    i++
+                    j++
+                }
+                lengths[i + 1][j] >= lengths[i][j + 1] -> i++
+                else -> j++
+            }
+        }
+        val current = shown.toMutableList()
+        var result = this
+        wanted.forEachIndexed { index, position ->
+            if (position in kept) return@forEachIndexed
+            val from = current.indexOf(position)
+            // Right behind the position that precedes it in the new order.
+            val anchor = if (index == 0) -1 else current.indexOf(wanted[index - 1])
+            val to = if (from > anchor) anchor + 1 else anchor
+            result = result.withShownPositionMoved(current, from, to)
+            current.removeAt(from)
+            current.add(to, position)
+        }
+        return result
     }
 
     fun enterPlayingPosition(): MachineQueue =
@@ -1120,6 +1403,23 @@ fun MachineQueue.hasSameQueueOperationState(other: MachineQueue): Boolean =
         registrationsHaveSameQueueState(playing, other.playing) &&
         registrationsHaveSameQueueState(waiting, other.waiting)
 
+/**
+ * Whether a pair forming across [registration] really passes it. One that cannot play at that
+ * moment (暂缓一次, 轮空一次, 暂时离开, 待签到) would be passed with or without its choice, so it
+ * is not told that it was (review 2026-11-27).
+ */
+internal fun isPassedOver(registration: Registration): Boolean =
+    registration.letsOthersPass && registration.canEnterPlayingPosition
+
+/**
+ * [isPassedOver] as the home page tells it in advance: a pending online registration counts as
+ * checking in there, so a pair forming across it is shown as passing it (reported 2026-11-27:
+ * “将越过” was missing). When the round really starts, one still pending is reached and removed
+ * instead, so the record made then ([isPassedOver]) leaves it out.
+ */
+internal fun isShownAsPassedOver(registration: Registration): Boolean =
+    registration.letsOthersPass && registration.absenceStatus == QueueAbsenceStatus.NONE
+
 fun registrationsHaveSameQueueState(
     first: List<Registration>,
     second: List<Registration>
@@ -1137,7 +1437,10 @@ fun registrationsHaveSameQueueState(
         left.requiresOnSiteCheckIn == right.requiresOnSiteCheckIn &&
         left.onSiteCheckInStartedAtMillis == right.onSiteCheckInStartedAtMillis &&
         left.alsoQueuesAtPairedMachine == right.alsoQueuesAtPairedMachine &&
-        left.skipsPairedMachineThisRound == right.skipsPairedMachineThisRound
+        left.skipsPairedMachineThisRound == right.skipsPairedMachineThisRound &&
+        // Who pairs with whom depends on it, so a plan made before it changed is out of date
+        // (review 2026-11-27: an old plan for a fixed pair turned a player's choice back).
+        left.allowsPassing == right.allowsPassing
 }
 
 fun groupIntoPositions(registrations: List<Registration>): List<List<Registration>> {
@@ -1191,7 +1494,9 @@ fun groupIntoPositions(registrations: List<Registration>): List<List<Registratio
         }
 
         if (isFixedPair) {
-            flushPendingOpen()
+            // Like a 单人游玩 registration that lets others pass, a fixed pair that does keeps
+            // the open registration ahead of it waiting for a partner from behind.
+            if (!group.all(Registration::letsOthersPass)) flushPendingOpen()
             positions += group.toMutableList()
             index = partnerIndex!! + 1
             continue
@@ -1199,7 +1504,9 @@ fun groupIntoPositions(registrations: List<Registration>): List<List<Registratio
 
         when (first.preference) {
             PlayPreference.SOLO -> {
-                flushPendingOpen()
+                // An open registration ahead still waiting for a partner may pair across a
+                // registration that lets others pass; it keeps its own position behind them.
+                if (!first.letsOthersPass) flushPendingOpen()
                 positions += mutableListOf(first)
             }
             PlayPreference.OPEN_TO_JOIN -> {
@@ -1218,6 +1525,18 @@ fun groupIntoPositions(registrations: List<Registration>): List<List<Registratio
     return positions.map { it.toList() }
 }
 
+/** The missed turns that are this registration's own, without those shared by a fixed partner. */
+val Registration.ownSkippedTurns: Int
+    get() = (temporaryAwaySkippedTurns - skippedTurnsCarriedFromPartner).coerceAtLeast(0)
+
+/** A registration that is no longer part of a fixed pair counts its own missed turns again. */
+fun Registration.withOwnSkippedTurnsOutsideAPair(): Registration =
+    if (fixedPartnerKey != null || skippedTurnsCarriedFromPartner == 0) {
+        this
+    } else {
+        copy(temporaryAwaySkippedTurns = ownSkippedTurns, skippedTurnsCarriedFromPartner = 0)
+    }
+
 fun sanitizeFriendPairs(registrations: List<Registration>): List<Registration> {
     val indexByKey = registrations.mapIndexed { index, registration -> registration.key to index }.toMap()
     val registrationByKey = registrations.associateBy { it.key }
@@ -1235,7 +1554,8 @@ fun sanitizeFriendPairs(registrations: List<Registration>): List<Registration> {
         if (partnerKey != null && !validPair) {
             registration.copy(
                 preference = PlayPreference.OPEN_TO_JOIN,
-                fixedPartnerKey = null
+                fixedPartnerKey = null,
+                allowsPassing = false
             )
         } else {
             registration

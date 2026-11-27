@@ -789,7 +789,7 @@ class QueueModelsTest {
     }
 
     @Test
-    fun regroupedRoundCountsCrossedTemporarilyAwayFixedPairTogether() {
+    fun aTemporarilyAwayFixedPairCountsAMissedTurnOnlyAtItsOwnTurn() {
         val firstPartner = registration(2).copy(
             absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY,
             temporaryAwaySkippedTurns = 1,
@@ -804,9 +804,17 @@ class QueueModelsTest {
             waiting = listOf(registration(1), firstPartner, secondPartner, registration(4))
         ).enterPlayingPosition()
 
+        // 1 and 4 play together across the pair. That round was not the pair's turn
+        // (maintainer, 2026-11-27: “只有登记自己本该进入游玩位置的那一轮，才算轮到它”).
         assertEquals(listOf(1, 4), queue.playing.map { it.key })
         assertEquals(listOf(2, 3), queue.waiting.map { it.key })
-        assertTrue(queue.waiting.all {
+        assertEquals(listOf(1, 2), queue.waiting.map { it.temporaryAwaySkippedTurns })
+
+        // The next round is: the pair misses it together and counts on from the larger count.
+        val next = queue.finishRound(atMillis = 2_000L)
+        assertEquals(listOf(1, 4), next.playing.map { it.key })
+        val pair = next.waiting.filter { it.key == 2 || it.key == 3 }
+        assertTrue(pair.all {
             it.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY &&
                 it.temporaryAwaySkippedTurns == 3
         })
@@ -1483,6 +1491,28 @@ class QueueModelsTest {
 
         assertTrue(original.hasSameQueueOperationState(profileUpdated))
         assertFalse(original.hasSameQueueOperationState(preferenceUpdated))
+    }
+
+    @Test
+    fun aPositionAsShownStandsForItsRegistrationsWhileTheyAllWait() {
+        // Beside a pending online registration the home screen groups 2 with it and shows 3
+        // alone, while the real positions are [1] and [2, 3]: the shown position has no index.
+        val pending = registration(1).copy(requiresOnSiteCheckIn = true, onSiteCheckInStartedAtMillis = 1_000L)
+        val queue = MachineQueue(waiting = listOf(pending, registration(2), registration(3)))
+        val shownAlone = PositionSelection(
+            machineId = MachineId.A,
+            label = "位置 A2",
+            registrationKeys = listOf(3),
+            isPlayingPosition = false,
+            waitingPositionIndex = null
+        )
+        assertTrue(queue.matchesExactPosition(shownAlone))
+        // Once the registration has left or entered the playing position it no longer does.
+        assertFalse(queue.remove(3).matchesExactPosition(shownAlone))
+        assertFalse(
+            queue.copy(playing = listOf(registration(3)), waiting = queue.waiting.dropLast(1))
+                .matchesExactPosition(shownAlone)
+        )
     }
 
     @Test

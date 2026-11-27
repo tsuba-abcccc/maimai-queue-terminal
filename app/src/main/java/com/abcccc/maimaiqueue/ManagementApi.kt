@@ -27,7 +27,12 @@ internal data class ManagementRegistration(
     /** 轮空一次 is set: at its next turn the registration goes to the tail. */
     val skipsOneTurn: Boolean = false,
     /** 暂缓一次 was used and the registration has not played since. */
-    val deferOneRoundUsed: Boolean = false
+    val deferOneRoundUsed: Boolean = false,
+    /**
+     * A checked-in online registration that has not played a round yet: a no-show can only be
+     * settled by removing it (snapshot field online_registration_not_played).
+     */
+    val onlineRegistrationNotPlayed: Boolean = false
 )
 
 internal data class ManagementWaitingPosition(
@@ -581,7 +586,7 @@ internal class ManagementApi(
             put("allow_defer_one_round", allowDeferOneRound)
             put("allow_temporary_leave", allowTemporaryLeave)
             put("onebot_sync_enabled", oneBotSyncEnabled)
-            put("reason", reason.trim().ifEmpty { "管理后台更新终端敏感策略" })
+            put("reason", reason.trim().ifEmpty { "管理后台更新接管的设置" })
         }.toString()
         val connection = openConnection(
             managementPath("/api/queue-management/terminal-policy"),
@@ -999,7 +1004,8 @@ private fun parseRegistrations(
                     "skips_paired_machine_this_round", false
                 ),
                 skipsOneTurn = registration.optBoolean("skips_one_turn", false),
-                deferOneRoundUsed = registration.optBoolean("defer_one_round_used", false)
+                deferOneRoundUsed = registration.optBoolean("defer_one_round_used", false),
+                onlineRegistrationNotPlayed = registration.optBoolean("online_registration_not_played", false)
             )
         )
     }

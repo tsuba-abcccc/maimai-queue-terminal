@@ -8,8 +8,10 @@ import kotlin.math.sqrt
  * The wait estimates shown to players (docs/releases/wait-estimate-2026-11.md).
  *
  * The future is replayed many times with the real queue rules. In each replay every uncertain
- * thing takes one possible value: how long each round lasts and whether a pending online
- * registration checks in. A registered player is shown an early value of the results, because
+ * thing takes one possible value, such as how long each round lasts. Pending online
+ * registrations count as checking in, as the waiting positions on screen are grouped; a second
+ * set of replays without them gives [Result.earlierIfOnlineMissing]. A registered player is
+ * shown an early value of the results, because
  * they use it to decide when to be back; a new registration is shown the middle value, because
  * it only helps to choose a machine.
  *
@@ -39,8 +41,19 @@ object WaitEstimator {
         val shorterByMillis: Long = 2L * 60_000L,
         /** ...to this much more (maintainer: solo 10–15, shared 13–18 minutes). */
         val longerByMillis: Long = 3L * 60_000L,
-        /** Share of pending online registrations that check in (maintainer: half). */
-        val checkInShare: Double = 0.5
+        /**
+         * Share of pending online registrations that check in. All of them (maintainer,
+         * 2026-11-26): the waiting positions on screen are grouped as if they do, so the
+         * estimates agree with the positions. [Result.earlierIfOnlineMissing] tells how much
+         * earlier a registration may play when they do not.
+         */
+        val checkInShare: Double = 1.0,
+        /**
+         * The earlier wait for when the pending online registrations ahead do not check in is
+         * told only when it is at least this much earlier; a smaller difference is within how
+         * much a round's length varies anyway.
+         */
+        val onlineMissingNoteAtLeastMillis: Long = 5L * 60_000L
     )
 
     data class Estimate(val waitMillis: Long, val uncertain: Boolean)
@@ -51,8 +64,62 @@ object WaitEstimator {
         /** By machine: the middle wait of a registration that would join now. */
         val newRegistrationWaitMillis: Map<String, Long>,
         /** By registration key: how often a registration was arranged to the other machine. */
-        val moveConfidence: Map<Int, Double> = emptyMap()
+        val moveConfidence: Map<Int, Double> = emptyMap(),
+        /**
+         * By registration key: the wait when none of the pending online registrations checks
+         * in, for registrations that would then play clearly earlier
+         * ([Settings.onlineMissingNoteAtLeastMillis]). Absent for the others.
+         */
+        val earlierIfOnlineMissing: Map<Int, Long> = emptyMap(),
+        /**
+         * By registration key: the wait to play at the machine where the registration waits now.
+         * It differs from [registrations] only for a registration that may be arranged to the
+         * other machine of a pair, whose own estimate also counts that machine and can be much
+         * earlier. Absent where the two are the same.
+         */
+        val here: Map<Int, Estimate> = emptyMap(),
+        /**
+         * By registration key, for uncertain estimates only: the wait at the registration's own
+         * machine if nobody is moved between the two machines. The estimate itself is the
+         * earliest time; this is the other one. Where the two lie far apart both are shown,
+         * each by itself, instead of 最快 ([rangeUpperMinutes]): the wait will be near one of
+         * them, not anywhere in between.
+         */
+        val ifNobodyMoves: Map<Int, Long> = emptyMap()
     ) {
+        /** The wait of the first of [registrationKeys] to play if nobody is moved; null if unknown. */
+        fun waitIfNobodyMoves(registrationKeys: Collection<Int>): Long? =
+            registrationKeys.mapNotNull { ifNobodyMoves[it] }.minOrNull()
+
+        /**
+         * The earlier wait of a whole position when the pending online registrations ahead do
+         * not check in: only when every one of [registrationKeys] would play clearly earlier.
+         */
+        fun earlierPositionWaitIfOnlineMissing(registrationKeys: Collection<Int>): Long? {
+            if (registrationKeys.isEmpty()) return null
+            return registrationKeys.map { earlierIfOnlineMissing[it] ?: return null }.minOrNull()
+        }
+
+        /**
+         * When the first of [registrationKeys] is expected to play at the machine where they
+         * wait now. It differs from [estimate] only where one of them may be arranged to the
+         * other machine of a pair. The positions before them are never shown later than this
+         * ([displayMinutesInOrder]); a registration's own earlier time at the other machine must
+         * not pull them down (reported 2026-11-26: every position after A1 showed the same 15
+         * minutes).
+         *
+         * [arrivingHere] are registrations of the other machine shown as expected to play at
+         * this one first (a preview): their time here is their own estimate, not the one at the
+         * machine where they wait (review 2026-11-27).
+         */
+        fun hereEstimate(registrationKeys: Collection<Int>, arrivingHere: Set<Int> = emptySet()): Estimate? {
+            val estimates = registrationKeys.mapNotNull {
+                if (it in arrivingHere) registrations[it] else here[it] ?: registrations[it]
+            }
+            val earliest = estimates.minByOrNull(Estimate::waitMillis) ?: return null
+            return earliest.copy(uncertain = estimates.any(Estimate::uncertain))
+        }
+
         /** The estimate of the first of [registrationKeys] to play; uncertain if any of them is. */
         fun estimate(registrationKeys: Collection<Int>): Estimate? {
             val estimates = registrationKeys.mapNotNull { registrations[it] }
@@ -63,12 +130,55 @@ object WaitEstimator {
 
     val EMPTY = Result(emptyMap(), emptyMap())
 
+    /**
+     * From how many minutes between the earliest time and the time if nobody is moved both
+     * are shown for an uncertain wait (maintainer, 2026-11-28: “24分钟以上算太多”). Below
+     * that, 最快 with the earliest time says enough.
+     */
+    const val RANGE_GAP_MINUTES = 24L
+
+    /**
+     * The second time to show under a wait shown as [shownMinutes] and marked uncertain, with
+     * its condition (系统未在两台机台之间安排登记时): [waitIfNobodyMovesMillis] in whole
+     * minutes, when it lies at least [RANGE_GAP_MINUTES] later. A shown wait of 0 (可能很快)
+     * counts too. Null when the wait is to be shown as before.
+     */
+    fun rangeUpperMinutes(shownMinutes: Long?, uncertain: Boolean, waitIfNobodyMovesMillis: Long?): Long? {
+        if (!uncertain || shownMinutes == null || shownMinutes < 0L || waitIfNobodyMovesMillis == null) return null
+        // Both would read 2 小时以上.
+        if (shownMinutes > LONG_WAIT_MINUTES) return null
+        val upper = displayMinutes(waitIfNobodyMovesMillis, roundDown = false)
+        return upper.takeIf { it - shownMinutes >= RANGE_GAP_MINUTES }
+    }
+
     fun estimate(
         state: QueueEngineState,
         policy: QueueEnginePolicy,
         durations: Map<String, PairedMachineForecast.RoundDurations>,
         nowMillis: Long,
         settings: Settings = Settings()
+    ): Result {
+        val result = estimateOnce(state, policy, durations, nowMillis, settings)
+        val anyPending = state.queues.values.any { queue -> queue.waiting.any(Registration::requiresOnSiteCheckIn) }
+        if (!anyPending || settings.checkInShare <= 0.0) return result
+        // The same replays with no pending online registration checking in: each is then removed
+        // at its turn, and the registrations behind it may play a round earlier.
+        val missing = estimateOnce(state, policy, durations, nowMillis, settings.copy(checkInShare = 0.0))
+        val earlier = result.registrations.mapNotNull { (key, estimate) ->
+            val withoutThem = missing.registrations[key]?.waitMillis ?: return@mapNotNull null
+            (key to withoutThem).takeIf {
+                estimate.waitMillis - withoutThem >= settings.onlineMissingNoteAtLeastMillis
+            }
+        }.toMap()
+        return result.copy(earlierIfOnlineMissing = earlier)
+    }
+
+    private fun estimateOnce(
+        state: QueueEngineState,
+        policy: QueueEnginePolicy,
+        durations: Map<String, PairedMachineForecast.RoundDurations>,
+        nowMillis: Long,
+        settings: Settings
     ): Result {
         if (state.queues.isEmpty() || settings.runs <= 0) return EMPTY
         val normalized = PairedMachineQueues.normalize(state, policy)
@@ -174,6 +284,7 @@ object WaitEstimator {
         }
 
         val estimates = mutableMapOf<Int, Estimate>()
+        val hereEstimates = mutableMapOf<Int, Estimate>()
         val newcomerWaits = mutableMapOf<String, Long>()
         val baseReplays = mutableMapOf<String, Map<Int, LongArray>>()
 
@@ -210,12 +321,35 @@ object WaitEstimator {
                 } else {
                     null
                 }
+                // The other machine cannot receive it before its preview has been shown for the
+                // announced time, however soon a round ends there; told an earlier time, the
+                // player would wait for a move the rules do not make (review 2026-11-27).
+                val earliestArrangementMillis = policy.pairedArrangementRules?.let { rules ->
+                    val record = normalized.pairedArrangements[key]
+                    val since = record?.previewSinceMillis
+                    if (since != null && record.previewPausedAtMillis == null) {
+                        (since + rules.leadMillis - nowMillis).coerceAtLeast(0L)
+                    } else {
+                        rules.leadMillis
+                    }
+                } ?: 0L
                 val awayTimes = if (policy.isOperational(partner)) {
-                    baseReplays[partner]?.get(key)
-                        ?: replay(partner, withInserted(partner, leanOrder(partner), registration), setOf(key))[key]
+                    (
+                        baseReplays[partner]?.get(key)
+                            ?: replay(partner, withInserted(partner, leanOrder(partner), registration), setOf(key))[key]
+                        )?.let { times ->
+                            if (earliestArrangementMillis <= 0L) {
+                                times
+                            } else {
+                                LongArray(times.size) { maxOf(times[it], earliestArrangementMillis) }
+                            }
+                        }
                 } else {
                     null
                 }
+                // Its time at this machine, for the position it shares here. Uncertain: it may leave.
+                percentile(homeTimes, settings.registeredPercentile)
+                    ?.let { hereEstimates[key] = Estimate(it, uncertain = true) }
                 val estimate = if (share >= settings.certainAtLeast && awayTimes != null) {
                     percentile(awayTimes, settings.registeredPercentile)
                         ?.let { Estimate(it, uncertainAhead(partner, key)) }
@@ -234,15 +368,42 @@ object WaitEstimator {
                 .newcomerWaits(settings.newRegistrationPercentile)[machineId]
                 ?.let { newcomerWaits[machineId] = it }
         }
-        return Result(estimates, newcomerWaits, confidence)
+        // The other end of an uncertain estimate: this machine's own queue as it stands, with
+        // nobody moved away and nobody arriving. One plain replay per machine, kept simple on
+        // purpose (maintainer, 2026-11-28: “估计时间要注意避免过拟合，覆盖常用场景为主”).
+        val ifNobodyMoves = mutableMapOf<Int, Long>()
+        normalized.queues.forEach { (machineId, queue) ->
+            if (partners[machineId] == null || !policy.isOperational(machineId)) return@forEach
+            val uncertainKeys = queue.waiting
+                .filter { estimates[it.key]?.uncertain == true }
+                .mapTo(mutableSetOf(), Registration::key)
+            if (uncertainKeys.isEmpty()) return@forEach
+            val times = replay(machineId, queue.waiting, uncertainKeys)
+            uncertainKeys.forEach { key ->
+                percentile(times[key], settings.registeredPercentile)?.let { ifNobodyMoves[key] = it }
+            }
+        }
+        return Result(estimates, newcomerWaits, confidence, here = hereEstimates, ifNobodyMoves = ifNobodyMoves)
     }
 
-    /** Whole minutes as shown, by the maintainer's steps: 1 up to 30, 5 below 100, then 10. */
+    /**
+     * Above this many minutes a wait is shown as 2 小时以上, without a number (maintainer,
+     * 2026-11-28). [displayMinutes] then gives a value above it, so that comparisons still work.
+     */
+    const val LONG_WAIT_MINUTES = 120L
+
+    /**
+     * Whole minutes as shown, by the maintainer's steps (2026-11-28: “45分钟以内都精确到1分钟，
+     * 45-90分钟精确到5分钟，90-120分钟精确到10分钟。120分钟以上一律显示‘2小时以上’”): 1 up to
+     * 45, 5 below 90, 10 up to 120. Above [LONG_WAIT_MINUTES] the minutes rounded up are
+     * returned, which every client shows as 2 小时以上. The step is chosen by the wait itself.
+     */
     fun displayMinutes(waitMillis: Long, roundDown: Boolean): Long {
         val minutes = waitMillis.coerceAtLeast(0L) / 60_000.0
+        if (minutes > LONG_WAIT_MINUTES) return ceil(minutes).toLong()
         val step = when {
-            minutes <= 30.0 -> 1.0
-            minutes < 100.0 -> 5.0
+            minutes <= 45.0 -> 1.0
+            minutes < 90.0 -> 5.0
             else -> 10.0
         }
         val steps = if (roundDown) floor(minutes / step) else floor(minutes / step + 0.5)
@@ -254,19 +415,45 @@ object WaitEstimator {
      * estimate is rounded down, a certain one to the nearest step; a position is then never shown
      * later than one behind it, so rounding cannot make the order look reversed.
      */
-    fun displayMinutesInOrder(estimates: List<Estimate?>): List<Long?> {
-        val shown = estimates.map { estimate ->
+    fun displayMinutesInOrder(
+        estimates: List<Estimate?>,
+        /** The waits at this machine (Result.hereEstimate); the same as [estimates] by default. */
+        hereEstimates: List<Estimate?> = estimates
+    ): List<Long?> {
+        val limits = laterLimits(hereEstimates)
+        return estimates.mapIndexed { index, estimate ->
             estimate?.let { displayMinutes(it.waitMillis, roundDown = it.uncertain) }
-        }.toMutableList()
-        var later: Long? = null
-        for (index in shown.indices.reversed()) {
-            val value = shown[index] ?: continue
-            val capped = later?.let { minOf(value, it) } ?: value
-            shown[index] = capped
-            later = capped
+                ?.let { value -> limits[index]?.let { minOf(value, it) } ?: value }
         }
-        return shown
     }
+
+    /**
+     * For each position, the wait it is shown with at most, so that rounding cannot make the
+     * order look reversed: the least shown wait at this machine of itself and of the positions
+     * behind it whose wait is not really shorter. A time at the other machine of a pair does not
+     * count.
+     *
+     * A position behind whose wait really is shorter limits nothing. That is no effect of
+     * rounding: the estimate counts on somebody ahead moving to the other machine (shown as
+     * 最快 while that is uncertain, as a plain time once it is taken as certain), and then a
+     * registration behind may well play before registrations shown ahead of it, for example by
+     * sharing a round with one whose partner has left. Such a time used to pull every position
+     * ahead down to itself, so that several positions in a row showed the same minutes, 8 to 16
+     * minutes too early (review 2026-11-27, and the second simulation of 2026-11-28).
+     */
+    fun laterLimits(hereEstimates: List<Estimate?>): List<Long?> =
+        hereEstimates.indices.map { index ->
+            val own = hereEstimates[index]
+            var limit: Long? = null
+            for (later in index until hereEstimates.size) {
+                val estimate = hereEstimates[later] ?: continue
+                val counts = later == index || (own != null && estimate.waitMillis >= own.waitMillis)
+                if (!counts) continue
+                val value = displayMinutes(estimate.waitMillis, roundDown = estimate.uncertain)
+                limit = limit?.let { minOf(value, it) } ?: value
+            }
+            limit
+        }
 
     private fun earlierOfEach(first: LongArray?, second: LongArray?): LongArray? {
         if (first == null) return second
@@ -452,9 +639,9 @@ object WaitEstimator {
                         elapsed,
                         Draw.currentRound(run, machineId, keys, simulated.playingStartedAtMillis)
                     )
-                    simulated = simulated.finishRound(nowMillis + waitMillis)
+                    simulated = simulated.finishRound(nowMillis + waitMillis).filledAgain()
                 } else {
-                    simulated = simulated.enterPlayingPosition()
+                    simulated = simulated.enterPlayingPosition().filledAgain()
                 }
                 val found = mutableSetOf<Int>()
                 var steps = 0
@@ -472,10 +659,26 @@ object WaitEstimator {
                         simulated.playing.size,
                         Draw.round(run, machineId, keys, occurrence)
                     )
-                    simulated = simulated.finishRound(nowMillis + waitMillis)
+                    simulated = simulated.finishRound(nowMillis + waitMillis).filledAgain()
                 }
             }
             return times
+        }
+
+        /**
+         * An opportunity that a 暂缓一次 or 轮空一次 used up with nobody else to play leaves the
+         * playing position empty; the next one, taken at once, lets the registration play. Without
+         * this a lone deferred registration got no wait at all.
+         */
+        private fun MachineQueue.filledAgain(): MachineQueue {
+            var queue = this
+            var attempts = 0
+            while (queue.playing.isEmpty() && queue.waiting.isNotEmpty() && attempts++ < 3) {
+                val next = queue.enterPlayingPosition()
+                if (next == queue) break
+                queue = next
+            }
+            return queue
         }
 
         private fun singlePlayerQueue(queue: MachineQueue): MachineQueue {

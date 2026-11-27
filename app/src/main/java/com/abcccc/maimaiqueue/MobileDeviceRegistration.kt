@@ -32,7 +32,11 @@ internal data class MobileDeviceRegistrationCommand(
     val newProfile: MobileNewPlayerProfile?,
     val machineConfigurationRevision: Long? = null,
     /** The answer given on the phone; null when the page did not ask. */
-    val alsoQueuesAtPairedMachine: Boolean? = null
+    val alsoQueuesAtPairedMachine: Boolean? = null,
+    /** The answer to 允许后方的登记越过 on the phone; null when the page did not offer it. */
+    val allowsPassing: Boolean? = null,
+    /** 将本次选择保存为默认偏好: the chosen preference becomes the profile's default. */
+    val rememberPreference: Boolean = false
 ) : RemoteTerminalCommand {
     val createsProfile: Boolean
         get() = newProfile != null
@@ -234,8 +238,15 @@ internal fun decideMobileDeviceRegistration(
                 command.createdAtMillis,
                 profileBeforeUsage.updatedAtMillis + 1L
             ),
+            preferenceToRemember = expectedPreference.takeIf {
+                command.rememberPreference && !singlePlayerMachine
+            },
             // The phone page opens the explanation before it sends a ticked box.
-            pairedMachineQueueingIntroducedNow = command.alsoQueuesAtPairedMachine == true
+            pairedMachineQueueingIntroducedNow = command.alsoQueuesAtPairedMachine == true,
+            // The profile remembers the answer for next time, where the page offered the box.
+            passingChoice = command.allowsPassing.takeIf {
+                expectedPreference == PlayPreference.SOLO && !singlePlayerMachine
+            }
         )
     } else {
         profileBeforeUsage
@@ -254,7 +265,9 @@ internal fun decideMobileDeviceRegistration(
         playerProfileId = usedProfile.id,
         requiresOnSiteCheckIn = false,
         originatingCommandId = command.commandId,
-        alsoQueuesAtPairedMachine = queuesAtPairedMachine
+        alsoQueuesAtPairedMachine = queuesAtPairedMachine,
+        allowsPassing = command.allowsPassing == true &&
+            expectedPreference == PlayPreference.SOLO && !singlePlayerMachine
     )
     val execution = state.executeQueueAction(
         action = QueueAction.AddRegistrations(

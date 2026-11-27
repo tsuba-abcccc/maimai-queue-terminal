@@ -492,6 +492,93 @@ class PairedArrangementAnnouncementTest {
     }
 
     @Test
+    fun whereARegistrationWasArrangedFromIsForgottenOnceThatRoundIsOver() {
+        var state = QueueEngine.settlePairedMachines(
+            QueueEngineState(
+                queues = linkedMapOf(
+                    "A" to MachineQueue(
+                        playing = listOf(registration(1)),
+                        waiting = listOf(registration(2)),
+                        playingStartedAtMillis = start
+                    ),
+                    "B" to MachineQueue(
+                        playing = listOf(registration(9, arranged = true)),
+                        playingStartedAtMillis = start
+                    )
+                ),
+                pairedArrangements = mapOf(
+                    9 to PairedArrangementRecord(arrangedFromMachineId = "A")
+                )
+            ),
+            policy,
+            start
+        )
+        // 9 is the only registration of machine B: its round ends and it plays again at once.
+        state = apply(state, QueueAction.FinishRound("B"), atMinute = 10)
+        assertEquals(listOf(9), state.playing("B"))
+        assertNull(state.pairedArrangements[9]?.arrangedFromMachineId)
+
+        // Not showing up for this round is an ordinary no-show; it is not sent to machine A.
+        state = apply(
+            state,
+            QueueAction.MarkNoShow("B", setOf(9), NoShowResolution.MOVE_TO_TAIL),
+            atMinute = 11
+        )
+        assertEquals(listOf(2), state.waiting("A"))
+        val stayed = state.queue("B")!!.allRegistrations.single()
+        assertEquals(9, stayed.key)
+        assertEquals(1, stayed.noShowCount)
+    }
+
+    /** Machine A stands empty with [waitingOnA], none of which can play; 9 waits at machine B. */
+    private fun idleMachineReceiving(waitingOnA: List<Registration>): QueueEngineState {
+        var state = QueueEngine.settlePairedMachines(
+            QueueEngineState(
+                linkedMapOf(
+                    "A" to MachineQueue(waiting = waitingOnA),
+                    "B" to MachineQueue(
+                        playing = listOf(registration(5)),
+                        waiting = listOf(registration(6), registration(7), registration(9, arranged = true)),
+                        playingStartedAtMillis = start
+                    )
+                )
+            ),
+            policy,
+            start
+        )
+        // The preview is announced, and twelve minutes later 9 takes the empty machine.
+        (1..14).forEach { minute -> state = refresh(state, atMinute = minute).state }
+        assertEquals(listOf(9), state.playing("A"))
+        return state
+    }
+
+    @Test
+    fun anArrivalAtAnIdleMachineDoesNotRemoveAPendingRegistrationWaitingThere() {
+        val pending = registration(31).copy(
+            requiresOnSiteCheckIn = true,
+            onSiteCheckInStartedAtMillis = start,
+            wasOnlineRegistration = true
+        )
+        val state = idleMachineReceiving(listOf(pending))
+        // Its 30 minutes are not over, and nobody started a round at machine A.
+        val waiting = state.queue("A")!!.waiting
+        assertEquals(listOf(31), waiting.map(Registration::key))
+        assertTrue(waiting.single().requiresOnSiteCheckIn)
+    }
+
+    @Test
+    fun anArrivalAtAnIdleMachineIsNotATurnOfThePostponedRegistrationsWaitingThere() {
+        val deferred = registration(32).copy(absenceStatus = QueueAbsenceStatus.DEFER_ONE_ROUND)
+        val away = registration(33).copy(absenceStatus = QueueAbsenceStatus.TEMPORARILY_AWAY)
+        val state = idleMachineReceiving(listOf(deferred, away))
+        val waiting = state.queue("A")!!.waiting
+        assertEquals(listOf(32, 33), waiting.map(Registration::key))
+        assertEquals(QueueAbsenceStatus.DEFER_ONE_ROUND, waiting[0].absenceStatus)
+        assertFalse(waiting[0].deferOneRoundUsed)
+        assertEquals(0, waiting[1].temporaryAwaySkippedTurns)
+    }
+
+    @Test
     fun arrangedRegistrationThatCannotGoBackFollowsTheOrdinaryNoShowRule() {
         val stoppedA = policy.copy(
             machineStatuses = mapOf("A" to MachineStatus().stop(MachineStopReason.MAINTENANCE, start))

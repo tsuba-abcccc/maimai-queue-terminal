@@ -189,7 +189,7 @@ internal fun TerminalSettingsUpdateCommand.rejectionDetail(
     queueId != currentQueueId -> "现场已开始新的队列，请刷新后重试。"
     !settings.managementAppBound -> "现场终端已经解除管理后台接管，请重新绑定后再提交。"
     expectedPolicyRevision != settings.managementPolicyRevision ->
-        "终端接管策略已经更新，请管理后台刷新后重试。"
+        "由管理后台接管的设置已经更新，请管理后台刷新后重试。"
     expectedSettingsRevision != settings.managementSettingsRevision ->
         "终端设置已经更新，请刷新后重试。"
     nextSettingsRevision != expectedSettingsRevision + 1L -> "终端设置版本无效，未应用这次修改。"
@@ -1191,7 +1191,9 @@ private fun parseSyncedPlayerProfile(source: JSONObject?): PlayerProfile? {
             createdAtMillis = source.getLong("created_at"),
             updatedAtMillis = source.getLong("updated_at"),
             pairedMachineQueueingIntroduced =
-                source.optBoolean("paired_machine_queueing_introduced", false)
+                source.optBoolean("paired_machine_queueing_introduced", false),
+            lastAllowsPassing = source.optBoolean("last_allows_passing", false),
+            passingIntroduced = source.optBoolean("passing_introduced", false)
         ).withCanonicalContact()
     }.getOrNull()?.takeIf { profile ->
         runCatching { UUID.fromString(profile.id) }.isSuccess &&
@@ -1659,7 +1661,11 @@ private fun parseQueueOperation(command: JSONObject?): RemoteQueueOperationComma
                 payload.getBoolean("also_queues_at_paired_machine")
             } else {
                 null
-            }
+            },
+            allowsPassing = if (payload.has("allows_passing")) payload.getBoolean("allows_passing") else null,
+            partnerRegistrationId = payload.optionalNonBlankString("partner_registration_id"),
+            displayId = payload.optionalNonBlankString("display_id"),
+            rememberPreference = payload.optBoolean("remember_preference", false)
         )
     }.getOrNull()?.takeIf(::isValidQueueOperationCommand)
 }
@@ -1913,7 +1919,9 @@ private fun parseMobileDeviceRegistration(
                 payload.getBoolean("also_queues_at_paired_machine")
             } else {
                 null
-            }
+            },
+            allowsPassing = if (payload.has("allows_passing")) payload.getBoolean("allows_passing") else null,
+            rememberPreference = payload.optBoolean("remember_preference", false)
         ).also { parsed ->
             check((mode == "NEW") == (parsed.newProfile != null))
             check((mode == "EXISTING") == (parsed.newProfile == null))
@@ -2050,6 +2058,15 @@ private fun isValidQueueOperationCommand(command: RemoteQueueOperationCommand): 
             validMachineId(command.machineId) && validRegistrationId &&
                 command.targetMachineId == null && command.preference == null &&
                 command.expectedPosition == RemoteRegistrationPosition.WAITING
+        RemoteQueueOperation.CREATE_FIXED_PAIR ->
+            validMachineId(command.machineId) && validRegistrationId &&
+                command.targetMachineId == null && command.preference == null &&
+                command.partnerRegistrationId?.matches(Regex("[0-9a-f]{24}")) == true &&
+                command.partnerRegistrationId != command.registrationId
+        RemoteQueueOperation.RENAME_REGISTRATION ->
+            validMachineId(command.machineId) && validRegistrationId &&
+                command.targetMachineId == null && command.preference == null &&
+                !command.displayId.isNullOrBlank()
         RemoteQueueOperation.CREATE_REGISTRATION ->
             validMachineId(command.machineId) &&
                 command.profileId != null &&
@@ -2421,6 +2438,12 @@ internal fun buildQueueSyncSnapshot(
                         if (profile.pairedMachineQueueingIntroduced) {
                             put("paired_machine_queueing_introduced", true)
                         }
+                        // The last answer to the passing tick box; the website starts from it.
+                        put("last_allows_passing", profile.lastAllowsPassing)
+                        // Like the flag above: only ever sent as true.
+                        if (profile.passingIntroduced) {
+                            put("passing_introduced", true)
+                        }
                     }
                 )
             }
@@ -2560,6 +2583,11 @@ internal fun buildPublicQueueSnapshot(
         state.registrationOpen && !displaySettings.businessHours.closingGracePeriod
     )
     put("website_remote_enabled", displaySettings.websiteRemoteEnabled)
+    // The remote operations this terminal can carry out, so that the server and the website
+    // offer none that it would have to drop.
+    put("supported_queue_operations", JSONArray(RemoteQueueOperation.entries.map { it.name }))
+    // SET_ALLOWS_PASSING is also accepted for a member of a fixed pair (one choice for both).
+    put("fixed_pair_passing_supported", true)
     put("onebot_sync_enabled", displaySettings.oneBotSyncEnabled)
     put("management_policy_supported", displaySettings.managementPolicySupported)
     put("management_app_bound", displaySettings.managementAppBound)
@@ -2664,7 +2692,8 @@ internal fun buildPublicQueueSnapshot(
         displaySettings = displaySettings,
         capturedAtMillis = capturedAtMillis
     )
-    val waitEstimates = publicWaitEstimates(state, displaySettings, capturedAtMillis)
+    // At background priority, and never at the same time as the terminal's own estimate.
+    val waitEstimates = onWaitEstimateThread { publicWaitEstimates(state, displaySettings, capturedAtMillis) }
     put(
         "machines",
         JSONObject().apply {
@@ -2959,7 +2988,11 @@ private fun buildPublicMachine(
         }
     val waitingKeys = waitingProjection.map { position -> position.registrations.map { it.key }.toSet() }
     val waitingEstimates = positionWaits(waitingKeys)
-    val waitingMinutes = WaitEstimator.displayMinutesInOrder(waitingEstimates)
+    // No position later than the times at this machine of those behind it (hereEstimate).
+    val waitingMinutes = WaitEstimator.displayMinutesInOrder(
+        waitingEstimates,
+        waitingKeys.map { keys -> if (status.isOperational) waitEstimates.hereEstimate(keys) else null }
+    )
     fun commonPlayPreviewJson(preview: Registration?): Any = preview?.let {
         JSONObject().apply {
             put("registration_id", publicRegistrationId(queueId, preview.key))
@@ -3011,6 +3044,10 @@ private fun buildPublicMachine(
         )
         put("registration_count", queue.registrationCount)
         put("waiting_position_count", waitingProjection.size)
+        // On the queue as the page shows it: with previews of the other machine the website draws
+        // paired_waiting_positions, where a preview that takes the place leaves nobody passing
+        // (maintainer, 2026-11-27); the terminal's own labels do the same.
+        val projectedPasses = (waitingWithPreviews?.first ?: queue).projectedPasses()
         put(
             "new_registration_estimated_wait_minutes",
             if (status.isOperational && queue.registrationCount < 20) {
@@ -3025,7 +3062,13 @@ private fun buildPublicMachine(
             "playing",
             JSONArray().apply {
                 queue.playing.forEach { registration ->
-                    put(buildPublicRegistration(queueId, registration))
+                    put(
+                        buildPublicRegistration(
+                            queueId,
+                            registration,
+                            passingOverKeys = registration.passedOverKeys
+                        )
+                    )
                 }
             }
         )
@@ -3050,6 +3093,14 @@ private fun buildPublicMachine(
                                 "estimated_wait_uncertain",
                                 waitingMinutes[index] != null && waitingEstimates[index]?.uncertain == true
                             )
+                            // An uncertain wait far from the wait if nobody is moved: the
+                            // minutes if nobody is moved, which clients show on their own line
+                            // with the condition 系统未在两台机台之间安排登记时. Absent otherwise.
+                            WaitEstimator.rangeUpperMinutes(
+                                waitingMinutes[index],
+                                waitingEstimates[index]?.uncertain == true,
+                                waitEstimates.waitIfNobodyMoves(registrationKeys)
+                            )?.let { put("estimated_wait_upper_minutes", it) }
                             put(
                                 "registrations",
                                 JSONArray().apply {
@@ -3058,8 +3109,33 @@ private fun buildPublicMachine(
                                             buildPublicRegistration(
                                                 queueId,
                                                 registration,
-                                                pairedMachines?.arrangementOutlook(registration.key)
-                                            )
+                                                pairedMachines?.arrangementOutlook(registration.key),
+                                                passingOverKeys = projectedPasses[registration.key].orEmpty()
+                                            ).apply {
+                                                // A position shows the earlier of its two; where
+                                                // that is the other one's, which may move to the
+                                                // other machine, this one's own wait as the
+                                                // terminal menu shows it (review 2026-11-27).
+                                                val own = if (status.isOperational && registrations.size == 2) {
+                                                    shownPositionWait(waitEstimates, waitingKeys, setOf(registration.key))
+                                                } else {
+                                                    null
+                                                }
+                                                val ownMinutes = own?.minutes?.takeIf { it != waitingMinutes[index] }
+                                                if (ownMinutes != null) {
+                                                    put("own_estimated_wait_minutes", ownMinutes)
+                                                    put("own_estimated_wait_uncertain", own.uncertain)
+                                                    own.upperMinutes?.let {
+                                                        put("own_estimated_wait_upper_minutes", it)
+                                                    }
+                                                }
+                                                // The earlier time for when the pending online
+                                                // registrations ahead do not check in.
+                                                onlineMissingWaitMinutes(
+                                                    waitEstimates.earlierIfOnlineMissing[registration.key],
+                                                    ownMinutes ?: waitingMinutes[index]
+                                                )?.let { put("wait_minutes_if_online_missing", it) }
+                                            }
                                         )
                                     }
                                 }
@@ -3084,10 +3160,14 @@ private fun buildPublicMachine(
                     val pairedPositions = displayQueue.waitingProjection(
                         includeCommonPlayPreview = includeCommonPlayPreview
                     ).positions
-                    val pairedEstimates = positionWaits(
-                        pairedPositions.map { position -> position.registrations.map { it.key }.toSet() }
+                    val pairedKeys = pairedPositions.map { position -> position.registrations.map { it.key }.toSet() }
+                    val pairedEstimates = positionWaits(pairedKeys)
+                    // Capped by the times at this machine, as waiting_positions is; a preview's
+                    // time here is its own (review 2026-11-27).
+                    val pairedMinutes = WaitEstimator.displayMinutesInOrder(
+                        pairedEstimates,
+                        pairedKeys.map { keys -> if (status.isOperational) waitEstimates.hereEstimate(keys, previewKeys) else null }
                     )
-                    val pairedMinutes = WaitEstimator.displayMinutesInOrder(pairedEstimates)
                     pairedPositions.forEachIndexed { index, position ->
                         val registrationKeys = position.registrations.map { it.key }.toSet()
                         put(
@@ -3140,10 +3220,19 @@ private fun buildPublicMachine(
 private fun buildPublicRegistration(
     queueId: String,
     registration: Registration,
-    arrangementOutlook: PairedArrangementOutlook? = null
+    arrangementOutlook: PairedArrangementOutlook? = null,
+    /**
+     * The registrations this one passes over: in the playing position the pass of this round,
+     * in the waiting order the pass the positions on screen show (docs/releases/solo-pass-plan-2026-11.md).
+     */
+    passingOverKeys: List<Int> = emptyList()
 ): JSONObject =
     JSONObject().apply {
         put("registration_id", publicRegistrationId(queueId, registration.key))
+        if (registration.letsOthersPass) put("allows_passing", true)
+        if (passingOverKeys.isNotEmpty()) {
+            put("passing_over", JSONArray(passingOverKeys.map { publicRegistrationId(queueId, it) }))
+        }
         put("display_id", registration.displayId)
         put("preference", registration.preference.name)
         put(
@@ -3160,6 +3249,10 @@ private fun buildPublicRegistration(
         // registration that has not played cannot be postponed at all (2026-11-25).
         put("defer_one_round_used", registration.deferOneRoundUsed)
         put("online_registration_not_played", registration.mustBeRemovedWhenAbsent)
+        // 线上登记，已签到: shown among the facts of a registration, as in the terminal's menu.
+        if (registration.wasOnlineRegistration && !registration.requiresOnSiteCheckIn) {
+            put("online_registration_checked_in", true)
+        }
         put("fixed_pair", registration.fixedPartnerKey != null)
         put(
             "fixed_pair_id",
@@ -3287,17 +3380,11 @@ private const val MAX_PUBLIC_EVENT_DETAIL_LENGTH = 2_000
 private const val NETWORK_TIMEOUT_MILLIS = 8_000
 
 /**
- * The count of missed turns as other parties are told it. To the server, the website and the
- * Bot it only means something while the registration is temporarily away or will skip one turn
- * (the two share the count), and the server refuses a snapshot that carries it otherwise; that
- * it is kept until the registration has played is known to the terminal alone.
+ * The count of missed turns as other parties are told it: the real count, at all times. It used
+ * to be told only while the registration was temporarily away or would skip one turn, so the
+ * website could not say “已轮空 2 次，这次将是第 3 次” before the player confirmed, as the
+ * terminal does (2026-11-28). A server from before that day refuses a snapshot that carries
+ * the count otherwise: the server is updated before the terminal.
  */
 internal val Registration.publishedTemporaryAwaySkippedTurns: Int
-    get() = if (
-        absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY ||
-        absenceStatus == QueueAbsenceStatus.SKIP_ONE_TURN
-    ) {
-        temporaryAwaySkippedTurns
-    } else {
-        0
-    }
+    get() = temporaryAwaySkippedTurns

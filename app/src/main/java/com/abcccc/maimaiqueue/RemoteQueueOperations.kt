@@ -15,7 +15,13 @@ internal enum class RemoteQueueOperation {
     CHECK_IN,
     CREATE_REGISTRATION,
     REORDER_QUEUE,
-    SET_PAIRED_MACHINE_QUEUEING
+    SET_PAIRED_MACHINE_QUEUEING,
+    /** 单人游玩 that lets the registrations around it pass (2026-11-26). */
+    SET_ALLOWS_PASSING,
+    /** 与朋友共同游玩 with a registration that already waits at the same machine (2026-11-28). */
+    CREATE_FIXED_PAIR,
+    /** 修改登记昵称: the name this one registration shows, not the profile's (2026-11-28). */
+    RENAME_REGISTRATION
 }
 
 internal enum class RemoteQueueOperationSource {
@@ -64,7 +70,22 @@ internal data class RemoteQueueOperationCommand(
      * made while joining, or the state asked for by [RemoteQueueOperation.SET_PAIRED_MACHINE_QUEUEING].
      * Null when the request does not mention it.
      */
-    val alsoQueuesAtPairedMachine: Boolean? = null
+    val alsoQueuesAtPairedMachine: Boolean? = null,
+    /**
+     * Whether a 单人游玩 registration lets the registrations around it pass: the choice made
+     * while joining, or the state asked for by [RemoteQueueOperation.SET_ALLOWS_PASSING]. Null
+     * when the request does not mention it.
+     */
+    val allowsPassing: Boolean? = null,
+    /** The friend's registration for [RemoteQueueOperation.CREATE_FIXED_PAIR], as a public id. */
+    val partnerRegistrationId: String? = null,
+    /** The new nickname for [RemoteQueueOperation.RENAME_REGISTRATION]. */
+    val displayId: String? = null,
+    /**
+     * When joining: the chosen play preference becomes the profile's default (“将本次选择保存为
+     * 默认游玩偏好，以后不再询问。”).
+     */
+    val rememberPreference: Boolean = false
 ) : RemoteTerminalCommand
 
 /**
@@ -100,8 +121,17 @@ internal data class RemoteQueueExecutionState(
     /** Orders shared by paired machines, and the pairs themselves, as the queue engine uses them. */
     val pairedMachineOrders: Map<String, List<Int>> = emptyMap(),
     val pairedArrangements: Map<Int, PairedArrangementRecord> = emptyMap(),
-    val machinePartners: Map<String, String> = emptyMap()
+    val machinePartners: Map<String, String> = emptyMap(),
+    /** The names the venue gave its machines, such as 左侧·机台 A, for the answers to players. */
+    val machineNames: Map<String, String> = emptyMap()
 )
+
+/**
+ * The name of [machineId] as the terminal and the website show it. The answers used to say
+ * 机台 B where the confirmation the player had just read said 右侧·机台 B (review 2026-11-27).
+ */
+internal fun RemoteQueueExecutionState.machineLabel(machineId: String): String =
+    machineNames[machineId]?.takeIf(String::isNotBlank) ?: "机台 $machineId"
 
 /**
  * The machine that holds [registrationKey]. A registration that queues at two machines can be
@@ -222,7 +252,11 @@ internal fun decideRemoteQueueOperation(
                         atMillis = maxOf(
                             exactRegistration.createdAtMillis,
                             profile.updatedAtMillis + 1L
-                        )
+                        ),
+                        passingChoice = exactRegistration.allowsPassing.takeIf {
+                            command.allowsPassing != null &&
+                                exactRegistration.preference == PlayPreference.SOLO
+                        }
                     )
                 }
             return already(
@@ -260,10 +294,10 @@ internal fun decideRemoteQueueOperation(
         val machineId = command.machineId ?: return reject("没有指定登记机台。")
         val queue = state.queues[machineId] ?: return reject("所选机台不存在。")
         if (state.machineStatuses[machineId]?.isOperational != true) {
-            return reject("机台 $machineId 已停止使用，暂不能创建登记。")
+            return reject("${state.machineLabel(machineId)} 已停止使用，暂不能创建登记。")
         }
         if (queue.registrationCount >= MAX_REGISTRATIONS_PER_MACHINE) {
-            return reject("机台 $machineId 的登记已满，请选择其他机台。")
+            return reject("${state.machineLabel(machineId)} 的登记已满，请选择其他机台。")
         }
         val alreadyRegistered = state.queues.values.any { currentQueue ->
             currentQueue.allRegistrations.any { registration ->
@@ -296,6 +330,8 @@ internal fun decideRemoteQueueOperation(
             machineId = machineId,
             requested = command.alsoQueuesAtPairedMachine
         ) ?: return reject("一对机台的设置已经变化，请重新确认后再创建。")
+        val allowsPassing = command.allowsPassing == true &&
+            resolvedPreference == PlayPreference.SOLO && !singlePlayerMachine
         val registration = Registration(
             key = state.nextRegistrationKey,
             displayId = profile.nickname,
@@ -306,7 +342,8 @@ internal fun decideRemoteQueueOperation(
             playerProfileId = profile.id,
             requiresOnSiteCheckIn = false,
             originatingCommandId = command.commandId,
-            alsoQueuesAtPairedMachine = queuesAtPairedMachine
+            alsoQueuesAtPairedMachine = queuesAtPairedMachine,
+            allowsPassing = allowsPassing
         )
         val queueAction = QueueAction.AddRegistrations(
             machineId = machineId,
@@ -322,7 +359,11 @@ internal fun decideRemoteQueueOperation(
             ?: return reject("终端未能创建登记，请重新查询后再试。")
         val usedProfile = if ((profile.lastUsedAtMillis ?: Long.MIN_VALUE) < appliedAtMillis) {
             profile.recordUsage(
-                atMillis = maxOf(appliedAtMillis, profile.updatedAtMillis + 1L)
+                atMillis = maxOf(appliedAtMillis, profile.updatedAtMillis + 1L),
+                // As the retry above records it (review 2026-11-27).
+                passingChoice = allowsPassing.takeIf {
+                    command.allowsPassing != null && resolvedPreference == PlayPreference.SOLO && !singlePlayerMachine
+                }
             )
         } else null
         return RemoteQueueOperationDecision.Apply(
@@ -333,12 +374,12 @@ internal fun decideRemoteQueueOperation(
                 nextRegistrationKey = state.nextRegistrationKey + 1
             ),
             detail = buildString {
-                append("管理后台已在 机台 $machineId 创建登记。")
+                append("管理后台已在 ${state.machineLabel(machineId)} 创建登记。")
                 if (singlePlayerMachine) append("这台机台仅能容纳一人游玩，本次已使用“单人游玩”。")
                 if (holdingMachineId != machineId) {
                     append(
-                        "机台 $holdingMachineId 当前可以游玩，" +
-                            "登记已自动转至 机台 $holdingMachineId 并进入游玩位置。"
+                        "${state.machineLabel(holdingMachineId)} 当前可以游玩，" +
+                            "登记已自动转至 ${state.machineLabel(holdingMachineId)} 并进入游玩位置。"
                     )
                 }
             },
@@ -394,9 +435,10 @@ internal fun decideRemoteQueueOperation(
             ?: return reject("命令缺少当前登记顺序。")
         val desiredOrder = command.registrationOrder
             ?: return reject("命令缺少新的登记顺序。")
-        val currentOrder = queue.allRegistrations.map {
-            publicRegistrationId(state.queueId, it.key)
-        }
+        // The order as the snapshot publishes it (the home screen's), which is what the
+        // management app and the server know; see decideManagementQueueAction.
+        val currentOrder = (queue.playing.map(Registration::key) + queue.shownWaitingPositionKeys().flatten())
+            .map { publicRegistrationId(state.queueId, it) }
         if (currentOrder != expectedOrder) {
             return reject("现场队列已经更新，请刷新后重试。")
         }
@@ -413,11 +455,13 @@ internal fun decideRemoteQueueOperation(
         val registrationsById = queue.allRegistrations.associateBy {
             publicRegistrationId(state.queueId, it.key)
         }
-        val reordered = desiredOrder.mapNotNull { registrationsById[it] }
-        if (reordered.size != desiredOrder.size) {
-            return reject("新的登记顺序包含不存在的登记。")
+        // Only what was moved changes place; the real order of the rest stays.
+        val desiredWaitingKeys = desiredOrder.drop(playingCount).map { id ->
+            registrationsById[id]?.key ?: return reject("新的登记顺序包含不存在的登记。")
         }
-        val queueAction = QueueAction.ReplaceOrder(machineId, reordered)
+        val reorderedQueue = queue.withShownRegistrationOrder(desiredWaitingKeys)
+            ?: return reject("新的登记顺序与当前队列不一致。")
+        val queueAction = QueueAction.ReplaceOrder(machineId, reorderedQueue.allRegistrations)
         val execution = state.executeQueueAction(
             action = queueAction,
             origin = command.source.queueActionOrigin,
@@ -433,7 +477,7 @@ internal fun decideRemoteQueueOperation(
                 pairedMachineOrders = execution.state.pairedMachineOrders,
                 pairedArrangements = execution.state.pairedArrangements
             ),
-            detail = "管理后台已调整 机台 $machineId 的等待顺序。",
+            detail = "管理后台已调整 ${state.machineLabel(machineId)} 的等待顺序。",
             changedMachineIds = setOf(machineId),
             action = queueAction
         )
@@ -473,10 +517,10 @@ internal fun decideRemoteQueueOperation(
         val machineId = command.machineId ?: return reject("没有指定排队机台。")
         val queue = state.queues[machineId] ?: return reject("所选机台不存在。")
         if (state.machineStatuses[machineId]?.isOperational != true) {
-            return reject("机台 $machineId 已停止使用，暂不能加入。")
+            return reject("${state.machineLabel(machineId)} 已停止使用，暂不能加入。")
         }
         if (queue.registrationCount >= MAX_REGISTRATIONS_PER_MACHINE) {
-            return reject("机台 $machineId 的登记已满，请选择其他机台。")
+            return reject("${state.machineLabel(machineId)} 的登记已满，请选择其他机台。")
         }
         val alreadyRegistered = state.queues.values.any { currentQueue ->
             currentQueue.allRegistrations.any { registration ->
@@ -510,6 +554,8 @@ internal fun decideRemoteQueueOperation(
             machineId = machineId,
             requested = command.alsoQueuesAtPairedMachine
         ) ?: return reject("一对机台的设置已经变化，请重新确认后再加入。")
+        val allowsPassing = command.allowsPassing == true &&
+            resolvedPreference == PlayPreference.SOLO && !singlePlayerMachine
         val registration = Registration(
             key = state.nextRegistrationKey,
             displayId = profile.nickname,
@@ -521,7 +567,8 @@ internal fun decideRemoteQueueOperation(
             requiresOnSiteCheckIn = true,
             wasOnlineRegistration = true,
             originatingCommandId = command.commandId,
-            alsoQueuesAtPairedMachine = queuesAtPairedMachine
+            alsoQueuesAtPairedMachine = queuesAtPairedMachine,
+            allowsPassing = allowsPassing
         )
         // A remote join may arrive while the playing position was deliberately left empty.
         // It must only append the pending registration and never advance another group.
@@ -535,17 +582,27 @@ internal fun decideRemoteQueueOperation(
             origin = command.source.queueActionOrigin,
             atMillis = appliedAtMillis
         ) as? QueueActionExecution.Applied
-        val updatedQueue = execution?.state?.queue(machineId)
-        if (updatedQueue == null || updatedQueue.registrationCount != queue.registrationCount + 1) {
+        // Judged by the new registration itself: the same execution may also let a waiting
+        // registration of the other machine of a pair move here, which changes the counts
+        // (review 2026-11-27).
+        if (execution?.state?.machineHolding(registration.key) == null) {
             return reject("终端未能创建线上登记，请重新查询后再试。")
         }
         val usedProfile = if ((profile.lastUsedAtMillis ?: Long.MIN_VALUE) < appliedAtMillis) {
             profile.recordUsage(
                 atMillis = maxOf(appliedAtMillis, profile.updatedAtMillis + 1L),
+                // 将本次选择保存为默认游玩偏好，以后不再询问。
+                preferenceToRemember = resolvedPreference.takeIf {
+                    command.rememberPreference && !singlePlayerMachine
+                },
                 // The website opens the explanation before it sends such a request; the Bot
                 // has nothing to show and therefore records nothing.
                 pairedMachineQueueingIntroducedNow = queuesAtPairedMachine &&
-                    command.source == RemoteQueueOperationSource.WEBSITE_REMOTE
+                    command.source == RemoteQueueOperationSource.WEBSITE_REMOTE,
+                // The website sends the answer, ticked or not, wherever it offered the box.
+                passingChoice = command.allowsPassing.takeIf {
+                    resolvedPreference == PlayPreference.SOLO && !singlePlayerMachine
+                }
             )
         } else {
             null
@@ -558,7 +615,7 @@ internal fun decideRemoteQueueOperation(
                 nextRegistrationKey = state.nextRegistrationKey + 1
             ),
             detail = buildString {
-                append("线上登记已加入 机台 $machineId 的等待顺序。")
+                append("线上登记已加入 ${state.machineLabel(machineId)} 的等待顺序。")
                 if (singlePlayerMachine) {
                     append("这台机台仅能容纳一人游玩，本次已使用“单人游玩”。")
                 }
@@ -594,6 +651,33 @@ internal fun decideRemoteQueueOperation(
     if (profile != null && registration.playerProfileId != profile.id) {
         return reject("这份登记已不再关联当前玩家资料。")
     }
+    // A cancel that arrives after the 轮空一次 or 暂缓一次 was carried out is not a repeated
+    // cancel: the registration is already at the tail, or has already let the others go first
+    // (review 2026-11-27). The skip count and the used deferral tell the two apart.
+    val carriedOutDetail = when (command.operation) {
+        RemoteQueueOperation.CANCEL_SKIP_ONE_TURN -> {
+            val expectedSkips = command.expectedTemporaryAwaySkippedTurns
+            if (
+                registration.absenceStatus == QueueAbsenceStatus.NONE &&
+                expectedSkips != null &&
+                registration.temporaryAwaySkippedTurns > expectedSkips
+            ) {
+                registrationSubject(
+                    "这份登记已轮空一次并移至队尾，无法再取消。",
+                    "固定组合的两份登记已轮空一次并移至队尾，无法再取消。"
+                )
+            } else null
+        }
+        RemoteQueueOperation.CANCEL_DEFER_ONE_ROUND ->
+            if (registration.absenceStatus == QueueAbsenceStatus.NONE && registration.deferOneRoundUsed) {
+                registrationSubject(
+                    "这份登记的暂缓一次已完成，无法再取消。",
+                    "固定组合两份登记的暂缓一次已完成，无法再取消。"
+                )
+            } else null
+        else -> null
+    }
+    if (carriedOutDetail != null) return reject(carriedOutDetail)
     val alreadyAppliedDetail = when (command.operation) {
         RemoteQueueOperation.DEFER_ONE_ROUND ->
             if (registration.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND) {
@@ -639,7 +723,7 @@ internal fun decideRemoteQueueOperation(
             } else null
         RemoteQueueOperation.TRANSFER_MACHINE ->
             if (command.targetMachineId == actualMachineId) {
-                "这份登记已经在 机台 $actualMachineId 排队。"
+                "这份登记已经在 ${state.machineLabel(actualMachineId)} 排队。"
             } else null
         RemoteQueueOperation.CHANGE_PLAY_PREFERENCE ->
             if (
@@ -662,12 +746,37 @@ internal fun decideRemoteQueueOperation(
                     }
                 else -> null
             }
+        RemoteQueueOperation.SET_ALLOWS_PASSING ->
+            when (command.allowsPassing) {
+                registration.allowsPassing -> {
+                    val subject = if (registration.fixedPartnerKey != null) "这组固定组合" else "这份登记"
+                    if (registration.allowsPassing) {
+                        "${subject}已经允许后方的登记越过。"
+                    } else {
+                        "${subject}已经不允许后方的登记越过。"
+                    }
+                }
+                else -> null
+            }
         RemoteQueueOperation.CREATE_REGISTRATION -> null
         RemoteQueueOperation.REORDER_QUEUE -> null
+        // Both say "already" themselves, further down.
+        RemoteQueueOperation.CREATE_FIXED_PAIR,
+        RemoteQueueOperation.RENAME_REGISTRATION -> null
         RemoteQueueOperation.JOIN_QUEUE,
         RemoteQueueOperation.LEAVE_QUEUE -> null
     }
-    if (alreadyAppliedDetail != null) return already(alreadyAppliedDetail)
+    if (alreadyAppliedDetail != null) {
+        // The answer may not have reached the profile the first time (its write failed after
+        // the queue was saved); a retry still remembers it (review 2026-11-27).
+        val profileWithPassingChoice = command.allowsPassing
+            ?.takeIf { command.operation == RemoteQueueOperation.SET_ALLOWS_PASSING }
+            ?.let { enabled ->
+                state.playerProfiles.firstOrNull { it.id == registration.playerProfileId }
+                    ?.let { profile -> profile.rememberingPassingAnswer(registration, enabled, appliedAtMillis) }
+            }
+        return already(alreadyAppliedDetail, profileWithPassingChoice)
+    }
 
     if (command.expectedPosition != null) {
         val actualPosition = if (queue.playing.any { it.key == registration.key }) {
@@ -707,7 +816,7 @@ internal fun decideRemoteQueueOperation(
         command.operation != RemoteQueueOperation.LEAVE_QUEUE &&
         command.operation != RemoteQueueOperation.TRANSFER_MACHINE
     ) {
-        return reject("机台 $actualMachineId 已停止使用，恢复正常使用前只能退出排队或转至其他机台。")
+        return reject("${state.machineLabel(actualMachineId)} 已停止使用，恢复正常使用前只能退出排队或转至其他机台。")
     }
     if (
         registration.requiresOnSiteCheckIn &&
@@ -716,6 +825,136 @@ internal fun decideRemoteQueueOperation(
             command.operation == RemoteQueueOperation.CHECK_IN)
     ) {
         return reject("线上登记完成现场签到后，才能进行这项操作。")
+    }
+
+    if (command.operation == RemoteQueueOperation.RENAME_REGISTRATION) {
+        val newName = command.displayId?.trim().orEmpty()
+        if (newName.isBlank() || newName.codePointCount(0, newName.length) > 18) {
+            return reject("登记昵称应为 1 至 18 个字符，请重新填写。")
+        }
+        if (newName == registration.displayId) {
+            return already("这份登记的昵称已经是“$newName”。")
+        }
+        // Every machine is one venue: no two registrations share a nickname.
+        val taken = state.queues.values.any { machineQueue ->
+            machineQueue.allRegistrations.any {
+                it.key != registration.key && it.displayId.trim().equals(newName, ignoreCase = true)
+            }
+        }
+        if (taken) return reject("当前队列中已经有相同昵称的登记。")
+        val queueAction = QueueAction.RenameRegistration(actualMachineId, registration.key, newName)
+        val execution = state.executeQueueAction(
+            action = queueAction,
+            origin = command.source.queueActionOrigin,
+            atMillis = appliedAtMillis
+        ) as? QueueActionExecution.Applied
+        val renamed = execution?.state?.queue(actualMachineId)?.allRegistrations
+            ?.firstOrNull { it.key == registration.key }
+        if (execution == null || renamed?.displayId != newName) {
+            return reject("队列状态已经变化，这项操作没有执行。")
+        }
+        return RemoteQueueOperationDecision.Apply(
+            state = state.copy(
+                queues = execution.state.queues,
+                pairedMachineOrders = execution.state.pairedMachineOrders,
+                pairedArrangements = execution.state.pairedArrangements
+            ),
+            detail = if (registration.playerProfileId != null) {
+                "登记昵称已改为“$newName”。玩家资料中的昵称没有改变。"
+            } else {
+                "登记昵称已改为“$newName”。"
+            },
+            changedMachineIds = setOf(actualMachineId),
+            action = queueAction
+        )
+    }
+
+    if (command.operation == RemoteQueueOperation.CREATE_FIXED_PAIR) {
+        if (state.machineCapacity(actualMachineId) == 1) {
+            return reject("${state.machineLabel(actualMachineId)} 仅能容纳一人游玩，不能组成固定组合。")
+        }
+        if (queue.waiting.none { it.key == registration.key }) {
+            return reject("这份登记处于游玩位置。请在本轮结束、这份登记回到等待顺序后，再组成固定组合。")
+        }
+        val partnerId = command.partnerRegistrationId
+            ?: return reject("未能确定朋友的登记，请重新选择。")
+        val partner = queue.waiting.firstOrNull {
+            publicRegistrationId(state.queueId, it.key) == partnerId
+        } ?: return reject("朋友的登记已经不在这台机台的等待顺序中，请重新选择。")
+        if (partner.key == registration.key) {
+            return reject("未能确定朋友的登记，请重新选择。")
+        }
+        if (registration.fixedPartnerKey != null) {
+            return if (registration.fixedPartnerKey == partner.key) {
+                already("这两份登记已经组成固定组合。")
+            } else {
+                reject("这份登记已经属于固定组合，请先解除固定组合。")
+            }
+        }
+        if (partner.fixedPartnerKey != null) {
+            return reject("“${partner.displayId}”已经属于固定组合。")
+        }
+        if (partner.requiresOnSiteCheckIn) {
+            return reject("这份线上登记尚未完成现场签到，签到后才能组成固定组合。")
+        }
+        if (
+            registration.absenceStatus != QueueAbsenceStatus.NONE ||
+            partner.absenceStatus != QueueAbsenceStatus.NONE
+        ) {
+            return reject(FIXED_PAIR_WHILE_POSTPONED_REASON)
+        }
+        val plan = queue.planFriendPair(registration.key, partner.key)
+            ?: return reject("无法确认这两份登记当前所在的等待顺序，请重新查询后再操作。")
+        fun names(registrations: List<Registration>) =
+            registrations.joinToString("、") { "“${it.displayId}”" }
+        if (plan.delayedOtherRegistrations.isNotEmpty()) {
+            return reject(
+                "如果直接组成固定组合，${names(plan.delayedOtherRegistrations)}会延后游玩，因此不能组成固定组合。"
+            )
+        }
+        val pairAllowsPassing = command.allowsPassing == true
+        val queueAction = QueueAction.CreateFixedPair(
+            machineId = actualMachineId,
+            firstRegistrationKey = plan.firstRegistration.key,
+            secondRegistrationKey = plan.secondRegistration.key,
+            expectedPlan = plan,
+            allowsPassing = pairAllowsPassing
+        )
+        val execution = state.executeQueueAction(
+            action = queueAction,
+            origin = command.source.queueActionOrigin,
+            atMillis = appliedAtMillis
+        ) as? QueueActionExecution.Applied
+        val paired = execution?.state?.queue(actualMachineId)?.waiting
+            ?.firstOrNull { it.key == registration.key }
+        if (execution == null || paired?.fixedPartnerKey != partner.key) {
+            return reject("队列状态已经变化，这项操作没有执行。")
+        }
+        return RemoteQueueOperationDecision.Apply(
+            state = state.copy(
+                queues = execution.state.queues,
+                pairedMachineOrders = execution.state.pairedMachineOrders,
+                pairedArrangements = execution.state.pairedArrangements
+            ),
+            detail = buildString {
+                append("“${registration.displayId}”与“${partner.displayId}”已组成固定组合。")
+                if (plan.movedBackRegistrations.isNotEmpty()) {
+                    append(
+                        "为避免延后其他玩家，${names(plan.movedBackRegistrations)}已后移至" +
+                            "位置 $actualMachineId${plan.pairPositionIndex + 1}。"
+                    )
+                }
+                if (pairAllowsPassing) {
+                    append("已允许后方的登记越过这组固定组合与前方的登记共同游玩。")
+                }
+            },
+            changedMachineIds = setOf(actualMachineId),
+            action = queueAction,
+            // Ticking the pair's box online showed the explanation there.
+            updatedProfile = profile?.takeIf { pairAllowsPassing }
+                ?.withPassingIntroduced(appliedAtMillis)
+                ?.takeIf { it != profile }
+        )
     }
 
     if (command.operation == RemoteQueueOperation.CHECK_IN) {
@@ -762,7 +1001,7 @@ internal fun decideRemoteQueueOperation(
         val targetMachineId = command.targetMachineId
             ?: return reject("没有指定要转入的机台。")
         if (actualMachineId == targetMachineId) {
-            return already("这份登记已经在 机台 $targetMachineId 排队。")
+            return already("这份登记已经在 ${state.machineLabel(targetMachineId)} 排队。")
         }
         if (command.machineId != actualMachineId) {
             return reject("登记所在机台已经变化，请重新查询后再操作。")
@@ -770,13 +1009,13 @@ internal fun decideRemoteQueueOperation(
         val targetQueue = state.queues[targetMachineId]
             ?: return reject("要转入的机台不存在。")
         if (state.machineStatuses[targetMachineId]?.isOperational != true) {
-            return reject("机台 $targetMachineId 已停止使用，暂不能转入。")
+            return reject("${state.machineLabel(targetMachineId)} 已停止使用，暂不能转入。")
         }
         if (queue.playing.any { it.key == registration.key }) {
             return reject("处于游玩位置的登记不能转至其他机台。")
         }
         if (targetQueue.registrationCount >= MAX_REGISTRATIONS_PER_MACHINE) {
-            return reject("机台 $targetMachineId 的登记已满，暂不能转入。")
+            return reject("${state.machineLabel(targetMachineId)} 的登记已满，暂不能转入。")
         }
         val queueAction = QueueAction.TransferRegistrations(
             sourceMachineId = actualMachineId,
@@ -788,11 +1027,9 @@ internal fun decideRemoteQueueOperation(
             origin = command.source.queueActionOrigin,
             atMillis = appliedAtMillis
         ) as? QueueActionExecution.Applied
-        val updatedTarget = execution?.state?.queue(targetMachineId)
-        if (execution == null ||
-            updatedTarget == null ||
-            updatedTarget.registrationCount != targetQueue.registrationCount + 1
-        ) {
+        // Judged by the registration itself, not by counts that an arrangement between the two
+        // machines of a pair may also change in the same execution (review 2026-11-27).
+        if (execution == null || execution.state.machineHolding(registration.key) != targetMachineId) {
             return reject("终端未能将登记转至其他机台，请重新查询后再试。")
         }
         return RemoteQueueOperationDecision.Apply(
@@ -802,7 +1039,7 @@ internal fun decideRemoteQueueOperation(
                 pairedArrangements = execution.state.pairedArrangements
             ),
             detail = buildString {
-                append("登记已转至 机台 $targetMachineId 的队尾。")
+                append("登记已转至 ${state.machineLabel(targetMachineId)} 的队尾。")
                 if (state.machineCapacity(targetMachineId) == 1) {
                     append("目标机台仅能容纳一人游玩，")
                     append(
@@ -996,7 +1233,7 @@ internal fun decideRemoteQueueOperation(
         }
         RemoteQueueOperation.CHANGE_PLAY_PREFERENCE -> {
             if (state.machineCapacity(actualMachineId) == 1) {
-                return reject("机台 $actualMachineId 仅能容纳一人游玩，本次登记不能更改游玩偏好。")
+                return reject("${state.machineLabel(actualMachineId)} 仅能容纳一人游玩，本次登记不能更改游玩偏好。")
             }
             val preference = command.preference ?: return reject("请选择本次游玩偏好。")
             if (registration.preference == preference && registration.fixedPartnerKey == null) {
@@ -1021,10 +1258,26 @@ internal fun decideRemoteQueueOperation(
             }
             QueueAction.SetPairedMachineQueueing(actualMachineId, registration.key, enabled)
         }
+        RemoteQueueOperation.SET_ALLOWS_PASSING -> {
+            val enabled = command.allowsPassing
+                ?: return reject("未能确定是否允许后方的登记越过这份登记，请重新操作。")
+            if (enabled) {
+                if (state.machineCapacities[actualMachineId] == 1) {
+                    return reject("当前机台仅能容纳一人游玩，不能设置这项选择。")
+                }
+                // 单人游玩 on its own, or a fixed pair (one choice for both registrations).
+                if (registration.fixedPartnerKey == null && registration.preference != PlayPreference.SOLO) {
+                    return reject("只有单人游玩的登记或固定组合可以允许后方的登记越过。")
+                }
+            }
+            QueueAction.SetAllowsPassing(actualMachineId, registration.key, enabled)
+        }
         RemoteQueueOperation.JOIN_QUEUE,
         RemoteQueueOperation.TRANSFER_MACHINE,
         RemoteQueueOperation.CHECK_IN,
         RemoteQueueOperation.CREATE_REGISTRATION,
+        RemoteQueueOperation.CREATE_FIXED_PAIR,
+        RemoteQueueOperation.RENAME_REGISTRATION,
         RemoteQueueOperation.REORDER_QUEUE -> error("operation handled above")
     }
     val execution = state.executeQueueAction(
@@ -1039,6 +1292,8 @@ internal fun decideRemoteQueueOperation(
     val updatedRegistration = updatedQueue.allRegistrations.firstOrNull {
         it.key == registration.key
     }
+    val registrationIsPlaying = queue.playing.any { it.key == registration.key } &&
+        updatedQueue.playing.any { it.key == registration.key }
     val detail = when (command.operation) {
         RemoteQueueOperation.DEFER_ONE_ROUND -> registrationSubject(
             "登记将暂缓一次。",
@@ -1069,7 +1324,10 @@ internal fun decideRemoteQueueOperation(
         )
         RemoteQueueOperation.CHANGE_PLAY_PREFERENCE -> buildString {
             val preference = command.preference ?: registration.preference
-            append("本次游玩偏好已改为“${remotePreferenceLabel(preference)}”。玩家资料中的默认游玩偏好没有改变。")
+            append("本次游玩偏好已改为“${remotePreferenceLabel(preference)}”")
+            // Changed while it plays: this round stays as it is (maintainer, 2026-11-26).
+            if (registrationIsPlaying) append("，本轮游玩结束后生效")
+            append("。玩家资料中的默认游玩偏好没有改变。")
             if (fixedPartner != null) {
                 append("与“${fixedPartner.displayId}”的固定组合已解除；对方保留原位，并恢复为允许他人加入。")
                 append(fixedPairAbsenceRetentionDetail(registration))
@@ -1089,16 +1347,25 @@ internal fun decideRemoteQueueOperation(
             val partnerMachineId = state.machinePartners[actualMachineId]
             when {
                 command.alsoQueuesAtPairedMachine != true ->
-                    "已取消系统在 机台 $actualMachineId 和 机台 $partnerMachineId 之间的安排，" +
-                        "这份登记只在 机台 $actualMachineId 排队。"
+                    "已取消系统在 ${state.machineLabel(actualMachineId)} 和 ${state.machineLabel(partnerMachineId.orEmpty())} 之间的安排，" +
+                        "这份登记只在 ${state.machineLabel(actualMachineId)} 排队。"
                 // Turned on for a registration that is already waiting: it counts from the
                 // round after the one it is waiting for.
                 updatedRegistration?.skipsPairedMachineThisRound == true ->
-                    "已允许系统在 机台 $actualMachineId 和 机台 $partnerMachineId 之间安排这份登记。" +
-                        "这份登记游玩一轮之前，不会被安排到 机台 $partnerMachineId。"
+                    "已允许系统在 ${state.machineLabel(actualMachineId)} 和 ${state.machineLabel(partnerMachineId.orEmpty())} 之间安排这份登记。" +
+                        "这份登记游玩一轮之前，不会被安排到 ${state.machineLabel(partnerMachineId.orEmpty())}。"
                 else ->
-                    "已允许系统在 机台 $actualMachineId 和 机台 $partnerMachineId 之间安排这份登记，" +
+                    "已允许系统在 ${state.machineLabel(actualMachineId)} 和 ${state.machineLabel(partnerMachineId.orEmpty())} 之间安排这份登记，" +
                         "本轮游玩结束后生效。"
+            }
+        }
+        RemoteQueueOperation.SET_ALLOWS_PASSING -> {
+            val fromNextRound = if (registrationIsPlaying) "，本轮游玩结束后生效" else ""
+            val subject = if (registration.fixedPartnerKey != null) "这组固定组合" else "这份登记"
+            if (command.allowsPassing == true) {
+                "已允许后方的登记越过${subject}与前方的登记共同游玩$fromNextRound。"
+            } else {
+                "${subject}不再允许后方的登记越过$fromNextRound。"
             }
         }
         RemoteQueueOperation.CHECK_IN -> "管理员已立即完成现场签到。"
@@ -1106,15 +1373,33 @@ internal fun decideRemoteQueueOperation(
         RemoteQueueOperation.REORDER_QUEUE -> "管理后台已调整等待顺序。"
         else -> "队列操作已完成。"
     }
+    // The player's answer to the passing tick box is remembered by their profile.
+    val profileWithPassingChoice = command.allowsPassing
+        ?.takeIf { command.operation == RemoteQueueOperation.SET_ALLOWS_PASSING }
+        ?.let { enabled ->
+            state.playerProfiles.firstOrNull { it.id == registration.playerProfileId }
+                ?.let { profile -> profile.rememberingPassingAnswer(registration, enabled, appliedAtMillis) }
+        }
     return RemoteQueueOperationDecision.Apply(
         state = state.copy(
                 queues = execution.state.queues,
                 pairedMachineOrders = execution.state.pairedMachineOrders,
                 pairedArrangements = execution.state.pairedArrangements
             ),
-        detail = detail,
+        // With an empty playing position the change can let the next group in at once. On the
+        // terminal the confirmation says so beforehand; a player far away is told in the answer.
+        detail = detail + if (queue.playing.isEmpty() && updatedQueue.playing.isNotEmpty()) {
+            updatedQueue.playing.joinToString(
+                prefix = "现在由",
+                postfix = "进入游玩位置 $actualMachineId。",
+                separator = "、"
+            ) { "“${it.displayId}”" }
+        } else {
+            ""
+        },
         changedMachineIds = setOf(actualMachineId),
-        action = action
+        action = action,
+        updatedProfile = profileWithPassingChoice
     )
 }
 
@@ -1166,3 +1451,22 @@ internal const val DEFER_ONE_ROUND_USED_REASON = "这份登记已暂缓过一次
 /** Why a checked-in online registration that has not played cannot be postponed. */
 internal const val ONLINE_REGISTRATION_POSTPONE_REASON =
     "已签到的线上登记在游玩一轮之前不能延后。"
+
+/**
+ * The profile after its player answered a passing tick box for [registration] from afar, or
+ * null when nothing about it changes. The answer for a 单人游玩 registration is remembered for
+ * the next time; the choice of a fixed pair is made by two and is not, but ticking it still
+ * records that the explanation was shown.
+ */
+private fun PlayerProfile.rememberingPassingAnswer(
+    registration: Registration,
+    enabled: Boolean,
+    atMillis: Long
+): PlayerProfile? {
+    val updated = if (registration.fixedPartnerKey != null) {
+        if (enabled) withPassingIntroduced(atMillis) else this
+    } else {
+        withPassingChoice(enabled, atMillis)
+    }
+    return updated.takeIf { it != this }
+}

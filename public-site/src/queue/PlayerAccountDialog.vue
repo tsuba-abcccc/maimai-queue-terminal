@@ -1,9 +1,18 @@
 <script setup>
-import { Bell, Camera, ChevronDown, CircleCheck, LogIn, LogOut, Save, ShieldCheck, UserRound, X } from '@lucide/vue'
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { Bell, Camera, ChevronDown, ChevronRight, CircleCheck, LogIn, LogOut, Pencil, Save, ShieldCheck, UserRound, X } from '@lucide/vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import FriendPairFlow from './FriendPairFlow.vue'
 import PairedQueueTickBox from './PairedQueueTickBox.vue'
 import PostponeChoiceCards from './PostponeChoiceCards.vue'
 import PreferenceOptions from './PreferenceOptions.vue'
+import RegistrationRenameForm from './RegistrationRenameForm.vue'
+import SoloPassTickBox from './SoloPassTickBox.vue'
+import { formatWaitAmount, noArrangementWaitNote, onlineMissingWaitNote } from './waitEstimateCopy.js'
+import {
+  soloPassStatusParts,
+  terminalSupportsFixedPairPassing,
+  terminalSupportsQueueOperation
+} from './soloPassCopy.js'
 import {
   PAIRED_QUEUE_UNCERTAIN_ESTIMATE_NOTE,
   pairedQueueStatusParts,
@@ -11,25 +20,75 @@ import {
   pairedQueueUncertainEstimateText
 } from './pairedQueueCopy.js'
 import {
+  FRIEND_PAIR_SECTION_LABEL,
   POSTPONEMENT_CANCEL_OPERATIONS,
   QUEUE_ACTION_MODE_BY_OPERATION,
+  REGISTRATION_RENAME_ENTRY_LABEL,
   STOPPED_MACHINE_ACTION_NOTICE,
+  TRANSFER_CHOOSER_TITLE,
+  TRANSFER_FIXED_PAIR_NOTE,
+  TRANSFER_WAIT_LABEL,
+  fixedPairPassingChanged,
+  fixedPairStateText,
+  friendPairCandidateRows,
+  friendPairEntry,
+  friendPairOffered,
+  initialPassingChoices,
+  initialPreferenceChoice,
   leaveConfirmation,
+  onlineCheckInLimitText,
   postponeChoiceCards,
   postponeChooserHeading,
   postponeConfirmation,
+  preferenceChangeCommands,
+  preferenceChangeReleasesFixedPair,
   preferenceChooserText,
   queueActionUnavailableReason as sharedQueueActionUnavailableReason,
+  registrationRenameOffered,
+  releaseFixedPairConfirmation,
+  skipOneTurnLimitNotice,
+  transferChooserRows,
   transferConfirmation,
-  transferEntryLabel
+  transferEntryLabel,
+  transferEntryUnavailableReason,
+  transferTargetUnavailableReason
 } from './queueActionAvailability.js'
+import {
+  QUEUE_COMMAND_SUBMITTED_NOTICE,
+  queueCommandOutcome,
+  queueCommandRun,
+  queueCommandRunNotice,
+  runQueueCommands
+} from './queueCommandChain.js'
 
 // The confirmations reached from the cards under 延后这份登记; their 返回 goes back to the cards.
 const POSTPONE_CONFIRMATION_MODES = ['defer', 'skip_one_turn', 'temporary_leave']
 
 const props = defineProps({
   bindingToken: { type: String, default: '' },
-  focusRegistrationId: { type: String, default: '' }
+  focusRegistrationId: { type: String, default: '' },
+  // The status page's `capabilities`: which operations the terminal has declared. The account's
+  // own queue API does not report them.
+  capabilities: { type: Object, default: () => ({}) },
+  // From the status page's public queue, for each registration that lets others pass over it:
+  // whether it is about to be passed over or is being passed over now (soloPassCopy.js). The
+  // account's own queue API lists only the player's registrations, so it cannot tell.
+  soloPassStates: { type: Object, default: () => ({}) },
+  // From the status page, for each registration it shows: the machine, whether it plays, the
+  // position as the page names it (位置 B2), that position's estimate and where the other machine
+  // of a pair shows its preview. With a preview the page numbers the waiting positions
+  // including it, and the dialog names positions and times as the page does (website review W4).
+  // From the public queue it also takes what the account's own queue API does not report: the
+  // name of the other registration of a fixed pair (fixedPartnerName) and whether the check-in
+  // time limit of a pending online registration has started again (checkInRestarted).
+  queuePagePlaces: { type: Object, default: () => ({}) },
+  // The number of waiting positions of each machine by machine id, as the status page counts
+  // them; the account's own queue API lists registrations only.
+  waitingPositionCounts: { type: Object, default: () => ({}) },
+  // Every registration of the public queue as the status page shows it, for 与朋友共同游玩 (the
+  // other registrations that wait at the same machine) and 修改登记昵称 (the nicknames in use);
+  // see `pageRegistrations` in queueActionAvailability.js.
+  queuePageRegistrations: { type: Array, default: () => [] }
 })
 const emit = defineEmits(['close', 'bound', 'session', 'queue-state'])
 
@@ -81,12 +140,25 @@ const queuePreference = ref('SOLO')
 // The tick box in the preference panel: whether the system may arrange the registration
 // between its machine and the machine paired with it.
 const queuePairedTick = ref(false)
+// The tick box inside 单人游玩: whether registrations behind may pass over this one.
+const queuePassing = ref(false)
+// The same choice of a fixed pair, shown with the pair's state: one choice for both
+// registrations of the pair.
+const queuePairPassing = ref(false)
 // The page's current time, kept up twice a minute: the line about an announced move says
 // "from HH:mm on" until that moment has passed.
 const currentTime = ref(Date.now())
 let clockTimer = null
-const queueActionSubmitting = ref(false)
-let queueCommandTimer
+// Commands run on the page, not in the dialog (queueCommandChain.js): one started here goes on
+// when the dialog is closed, and a dialog opened meanwhile waits for it as well.
+const queueActionSubmitting = computed(() => queueCommandRun.value !== null)
+// While a request without an answer is sent again, the line says so and why nothing else can be
+// sent (website review W-L7).
+const queueNoticeText = computed(() => (
+  queueCommandRun.value?.confirming
+    ? queueCommandRunNotice()
+    : queueNotice.value || queueCommandRunNotice()
+))
 
 const title = computed(() => {
   if (props.bindingToken && !bindingCompleted.value) return '绑定网页账户'
@@ -135,10 +207,6 @@ function setAccount(nextAccount) {
 }
 
 function clearAccountSession() {
-  if (queueCommandTimer) {
-    window.clearTimeout(queueCommandTimer)
-    queueCommandTimer = undefined
-  }
   setAccount(null)
   loginStep.value = 'QQ'
   password.value = ''
@@ -146,15 +214,6 @@ function clearAccountSession() {
   csrfToken.value = ''
   queueState.value = null
   emit('queue-state', null)
-}
-
-function createRequestId() {
-  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID()
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (character) => {
-    const value = Math.floor(Math.random() * 16)
-    const result = character === 'x' ? value : (value & 0x3) | 0x8
-    return result.toString(16)
-  })
 }
 
 async function accountRequest(path = '', options = {}) {
@@ -334,17 +393,42 @@ async function loadQueueState() {
   }
 }
 
-function registrationAbsenceStatus(registration) {
-  if (registration.deferred_once) return 'DEFER_ONE_ROUND'
-  if (registration.skips_one_turn) return 'SKIP_ONE_TURN'
-  if (registration.temporarily_away) return 'TEMPORARILY_AWAY'
-  return 'NONE'
+// Where the queue page shows the registration, provided it shows it at the same machine and in
+// the same kind of position; the two are read separately and may differ for a moment.
+function queuePagePlace(registration) {
+  const place = props.queuePagePlaces?.[registration?.registration_id]
+  if (!place || place.machineId !== registration.machine_id) return null
+  if (place.playing !== (registration.position === 'PLAYING')) return null
+  return place
 }
 
 function accountQueuePositionText(registration) {
+  const place = queuePagePlace(registration)
+  if (place) return place.label
   return registration.position === 'PLAYING'
     ? `游玩位置 ${registration.machine_id}`
     : `位置 ${registration.machine_id}${registration.position_index || ''}`
+}
+
+// The estimate of the position the registration waits in, as the queue page shows it. Where
+// the terminal sent this registration's own wait (estimated_wait_is_own), that one is kept: the
+// position shows the earlier of its two registrations, and the other one may be arranged to the
+// other machine of a pair, which does not make this one play earlier (review 2026-11-27).
+function accountQueueEstimate(registration) {
+  const place = queuePagePlace(registration)
+  if (place && !place.playing && registration.estimated_wait_is_own !== true) {
+    return {
+      minutes: place.estimate ?? null,
+      uncertain: place.estimateUncertain === true,
+      upper: place.estimateUncertain === true ? place.estimateUpper ?? null : null
+    }
+  }
+  const uncertain = (registration.estimated_wait_uncertain ?? registration.estimatedWaitUncertain) === true
+  return {
+    minutes: registration.estimated_wait_minutes ?? null,
+    uncertain,
+    upper: uncertain ? registration.estimated_wait_upper_minutes ?? null : null
+  }
 }
 
 // Why the action of this mode cannot be carried out for the registration right now; empty
@@ -354,7 +438,8 @@ function queueActionUnavailableReason(registration, mode) {
     terminalOnline: Boolean(queueState.value?.queue?.terminal_online),
     remoteActions: Boolean(queueState.value?.queue?.remote_actions),
     registration,
-    mode
+    mode,
+    queueOperations: props.capabilities?.queue_operations
   })
 }
 
@@ -382,18 +467,140 @@ function otherMachinesFor(registration) {
   return queueState.value?.queue?.machines?.filter((machine) => machine.id !== registration.machine_id) || []
 }
 
+// Why the entry for moving machines is grey, or an empty string.
+function queueTransferUnavailableReason(registration) {
+  return queueActionUnavailableReason(registration, 'transfer') ||
+    transferEntryUnavailableReason(registration, otherMachinesFor(registration))
+}
+
 // With only one other machine there is nothing to choose: the confirmation opens at once, as
-// on the terminal.
+// on the terminal. A machine that cannot take the registration says so before (website review
+// W5), as the terminal's grey entry does.
 function requestQueueTransfer(registration) {
+  const reason = queueTransferUnavailableReason(registration)
+  if (reason) {
+    queueError.value = reason
+    queueNotice.value = ''
+    return
+  }
   if (!requestQueueAction(registration, 'transfer')) return
   const others = otherMachinesFor(registration)
   queueTargetMachineId.value = others.length === 1 ? others[0].id : ''
 }
 
+// The machines of 选择要转至的机台, each with what waits there and the wait after moving, or
+// the reason why it cannot take the registration.
+function queueTransferRows(registration) {
+  return transferChooserRows(registration, otherMachinesFor(registration), props.waitingPositionCounts)
+}
+
+function chooseQueueTransferTarget(row) {
+  if (row.reason || queueActionSubmitting.value) return
+  queueTargetMachineId.value = row.id
+}
+
+// Why the chosen machine cannot take the registration, should that have changed since the
+// confirmation opened; the confirmation is then grey.
+function queueTransferTargetReason(registration) {
+  const target = queueState.value?.queue?.machines?.find(
+    (machine) => machine.id === queueTargetMachineId.value
+  )
+  return transferTargetUnavailableReason(registration, target)
+}
+
+function submitQueueTransfer(registration) {
+  const reason = queueTransferTargetReason(registration)
+  if (reason) {
+    queueError.value = reason
+    queueNotice.value = ''
+    return
+  }
+  submitQueueAction(registration, 'TRANSFER_MACHINE', {
+    target_machine_id: queueTargetMachineId.value,
+    expected_target_machine_stable_id: targetMachineStableId(queueTargetMachineId.value)
+  })
+}
+
 function requestQueuePreference(registration) {
   if (!requestQueueAction(registration, 'preference')) return
-  queuePreference.value = registration.preference
+  queuePreference.value = initialPreferenceChoice(registration)
   queuePairedTick.value = registration.also_queues_at_paired_machine === true
+  const passingChoices = initialPassingChoices(registration)
+  queuePassing.value = passingChoices.passing
+  queuePairPassing.value = passingChoices.pairPassing
+}
+
+// The tick box that lets others pass is offered inside 单人游玩 where the preference can be
+// chosen and the terminal knows the choice.
+function queuePassingOffered(registration) {
+  return registration.machine_capacity > 1 &&
+    terminalSupportsQueueOperation(props.capabilities, 'SET_ALLOWS_PASSING')
+}
+
+// A member of a fixed pair is offered the pair's tick box where the terminal lets a fixed pair
+// allow passing.
+function queuePairPassingOffered(registration) {
+  return registration.fixed_pair === true && queuePassingOffered(registration) &&
+    terminalSupportsFixedPairPassing(props.capabilities)
+}
+
+function queuePairPassingChanged(registration) {
+  return fixedPairPassingChanged({
+    registration,
+    preference: queuePreference.value,
+    pairPassing: queuePairPassingOffered(registration) ? queuePairPassing.value : null
+  })
+}
+
+// A new fixed pair is asked whether it lets others pass where the terminal lets a fixed pair
+// allow passing, as on the terminal's confirmation.
+function queueNewPairPassingOffered(registration) {
+  return queuePassingOffered(registration) && terminalSupportsFixedPairPassing(props.capabilities)
+}
+
+// 与朋友共同游玩, the row under 也可以 in 更改游玩偏好: offered where the terminal has declared the
+// operation, greyed with its reason.
+function queueFriendPairOffered(registration) {
+  return friendPairOffered(registration, props.capabilities?.queue_operations)
+}
+
+function queueFriendPairEntry(registration) {
+  return friendPairEntry(registration, props.queuePageRegistrations)
+}
+
+function requestQueueFriendPair(registration) {
+  if (queueFriendPairEntry(registration).reason) return
+  requestQueueAction(registration, 'friend_pair')
+}
+
+function submitQueueFriendPair(registration, { partnerRegistrationId, allowsPassing }) {
+  submitQueueAction(registration, 'CREATE_FIXED_PAIR', {
+    partner_registration_id: partnerRegistrationId,
+    // Sent, ticked or not, wherever the pair's box was offered.
+    ...(allowsPassing === null ? {} : { allows_passing: allowsPassing })
+  })
+}
+
+// 修改登记昵称: the pencil beside the registration's nickname, as on the terminal's registration
+// menu.
+function queueRenameOffered(registration) {
+  return registrationRenameOffered(registration, props.capabilities?.queue_operations)
+}
+
+function submitQueueRename(registration, displayId) {
+  submitQueueAction(registration, 'RENAME_REGISTRATION', { display_id: displayId })
+}
+
+// One small line on a registration that lets others pass over it, in the place and style of the
+// line about the two machines: whether that is only allowed, about to happen or happening now.
+// The account's own state decides whether there is a line at all: it is read again after every
+// command, while the status page reads the public queue on its own schedule.
+function soloPassStatusPartsFor(registration) {
+  if (registration.allows_passing !== true) return null
+  return soloPassStatusParts(
+    props.soloPassStates?.[registration.registration_id] || { kind: 'enabled' },
+    { fixedPair: registration.fixed_pair === true }
+  )
 }
 
 // The name of the machine that forms a pair with the registration's machine, if there is one.
@@ -417,7 +624,9 @@ function pairedQueueStatusPartsFor(registration) {
     skipsThisRound: registration.skips_paired_machine_this_round === true,
     announced: registration.paired_arrangement_announced === true,
     notBeforeMillis: registration.paired_arrangement_not_before ?? null,
-    nowMillis: currentTime.value
+    nowMillis: currentTime.value,
+    // The position at which the other machine shows the preview, as the queue page names it.
+    previewPosition: queuePagePlace(registration)?.previewPosition ?? null
   })
 }
 
@@ -426,62 +635,112 @@ function queuePairedTickChanged(registration) {
     queuePairedTick.value !== (registration.also_queues_at_paired_machine === true)
 }
 
-// On a machine for one player the panel holds nothing but the tick box.
+// On a machine for one player the panel holds nothing but the tick box. A member of a fixed
+// pair opens the panel with neither preference chosen; until it chooses one, only a change of
+// a tick box can be confirmed: the one for the two machines, or the pair's own.
 function queuePreferenceChangeIsEmpty(registration) {
-  return !(registration.machine_capacity > 1) && !queuePairedTickChanged(registration)
+  const preferenceChosen = registration.machine_capacity > 1 && Boolean(queuePreference.value)
+  return !preferenceChosen && !queuePairedTickChanged(registration) &&
+    !queuePairPassingChanged(registration)
 }
 
-// One confirmation, up to two commands for the terminal: the play preference, and the tick
-// box. When both changed, the tick box follows once the preference has been applied.
+// One confirmation, up to three commands for the terminal: the play preference and the two tick
+// boxes, each sent once the one before has been applied (preferenceChangeCommands).
 function submitQueuePreferenceChange(registration) {
-  const preferenceChanged = registration.machine_capacity > 1 &&
-    queuePreference.value !== registration.preference
-  const pairedTickChanged = queuePairedTickChanged(registration)
-  const pairedTickExtra = { also_queues_at_paired_machine: queuePairedTick.value }
-  if (pairedTickChanged && !preferenceChanged) {
-    submitQueueAction(registration, 'SET_PAIRED_MACHINE_QUEUEING', pairedTickExtra)
+  const pairedMachineName = pairedMachineNameFor(registration)
+  submitQueueCommands(registration, preferenceChangeCommands({
+    registration,
+    preference: queuePreference.value,
+    pairedTick: pairedMachineName ? queuePairedTick.value : null,
+    passing: queuePassingOffered(registration) ? queuePassing.value : null,
+    pairPassing: queuePairPassingOffered(registration) ? queuePairPassing.value : null
+  }), pairedMachineName)
+}
+
+// A member of a fixed pair that has chosen a preference releases the pair: the terminal asks a
+// second question first, and so does the panel. Otherwise the change is sent at once.
+function confirmQueuePreferenceChange(registration) {
+  if (preferenceChangeReleasesFixedPair(registration, queuePreference.value)) {
+    queueError.value = ''
+    queueNotice.value = ''
+    queueActionMode.value = 'release_pair'
     return
   }
-  submitQueueAction(
+  submitQueuePreferenceChange(registration)
+}
+
+// The other registration of the fixed pair by name, where the queue page shows it.
+function fixedPartnerNameFor(registration) {
+  if (!registration?.fixed_pair) return null
+  return props.queuePagePlaces?.[registration.registration_id]?.fixedPartnerName || null
+}
+
+function releasePairPrompt(registration) {
+  return releaseFixedPairConfirmation(
     registration,
-    'CHANGE_PLAY_PREFERENCE',
-    { preference: queuePreference.value },
-    pairedTickChanged
-      ? {
-          registrationId: registration.registration_id,
-          operation: 'SET_PAIRED_MACHINE_QUEUEING',
-          extra: pairedTickExtra
-        }
-      : null
+    queuePreference.value,
+    fixedPartnerNameFor(registration)
   )
 }
 
-// Why the registration shows no wait estimate at the moment, or null when it shows one.
+// The time limit of a pending online registration, in the terminal's words, with where and how
+// to check in for a player who is not at the venue.
+function accountCheckInLimitText(registration) {
+  return onlineCheckInLimitText({
+    restarted: props.queuePagePlaces?.[registration.registration_id]?.checkInRestarted === true,
+    tellsHowToCheckIn: true
+  })
+}
+
+// Why the registration shows no wait estimate at the moment, or null when it shows one. A
+// pending online registration shows its estimate, which counts it as checking in, as the
+// terminal and the registration detail do.
 function accountQueueEstimateUnavailableText(registration) {
   if (!queueState.value?.queue?.terminal_online) return '状态待更新，暂时无法确认当前安排'
-  if (registration.machine_operational === false) return '机台停止使用，恢复后重新确认'
+  if (registration.machine_operational === false) return '机台恢复使用后重新估算'
   if (registration.position === 'PLAYING') return '现在可以游玩'
-  if (registration.online_registration_pending_check_in) return '完成现场签到后才是有效登记'
   if (registration.temporarily_away) return '暂时离开，无法估算'
-  if (registration.estimated_wait_minutes == null) return '暂时无法估算'
+  if (accountQueueEstimate(registration).minutes == null) return '暂时无法估算'
   return null
 }
 
 // Whether the estimate shown is one the terminal marked as possibly inaccurate; the card then
 // adds PAIRED_QUEUE_UNCERTAIN_ESTIMATE_NOTE once.
 function accountQueueEstimateUncertain(registration) {
-  const uncertain = registration.estimated_wait_uncertain ?? registration.estimatedWaitUncertain
-  return uncertain === true && accountQueueEstimateUnavailableText(registration) === null
+  return accountQueueEstimate(registration).uncertain &&
+    accountQueueEstimateUnavailableText(registration) === null
+}
+
+// The line under an uncertain wait: the wait if the system arranges nobody between the two
+// machines with its condition where the terminal sent one, otherwise the general note.
+function accountQueueUncertainNote(registration) {
+  return noArrangementWaitNote('这份登记', accountQueueEstimate(registration).upper) ||
+    PAIRED_QUEUE_UNCERTAIN_ESTIMATE_NOTE
+}
+
+// The earlier time for when the pending online registrations ahead do not check in.
+function accountQueueOnlineMissingNote(registration) {
+  if (accountQueueEstimateUnavailableText(registration) !== null) return null
+  return onlineMissingWaitNote(
+    '这份登记',
+    registration.wait_minutes_if_online_missing ?? registration.waitMinutesIfOnlineMissing
+  )
 }
 
 function accountQueueEstimateText(registration) {
   const unavailable = accountQueueEstimateUnavailableText(registration)
   if (unavailable) return unavailable
-  if (accountQueueEstimateUncertain(registration)) {
-    return pairedQueueUncertainEstimateText(registration.estimated_wait_minutes)
-  }
-  if (registration.estimated_wait_minutes < 1) return '预计很快可以游玩'
-  return `约 ${registration.estimated_wait_minutes} 分钟后可以游玩`
+  const minutes = accountQueueEstimate(registration).minutes
+  if (accountQueueEstimateUncertain(registration)) return pairedQueueUncertainEstimateText(minutes)
+  if (minutes < 1) return '预计很快可以游玩'
+  return `${formatWaitAmount(minutes)}后可以游玩`
+}
+
+// Near the limit of skipped turns, the same reminder as the 标记为自己 card and the terminal
+// (website review W7).
+function accountQueueSkipLimitNotice(registration) {
+  if (!registration.skips_one_turn) return ''
+  return skipOneTurnLimitNotice(registration.temporary_away_skipped_turns || 0)
 }
 
 function accountQueueStateText(registration) {
@@ -496,47 +755,13 @@ function accountQueueStateText(registration) {
     return skippedTurns > 0 ? `将轮空一次·已轮空 ${skippedTurns} 次` : '将轮空一次'
   }
   if (registration.deferred_once) return '将暂缓一次'
+  // A member of a fixed pair reads as on the terminal, not as its underlying preference.
+  if (registration.fixed_pair) return fixedPairStateText(fixedPartnerNameFor(registration))
   return registration.preference === 'SOLO' ? '单人游玩' : '允许他人加入'
 }
 
 function targetMachineStableId(machineId) {
   return queueState.value?.queue?.machines?.find((machine) => machine.id === machineId)?.stable_id
-}
-
-function queueOperationPayload(registration, operation, extra = {}) {
-  return {
-    request_id: createRequestId(),
-    operation,
-    expected_queue_id: queueState.value.queue.queue_id,
-    expected_registration_id: registration.registration_id,
-    expected_machine_id: registration.machine_id,
-    expected_position: registration.position,
-    expected_fixed_pair_id: registration.fixed_pair_id || null,
-    expected_absence_status: registrationAbsenceStatus(registration),
-    expected_temporary_away_skipped_turns: registration.temporary_away_skipped_turns || 0,
-    expected_pending_check_in: registration.online_registration_pending_check_in === true,
-    expected_machine_configuration_revision: queueState.value.queue.machine_configuration_revision,
-    expected_machine_stable_id: registration.machine_stable_id,
-    ...extra
-  }
-}
-
-// [followUp] is a second command that belongs to the same confirmation. It is sent only
-// after the terminal has applied the first one, against the state that one left behind.
-function finishQueueCommand(message, errorMessage = '', followUp = null) {
-  queueActionSubmitting.value = false
-  queueActionMode.value = null
-  queueNotice.value = message
-  queueError.value = errorMessage
-  const refreshed = loadQueueState()
-  if (followUp && !errorMessage) {
-    refreshed.then(() => {
-      const registration = queueState.value?.registrations?.find((candidate) => (
-        candidate.registration_id === followUp.registrationId
-      ))
-      if (registration) submitQueueAction(registration, followUp.operation, followUp.extra)
-    })
-  }
 }
 
 function queueActionPrompt(registration, mode) {
@@ -570,71 +795,56 @@ function transferPrompt(registration) {
   )
 }
 
-async function pollQueueCommand(commandId, attempts = 0, followUp = null) {
-  try {
-    const response = await fetch(`${QUEUE_COMMAND_STATUS_API_URL}/${encodeURIComponent(commandId)}`, {
-      credentials: 'include', cache: 'no-store', headers: { Accept: 'application/json' }
-    })
-    const payload = await response.json().catch(() => ({}))
-    if (!response.ok) {
-      const pollError = new Error(payload.error || '暂时无法读取现场处理结果。')
-      pollError.code = payload.code
-      throw pollError
-    }
-    if (payload.status === 'PENDING' && attempts < 30) {
-      queueCommandTimer = window.setTimeout(() => pollQueueCommand(commandId, attempts + 1, followUp), 1500)
-      return
-    }
-    if (payload.status === 'APPLIED') {
-      finishQueueCommand(payload.result_detail || '现场终端已完成这次操作。', '', followUp)
-    } else if (payload.status === 'PENDING') {
-      finishQueueCommand('操作仍在等待现场终端处理，请稍后刷新查看。')
-    } else {
-      finishQueueCommand('', payload.result_detail || '现场终端没有执行这次操作。')
-    }
-  } catch (pollError) {
-    if (pollError.code === 'ACCOUNT_LOGIN_REQUIRED') {
-      clearAccountSession()
-      finishQueueCommand('', '登录状态已失效，请重新登录。')
-      return
-    }
-    if (attempts < 30) {
-      queueCommandTimer = window.setTimeout(() => pollQueueCommand(commandId, attempts + 1, followUp), 1500)
-    } else {
-      finishQueueCommand('', pollError.message)
-    }
-  }
-}
-
-async function submitQueueAction(registration, operation, extra = {}, followUp = null) {
-  if (queueActionSubmitting.value) return
+// Every command on the registration runs through queueCommandChain.js, which carries on when
+// the dialog is closed; while the dialog is open it shows the outcome (website review W3).
+function submitQueueCommands(registration, commands, pairedMachineName = null) {
+  if (queueActionSubmitting.value || !registration || !commands?.length) return
   const unavailableReason = queueActionUnavailableReason(
     registration,
-    QUEUE_ACTION_MODE_BY_OPERATION[operation]
+    QUEUE_ACTION_MODE_BY_OPERATION[commands[0].operation]
   )
   if (unavailableReason) {
     queueError.value = unavailableReason
     queueNotice.value = ''
     return
   }
-  queueActionSubmitting.value = true
   queueError.value = ''
-  queueNotice.value = '操作已提交，正在等待现场终端确认。'
-  try {
-    const response = await accountRequest('/queue-commands', {
-      method: 'POST',
-      headers: csrfHeaders(),
-      body: JSON.stringify(queueOperationPayload(registration, operation, extra))
-    })
-    if (response.status === 'APPLIED' || response.status === 'REJECTED') {
-      await pollQueueCommand(response.command_id, 0, followUp)
-    } else {
-      pollQueueCommand(response.command_id, 0, followUp)
-    }
-  } catch (actionError) {
-    finishQueueCommand('', actionError.message)
-  }
+  queueNotice.value = QUEUE_COMMAND_SUBMITTED_NOTICE
+  runQueueCommands({
+    source: 'account-dialog',
+    registration,
+    state: queueState.value,
+    commands,
+    pairedMachineName,
+    queueOperations: props.capabilities?.queue_operations,
+    accountApiUrl: ACCOUNT_API_URL,
+    commandApiBase: QUEUE_COMMAND_STATUS_API_URL,
+    csrfHeaders
+  })
 }
+
+function submitQueueAction(registration, operation, extra = {}) {
+  submitQueueCommands(registration, [{ operation, extra }])
+}
+
+// The outcome of a run, whether started here or in the registration detail: what was applied
+// stays beside what was not.
+watch(queueCommandOutcome, (outcome) => {
+  if (!outcome) return
+  queueActionMode.value = null
+  if (outcome.loginRequired) {
+    clearAccountSession()
+    queueNotice.value = ''
+    queueError.value = outcome.error
+    return
+  }
+  queueNotice.value = outcome.notice
+  const refreshed = loadQueueState()
+  // The refresh clears the error line when it starts, so a failed command's reason is set
+  // once it has finished; otherwise the player would see no reason at all.
+  queueError.value = outcome.error
+  if (outcome.error) refreshed.then(() => { queueError.value = outcome.error })
+})
 
 function profileChanged() {
   if (!profileDraft.value || !originalProfile.value) return false
@@ -789,7 +999,6 @@ onMounted(() => {
   load()
 })
 onBeforeUnmount(() => {
-  if (queueCommandTimer) window.clearTimeout(queueCommandTimer)
   if (clockTimer) window.clearInterval(clockTimer)
   window.removeEventListener('keydown', handleKeydown)
 })
@@ -926,6 +1135,15 @@ onBeforeUnmount(() => {
           <article v-else-if="queueState?.registrations?.length === 1" class="account-queue-card"
             :class="{ 'is-focused': focusRegistrationId && queueState.registrations[0].registration_id === focusRegistrationId }">
             <template v-for="registration in queueState.registrations" :key="registration.registration_id">
+              <!-- The nickname this registration shows, with the terminal's pencil beside it. -->
+              <div class="account-queue-name">
+                <strong>{{ registration.display_id }}</strong>
+                <button v-if="queueRenameOffered(registration)" type="button" :disabled="queueActionSubmitting"
+                  :aria-label="REGISTRATION_RENAME_ENTRY_LABEL" :title="REGISTRATION_RENAME_ENTRY_LABEL"
+                  @click="requestQueueAction(registration, 'rename')">
+                  <Pencil :size="15" aria-hidden="true" />
+                </button>
+              </div>
               <div class="account-queue-summary">
                 <div>
                   <strong>{{ accountQueuePositionText(registration) }}</strong>
@@ -936,26 +1154,38 @@ onBeforeUnmount(() => {
                   <span>{{ accountQueueStateText(registration) }}</span>
                 </div>
               </div>
-              <p v-if="accountQueueEstimateUncertain(registration)" class="account-queue-estimate-note">{{ PAIRED_QUEUE_UNCERTAIN_ESTIMATE_NOTE }}</p>
-              <p v-if="registration.online_registration_pending_check_in" class="account-queue-warning">请在创建登记后的 30 分钟内到现场终端完成签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，登记会自动移除。</p>
+              <p v-if="accountQueueSkipLimitNotice(registration)" class="account-queue-skip-limit">{{ accountQueueSkipLimitNotice(registration) }}</p>
+              <p v-if="accountQueueEstimateUncertain(registration)" class="account-queue-estimate-note">{{ accountQueueUncertainNote(registration) }}</p>
+              <p v-if="accountQueueOnlineMissingNote(registration)" class="account-queue-estimate-note">{{ accountQueueOnlineMissingNote(registration) }}</p>
+              <p v-if="registration.online_registration_pending_check_in" class="account-queue-warning">{{ accountCheckInLimitText(registration) }}</p>
               <p v-if="!queueState.queue?.terminal_online" class="account-queue-warning">现场终端暂时离线，当前只能查看状态。</p>
               <p v-else-if="registration.machine_operational === false" class="account-queue-warning">{{ STOPPED_MACHINE_ACTION_NOTICE }}</p>
-              <p v-else-if="!queueState.queue?.remote_actions" class="account-queue-warning">现场未开启网站远程操作，当前只能查看状态。</p>
+              <p v-else-if="!queueState.queue?.remote_actions" class="account-queue-warning">现场未开启网页端远程操作，当前只能查看状态。</p>
               <p v-if="pairedQueueStatusPartsFor(registration)" class="account-queue-paired-status">{{ pairedQueueStatusPartsFor(registration).before }}<span class="account-queue-paired-announcement">{{ pairedQueueStatusPartsFor(registration).highlighted }}</span>{{ pairedQueueStatusPartsFor(registration).after }}</p>
+              <p v-if="soloPassStatusPartsFor(registration)" class="account-queue-paired-status">{{ soloPassStatusPartsFor(registration).before }}<span class="account-queue-paired-announcement">{{ soloPassStatusPartsFor(registration).highlighted }}</span>{{ soloPassStatusPartsFor(registration).after }}</p>
 
               <div v-if="queueActionMode === 'transfer'" class="account-inline-action">
+                <!-- One row per machine, as on the terminal: what waits there and the wait after
+                  moving; a machine that cannot take the registration is grey and says why. -->
                 <template v-if="otherMachinesFor(registration).length > 1">
-                <strong>选择要转至的机台</strong>
-                <div class="account-choice-grid">
-                  <button v-for="machine in queueState.queue.machines.filter((item) => item.id !== registration.machine_id)"
-                    :key="machine.id" type="button" :disabled="!machine.available || (registration.fixed_pair && machine.capacity === 1)"
-                    :title="registration.fixed_pair && machine.capacity === 1 ? '容量为 1 的机台不能接收固定组合，请先更改本次游玩偏好解除组合。' : ''"
-                    :class="{ active: queueTargetMachineId === machine.id }" @click="queueTargetMachineId = machine.id">
-                    {{ machine.name }}
+                <strong>{{ TRANSFER_CHOOSER_TITLE }}</strong>
+                <div class="account-transfer-rows">
+                  <button v-for="row in queueTransferRows(registration)" :key="row.id" type="button"
+                    :disabled="queueActionSubmitting" :aria-disabled="row.reason ? 'true' : 'false'"
+                    :class="{ active: queueTargetMachineId === row.id, 'is-unavailable': row.reason }"
+                    @click="chooseQueueTransferTarget(row)">
+                    <span class="account-transfer-row-main">
+                      <strong>{{ row.name }}</strong>
+                      <small>{{ row.description }}</small>
+                    </span>
+                    <span v-if="!row.reason" class="account-transfer-row-wait">
+                      <small>{{ TRANSFER_WAIT_LABEL }}</small>
+                      <strong>{{ row.wait }}</strong>
+                    </span>
                   </button>
                 </div>
                 <p v-if="registration.fixed_pair && queueState.queue.machines.some((machine) => machine.id !== registration.machine_id && machine.available && machine.capacity === 1)"
-                  class="account-action-note">仅能容纳一人游玩的机台不能接收固定组合；如需转至这类机台，请先更改本次游玩偏好，解除固定组合。</p>
+                  class="account-action-note">{{ TRANSFER_FIXED_PAIR_NOTE }}</p>
                 </template>
                 <template v-if="transferPrompt(registration)">
                   <strong>{{ transferPrompt(registration).title }}</strong>
@@ -963,10 +1193,11 @@ onBeforeUnmount(() => {
                   <p class="account-action-warning">{{ transferPrompt(registration).warning }}</p>
                   <p v-for="line in transferPrompt(registration).details.slice(1)" :key="line" class="account-action-detail">{{ line }}</p>
                 </template>
+                <p v-if="queueTransferTargetReason(registration)" class="account-action-note">{{ queueTransferTargetReason(registration) }}</p>
                 <div class="account-confirm-actions">
                   <button type="button" @click="queueActionMode = null">取消</button>
-                  <button class="primary" type="button" :disabled="!queueTargetMachineId || queueActionSubmitting"
-                    @click="submitQueueAction(registration, 'TRANSFER_MACHINE', { target_machine_id: queueTargetMachineId, expected_target_machine_stable_id: targetMachineStableId(queueTargetMachineId) })">
+                  <button class="primary" type="button" :disabled="!queueTargetMachineId || queueActionSubmitting || Boolean(queueTransferTargetReason(registration))"
+                    @click="submitQueueTransfer(registration)">
                     {{ transferPrompt(registration)?.confirm || '确认转至其他机台' }}
                   </button>
                 </div>
@@ -976,21 +1207,76 @@ onBeforeUnmount(() => {
                 <strong>{{ preferenceChooserText(registration).title }}</strong>
                 <p class="account-action-detail">{{ preferenceChooserText(registration).intro }}</p>
                 <p v-if="preferenceChooserText(registration).fixedPairNote" class="account-action-note">{{ preferenceChooserText(registration).fixedPairNote }}</p>
-                <PreferenceOptions v-if="registration.machine_capacity > 1" v-model="queuePreference" :disabled="queueActionSubmitting" />
+                <!-- The pair's own tick box, while the pair is kept: a chosen preference releases it. -->
+                <SoloPassTickBox v-if="queuePairPassingOffered(registration) && !queuePreference" v-model="queuePairPassing"
+                  fixed-pair :disabled="queueActionSubmitting"
+                  :explanation-shown="account.profile.passing_introduced === true"
+                  :explanation-key="account.profile.profile_id || ''" />
+                <PreferenceOptions v-if="registration.machine_capacity > 1" v-model="queuePreference" v-model:passing="queuePassing"
+                  :passing-available="queuePassingOffered(registration)" :disabled="queueActionSubmitting"
+                  :passing-explanation-shown="account.profile.passing_introduced === true"
+                  :passing-explanation-key="account.profile.profile_id || ''" />
                 <p v-else class="account-action-detail">{{ preferenceChooserText(registration).singleMachineNote }}</p>
                 <PairedQueueTickBox v-if="pairedMachineNameFor(registration)" v-model="queuePairedTick"
                   :disabled="queueActionSubmitting"
                   :paired-machine-name="pairedMachineNameFor(registration)"
                   :fixed-pair="registration.fixed_pair === true"
-                  :takes-effect-after-a-round="queuePairedTick && !registration.also_queues_at_paired_machine"
+                  :takes-effect-after-a-round="!registration.also_queues_at_paired_machine && registration.position !== 'PLAYING'"
                   :explanation-shown="account.profile.paired_machine_queueing_introduced === true"
                   :explanation-key="account.profile.profile_id || ''" />
+                <!-- Apart from the choices above, as on the terminal: it opens its own steps. -->
+                <template v-if="queueFriendPairOffered(registration)">
+                  <p class="account-action-group">{{ FRIEND_PAIR_SECTION_LABEL }}</p>
+                  <button type="button" class="account-friend-pair-entry"
+                    :class="{ 'is-unavailable': queueFriendPairEntry(registration).reason }"
+                    :aria-disabled="queueFriendPairEntry(registration).reason ? 'true' : 'false'"
+                    :disabled="queueActionSubmitting" @click="requestQueueFriendPair(registration)">
+                    <span>
+                      <strong>{{ queueFriendPairEntry(registration).title }}</strong>
+                      <small>{{ queueFriendPairEntry(registration).description }}</small>
+                    </span>
+                    <ChevronRight v-if="!queueFriendPairEntry(registration).reason" :size="16" aria-hidden="true" />
+                  </button>
+                </template>
                 <div class="account-confirm-actions">
                   <button type="button" @click="queueActionMode = null">取消</button>
                   <button class="primary" type="button"
                     :disabled="queueActionSubmitting || queuePreferenceChangeIsEmpty(registration)"
-                    @click="submitQueuePreferenceChange(registration)">
+                    @click="confirmQueuePreferenceChange(registration)">
                     确认更改游玩偏好
+                  </button>
+                </div>
+              </div>
+
+              <!-- 与朋友共同游玩: the friend's registration, then the confirmation; 返回 goes back
+                to 更改游玩偏好. -->
+              <div v-else-if="queueActionMode === 'friend_pair'" class="account-inline-action">
+                <FriendPairFlow :rows="friendPairCandidateRows(registration, queuePageRegistrations)"
+                  :disabled="queueActionSubmitting"
+                  :passing-offered="queueNewPairPassingOffered(registration)"
+                  :passing-explanation-shown="account.profile.passing_introduced === true"
+                  :passing-explanation-key="account.profile.profile_id || ''"
+                  @back="queueActionMode = 'preference'"
+                  @confirm="(choice) => submitQueueFriendPair(registration, choice)" />
+              </div>
+
+              <div v-else-if="queueActionMode === 'rename'" class="account-inline-action">
+                <RegistrationRenameForm :registration="registration" :page-registrations="queuePageRegistrations"
+                  :disabled="queueActionSubmitting" @cancel="queueActionMode = null"
+                  @save="(displayId) => submitQueueRename(registration, displayId)" />
+              </div>
+
+              <!-- The second question of a fixed-pair member that chose a preference, as on the
+                terminal; 返回 goes back to 更改游玩偏好 with the choices kept. -->
+              <div v-else-if="queueActionMode === 'release_pair'" class="account-inline-action">
+                <strong>{{ releasePairPrompt(registration).title }}</strong>
+                <p class="account-action-detail">{{ releasePairPrompt(registration).detail }}</p>
+                <div class="account-confirm-actions">
+                  <button type="button" @click="queueActionMode = 'preference'">返回</button>
+                  <button class="primary" type="button"
+                    :disabled="queueActionSubmitting || !preferenceChangeReleasesFixedPair(registration, queuePreference)"
+                    @click="submitQueuePreferenceChange(registration)">
+                    {{ releasePairPrompt(registration).confirm }}
                   </button>
                 </div>
               </div>
@@ -1009,6 +1295,10 @@ onBeforeUnmount(() => {
                 <template v-if="queueActionPrompt(registration, queueActionMode)">
                   <strong>{{ queueActionPrompt(registration, queueActionMode).title }}</strong>
                   <p class="account-action-detail">{{ queueActionPrompt(registration, queueActionMode).detail }}</p>
+                  <!-- The turns already missed, told before confirming as on the terminal. -->
+                  <p v-if="queueActionPrompt(registration, queueActionMode).limitNotice" class="account-action-limit">
+                    {{ queueActionPrompt(registration, queueActionMode).limitNotice }}
+                  </p>
                   <p v-if="queueActionPrompt(registration, queueActionMode).note" class="account-action-note">
                     {{ queueActionPrompt(registration, queueActionMode).note }}
                   </p>
@@ -1028,32 +1318,55 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <!-- Grouped as on the terminal's registration menu (docs/ui-guide.md, 菜单的分组). -->
+              <!-- Grouped as on the terminal's registration menu (docs/ui-guide.md, 菜单的分组).
+                An action that cannot be used is grey and says why under its name, as on the
+                terminal; the entry for moving machines is always there outside the playing
+                position. -->
               <div v-else class="account-queue-action-groups">
                 <template v-if="!registration.online_registration_pending_check_in &&
-                  (registration.machine_capacity > 1 || pairedMachineNameFor(registration) ||
-                    (registration.position !== 'PLAYING' && otherMachinesFor(registration).some((machine) => machine.available)))">
+                  (registration.machine_capacity > 1 || pairedMachineNameFor(registration) || registration.position !== 'PLAYING')">
                   <p class="account-action-group">游玩方式</p>
                   <div class="account-queue-actions">
-                    <button v-if="registration.machine_capacity > 1 || pairedMachineNameFor(registration)" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'preference') }" @click="requestQueuePreference(registration)">更改游玩偏好</button>
-                    <button v-if="registration.position !== 'PLAYING' && otherMachinesFor(registration).some((machine) => machine.available)" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'transfer') }" @click="requestQueueTransfer(registration)">{{ transferEntryLabel(otherMachinesFor(registration)) }}</button>
+                    <button v-if="registration.machine_capacity > 1 || pairedMachineNameFor(registration)" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'preference') }" @click="requestQueuePreference(registration)">
+                      <span>更改游玩偏好</span>
+                      <small v-if="queueActionUnavailableReason(registration, 'preference')">{{ queueActionUnavailableReason(registration, 'preference') }}</small>
+                    </button>
+                    <button v-if="registration.position !== 'PLAYING'" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueTransferUnavailableReason(registration) }" @click="requestQueueTransfer(registration)">
+                      <span>{{ transferEntryLabel(otherMachinesFor(registration)) }}</span>
+                      <small v-if="queueTransferUnavailableReason(registration)">{{ queueTransferUnavailableReason(registration) }}</small>
+                    </button>
                   </div>
                 </template>
                 <p class="account-action-group">这份登记</p>
                 <div class="account-queue-actions">
                   <template v-if="!registration.online_registration_pending_check_in">
-                    <button v-if="registration.deferred_once" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'cancel_defer') }" @click="cancelPostponement(registration, 'cancel_defer')">取消暂缓一次</button>
-                    <button v-else-if="registration.skips_one_turn" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'cancel_skip_one_turn') }" @click="cancelPostponement(registration, 'cancel_skip_one_turn')">取消轮空一次</button>
-                    <button v-else-if="registration.temporarily_away" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'cancel_temporary_leave') }" @click="cancelPostponement(registration, 'cancel_temporary_leave')">取消暂时离开</button>
-                    <button v-else-if="registration.position !== 'PLAYING'" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'postpone') }" @click="requestQueueAction(registration, 'postpone')">延后这份登记</button>
+                    <button v-if="registration.deferred_once" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'cancel_defer') }" @click="cancelPostponement(registration, 'cancel_defer')">
+                      <span>取消暂缓一次</span>
+                      <small v-if="queueActionUnavailableReason(registration, 'cancel_defer')">{{ queueActionUnavailableReason(registration, 'cancel_defer') }}</small>
+                    </button>
+                    <button v-else-if="registration.skips_one_turn" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'cancel_skip_one_turn') }" @click="cancelPostponement(registration, 'cancel_skip_one_turn')">
+                      <span>取消轮空一次</span>
+                      <small v-if="queueActionUnavailableReason(registration, 'cancel_skip_one_turn')">{{ queueActionUnavailableReason(registration, 'cancel_skip_one_turn') }}</small>
+                    </button>
+                    <button v-else-if="registration.temporarily_away" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'cancel_temporary_leave') }" @click="cancelPostponement(registration, 'cancel_temporary_leave')">
+                      <span>取消暂时离开</span>
+                      <small v-if="queueActionUnavailableReason(registration, 'cancel_temporary_leave')">{{ queueActionUnavailableReason(registration, 'cancel_temporary_leave') }}</small>
+                    </button>
+                    <button v-else-if="registration.position !== 'PLAYING'" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'postpone') }" @click="requestQueueAction(registration, 'postpone')">
+                      <span>延后这份登记</span>
+                      <small v-if="queueActionUnavailableReason(registration, 'postpone')">{{ queueActionUnavailableReason(registration, 'postpone') }}</small>
+                    </button>
                   </template>
-                  <button class="is-danger" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'leave') }" @click="requestQueueAction(registration, 'leave')">退出排队</button>
+                  <button class="is-danger" type="button" :disabled="queueActionSubmitting" :class="{ 'is-unavailable': queueActionUnavailableReason(registration, 'leave') }" @click="requestQueueAction(registration, 'leave')">
+                    <span>退出排队</span>
+                    <small v-if="queueActionUnavailableReason(registration, 'leave')">{{ queueActionUnavailableReason(registration, 'leave') }}</small>
+                  </button>
                 </div>
               </div>
             </template>
           </article>
           <p v-if="queueError" class="account-error" role="alert">{{ queueError }}</p>
-          <p v-if="queueNotice" class="account-notice" role="status">{{ queueNotice }}</p>
+          <p v-if="queueNoticeText" class="account-notice" role="status">{{ queueNoticeText }}</p>
         </section>
 
         <form v-else-if="activeSection === 'profile' && profileDraft" class="account-settings-form" @submit.prevent="saveProfile">
@@ -1065,7 +1378,7 @@ onBeforeUnmount(() => {
             <span>性别</span>
             <span class="account-select-wrap">
               <select v-model="profileDraft.gender">
-                <option value="UNDISCLOSED">不公开</option>
+                <option value="UNDISCLOSED">不愿透露</option>
                 <option value="MALE">男</option>
                 <option value="FEMALE">女</option>
               </select>
@@ -1092,7 +1405,7 @@ onBeforeUnmount(() => {
             <span>QQ 显示范围</span>
             <span class="account-select-wrap">
               <select v-model="profileDraft.qq_visibility">
-                <option value="PUBLIC_WEBSITE">允许网站显示</option>
+                <option value="PUBLIC_WEBSITE">允许网页端显示</option>
                 <option value="TERMINAL_ONLY">仅终端显示</option>
               </select>
               <ChevronDown :size="16" aria-hidden="true" />
@@ -1122,7 +1435,7 @@ onBeforeUnmount(() => {
           </fieldset>
           <fieldset class="account-fieldset">
             <legend>隐私与终端权限</legend>
-            <label class="account-toggle"><input v-model="profileDraft.visited_venues_public" type="checkbox" /><span><strong>公开到访过的机厅</strong><small>允许网站展示本人的机厅记录。</small></span></label>
+            <label class="account-toggle"><input v-model="profileDraft.visited_venues_public" type="checkbox" /><span><strong>公开到访过的机厅</strong><small>允许网页端展示本人的机厅记录。</small></span></label>
             <label class="account-toggle"><input v-model="profileDraft.terminal_editing_allowed" type="checkbox" /><span><strong>允许现场终端编辑资料</strong><small>关闭后，终端只能查看资料；QQ 始终只能在网页修改。</small></span></label>
           </fieldset>
           <p v-if="profileError" class="account-error" role="alert">{{ profileError }}</p>
@@ -1300,6 +1613,11 @@ onBeforeUnmount(() => {
 .account-queue-empty { margin: 12px 0 0; padding: 20px 12px; color: var(--queue-secondary, #6e6e73); background: var(--queue-soft, #f5f5f7); font-size: 11px; text-align: center; }
 .account-queue-card { margin-top: 10px; padding: 14px; border: 1px solid var(--queue-separator, #d2d2d7); border-radius: 8px; }
 .account-queue-card.is-focused { border-color: var(--queue-blue); box-shadow: 0 0 0 3px color-mix(in srgb, var(--queue-blue) 15%, transparent); }
+.account-queue-name { display: flex; min-height: 30px; margin: -4px 0 8px; align-items: center; gap: 2px; }
+.account-queue-name strong { min-width: 0; overflow-wrap: anywhere; font-size: 14px; font-weight: 650; line-height: 1.4; }
+.account-queue-name button { display: grid; width: 34px; height: 34px; flex: none; place-items: center; padding: 0; border: 0; border-radius: 50%; color: var(--queue-blue); background: transparent; cursor: pointer; }
+.account-queue-name button:hover { background: var(--queue-soft); }
+.account-queue-name button:disabled { color: var(--queue-tertiary, #8e8e93); cursor: default; }
 .account-queue-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .account-queue-summary > div:last-child { text-align: right; }
 .account-queue-summary strong, .account-queue-summary span { display: block; overflow-wrap: anywhere; }
@@ -1309,16 +1627,41 @@ onBeforeUnmount(() => {
 .account-queue-actions { display: grid; margin-top: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 .account-queue-actions button, .account-confirm-actions button { min-height: 42px; padding: 0 9px; border: 0; border-radius: 7px; color: var(--queue-text); background: var(--queue-soft); cursor: pointer; font-size: 10px; font-weight: 620; }
 .account-queue-actions button:disabled, .account-confirm-actions button:disabled { color: var(--queue-tertiary, #8e8e93); cursor: default; }
-.account-queue-actions button.is-unavailable { color: var(--queue-tertiary, #8e8e93); }
+.account-queue-actions button.is-unavailable { display: grid; align-content: center; gap: 3px; padding: 8px 10px; color: var(--queue-tertiary, #8e8e93); background: var(--queue-disabled); text-align: left; }
+.account-queue-actions button small { display: block; color: var(--queue-tertiary, #8e8e93); font-size: 10px; font-weight: 400; line-height: 1.5; }
+.account-transfer-rows { display: grid; gap: 6px; }
+.account-transfer-rows button { display: flex; min-height: 52px; padding: 9px 11px; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--queue-separator); border-radius: 7px; color: var(--queue-text); background: var(--queue-card); cursor: pointer; text-align: left; font: inherit; }
+.account-transfer-rows button.active { border-color: var(--queue-blue); background: var(--queue-soft-blue); }
+.account-transfer-rows button.is-unavailable { color: var(--queue-tertiary, #8e8e93); background: var(--queue-disabled); cursor: default; }
+.account-transfer-rows button:disabled { cursor: default; }
+.account-transfer-rows strong, .account-transfer-rows small { display: block; }
+.account-transfer-rows strong { font-size: 12px; font-weight: 620; line-height: 1.4; }
+.account-transfer-rows small { color: var(--queue-secondary, #6e6e73); font-size: 10px; font-weight: 400; line-height: 1.5; }
+.account-transfer-rows button.active .account-transfer-row-main strong { color: var(--queue-blue); }
+.account-transfer-rows button.is-unavailable small { color: var(--queue-tertiary, #8e8e93); }
+.account-transfer-row-main { display: grid; min-width: 0; gap: 2px; }
+.account-transfer-row-wait { display: grid; flex: none; gap: 2px; text-align: right; }
+.account-transfer-row-wait small { color: var(--queue-tertiary, #8e8e93); }
 .account-queue-actions button.is-danger, .account-confirm-actions button.is-danger { color: var(--queue-red); }
 .account-queue-paired-status { margin: 11px 0 0; color: var(--queue-secondary, #6e6e73); font-size: 10px; line-height: 1.55; }
 .account-queue-estimate-note { margin: 11px 0 0; color: var(--queue-secondary, #6e6e73); font-size: 10px; line-height: 1.55; }
+.account-queue-skip-limit { margin: 11px 0 0; color: var(--queue-orange); font-size: 10px; font-weight: 570; line-height: 1.55; }
 .account-queue-paired-announcement { color: var(--queue-blue, #007aff); font-weight: 570; }
 .account-inline-action { display: grid; margin-top: 12px; gap: 9px; padding-top: 12px; border-top: 1px solid var(--queue-separator, #d2d2d7); }
 .account-inline-action > strong { font-size: 12px; }
 .account-inline-action > p { margin: 0; color: var(--queue-secondary, #6e6e73); font-size: 10px; line-height: 1.5; }
 .account-inline-action > .account-action-detail { font-size: 11px; line-height: 1.65; }
 .account-inline-action > .account-action-note { padding: 9px 10px; border-left: 3px solid var(--queue-blue); color: var(--queue-secondary); background: var(--queue-soft-blue); font-size: 10px; line-height: 1.6; }
+.account-inline-action > .account-action-limit { color: var(--queue-orange); font-size: 11px; font-weight: 570; line-height: 1.65; }
+.account-inline-action > .account-action-group { margin: 3px 0 0; font-size: 10px; line-height: 1.5; }
+.account-friend-pair-entry { display: flex; min-height: 52px; padding: 9px 11px; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--queue-separator); border-radius: 9px; color: var(--queue-text); background: var(--queue-card); cursor: pointer; text-align: left; font: inherit; }
+.account-friend-pair-entry > span { display: grid; min-width: 0; gap: 3px; }
+.account-friend-pair-entry strong { font-size: 12px; font-weight: 620; line-height: 1.4; }
+.account-friend-pair-entry small { color: var(--queue-secondary, #6e6e73); font-size: 10px; font-weight: 400; line-height: 1.55; }
+.account-friend-pair-entry > svg { flex: none; color: var(--queue-tertiary, #8e8e93); }
+.account-friend-pair-entry.is-unavailable { color: var(--queue-tertiary, #8e8e93); background: var(--queue-disabled); cursor: default; }
+.account-friend-pair-entry.is-unavailable small { color: var(--queue-tertiary, #8e8e93); }
+.account-friend-pair-entry:disabled { cursor: default; }
 .account-confirm-actions { display: grid; grid-template-columns: .8fr 1.2fr; gap: 6px; }
 .account-confirm-actions.is-single { grid-template-columns: 1fr; }
 .account-inline-action > .account-action-warning { margin: 0; padding: 9px 10px; border-left: 3px solid var(--queue-red); color: var(--queue-red); background: var(--queue-soft-red); font-size: 10px; line-height: 1.6; }

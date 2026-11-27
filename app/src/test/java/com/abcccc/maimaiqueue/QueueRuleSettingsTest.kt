@@ -693,4 +693,53 @@ class QueueRuleSettingsTest {
         assertEquals("", settings.queueSyncEndpoint)
         assertEquals("", settings.queueSyncToken)
     }
+
+    @Test
+    fun aRemoteChangeWhileTheSettingsPageIsOpenKeepsTheOperatorsEdits() {
+        // Review T-C12: the page used to throw its draft away whenever the saved settings changed.
+        val base = fourMachines()
+        val remark = base.machineConfigurations.getValue(MachineId.A).copy(remark = "靠窗")
+        val draft = base.copy(
+            allowTemporaryLeave = false,
+            machineConfigurations = base.machineConfigurations + (MachineId.A to remark)
+        )
+        // A management command changes another setting and the policy revision.
+        val remote = base.copy(allowOnlineRegistration = false, managementPolicyRevision = 3L)
+        val merged = mergeRemoteSettingsIntoDraft(base, draft, remote)
+        assertFalse(merged.allowTemporaryLeave)
+        assertEquals("靠窗", merged.machineConfigurations.getValue(MachineId.A).remark)
+        assertFalse(merged.allowOnlineRegistration)
+        assertEquals(3L, merged.managementPolicyRevision)
+        // Nothing edited: the saved settings as they are.
+        assertEquals(remote, mergeRemoteSettingsIntoDraft(base, base, remote))
+    }
+
+    @Test
+    fun theMachineLayoutIsMergedAsOneUnit() {
+        val base = fourMachines()
+        val draft = base.copy(
+            machineConfigurations = base.machineConfigurations +
+                (MachineId.B to base.machineConfigurations.getValue(MachineId.B).copy(remark = "门口"))
+        )
+        val remote = normalizeMachineLayoutSettings(base.copy(configuredMachineCount = 3))
+        // The operator edited the layout: theirs stays whole, not mixed with the saved one.
+        val merged = mergeRemoteSettingsIntoDraft(base, draft, remote)
+        assertEquals(draft.configuredMachineCount, merged.configuredMachineCount)
+        assertEquals(draft.machineConfigurations, merged.machineConfigurations)
+        assertEquals(remote.machineConfigurationRevision, merged.machineConfigurationRevision)
+    }
+
+    @Test
+    fun aManagementTakeoverWinsForTheSettingsItHolds() {
+        val base = fourMachines()
+        val draft = base.copy(allowDeferOneRound = false, queueSyncEndpoint = "https://example.test")
+        val remote = base.copy(managementAppBound = true, allowDeferOneRound = true, allowTemporaryLeave = false)
+        val merged = mergeRemoteSettingsIntoDraft(base, draft, remote)
+        assertTrue(merged.allowDeferOneRound)
+        assertFalse(merged.allowTemporaryLeave)
+        assertTrue(merged.managementAppBound)
+        // The connection is not the management app's: the operator's edit stays.
+        assertEquals("https://example.test", merged.queueSyncEndpoint)
+    }
 }
+

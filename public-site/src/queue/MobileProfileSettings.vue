@@ -27,7 +27,7 @@ function update(key, value) {
       <button type="button" :class="{ active: settings.qq_visibility === 'TERMINAL_ONLY' }"
         @click="update('qq_visibility', 'TERMINAL_ONLY')">仅终端显示</button>
       <button type="button" :class="{ active: settings.qq_visibility === 'PUBLIC_WEBSITE' }"
-        @click="update('qq_visibility', 'PUBLIC_WEBSITE')">允许网站显示</button>
+        @click="update('qq_visibility', 'PUBLIC_WEBSITE')">允许网页端显示</button>
     </div>
   </fieldset>
   <fieldset class="mobile-notifications">

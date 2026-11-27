@@ -14,7 +14,32 @@ import {
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import MobileProfileSettings from './MobileProfileSettings.vue'
 import PairedQueueTickBox from './PairedQueueTickBox.vue'
+import SoloPassTickBox from './SoloPassTickBox.vue'
 import { formatMiddleDots, normalizeMachineConfiguration } from './machineConfiguration.js'
+import { pairedQueueClockTime } from './pairedQueueCopy.js'
+import {
+  PREFERENCE_OPTIONS,
+  PREFERENCE_RECOMMENDED_BADGE,
+  REMEMBER_PREFERENCE_LABEL,
+  rememberPreferenceOffered
+} from './queueActionAvailability.js'
+import { terminalSupportsQueueOperation } from './soloPassCopy.js'
+import {
+  CONFIRMING_REGISTRATION_DETAIL,
+  CONFIRMING_RESULT_TITLE,
+  fetchWithTimeout,
+  isConnectionLost,
+  retryWhileConnectionLost
+} from './commandDelivery.js'
+import {
+  CLOSING_WARNING_CONFIRM,
+  CLOSING_WARNING_TITLE,
+  NEW_REGISTRATION_WAIT_LABEL,
+  NEW_REGISTRATION_WAIT_NOTE,
+  closingWarningText,
+  newRegistrationWaitTextWithPaired,
+  waitExtendsPastClosing
+} from './waitEstimateCopy.js'
 
 const props = defineProps({
   token: { type: String, required: true }
@@ -52,11 +77,32 @@ const searching = ref(false)
 const errorDetail = ref('')
 const resultDetail = ref('')
 const requestId = ref(createRequestId())
+// While the registration, or the reading of its result, gets no answer and is made again
+// (website review W-L7).
+const confirming = ref(false)
+// The registration last sent, for 重新提交 when its result is unknown; kept in memory only.
+let submittedPayload = null
 const rememberedProfileId = ref(readRememberedProfileId())
 const selectedPreference = ref(null)
 // The tick box of this registration: whether the system may arrange it between this machine
 // and the machine paired with it. Unticked unless the player ticks it; no profile stores it.
 const allowsPairedArrangement = ref(false)
+// The tick box that lets registrations behind pass over this one, as on the status page: it
+// starts from the profile's last answer; a new profile starts unticked.
+const allowsPassing = ref(false)
+// 将本次选择保存为默认游玩偏好: unticked whenever a profile is chosen, as on the terminal.
+const rememberPreference = ref(false)
+// What the terminal can carry out (capabilities.queue_operations of the session).
+const sessionCapabilities = ref(null)
+// The machines with the wait of a new registration, and the business hours, as the online join
+// reads them (machines[].estimated_wait_minutes, business_hours.closes_at). Older servers leave
+// both out: the page then shows no wait and asks nothing about closing time.
+const sessionMachines = ref([])
+const sessionBusinessHours = ref(null)
+// The warning that the new registration may not play before closing time, asked once before
+// the registration is submitted; 仍然继续 is not asked again.
+const closingWarningVisible = ref(false)
+const closingWarningAcknowledged = ref(false)
 const draftMode = ref(null)
 const completionDraft = reactive(createCompletionDraft())
 const newProfileDraft = reactive(createNewProfileDraft())
@@ -109,6 +155,18 @@ const needsCurrentPreference = computed(() => (
   confirmationProfile.value?.defaultPreference === 'ASK_EVERY_TIME'
 ))
 
+// What each play preference means, in the words of 更改游玩偏好 and the terminal's join step.
+const PREFERENCE_DESCRIPTIONS = Object.fromEntries(
+  PREFERENCE_OPTIONS.map((option) => [option.value, option.description])
+)
+
+// Under the title 确认加入排队, in the terminal's two sentences.
+const confirmationSubtitle = computed(() => (
+  singlePlayerMachine.value
+    ? `请确认玩家资料。完成后会以单人游玩加入 ${sessionMachineName.value}。`
+    : `请确认玩家资料和本次游玩偏好。完成后会加入 ${sessionMachineName.value}。`
+))
+
 // The machine that forms a pair with this session's machine, if the venue has set one up.
 const pairedMachineName = computed(() => {
   const name = session.value?.paired_machine_name ?? session.value?.pairedMachineName
@@ -120,6 +178,96 @@ const pairedMachineName = computed(() => {
 const showsPairedTickBox = computed(() => (
   session.value?.paired_machine_queueing_available === true && Boolean(pairedMachineName.value)
 ))
+
+// This registration's play preference, as it will be submitted.
+const effectivePreference = computed(() => (
+  singlePlayerMachine.value
+    ? 'SOLO'
+    : needsCurrentPreference.value
+    ? selectedPreference.value
+    : confirmationProfile.value?.defaultPreference
+))
+
+// Offered where the terminal knows the choice and only for 单人游玩 on a machine for two.
+const passingAvailable = computed(() => (
+  !singlePlayerMachine.value &&
+  terminalSupportsQueueOperation(sessionCapabilities.value, 'SET_ALLOWS_PASSING')
+))
+
+const showsPassingTickBox = computed(() => (
+  passingAvailable.value && effectivePreference.value === 'SOLO'
+))
+
+// A profile that always plays alone gets the tick box on its own, as on the status page.
+const passingForSoloDefault = computed(() => (
+  showsPassingTickBox.value && !needsCurrentPreference.value
+))
+
+// The tick row under the play preference, where the terminal offers it: the profile asks every
+// time and the machine takes two players (rememberPreferenceOffered).
+const rememberOffered = computed(() => (
+  rememberPreferenceOffered(needsCurrentPreference.value, sessionCapabilities.value?.queue_operations)
+))
+
+function sessionMachineEntry(machineId) {
+  if (!machineId) return null
+  return sessionMachines.value.find((machine) => machine?.id === machineId) || null
+}
+
+function newRegistrationWaitMinutes(machine) {
+  const minutes = machine?.estimated_wait_minutes
+  return typeof minutes === 'number' && Number.isFinite(minutes) && minutes >= 0
+    ? Math.trunc(minutes)
+    : null
+}
+
+const currentMachineEntry = computed(() => (
+  sessionMachineEntry(session.value?.machine_id ?? session.value?.machineId)
+))
+
+// 新登记预计等待 of this session's machine, as the online join shows it. With the tick box for
+// the two machines on, the registration may play at the other machine first: that machine's wait
+// is shown when it is the earlier one, as the earliest.
+const newRegistrationWaitSummary = computed(() => {
+  const machine = currentMachineEntry.value
+  if (machine?.available !== true) return null
+  const pairedMachine = showsPairedTickBox.value && allowsPairedArrangement.value
+    ? sessionMachineEntry(session.value?.paired_machine_id ?? session.value?.pairedMachineId)
+    : null
+  return newRegistrationWaitTextWithPaired(
+    newRegistrationWaitMinutes(machine),
+    pairedMachine?.available === true ? newRegistrationWaitMinutes(pairedMachine) : null
+  )
+})
+
+// The closing time of the business hours in force, or null.
+const closesAtMillis = computed(() => {
+  const hours = sessionBusinessHours.value
+  const value = hours?.enabled === true ? hours.closes_at : null
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  return value < 1_000_000_000_000 ? value * 1000 : value
+})
+
+// The sentence of the warning, as the online join and the terminal write it. The machine was
+// chosen on the terminal and cannot be changed on this page, so no other machine is offered.
+const closingWarningSentence = computed(() => closingWarningText({
+  machineName: sessionMachineName.value,
+  minutes: newRegistrationWaitMinutes(currentMachineEntry.value),
+  closingTime: closesAtMillis.value === null ? null : pairedQueueClockTime(closesAtMillis.value)
+}))
+
+function needsClosingWarning() {
+  return !closingWarningAcknowledged.value && waitExtendsPastClosing(
+    newRegistrationWaitMinutes(currentMachineEntry.value),
+    closesAtMillis.value
+  )
+}
+
+function confirmClosingWarning() {
+  closingWarningVisible.value = false
+  closingWarningAcknowledged.value = true
+  submitRegistration()
+}
 
 const newProfileValid = computed(() => (
   inRange(codePointLength(newProfileDraft.nickname.trim()), [1, 18]) &&
@@ -207,8 +355,9 @@ function forgetRememberedProfile() {
   rememberedProfileId.value = null
 }
 
+// A request without a response throws ConnectionLostError (commandDelivery.js).
 async function requestJson(url, options = {}) {
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     cache: 'no-store',
     headers: { Accept: 'application/json', ...(options.headers || {}) },
     ...options
@@ -248,6 +397,10 @@ function normalizeProfile(source) {
     setupComplete: source.setup_complete === true,
     // Whether this profile's player has already been shown the explanation of the tick box.
     pairedQueueExplanationShown: source.paired_machine_queueing_introduced === true,
+    // The same for the explanation of letting others pass.
+    passingExplanationShown: source.passing_introduced === true,
+    // The player's last answer to the passing tick box.
+    lastAllowsPassing: source.last_allows_passing === true,
     revision: Number(source.profile_revision) || 1,
     usageCount: Number(source.usage_count) || 0,
     lastUsedAt: Number(source.last_used_at) || null
@@ -333,6 +486,9 @@ async function loadProfiles(query) {
     const payload = await requestJson(url)
     if (sequence !== searchSequence) return
     session.value = payload.session || null
+    sessionCapabilities.value = payload.capabilities || null
+    sessionMachines.value = Array.isArray(payload.machines) ? payload.machines : []
+    sessionBusinessHours.value = payload.business_hours || null
     botQq.value = payload.bot_qq || null
     profiles.value = Array.isArray(payload.profiles)
       ? payload.profiles.map(normalizeProfile).filter(Boolean)
@@ -359,6 +515,8 @@ async function loadProfiles(query) {
 function selectProfile(profile) {
   selectedProfile.value = profile
   allowsPairedArrangement.value = false
+  rememberPreference.value = false
+  allowsPassing.value = profile.lastAllowsPassing === true
   selectedPreference.value = singlePlayerMachine.value
     ? 'SOLO'
     : profile.defaultPreference === 'ASK_EVERY_TIME'
@@ -382,6 +540,8 @@ function selectProfile(profile) {
 function beginNewProfile() {
   selectedProfile.value = null
   allowsPairedArrangement.value = false
+  rememberPreference.value = false
+  allowsPassing.value = false
   selectedPreference.value = null
   requestId.value = createRequestId()
   resetDraft(newProfileDraft, createNewProfileDraft())
@@ -436,13 +596,25 @@ async function submitRegistration() {
     errorDetail.value = '请选择本次游玩偏好。'
     return
   }
+  // As the online join asks before it submits a registration that may come too late.
+  if (needsClosingWarning()) {
+    closingWarningVisible.value = true
+    return
+  }
   const payload = {
     request_id: requestId.value,
     preference
   }
+  // Sent only when ticked: the terminal then stores the chosen preference as the profile's
+  // default.
+  if (rememberOffered.value && rememberPreference.value) payload.remember_preference = true
   // The tick box belongs to this registration alone. It is sent only where it was offered.
   if (showsPairedTickBox.value) {
     payload.also_queues_at_paired_machine = allowsPairedArrangement.value
+  }
+  // Sent, ticked or not, wherever the box was offered; the profile remembers the answer.
+  if (passingAvailable.value && preference === 'SOLO') {
+    payload.allows_passing = allowsPassing.value
   }
   if (draftMode.value === 'NEW') {
     payload.new_profile = {
@@ -463,16 +635,27 @@ async function submitRegistration() {
     }
   }
 
+  await sendRegistration(payload)
+}
+
+// Sends the registration. A request that gets no answer is sent again unchanged, with the same
+// request_id, so that the server returns the registration it already holds instead of creating
+// another; meanwhile the page says the result is being confirmed (website review W-L7).
+async function sendRegistration(payload, resending = false) {
+  submittedPayload = payload
   step.value = 'SUBMITTING'
+  confirming.value = resending
   errorDetail.value = ''
   try {
-    const result = await requestJson(`${sessionEndpoint.value}/submit`, {
+    const result = await retryWhileConnectionLost(() => requestJson(`${sessionEndpoint.value}/submit`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
-    })
+    }), { onConnectionLost: () => { confirming.value = true } })
+    confirming.value = false
     applyCommandResult(result)
   } catch (error) {
+    confirming.value = false
     if (PROFILE_FORM_ERROR_CODES.has(error?.code) && draftMode.value === 'NEW') {
       step.value = 'NEW'
       errorDetail.value = error.message
@@ -488,7 +671,11 @@ async function submitRegistration() {
       errorDetail.value = error.message
       return
     }
-    if (isTemporaryRequestError(error)) {
+    if (isConnectionLost(error)) {
+      // The registration may have been created; 重新提交 sends the same request again.
+      step.value = 'SUBMIT_ERROR'
+      resultDetail.value = '暂时无法确认登记是否已经提交。'
+    } else if (isTemporaryRequestError(error)) {
       step.value = 'SUBMIT_ERROR'
       resultDetail.value = error?.message || '暂时无法确认登记是否已经提交。'
     } else {
@@ -496,6 +683,12 @@ async function submitRegistration() {
       errorDetail.value = error?.message || '这次登记未能提交，请重新核对资料。'
     }
   }
+}
+
+// 重新提交 when the result is unknown: the same request, with the same request_id.
+function resendRegistration() {
+  if (submittedPayload) sendRegistration(submittedPayload, true)
+  else submitRegistration()
 }
 
 function applyCommandResult(result) {
@@ -523,10 +716,18 @@ function applyCommandResult(result) {
   errorDetail.value = '这次移动设备登记的状态无法识别，请在终端重新打开。'
 }
 
+// A reading that gets no answer is made again, a little later each time, while the page says the
+// result is being confirmed (website review W-L7).
 async function pollResult() {
   try {
-    applyCommandResult(await requestJson(`${sessionEndpoint.value}/result`))
+    const result = await retryWhileConnectionLost(
+      () => requestJson(`${sessionEndpoint.value}/result`),
+      { onConnectionLost: () => { confirming.value = true } }
+    )
+    confirming.value = false
+    applyCommandResult(result)
   } catch (error) {
+    confirming.value = false
     if (isTemporaryRequestError(error)) {
       step.value = 'RESULT_ERROR'
       resultDetail.value = error?.message || '暂时无法读取终端处理结果。'
@@ -562,7 +763,7 @@ function preferenceLabel(value) {
 function genderLabel(value) {
   if (value === 'MALE') return '男'
   if (value === 'FEMALE') return '女'
-  return '不显示'
+  return '不愿透露'
 }
 
 function genderSymbol(value) {
@@ -609,8 +810,8 @@ onBeforeUnmount(() => {
 
         <section v-if="step === 'LOADING' || step === 'SUBMITTING'" class="mobile-registration-result" aria-live="polite">
           <span class="is-progress" aria-hidden="true"><RefreshCw :size="25" /></span>
-          <h2>{{ step === 'LOADING' ? '正在读取玩家资料库' : '正在提交登记' }}</h2>
-          <p>{{ step === 'LOADING' ? '请稍候。' : '请保持页面打开，重复提交不会创建多份登记。' }}</p>
+          <h2>{{ step === 'LOADING' ? '正在读取玩家资料库' : confirming ? CONFIRMING_RESULT_TITLE : '正在提交登记' }}</h2>
+          <p>{{ step === 'LOADING' ? '请稍候。' : confirming ? CONFIRMING_REGISTRATION_DETAIL : '请保持页面打开，重复提交不会创建多份登记。' }}</p>
         </section>
 
         <section v-else-if="step === 'ERROR'" class="mobile-registration-result is-error" aria-live="assertive">
@@ -694,7 +895,7 @@ onBeforeUnmount(() => {
         <template v-else-if="step === 'CONFIRM'">
           <section class="mobile-step-heading">
             <button type="button" aria-label="返回修改" @click="returnFromConfirmation"><ArrowLeft :size="19" /></button>
-            <div><span>信息核对</span><h2>确认本次登记</h2><p>提交后，现场终端会进行最终校验。</p></div>
+            <div><span>信息核对</span><h2>确认加入排队</h2><p>{{ confirmationSubtitle }}</p></div>
           </section>
           <section class="mobile-confirmation">
             <dl>
@@ -704,11 +905,28 @@ onBeforeUnmount(() => {
               <div><dt>默认游玩偏好</dt><dd>{{ preferenceLabel(confirmationProfile.defaultPreference) }}</dd></div>
               <div v-if="draftMode === 'NEW'"><dt>QQ</dt><dd>{{ confirmationProfile.qqNumber }}</dd></div>
             </dl>
-            <fieldset v-if="needsCurrentPreference || showsPairedTickBox">
-              <legend>{{ needsCurrentPreference ? '选择本次游玩偏好' : '本次游玩偏好' }}</legend>
-              <div v-if="needsCurrentPreference" class="mobile-preference-cards">
-                <button type="button" :class="{ active: selectedPreference === 'OPEN_TO_JOIN' }" @click="selectedPreference = 'OPEN_TO_JOIN'"><strong>允许他人加入</strong><span>接受系统分配的共同游玩，通常可以缩短等待时间。</span></button>
-                <button type="button" :class="{ active: selectedPreference === 'SOLO' }" @click="selectedPreference = 'SOLO'"><strong>单人游玩</strong><span>独自占用一个等待位置。</span></button>
+            <fieldset v-if="needsCurrentPreference || showsPairedTickBox || passingForSoloDefault">
+              <legend>本次游玩偏好</legend>
+              <div v-if="needsCurrentPreference" class="mobile-preference-cards" :class="{ 'is-stacked': passingAvailable }">
+                <!-- In the terminal's order and words: 单人游玩 first, then 允许他人加入, which is
+                  marked 推荐. The tick box sits inside 单人游玩, as on the terminal and the status page. -->
+                <div class="mobile-preference-option" :class="{ active: selectedPreference === 'SOLO' }">
+                  <button type="button" @click="selectedPreference = 'SOLO'"><strong>单人游玩</strong><span>{{ PREFERENCE_DESCRIPTIONS.SOLO }}</span></button>
+                  <SoloPassTickBox v-if="showsPassingTickBox" v-model="allowsPassing"
+                    :explanation-shown="draftMode !== 'NEW' && selectedProfile?.passingExplanationShown === true"
+                    :explanation-key="draftMode === 'NEW' ? 'new-profile' : (selectedProfile?.profileId || '')" />
+                </div>
+                <button type="button" :class="{ active: selectedPreference === 'OPEN_TO_JOIN' }" @click="selectedPreference = 'OPEN_TO_JOIN'"><strong>允许他人加入<em class="mobile-preference-recommended">{{ PREFERENCE_RECOMMENDED_BADGE }}</em></strong><span>{{ PREFERENCE_DESCRIPTIONS.OPEN_TO_JOIN }}</span></button>
+              </div>
+              <label v-if="rememberOffered" class="mobile-remember">
+                <input v-model="rememberPreference" type="checkbox" />
+                <span>{{ REMEMBER_PREFERENCE_LABEL }}</span>
+              </label>
+              <div v-if="passingForSoloDefault" class="mobile-solo-default">
+                <p>本次将使用“单人游玩”。</p>
+                <SoloPassTickBox v-model="allowsPassing"
+                  :explanation-shown="draftMode !== 'NEW' && selectedProfile?.passingExplanationShown === true"
+                  :explanation-key="draftMode === 'NEW' ? 'new-profile' : (selectedProfile?.profileId || '')" />
               </div>
               <PairedQueueTickBox v-if="showsPairedTickBox" v-model="allowsPairedArrangement"
                 :paired-machine-name="pairedMachineName"
@@ -719,16 +937,22 @@ onBeforeUnmount(() => {
               <Smartphone :size="17" aria-hidden="true" />
               {{ sessionMachineName }} 仅能容纳一人游玩，本次将使用“单人游玩”。玩家资料中的默认游玩偏好不会改变。
             </p>
+            <!-- Under the choices that change it, as in the online join. -->
+            <div v-if="newRegistrationWaitSummary" class="mobile-wait-summary" aria-live="polite">
+              <span>{{ NEW_REGISTRATION_WAIT_LABEL }}</span>
+              <strong>{{ newRegistrationWaitSummary }}</strong>
+              <small>{{ NEW_REGISTRATION_WAIT_NOTE }}</small>
+            </div>
             <p class="mobile-information"><Smartphone :size="17" aria-hidden="true" />这份登记在现场扫码创建，提交成功后无需签到。</p>
             <p v-if="errorDetail" class="mobile-form-error" role="alert">{{ errorDetail }}</p>
-            <button class="mobile-primary" type="button" :disabled="needsCurrentPreference && !selectedPreference" @click="submitRegistration">确认并加入排队</button>
+            <button class="mobile-primary" type="button" :disabled="needsCurrentPreference && !selectedPreference" @click="submitRegistration">完成并加入排队</button>
           </section>
         </template>
 
         <section v-else-if="step === 'PENDING'" class="mobile-registration-result" aria-live="polite">
           <span class="is-progress" aria-hidden="true"><Clock3 :size="25" /></span>
-          <h2>正在等待现场终端确认</h2>
-          <p>请保持页面打开。现场终端会再次检查机台状态、玩家资料和重复登记，完成后会显示最终结果。</p>
+          <h2>{{ confirming ? CONFIRMING_RESULT_TITLE : '正在等待现场终端确认' }}</h2>
+          <p>{{ confirming ? CONFIRMING_REGISTRATION_DETAIL : '请保持页面打开。现场终端会再次检查机台状态、玩家资料和重复登记，完成后会显示最终结果。' }}</p>
         </section>
 
         <section v-else-if="step === 'SUBMIT_ERROR'" class="mobile-registration-result is-error" aria-live="assertive">
@@ -736,7 +960,7 @@ onBeforeUnmount(() => {
           <h2>暂时无法确认提交结果</h2>
           <p>{{ resultDetail }}</p>
           <p class="mobile-information"><RefreshCw :size="17" aria-hidden="true" />重新提交不会创建重复的登记。</p>
-          <button class="mobile-primary" type="button" @click="submitRegistration">重新提交</button>
+          <button class="mobile-primary" type="button" @click="resendRegistration">重新提交</button>
           <button class="mobile-secondary" type="button" @click="leaveFlow">返回队列</button>
         </section>
 
@@ -764,6 +988,16 @@ onBeforeUnmount(() => {
           <button class="mobile-primary" type="button" @click="leaveFlow">返回队列</button>
         </section>
       </main>
+      <div v-if="closingWarningVisible" class="mobile-warning-backdrop" @click.self="closingWarningVisible = false">
+        <section class="mobile-warning-dialog" role="alertdialog" aria-modal="true" :aria-label="CLOSING_WARNING_TITLE">
+          <h2>{{ CLOSING_WARNING_TITLE }}</h2>
+          <p>{{ closingWarningSentence }}</p>
+          <div>
+            <button type="button" @click="closingWarningVisible = false">取消</button>
+            <button type="button" class="primary" @click="confirmClosingWarning">{{ CLOSING_WARNING_CONFIRM }}</button>
+          </div>
+        </section>
+      </div>
     </div>
   </Teleport>
 </template>
@@ -844,9 +1078,31 @@ onBeforeUnmount(() => {
 .mobile-preference-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .mobile-preference-cards button { display: flex; min-height: 66px; padding: 10px 12px; justify-content: center; flex-direction: column; border: 1px solid var(--mobile-separator); border-radius: 8px; color: var(--mobile-text); background: var(--mobile-bg); text-align: left; cursor: pointer; }
 .mobile-preference-cards button.active { border-color: var(--mobile-blue); background: var(--mobile-soft-blue); }
+.mobile-preference-cards.is-stacked { grid-template-columns: minmax(0, 1fr); }
+.mobile-preference-option { min-width: 0; border: 1px solid var(--mobile-separator); border-radius: 8px; background: var(--mobile-bg); }
+.mobile-preference-option.active { border-color: var(--mobile-blue); background: var(--mobile-soft-blue); }
+.mobile-preference-cards .mobile-preference-option > button { width: 100%; border: 0; background: transparent; }
+.mobile-preference-option > .solo-pass-tick-box { margin: 0 12px 10px; }
+.mobile-remember { display: flex; margin-top: 8px; padding: 11px 12px; align-items: center; gap: 9px; border-radius: 8px; color: var(--mobile-text); background: var(--mobile-bg); cursor: pointer; font-size: 13px; line-height: 1.55; }
+.mobile-remember input { width: 17px; height: 17px; flex: none; margin: 0; accent-color: var(--mobile-blue); }
+.mobile-wait-summary { display: grid; padding: 11px 12px; gap: 2px; border: 1px solid var(--mobile-separator); border-radius: 8px; background: var(--mobile-bg); }
+.mobile-wait-summary span { color: var(--mobile-secondary); font-size: 12px; line-height: 1.45; }
+.mobile-wait-summary strong { font-size: 17px; font-weight: 640; line-height: 1.4; }
+.mobile-wait-summary small { color: var(--mobile-tertiary); font-size: 12px; line-height: 1.5; }
+.mobile-warning-backdrop { position: fixed; z-index: 10001; inset: 0; display: grid; padding: 18px; place-items: center; background: rgb(0 0 0 / 42%); }
+.mobile-warning-dialog { width: min(100%, 420px); padding: 20px; border-radius: 14px; color: var(--mobile-text); background: var(--mobile-card); box-shadow: 0 18px 54px rgb(0 0 0 / 22%); }
+.mobile-warning-dialog h2 { margin: 0; font-size: 20px; font-weight: 650; line-height: 1.3; }
+.mobile-warning-dialog p { margin: 8px 0 0; color: var(--mobile-secondary); font-size: 13px; line-height: 1.65; }
+.mobile-warning-dialog > div { display: grid; margin-top: 18px; grid-template-columns: 1fr 1fr; gap: 8px; }
+.mobile-warning-dialog button { min-height: 46px; border: 0; border-radius: 8px; color: var(--mobile-text); background: #e8e8ed; cursor: pointer; font-size: 14px; font-weight: 620; }
+.mobile-warning-dialog button.primary { color: #fff; background: var(--mobile-blue); }
+.mobile-solo-default { display: grid; gap: 8px; }
+.mobile-solo-default > p { margin: 0; color: var(--mobile-secondary); font-size: 12px; line-height: 1.5; }
+.mobile-solo-default > .solo-pass-tick-box { padding: 10px 12px; border: 1px solid var(--mobile-separator); border-radius: 8px; background: var(--mobile-bg); }
 .mobile-preference-cards strong, .mobile-preference-cards span { display: block; }
 .mobile-preference-cards strong { font-size: 14px; }
 .mobile-preference-cards span { margin-top: 3px; color: var(--mobile-secondary); font-size: 11px; }
+.mobile-preference-recommended { display: inline-block; margin-left: 7px; padding: 1px 8px; border-radius: 100px; color: var(--mobile-blue); background: color-mix(in srgb, var(--mobile-blue) 13%, transparent); font-size: 11px; font-style: normal; font-weight: 650; line-height: 1.5; vertical-align: 1px; }
 .mobile-information { display: flex; margin: 0; padding: 11px 12px; align-items: flex-start; gap: 8px; border-left: 3px solid var(--mobile-blue); color: var(--mobile-secondary); background: var(--mobile-soft-blue); font-size: 12px; line-height: 1.6; }
 .mobile-information > svg { margin-top: 1px; flex: 0 0 auto; color: var(--mobile-blue); }
 .mobile-form-error { margin: 0; padding: 10px 11px; border-radius: 8px; color: var(--mobile-red); background: #fff0ef; font-size: 12px; line-height: 1.5; }

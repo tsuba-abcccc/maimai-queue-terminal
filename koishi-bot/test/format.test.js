@@ -926,6 +926,38 @@ test('queue notifications append only the concise current position', () => {
   assert.doesNotMatch(message, /你好|游玩偏好|暂缓一次|退出排队/)
 })
 
+test('an earlier time for missing online check-ins follows the estimate', () => {
+  const player = {
+    registration_id: 'registration-behind-online',
+    profile_id: 'profile-behind-online',
+    qq_number: '12345678',
+    display_id: '小张',
+    machine_id: 'A',
+    position: 'WAITING',
+    position_index: 2,
+    estimated_wait_minutes: 25,
+    wait_minutes_if_online_missing: 10,
+    preference: 'OPEN_TO_JOIN',
+    deferred_once: false,
+    temporarily_away: false,
+    temporary_away_skipped_turns: 0,
+    no_show_count: 0,
+    last_no_show_action_was_defer: false,
+  }
+  assert.equal(
+    formatNotificationQueueStatus([player]),
+    '现在，你位于队列位置 A2，约 25 分钟后可以游玩。前方的线上登记未按时签到时，这份登记最快约 10 分钟后可以游玩。',
+  )
+  assert.equal(
+    formatNotificationQueueStatus([{ ...player, wait_minutes_if_online_missing: null }]),
+    '现在，你位于队列位置 A2，约 25 分钟后可以游玩。',
+  )
+  assert.equal(
+    formatNotificationQueueStatus([{ ...player, temporarily_away: true }]),
+    '现在，你位于队列位置 A2，暂时离开期间无法估算等待时间。',
+  )
+})
+
 test('notification position summaries handle playing and unavailable estimates', () => {
   const base = {
     registration_id: 'registration-status',

@@ -218,7 +218,7 @@ internal fun ManagementApp() {
                     allowDeferOneRound = policy.allowDeferOneRound,
                     allowTemporaryLeave = policy.allowTemporaryLeave,
                     oneBotSyncEnabled = policy.oneBotSyncEnabled,
-                    reason = if (policy.managementAppBound) "管理后台接管终端敏感策略" else "管理后台解除终端敏感策略接管"
+                    reason = if (policy.managementAppBound) "管理后台接管设置" else "管理后台解除对设置的接管"
                 )
             }.onSuccess { result ->
                 error = if (result.status.equals("REJECTED", true)) result.detail ?: "终端策略修改未执行" else "操作已提交，正在等待现场终端确认。"
@@ -1229,11 +1229,14 @@ private fun ManagementMachineCard(
                                     buildString {
                                         append("第 $position 位")
                                         waitingPosition.estimatedWaitMinutes?.let {
+                                            // The terminal's wording of a wait (2026-11-28):
+                                            // hours from 60 minutes on, 2 小时以上 above 120.
+                                            val amount = formatWaitAmount(it.toLong()).removePrefix("约 ")
                                             append(
-                                                if (waitingPosition.estimatedWaitUncertain) {
-                                                    "·最快 $it 分钟"
-                                                } else {
-                                                    "·预计 $it 分钟"
+                                                when {
+                                                    it > WaitEstimator.LONG_WAIT_MINUTES -> "·$amount"
+                                                    waitingPosition.estimatedWaitUncertain -> "·最快 $amount"
+                                                    else -> "·预计 $amount"
                                                 }
                                             )
                                         }
@@ -1586,11 +1589,25 @@ private fun ManagementNoShowDialog(
     onDismiss: () -> Unit,
     onSelect: (String) -> Unit
 ) {
+    // As on the terminal: a checked-in online registration that has not played can only be
+    // removed; the terminal refuses the other two (backlog item since 2026-11-24).
+    val removalOnly = target.registrations.any { it.onlineRegistrationNotPlayed }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("未到场处理") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (removalOnly) {
+                    Text(
+                        if (target.registrations.size > 1) {
+                            "组内有已完成签到、尚未游玩的线上登记。$ONLINE_REGISTRATION_NO_SHOW_REMOVAL_ONLY"
+                        } else {
+                            "这份线上登记已完成签到，尚未游玩。$ONLINE_REGISTRATION_NO_SHOW_REMOVAL_ONLY"
+                        },
+                        color = SecondaryText,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
                 OutlinedButton(
                     onClick = {
                         onSelect(
@@ -1602,12 +1619,13 @@ private fun ManagementNoShowDialog(
                         )
                     },
                     // Not a second time before the registration has played a round.
-                    enabled = allowDeferOneRound &&
+                    enabled = allowDeferOneRound && !removalOnly &&
                         target.registrations.none { it.deferOneRoundUsed },
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("暂缓一次") }
                 OutlinedButton(
                     onClick = { onSelect("MOVE_TO_TAIL") },
+                    enabled = !removalOnly,
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("移至队尾") }
                 Button(
@@ -2048,8 +2066,12 @@ private fun ManagementRegistrationRow(
                         }
                         DropdownMenuItem(
                             text = { Text("与朋友组成固定组合") },
+                            // Not while it is postponed (maintainer, 2026-11-27); the terminal
+                            // refuses it as well.
                             enabled = registrationOpen && machine.capacity > 1 &&
-                                registration.position == "WAITING" && !registration.pendingCheckIn,
+                                registration.position == "WAITING" && !registration.pendingCheckIn &&
+                                !registration.deferredOnce && !registration.skipsOneTurn &&
+                                !registration.temporarilyAway,
                             onClick = {
                                 actionMenuOpen = false
                                 fixedPairDialogOpen = true
@@ -2417,7 +2439,8 @@ private fun ManagementFixedPairDialog(
     var temporaryName by remember { mutableStateOf("") }
     var preference by remember { mutableStateOf("SOLO") }
     val candidates = machine.waiting.filter {
-        it.registrationId != registration.registrationId && !it.pendingCheckIn
+        it.registrationId != registration.registrationId && !it.pendingCheckIn &&
+            !it.deferredOnce && !it.skipsOneTurn && !it.temporarilyAway
     }
     val availableProfiles = profiles.filter { it.id !in registeredProfileIds }
     val selectedProfile = availableProfiles.firstOrNull { it.id == selectedProfileId }
@@ -2717,7 +2740,7 @@ private fun ManagementProfileEditorDialog(
     )
     val visibilityOptions = listOf(
         "TERMINAL_ONLY" to "仅终端显示",
-        "PUBLIC_WEBSITE" to "允许网站显示"
+        "PUBLIC_WEBSITE" to "允许网页端显示"
     )
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
@@ -2812,7 +2835,7 @@ private fun ManagementProfileEditorDialog(
                         checked = visitedVenuesPublic,
                         onCheckedChange = { visitedVenuesPublic = it }
                     )
-                    Text("允许网站公开到访机厅", color = PrimaryText, style = MaterialTheme.typography.bodySmall)
+                    Text("允许网页端公开到访机厅", color = PrimaryText, style = MaterialTheme.typography.bodySmall)
                 }
             }
         },
@@ -2947,7 +2970,7 @@ private fun ManagementCapabilitiesPage(
         "编辑所有玩家资料" to capabilities.profileEditAll,
         "删除玩家资料" to capabilities.profileDelete,
         "修改玩家密码" to capabilities.profileResetPassword,
-        "修改终端敏感策略" to capabilities.terminalPolicyEdit,
+        "修改由管理后台接管的设置" to capabilities.terminalPolicyEdit,
         "查看操作日志" to capabilities.auditRead
     )
     LazyColumn(
@@ -2963,7 +2986,7 @@ private fun ManagementCapabilitiesPage(
                     Column {
                         Text("管理权限", color = PrimaryText, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(4.dp))
-                        Text("绑定后，终端敏感策略只能在管理后台修改；在现场终端调整等待顺序不受影响。", color = SecondaryText, style = MaterialTheme.typography.bodySmall)
+                        Text("绑定后，由管理后台接管的设置只能在管理后台修改；在现场终端调整等待顺序不受影响。", color = SecondaryText, style = MaterialTheme.typography.bodySmall)
                     }
                 }
             }
@@ -2985,7 +3008,7 @@ private fun ManagementCapabilitiesPage(
                         Spacer(Modifier.width(10.dp))
                         Column(Modifier.weight(1f)) {
                             Text(
-                                "终端敏感策略",
+                                "由管理后台接管的设置",
                                 color = PrimaryText,
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold
@@ -2993,9 +3016,9 @@ private fun ManagementCapabilitiesPage(
                             Text(
                                 if (terminalPolicy.supported) {
                                     if (terminalPolicy.managementAppBound) {
-                                        "管理后台已接管终端敏感策略"
+                                        "管理后台已接管这些设置"
                                     } else {
-                                        "管理后台尚未接管终端敏感策略"
+                                        "管理后台尚未接管这些设置"
                                     }
                                 } else {
                                     "当前终端版本不支持管理后台接管。"

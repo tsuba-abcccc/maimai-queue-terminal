@@ -260,4 +260,29 @@ class PairedMachineQueueNoticesTest {
         assertTrue(offences.joinToString("\n"), offences.isEmpty())
         assertFalse(sources.listFiles().isNullOrEmpty())
     }
+
+    @Test
+    fun aPausedAnnouncementIsNotShownOnTheTile() {
+        val allowed = Registration(
+            key = 1,
+            displayId = "小明",
+            preference = PlayPreference.OPEN_TO_JOIN,
+            alsoQueuesAtPairedMachine = true
+        )
+        assertTrue(announcesPairedArrangement(allowed, PairedArrangementRecord(previewSinceMillis = 1_000L)))
+        assertFalse(
+            announcesPairedArrangement(
+                allowed,
+                PairedArrangementRecord(previewSinceMillis = 1_000L, previewPausedAtMillis = 2_000L)
+            )
+        )
+        assertFalse(announcesPairedArrangement(allowed, PairedArrangementRecord()))
+        assertFalse(announcesPairedArrangement(allowed, null))
+        assertFalse(
+            announcesPairedArrangement(
+                allowed.copy(alsoQueuesAtPairedMachine = false),
+                PairedArrangementRecord(previewSinceMillis = 1_000L)
+            )
+        )
+    }
 }

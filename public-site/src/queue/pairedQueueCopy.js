@@ -1,3 +1,4 @@
+import { formatWaitAmount } from './waitEstimateCopy.js'
 // Wording for letting the system arrange a registration between the two machines of a pair.
 // Several pages share it, so that every page says the same thing in the same words. The
 // approved texts are listed in docs/releases/dual-machine-queue-copy.md; the vocabulary is in
@@ -178,7 +179,7 @@ export const PAIRED_QUEUE_PILL = '已允许系统在两台机台之间安排'
 // earliest time. [minutes] is a whole number of minutes. The texts are approved in
 // docs/releases/wait-estimate-2026-11.md, section 三, “可能不准确时怎样显示”.
 export function pairedQueueUncertainEstimateText(minutes) {
-  return minutes <= 0 ? '可能很快可以游玩' : `最快约 ${minutes} 分钟后可以游玩`
+  return minutes <= 0 ? '可能很快可以游玩' : `${formatWaitAmount(minutes, true)}后可以游玩`
 }
 
 // Said once in a detail view wherever such an estimate is shown; list cells leave it out.

@@ -135,6 +135,17 @@ internal fun Text(
     )
 }
 
+/**
+ * A plain string as [Text] draws it: with pangu spacing and, when it has a separator, the side
+ * room of the separator. Use it to measure a text the same way it will be drawn.
+ */
+internal fun appDisplayText(value: String): AnnotatedString =
+    if ('·' in value) {
+        withAppMiddleDotSideSpace(panguSpacing(AnnotatedString(value)))
+    } else {
+        AnnotatedString(panguSpacing(value))
+    }
+
 internal fun panguSpacing(value: AnnotatedString): AnnotatedString {
     if (value.isEmpty()) return value
     val compactedText = compactAppMiddleDotSpacing(value.text)

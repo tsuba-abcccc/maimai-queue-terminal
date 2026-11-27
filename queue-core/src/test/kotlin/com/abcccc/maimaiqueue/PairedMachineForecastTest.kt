@@ -31,6 +31,68 @@ class PairedMachineForecastTest {
         alsoQueuesAtPairedMachine = paired
     )
 
+    /**
+     * Maintainer, 2026-11-27: where a registration that lets others pass and a preview of the
+     * other machine compete for one position, the preview comes first and nobody passes: “这种处理
+     * 方式是合理的……目前可以作为实际逻辑应用”. The home screen shows it so, and the round that
+     * starts when the registration arrives does the same.
+     */
+    @Test
+    fun anArrivingRegistrationTakesThePlaceAPassWouldHaveTaken() {
+        fun at(key: Int, createdAt: Long, preference: PlayPreference, passable: Boolean = false, paired: Boolean = false) =
+            Registration(
+                key = key,
+                displayId = "玩家$key",
+                preference = preference,
+                // Only a registration of a player profile can be arranged between two machines.
+                isTemporary = !paired,
+                createdAtMillis = createdAt,
+                alsoQueuesAtPairedMachine = paired,
+                allowsPassing = passable
+            )
+        val state = QueueEngine.settlePairedMachines(
+            QueueEngineState(
+                linkedMapOf(
+                    "A" to MachineQueue(
+                        playing = listOf(at(8, 500L, PlayPreference.SOLO)),
+                        waiting = listOf(at(4, 1_500L, PlayPreference.OPEN_TO_JOIN, paired = true)),
+                        playingStartedAtMillis = NOW
+                    ),
+                    "B" to MachineQueue(
+                        playing = listOf(at(9, 400L, PlayPreference.SOLO)),
+                        waiting = listOf(
+                            at(1, 1_000L, PlayPreference.OPEN_TO_JOIN),
+                            at(2, 2_000L, PlayPreference.SOLO, passable = true),
+                            at(3, 3_000L, PlayPreference.OPEN_TO_JOIN)
+                        ),
+                        playingStartedAtMillis = NOW - 9 * MINUTE
+                    )
+                ),
+                // 4 waits at A and holds a place at B between 1 and 2.
+                pairedMachineOrders = mapOf("B" to listOf(1, 4, 2, 3))
+            ),
+            policy,
+            NOW
+        )
+        // Without 4, 3 would pass 2 to play with 1.
+        assertEquals(mapOf(3 to listOf(2)), state.queue("B")!!.projectedPasses())
+        val forecast = PairedMachineForecast.forecast(state, policy, durations, NOW)
+        assertEquals(setOf(4), forecast.arrivingKeys(state, "B"))
+        val (shown, previewKeys) = PairedMachineForecast.displayQueue(state, policy, "B", forecast)
+        assertEquals(setOf(4), previewKeys)
+        val shownPositions = shown.waitingProjection(includeCommonPlayPreview = false).positions
+            .map { position -> position.registrations.map(Registration::key) }
+        assertEquals(listOf(listOf(1, 4), listOf(2), listOf(3)), shownPositions)
+        assertEquals(emptyMap<Int, List<Int>>(), shown.projectedPasses())
+
+        // B's round ends: 4 arrives and plays with 1; 2 is not passed.
+        val finished = QueueEngine.execute(state, QueueAction.FinishRound("B"), QueueActionContext(atMillis = NOW + MINUTE, policy = policy))
+        val machineB = (finished as QueueActionExecution.Applied).state.queue("B")!!
+        assertEquals(setOf(1, 4), machineB.playing.map(Registration::key).toSet())
+        assertTrue(machineB.playing.all { it.passedOverKeys.isEmpty() })
+        assertEquals(listOf(2, 3), machineB.waiting.map(Registration::key).take(2))
+    }
+
     private fun stateOf(vararg queues: Pair<String, MachineQueue>): QueueEngineState =
         QueueEngine.settlePairedMachines(QueueEngineState(linkedMapOf(*queues)), policy, NOW)
 

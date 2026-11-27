@@ -108,16 +108,28 @@ internal class PlayerProfilePersistenceCoordinator(
         val introducedLocally = localProfiles
             .filter { it.pairedMachineQueueingIntroduced }
             .mapTo(mutableSetOf(), PlayerProfile::id)
+        // The same for the explanation of letting others pass.
+        val passingIntroducedLocally = localProfiles
+            .filter { it.passingIntroduced }
+            .mapTo(mutableSetOf(), PlayerProfile::id)
         @Suppress("NAME_SHADOWING")
         val cloudProfiles = cloudProfiles.map { cloudProfile ->
-            if (!cloudProfile.pairedMachineQueueingIntroduced && cloudProfile.id in introducedLocally) {
-                cloudProfile.copy(pairedMachineQueueingIntroduced = true)
+            val paired = cloudProfile.pairedMachineQueueingIntroduced || cloudProfile.id in introducedLocally
+            val passing = cloudProfile.passingIntroduced || cloudProfile.id in passingIntroducedLocally
+            if (
+                paired != cloudProfile.pairedMachineQueueingIntroduced ||
+                passing != cloudProfile.passingIntroduced
+            ) {
+                cloudProfile.copy(pairedMachineQueueingIntroduced = paired, passingIntroduced = passing)
             } else {
                 cloudProfile
             }
         }
         val introducedInCloud = cloudProfiles
             .filter { it.pairedMachineQueueingIntroduced }
+            .mapTo(mutableSetOf(), PlayerProfile::id)
+        val passingIntroducedInCloud = cloudProfiles
+            .filter { it.passingIntroduced }
             .mapTo(mutableSetOf(), PlayerProfile::id)
         val cloudById = cloudProfiles.associateBy(PlayerProfile::id)
         val validAliases = profileAliases.filter { (sourceId, targetId) ->
@@ -127,8 +139,13 @@ internal class PlayerProfilePersistenceCoordinator(
         val workingProfiles = localProfiles
             .filterNot { it.id in aliasSources }
             .map { localProfile ->
-                if (!localProfile.pairedMachineQueueingIntroduced && localProfile.id in introducedInCloud) {
-                    localProfile.copy(pairedMachineQueueingIntroduced = true)
+                val paired = localProfile.pairedMachineQueueingIntroduced || localProfile.id in introducedInCloud
+                val passing = localProfile.passingIntroduced || localProfile.id in passingIntroducedInCloud
+                if (
+                    paired != localProfile.pairedMachineQueueingIntroduced ||
+                    passing != localProfile.passingIntroduced
+                ) {
+                    localProfile.copy(pairedMachineQueueingIntroduced = paired, passingIntroduced = passing)
                 } else {
                     localProfile
                 }

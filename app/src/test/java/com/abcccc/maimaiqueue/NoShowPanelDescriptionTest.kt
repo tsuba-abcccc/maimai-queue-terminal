@@ -27,4 +27,19 @@ class NoShowPanelDescriptionTest {
             noShowPanelDescription(group = true, notYetTheirTurn = false, alreadyPlaying = true)
         )
     }
+
+    @Test
+    fun greyForAnotherReasonThePanelKeepsItsGeneralDescription() {
+        // Machine stopped or registration postponed: the button states the reason under its
+        // title; the panel no longer tells the players to record a no-show they cannot.
+        assertEquals(
+            null,
+            noShowPanelDescription(
+                group = false,
+                notYetTheirTurn = false,
+                alreadyPlaying = false,
+                otherwiseUnavailable = true
+            )
+        )
+    }
 }

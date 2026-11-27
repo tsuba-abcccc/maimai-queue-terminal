@@ -170,4 +170,115 @@ class PostponeRulesTest {
     private companion object {
         const val NOW = 10_000_000L
     }
+
+    // ---- whose turn a round is (maintainer, 2026-11-27) -----------------------------------
+
+    private fun open(key: Int, absence: QueueAbsenceStatus = QueueAbsenceStatus.NONE) =
+        registration(key, absence).copy(preference = PlayPreference.OPEN_TO_JOIN)
+
+    private fun MachineQueue.playingKeys() = playing.map(Registration::key)
+
+    @Test
+    fun deferringAlwaysBuysARoundEvenWhenTwoOthersPairAcrossIt() {
+        // Without the deferral: 1 plays alone, then 2, then 3, then 4.
+        val queue = MachineQueue(
+            playing = listOf(registration(9)),
+            waiting = listOf(open(1), registration(2, QueueAbsenceStatus.DEFER_ONE_ROUND), open(3), registration(4)),
+            playingStartedAtMillis = 1L
+        )
+        // 1 and 3 pair across 2. That round was not the turn of 2, so its deferral is unused.
+        val first = queue.finishRound(NOW)
+        assertEquals(listOf(1, 3), first.playingKeys())
+        val waitingTwo = first.waiting.first()
+        assertEquals(2, waitingTwo.key)
+        assertEquals(QueueAbsenceStatus.DEFER_ONE_ROUND, waitingTwo.absenceStatus)
+        assertFalse(waitingTwo.deferOneRoundUsed)
+        // The next round is its turn: it lets 4 go first, and plays the round after.
+        val second = first.finishRound(NOW + 1)
+        assertEquals(listOf(4), second.playingKeys())
+        assertTrue(second.waiting.first().let { it.key == 2 && it.deferOneRoundUsed })
+        assertEquals(listOf(2), second.finishRound(NOW + 2).playingKeys())
+    }
+
+    @Test
+    fun aPostponedRegistrationThatWouldHaveSharedTheRoundIsReached() {
+        // 1 and 2 would have played together; 2 defers, so 1 plays with 4 across 2 and 3.
+        val queue = MachineQueue(
+            playing = listOf(registration(9)),
+            waiting = listOf(
+                open(1),
+                open(2, QueueAbsenceStatus.DEFER_ONE_ROUND),
+                open(3, QueueAbsenceStatus.DEFER_ONE_ROUND),
+                open(4),
+                registration(5)
+            ),
+            playingStartedAtMillis = 1L
+        )
+        val first = queue.finishRound(NOW)
+        assertEquals(listOf(1, 4), first.playingKeys())
+        // It was the turn of 2, not yet that of 3.
+        assertTrue(first.waiting[0].let { it.key == 2 && it.deferOneRoundUsed })
+        assertTrue(
+            first.waiting[1].let {
+                it.key == 3 && it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND && !it.deferOneRoundUsed
+            }
+        )
+        // Each of them plays exactly one round later than without the deferral.
+        val second = first.finishRound(NOW + 1)
+        assertEquals(listOf(2), second.playingKeys())
+        assertTrue(second.waiting.first().let { it.key == 3 && it.deferOneRoundUsed })
+        assertEquals(listOf(3), second.finishRound(NOW + 2).playingKeys())
+    }
+
+    @Test
+    fun aPendingOnlineRegistrationStaysUntilItsOwnTurn() {
+        val pending = registration(2).copy(
+            requiresOnSiteCheckIn = true,
+            onSiteCheckInStartedAtMillis = NOW,
+            wasOnlineRegistration = true
+        )
+        val queue = MachineQueue(
+            playing = listOf(registration(9)),
+            waiting = listOf(open(1), pending, open(3), registration(4)),
+            playingStartedAtMillis = 1L
+        )
+        // The home page shows 2 in the second position.
+        val shown = queue.waitingProjection(includeCommonPlayPreview = false).positions
+        assertEquals(1, shown.indexOfFirst { position -> position.registrations.any { it.key == 2 } })
+        val first = queue.finishRound(NOW)
+        assertEquals(listOf(1, 3), first.playingKeys())
+        assertTrue("轮到之前不移除", first.waiting.first().let { it.key == 2 && it.requiresOnSiteCheckIn })
+        // Its own turn: still not checked in, it leaves and 4 plays.
+        val second = first.finishRound(NOW + 1)
+        assertEquals(listOf(4), second.playingKeys())
+        assertTrue(second.allRegistrations.none { it.key == 2 })
+    }
+
+    @Test
+    fun missedTurnsSharedByAFixedPairDoNotStayWithThePartnerAfterTheRelease() {
+        var state = stateOf(
+            MachineQueue(
+                playing = listOf(registration(9)),
+                waiting = listOf(open(1).copy(temporaryAwaySkippedTurns = 2), open(2), registration(3)),
+                playingStartedAtMillis = 1L
+            )
+        )
+        fun waiting(key: Int) = state.queue("A")!!.waiting.first { it.key == key }
+        state = (execute(state, QueueAction.CreateFixedPair("A", 1, 2)) as QueueActionExecution.Applied).state
+        // As a pair the two share the larger count.
+        assertEquals(listOf(2, 2), listOf(waiting(1), waiting(2)).map(Registration::temporaryAwaySkippedTurns))
+
+        // The pair misses a turn together.
+        state = (execute(state, QueueAction.SkipOneTurn("A", 1)) as QueueActionExecution.Applied).state
+        state = (execute(state, QueueAction.FinishRound("A")) as QueueActionExecution.Applied).state
+        assertEquals(listOf(3, 3), listOf(waiting(1), waiting(2)).map(Registration::temporaryAwaySkippedTurns))
+
+        // Released, each counts its own: 1 had two and one more, 2 only the one they shared.
+        state = (
+            execute(state, QueueAction.ChangePreference("A", 1, PlayPreference.SOLO)) as QueueActionExecution.Applied
+            ).state
+        assertEquals(3, waiting(1).temporaryAwaySkippedTurns)
+        assertEquals(1, waiting(2).temporaryAwaySkippedTurns)
+        assertEquals(0, waiting(2).skippedTurnsCarriedFromPartner)
+    }
 }

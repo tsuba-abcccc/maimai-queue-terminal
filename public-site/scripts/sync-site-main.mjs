@@ -3,13 +3,28 @@ import { resolve, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const projectRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
+// Every file of src/queue: the queue page imports them all, so the main site cannot build
+// without any one of them.
 const sharedFiles = [
   'QueueStatusPanel.vue',
   'PlayerAccountDialog.vue',
   'MobileRegistrationFlow.vue',
   'MobileProfileCreationFlow.vue',
   'MobileProfileSettings.vue',
-  'machineConfiguration.js'
+  'machineConfiguration.js',
+  'commandDelivery.js',
+  'FriendPairFlow.vue',
+  'PairedQueueTickBox.vue',
+  'PairedQueueIntroduction.vue',
+  'PostponeChoiceCards.vue',
+  'PreferenceOptions.vue',
+  'RegistrationRenameForm.vue',
+  'SoloPassTickBox.vue',
+  'pairedQueueCopy.js',
+  'queueActionAvailability.js',
+  'queueCommandChain.js',
+  'soloPassCopy.js',
+  'waitEstimateCopy.js'
 ]
 
 function parseTarget() {

@@ -3,6 +3,9 @@ package com.abcccc.maimaiqueue
 import android.app.TimePickerDialog
 import android.graphics.Bitmap
 import android.os.BatteryManager
+import android.os.Build
+import android.content.pm.PackageManager
+import java.security.MessageDigest
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
@@ -62,6 +65,8 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.ui.graphics.Brush
@@ -72,6 +77,7 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
@@ -106,6 +112,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.key
@@ -118,6 +125,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.derivedStateOf
@@ -149,6 +157,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
@@ -194,6 +203,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
@@ -450,6 +460,8 @@ internal fun RegistrationApp() {
     }
     var selectedMachine by remember { mutableStateOf<MachineId?>(null) }
     var isBatchFlow by remember { mutableStateOf(false) }
+    // Batch creation chosen on the 选择登记方式 page of the join flow, which it then continues.
+    var batchFromJoinFlow by remember { mutableStateOf(false) }
     var batchAmount by remember { mutableStateOf("2") }
     var draftId by remember { mutableStateOf("") }
     var temporarySelected by remember { mutableStateOf(false) }
@@ -472,7 +484,11 @@ internal fun RegistrationApp() {
     var auditLogs by remember { mutableStateOf<List<AuditLogEntry>>(emptyList()) }
     var auditLogsLoaded by remember { mutableStateOf(false) }
     var queueRuleSettings by remember { mutableStateOf(initialQueueRuleSettings) }
-    val configuredMachineIds = queueRuleSettings.configuredMachineIds
+    // Read through a state, so the loops that live across recompositions (the remote-command
+    // poll, timers) see machines added after they were started; a plain value kept the list of
+    // that moment, and every remote operation on a new machine was refused until a restart
+    // (review 2026-11-27).
+    val configuredMachineIds by rememberUpdatedState(queueRuleSettings.configuredMachineIds)
     val configuredMachineStateSnapshot = machineStates.snapshot(configuredMachineIds)
     val configuredMachines = configuredMachineIds.map { machineId ->
         val state = configuredMachineStateSnapshot.getValue(machineId)
@@ -531,6 +547,8 @@ internal fun RegistrationApp() {
     // The tick box of the registration being created: let the system arrange it between the
     // two machines of the pair. Never ticked in advance.
     var joinAlsoQueuesAtPairedMachine by remember { mutableStateOf(false) }
+    // The 单人游玩 choice to let the registrations around it pass; never ticked in advance.
+    var joinAllowsPassing by remember { mutableStateOf(false) }
     // Machine labels of the pair whose explanation is on screen.
     var pairedMachineQueueIntroduction by remember { mutableStateOf<Pair<String, String>?>(null) }
     // True when it opened by itself on first use: it can then only be closed after five seconds.
@@ -539,6 +557,12 @@ internal fun RegistrationApp() {
     // Profiles that were shown the explanation since the app started, so that it does not open
     // a second time while the record on the profile is still being saved.
     var pairedExplanationShownProfileIds by remember { mutableStateOf(emptySet<String>()) }
+    // The explanation of letting others pass: whether it is for a fixed pair, and whether it
+    // opened by itself (then it counts down). Shown once per player profile, like the one above.
+    var passingIntroduction by remember { mutableStateOf<Pair<Boolean, Boolean>?>(null) }
+    var passingExplanationShownProfileIds by remember { mutableStateOf(emptySet<String>()) }
+    // The answer given while a fixed pair is being formed; never ticked in advance.
+    var friendPairAllowsPassing by remember { mutableStateOf(false) }
     // Machine labels (the registration's machine, the machine showing the preview).
     var pairedPreviewExplanation by remember { mutableStateOf<Pair<String, String>?>(null) }
     var playerProfileContext by remember { mutableStateOf(PlayerProfileContext.JOIN_QUEUE) }
@@ -591,9 +615,13 @@ internal fun RegistrationApp() {
     var removeGroupTarget by remember { mutableStateOf<PositionSelection?>(null) }
     var machineTransferTarget by remember { mutableStateOf<MachineTransferRequest?>(null) }
     var friendPairTarget by remember { mutableStateOf<SelectedRegistration?>(null) }
+    // Set when the pair flow is opened from a position menu with both registrations known: the
+    // flow starts at its confirmation (组成固定组合, 2026-11-28).
+    var friendPairDirectPartnerKey by remember { mutableStateOf<Int?>(null) }
     var friendPairProfileTarget by remember { mutableStateOf<SelectedRegistration?>(null) }
     var stagedFriendPairRegistration by remember { mutableStateOf<SelectedRegistration?>(null) }
     var releaseFixedPairTarget by remember { mutableStateOf<PositionSelection?>(null) }
+    var fixedPairPreferenceChange by remember { mutableStateOf<FixedPairPreferenceChange?>(null) }
     var queueUndoAction by remember { mutableStateOf<QueueUndoAction?>(null) }
     var nextQueueUndoId by remember { mutableLongStateOf(1L) }
     var homeSidePanelFeedback by remember { mutableStateOf<HomeSidePanelFeedback?>(null) }
@@ -628,7 +656,8 @@ internal fun RegistrationApp() {
         title: String,
         detail: String,
         contextLabel: String? = null,
-        tone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS
+        tone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS,
+        machineId: MachineId? = null
     ) {
         if (queueUndoAction != null && tone != HomeSidePanelFeedbackTone.WARNING) return
         if (tone == HomeSidePanelFeedbackTone.WARNING) queueUndoAction = null
@@ -638,7 +667,8 @@ internal fun RegistrationApp() {
             title = title,
             detail = detail,
             contextLabel = contextLabel,
-            tone = tone
+            tone = tone,
+            machineId = machineId
         )
     }
 
@@ -652,6 +682,7 @@ internal fun RegistrationApp() {
                 "${configuredMachineName(machineId)}已停止使用，恢复正常使用后才能调整队列。"
             },
             contextLabel = configuredMachineName(machineId),
+            machineId = machineId,
             tone = HomeSidePanelFeedbackTone.WARNING
         )
     }
@@ -661,6 +692,7 @@ internal fun RegistrationApp() {
             title = "本次操作未执行",
             detail = "队列位置、组内登记或登记状态已发生变化，请按当前队列重新选择后再操作。",
             contextLabel = configuredMachineName(machineId),
+            machineId = machineId,
             tone = HomeSidePanelFeedbackTone.WARNING
         )
     }
@@ -678,6 +710,7 @@ internal fun RegistrationApp() {
                 "队列状态或操作条件已经变化，请按当前队列重新确认。"
             },
             contextLabel = configuredMachineName(machineId),
+            machineId = machineId,
             tone = HomeSidePanelFeedbackTone.WARNING
         )
     }
@@ -1305,7 +1338,7 @@ internal fun RegistrationApp() {
     )
 
     fun currentQueueEnginePolicy(): QueueEnginePolicy = QueueEnginePolicy(
-        registrationOpen = acceptingNewRegistrations,
+        registrationOpen = latestAcceptingNewRegistrations,
         allowOnlineRegistration = queueRuleSettings.allowOnlineRegistration,
         allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
         allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
@@ -1347,19 +1380,30 @@ internal fun RegistrationApp() {
     // Wait estimates (docs/releases/wait-estimate-2026-11.md). The replays take a moment, so
     // they run away from the main thread, twice a minute and after every queue change.
     var waitEstimates by remember { mutableStateOf(WaitEstimator.EMPTY) }
+    // Whether [waitEstimates] belong to the queue as it is now. After a change, until the new
+    // estimates are in, no old value is shown: the registration menu leaves its wait out, and
+    // other places say 正在估算 (maintainer, 2026-11-28: “以后估计时间没算完时，不显示（对于
+    // 登记菜单内小字）或者显示计算中...。不要显示旧数值”). The twice-a-minute refresh as time
+    // passes keeps the old values up meanwhile: they belong to the same queue.
+    val waitEstimateInputs = remember(configuredMachineStateSnapshot, pairedArrangements, queueRuleSettings) { Any() }
+    var waitEstimatesInputs by remember { mutableStateOf<Any?>(null) }
+    val waitEstimatesPending = waitEstimatesInputs !== waitEstimateInputs
     LaunchedEffect(
         configuredMachineStateSnapshot,
         pairedArrangements,
         queueRuleSettings,
         nowMillis / 30_000L
     ) {
+        val inputs = waitEstimateInputs
         val state = currentQueueEngineState()
         val policy = currentQueueEnginePolicy()
         val durations = pairedForecastDurations()
         val atMillis = System.currentTimeMillis()
-        waitEstimates = withContext(Dispatchers.Default) {
+        // On its own background-priority thread: see [WaitEstimateDispatcher].
+        waitEstimates = withContext(WaitEstimateDispatcher) {
             WaitEstimator.estimate(state, policy, durations, atMillis)
         }
+        waitEstimatesInputs = inputs
     }
 
     /** The middle wait of a registration that would join [machineId] now, as shown. */
@@ -1376,6 +1420,95 @@ internal fun RegistrationApp() {
         nowMillis / 30_000L
     ) { pairedMachineForecast(nowMillis) }
     val homeNewRegistrationWaits = configuredMachineIds.associateWith(::newRegistrationWaitMinutes)
+
+    /**
+     * [machineId]'s queue as the home screen shows it: with the registrations of the other
+     * machine of its pair that are expected to play here first (their previews), and the keys of
+     * those previews. What describes the screen (将越过, the position a 结束本轮 names, the
+     * positions a drag works on) is worked out on this queue, not on the machine's own.
+     */
+    /**
+     * The registrations that enter the playing position of [machineId] next, counting one of
+     * the paired machine that may be arranged there now. Ending the round lets exactly these
+     * in, so this, not the machine's own first group, decides who can be marked as not present
+     * or be moved into the current round (review 2026-11-27).
+     */
+    fun nextEnteringKeys(machineId: MachineId): Set<Int> = QueueEngine.nextWaitingGroup(
+        currentQueueEngineState(),
+        currentQueueEnginePolicy(),
+        machineId.name,
+        System.currentTimeMillis()
+    ).mapTo(mutableSetOf()) { it.key }
+
+    fun canMarkNoShowNow(machineId: MachineId, registrationKey: Int): Boolean =
+        queueFor(machineId).canMarkNoShow(registrationKey, nextEnteringKeys(machineId))
+
+    fun shownQueue(machineId: MachineId): Pair<MachineQueue, Set<Int>> =
+        if (queueRuleSettings.pairedMachine(machineId) == null) {
+            queueFor(machineId) to emptySet()
+        } else {
+            PairedMachineForecast.displayQueue(
+                state = currentQueueEngineState(),
+                policy = currentQueueEnginePolicy(),
+                machineId = machineId.name,
+                forecast = homePairedForecast
+            )
+        }
+
+    /**
+     * The name the home screen gives the waiting position of each registration it shows at
+     * [machineId], such as B4, by registration key. Texts that name a position use these, not the
+     * index among MachineQueue.waitingPositions, which differs as soon as the screen shows a
+     * preview of the other machine (found 2026-11-27: 位置 B3 in a list for the one shown at B4).
+     */
+    fun shownPositionNames(machineId: MachineId): Map<Int, String> = buildMap {
+        shownQueue(machineId).first.waitingProjection(includeCommonPlayPreview = false).positions
+            .forEachIndexed { index, position ->
+                position.registrations.forEach { put(it.key, "${machineId.name}${index + 1}") }
+            }
+    }
+
+    /**
+     * How the home screen would group [machineId]'s own registrations once its order is
+     * [proposedQueue]'s, in that order; the previews of the other machine left out.
+     */
+    fun shownHomePositionsAfter(
+        machineId: MachineId,
+        proposedQueue: MachineQueue,
+        movedKeys: Set<Int>
+    ): List<List<Registration>> {
+        val (shown, previewKeys) = if (queueRuleSettings.pairedMachine(machineId) == null) {
+            proposedQueue to emptySet()
+        } else {
+            val plan = QueueEngine.plan(
+                state = currentQueueEngineState(),
+                action = QueueAction.ReplaceOrder(machineId.name, proposedQueue.allRegistrations, movedKeys),
+                context = QueueActionContext(
+                    atMillis = System.currentTimeMillis(),
+                    policy = currentQueueEnginePolicy(),
+                    origin = QueueActionOrigin.ON_SITE_TERMINAL
+                )
+            )
+            if (plan.failure != null) {
+                proposedQueue to emptySet()
+            } else {
+                PairedMachineForecast.displayQueue(
+                    state = plan.resultState,
+                    policy = currentQueueEnginePolicy(),
+                    machineId = machineId.name,
+                    forecast = homePairedForecast
+                )
+            }
+        }
+        val realIndex = proposedQueue.waiting.mapIndexed { index, registration -> registration.key to index }.toMap()
+        return shown.waitingProjection(includeCommonPlayPreview = false).positions
+            .mapNotNull { position ->
+                position.registrations
+                    .filter { it.key !in previewKeys && it.key in realIndex }
+                    .takeIf { it.isNotEmpty() }
+            }
+            .sortedBy { registrations -> registrations.minOf { realIndex.getValue(it.key) } }
+    }
 
     /**
      * Where the other machine of [machineId]'s pair shows the preview of [registrationKey], such
@@ -1470,7 +1603,7 @@ internal fun RegistrationApp() {
         ) {
             Toast.makeText(
                 context,
-                panguSpacing("终端敏感策略已由管理后台接管，只能从管理后台修改。"),
+                panguSpacing("由管理后台接管的设置只能从管理后台修改。"),
                 Toast.LENGTH_LONG
             ).show()
             return false
@@ -2123,6 +2256,7 @@ internal fun RegistrationApp() {
                     },
                 detail = auditEntries.joinToString("\n") { it.detail },
                 contextLabel = machineLabel,
+                machineId = machineId,
                 tone = if (missedOnlineRegistrationKeys.isNotEmpty()) {
                     HomeSidePanelFeedbackTone.WARNING
                 } else {
@@ -2389,8 +2523,13 @@ internal fun RegistrationApp() {
             val restoredQueue = restoreExecution.state.queue(action.machineId.name)
                 ?: action.afterQueue
             setQueue(action.machineId, restoredQueue)
-            action.otherMachineQueues.keys.forEach { otherId ->
-                restoreExecution.state.queue(otherId.name)?.let { queue -> setQueue(otherId, queue) }
+            // Every machine the engine changed, as in transferRegistrations.
+            configuredMachineIds.forEach { otherId ->
+                if (otherId != action.machineId) {
+                    restoreExecution.state.queue(otherId.name)
+                        ?.takeIf { it != queueFor(otherId) }
+                        ?.let { queue -> setQueue(otherId, queue) }
+                }
             }
             storePairedMachineOrders(
                 restoreExecution.state.pairedMachineOrders,
@@ -2492,10 +2631,19 @@ internal fun RegistrationApp() {
                 append(stoppedQueueDetail)
             },
             contextLabel = configuredMachineName(machineId),
+            machineId = machineId,
             tone = HomeSidePanelFeedbackTone.WARNING
         )
-        if (selectedMachine == machineId) selectedMachine = null
-        screen = Screen.HOME
+        // Reported at the terminal, the report ends on the home screen. Reported from the
+        // management app it must not throw out somebody who is using the terminal for something
+        // else (review 2026-11-27); only a flow for that very machine ends.
+        if (source == AuditLogSource.ON_SITE_TERMINAL) {
+            if (selectedMachine == machineId) selectedMachine = null
+            screen = Screen.HOME
+        } else if (selectedMachine == machineId) {
+            selectedMachine = null
+            screen = Screen.HOME
+        }
     }
 
     fun restoreMachine(
@@ -2556,7 +2704,8 @@ internal fun RegistrationApp() {
         showHomeOperationFeedback(
             title = "机台已恢复正常使用",
             detail = restoredQueueDetail,
-            contextLabel = configuredMachineName(machineId)
+            contextLabel = configuredMachineName(machineId),
+            machineId = machineId
         )
     }
 
@@ -2618,6 +2767,16 @@ internal fun RegistrationApp() {
         queueUndoAction = null
         setQueue(request.sourceMachineId, updatedSource)
         setQueue(destinationMachineId, updatedDestination)
+        // Every machine the engine changed is written, not only the two of the transfer: the
+        // machine left behind may be idle now and take a registration of its pair, and writing
+        // half of that put the registration at both machines (review 2026-11-27).
+        configuredMachineIds.forEach { machineId ->
+            if (machineId != request.sourceMachineId && machineId != destinationMachineId) {
+                execution.state.queue(machineId.name)
+                    ?.takeIf { it != queueFor(machineId) }
+                    ?.let { changed -> setQueue(machineId, changed) }
+            }
+        }
         storePairedMachineOrders(execution.state.pairedMachineOrders, execution.state.pairedArrangements)
         val transferAuditLog = createMachineTransferAuditLog(
             category = auditCategoryFor(request.sourceMachineId),
@@ -2643,7 +2802,8 @@ internal fun RegistrationApp() {
             title = if (registrations.size == 1) "登记已转至$destination" else "多份登记已转至$destination",
             detail = transferAuditLog?.detail
                 ?: "${registrations.joinToString("、") { "“${it.displayId}”" }}已转至 $destinationMachineName 的队尾。",
-            contextLabel = "$sourceMachineName·转至 $destinationMachineName"
+            contextLabel = "$sourceMachineName·转至 $destinationMachineName",
+            machineId = destinationMachineId
         )
         return true
     }
@@ -2675,21 +2835,44 @@ internal fun RegistrationApp() {
         } else {
             null
         }
-        return configuredMachineIds.flatMap { queueFor(it).allRegistrations }.any { registration ->
-            registration.key != claimRegistrationKey &&
-                registration.playerProfileId != profileId &&
-                registration.playerProfileId !in equivalentProfileIds &&
-                registration.displayId.trim().equals(normalizedNickname, ignoreCase = true)
-        }
+        return nicknameConflictsWithRegistrations(
+            nickname = normalizedNickname,
+            registrations = configuredMachineIds.flatMap { queueFor(it).allRegistrations },
+            profileId = profileId,
+            equivalentProfileIds = equivalentProfileIds,
+            exceptRegistrationKey = claimRegistrationKey
+        )
     }
 
     fun playerProfileAlreadyRegistered(profile: PlayerProfile, exceptKey: Int? = null): Boolean =
-        configuredMachineIds.flatMap { queueFor(it).allRegistrations }.any {
-            it.key != exceptKey && (
-                it.playerProfileId == profile.id ||
-                    it.displayId.equals(profile.nickname.trim(), ignoreCase = true)
-                )
+        registrationOfPlayerProfile(
+            profile,
+            configuredMachineIds.flatMap { queueFor(it).allRegistrations },
+            exceptKey
+        ) != null
+
+    /**
+     * For the player library: the line of a profile that already has a registration, such as
+     * “排队中·位置 A7”, named as the home screen names the position; null for one that can be chosen.
+     */
+    fun queuedPlayerProfileLines(exceptKey: Int? = null): (PlayerProfile) -> String? {
+        val registrations = configuredMachineIds.flatMap { queueFor(it).allRegistrations }
+        val positionLabels = buildMap {
+            configuredMachineIds.forEach { machineId ->
+                val machineRegistrations = queueFor(machineId).allRegistrations
+                if (machineRegistrations.isEmpty()) return@forEach
+                val shown = shownQueue(machineId).first
+                machineRegistrations.forEach { registration ->
+                    shown.registrationPositionName(machineId, registration.key)
+                        ?.let { put(registration.key, it) }
+                }
+            }
         }
+        return { profile ->
+            registrationOfPlayerProfile(profile, registrations, exceptKey)
+                ?.let { queuedPlayerProfileLine(positionLabels[it.key]) }
+        }
+    }
 
     fun applyPlayerProfileToState(
         profile: PlayerProfile,
@@ -2955,7 +3138,7 @@ internal fun RegistrationApp() {
         )
     }
 
-    fun restorePreviousQueue(savedState: PersistedQueueState) {
+    fun restorePreviousQueue(savedState: PersistedQueueState, automatic: Boolean = false) {
         fun syncKnownProfiles(queue: MachineQueue): MachineQueue = playerProfiles.fold(queue) {
             updatedQueue, profile ->
             updatedQueue.syncPlayerProfileDetails(profile.id, profile.nickname, profile.gender)
@@ -2975,6 +3158,7 @@ internal fun RegistrationApp() {
             )
             queueRuleSettingsRepository.saveSettings(queueRuleSettings)
         }
+        val restoredAtMillis = System.currentTimeMillis()
         machineStates.replace(
             configuredMachineIds(restoredMachineCount).associateWith { machineId ->
                 savedState.machines[machineId]?.let { machine ->
@@ -2983,6 +3167,11 @@ internal fun RegistrationApp() {
                             queue = syncKnownProfiles(machine.queue),
                             capacity = queueRuleSettings.machineConfiguration(machineId).capacity
                         )
+                            // Nobody could check in while the terminal was off: as after a
+                            // machine stop, the pending online registrations get a fresh 30
+                            // minutes (backlog item from the 2026-11-24 review: the time limit
+                            // must not run while the terminal is off).
+                            .restartPendingCheckInTimers(restoredAtMillis)
                     )
                 } ?: PersistedMachineState()
             }
@@ -2995,21 +3184,34 @@ internal fun RegistrationApp() {
         )
         registrationOpen = savedState.registrationOpen
         nextKey = savedState.safeNextRegistrationKey
+        if (!automatic) {
+            // Somebody chose to go on with this queue. Outside business hours the closing that
+            // has already passed must not clear it the next moment, against what the dialog
+            // says is restored (review 2026-11-27); the next closing counts again.
+            val hoursStatus = evaluateBusinessHours(queueRuleSettings.businessHours, restoredAtMillis)
+            hoursStatus.mostRecentClosingOccurrenceId
+                ?.takeIf { hoursStatus.outsideBusinessHours && it != lastHandledClosingOccurrenceId }
+                ?.let { occurrenceId ->
+                    lastHandledClosingOccurrenceId = occurrenceId
+                    queueRuleSettingsRepository.markClosingOccurrenceHandled(occurrenceId)
+                }
+        }
         queueUndoAction = null
         screen = Screen.HOME
         pendingQueueRestore = null
         queueSoundPlayer.play(QueueSoundCue.CONFIRM)
+        val restoredQueueDetail = restoredQueueSummary(
+            savedState.configuredMachineIds.map { machineId ->
+                configuredMachineName(machineId) to savedState.machine(machineId).queue.registrationCount
+            }
+        )
         appendAuditLog(
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
                 title = "上次队列已恢复",
-                detail = savedState.configuredMachineIds.joinToString(
-                    separator = "，",
-                    prefix = "已恢复",
-                    postfix = "。"
-                ) { machineId ->
-                    "${configuredMachineName(machineId)} 的 ${savedState.machine(machineId).queue.registrationCount} 份登记"
-                },
+                detail = restoredQueueDetail,
+                // Nobody chose: the 30 seconds without a touch did (found 2026-11-27).
+                source = if (automatic) AuditLogSource.SYSTEM_AUTOMATIC else AuditLogSource.ON_SITE_TERMINAL,
                 publicEventType = PublicQueueEventType.QUEUE_RESTORED,
                 affectedRegistrationKeys = (
                     savedState.machines.values.flatMap { it.queue.allRegistrations }
@@ -3018,24 +3220,30 @@ internal fun RegistrationApp() {
         )
         showHomeOperationFeedback(
             title = "上次队列已恢复",
-            detail = savedState.configuredMachineIds.joinToString(
-                separator = "，",
-                prefix = "已恢复 ",
-                postfix = "。"
-            ) { machineId ->
-                "${configuredMachineName(machineId)} 的 ${savedState.machine(machineId).queue.registrationCount} 份登记"
-            },
+            detail = restoredQueueDetail,
             contextLabel = "本机队列恢复",
             tone = HomeSidePanelFeedbackTone.INFO
         )
     }
 
-    fun startWithNewQueue(savedState: PersistedQueueState) {
+    fun startWithNewQueue(savedState: PersistedQueueState, automatic: Boolean = false) {
         queueId = newQueueId()
         queueRevision.updateAndGet { current -> maxOf(current, savedState.revision) }
         val newMachineCount = queueRuleSettings.configuredMachineCount
-        machineStates.reset(configuredMachineIds(newMachineCount))
-        registrationOpen = true
+        if (automatic) {
+            // Nobody was there to decide: only yesterday's registrations go. A machine that was
+            // out of use stays so, and a registration that was closed stays closed (the manual:
+            // “到达下一次开店时间也不会自动开启登记”; review 2026-11-27).
+            machineStates.replace(
+                configuredMachineIds(newMachineCount).associateWith { machineId ->
+                    PersistedMachineState(status = savedState.machines[machineId]?.status ?: MachineStatus())
+                }
+            )
+            registrationOpen = savedState.registrationOpen
+        } else {
+            machineStates.reset(configuredMachineIds(newMachineCount))
+            registrationOpen = true
+        }
         nextKey = 1
         queueUndoAction = null
         screen = Screen.HOME
@@ -3045,13 +3253,22 @@ internal fun RegistrationApp() {
             createAuditLogEntry(
                 category = AuditLogCategory.SYSTEM,
                 title = "已开始新的队列",
-                detail = "未载入上次保存的 ${savedState.totalRegistrationCount} 份登记，已从空队列开始。",
+                detail = if (automatic) {
+                    "上次队列来自之前的营业日，无人选择是否继续，已自动开始新的队列；未载入上次保存的 ${savedState.totalRegistrationCount} 份登记。"
+                } else {
+                    "未载入上次保存的 ${savedState.totalRegistrationCount} 份登记，已从空队列开始。"
+                },
+                source = if (automatic) AuditLogSource.SYSTEM_AUTOMATIC else AuditLogSource.ON_SITE_TERMINAL,
                 publicEventType = PublicQueueEventType.QUEUE_RESET
             )
         )
         showHomeOperationFeedback(
             title = "已开始新的队列",
-            detail = "上次保存的 ${savedState.totalRegistrationCount} 份登记没有载入，当前从空队列开始。",
+            detail = if (automatic) {
+                "上次队列来自之前的营业日，已自动开始新的队列。上次保存的 ${savedState.totalRegistrationCount} 份登记没有载入。"
+            } else {
+                "上次保存的 ${savedState.totalRegistrationCount} 份登记没有载入，当前从空队列开始。"
+            },
             contextLabel = "本机队列恢复",
             tone = HomeSidePanelFeedbackTone.WARNING
         )
@@ -3224,6 +3441,8 @@ internal fun RegistrationApp() {
         }
         rememberProfileJoinPreference = false
         joinAlsoQueuesAtPairedMachine = false
+        // A player profile starts from the player's last answer (maintainer, 2026-11-26).
+        joinAllowsPassing = profile.lastAllowsPassing
         screen = Screen.PLAYER_PROFILE_DETAIL
     }
 
@@ -3319,6 +3538,52 @@ internal fun RegistrationApp() {
     }
 
     /**
+     * The small line that stands in place of the play preference on registration tiles, by
+     * registration key. Home and the round-end preview show the same (usability U8).
+     */
+    fun registrationTileNotices(machineId: MachineId): Map<Int, String> {
+        // The same record decides what the registration's menu says.
+        val paired = queueRuleSettings.pairedMachine(machineId)?.let { partnerId ->
+            // Where the other machine shows the registration's preview, the notice names that
+            // position, such as 可能转至 B2 (maintainer, 2026-11-25); otherwise the machine.
+            queueFor(machineId).waiting
+                .filter { announcesPairedArrangement(it, pairedArrangements[it.key]) }
+                .associate { registration ->
+                    registration.key to pairedMachineArrangementTileNotice(
+                        pairedPreviewPosition(machineId, registration.key)
+                            ?: "机台 ${partnerId.name}"
+                    )
+                }
+        }.orEmpty()
+        // A registration that passes a 单人游玩 one says whom it passes, which tells why it
+        // stands ahead (solo-pass-mockup.html, 三).
+        // On the queue as shown: where a preview of the other machine takes the place, nobody
+        // passes and nothing says so (maintainer, 2026-11-27).
+        return soloPassingTileNotices(shownQueue(machineId).first) + paired
+    }
+
+    /**
+     * The player profile remembers the last answer to the passing tick box. A failure to save
+     * only means that the box starts from the earlier answer next time.
+     */
+    fun rememberPassingChoice(profileId: String?, enabled: Boolean) {
+        if (profileId == null) return
+        if (playerProfiles.firstOrNull { it.id == profileId }?.lastAllowsPassing == enabled) return
+        coroutineScope.launch {
+            playerProfilePersistence.mutateAndApply(
+                profileId = profileId,
+                currentProfiles = { playerProfiles },
+                mutation = { latestProfile ->
+                    latestProfile.withPassingChoice(enabled, System.currentTimeMillis())
+                },
+                onPersisted = { persistedProfile ->
+                    applyPlayerProfileToState(persistedProfile, recordAudit = false)
+                }
+            )
+        }
+    }
+
+    /**
      * Opens the explanation by itself when the box is turned on for the first time: every time
      * for a temporary registration, once for a player profile. The profile remembers it.
      */
@@ -3390,6 +3655,81 @@ internal fun RegistrationApp() {
         )
     }
 
+    /**
+     * Opens the explanation of letting others pass by itself when a box for it is ticked for
+     * the first time: every time for a temporary registration, once for a player profile,
+     * which remembers it ([PlayerProfile.passingIntroduced]). For a fixed pair it is the
+     * profile of whoever ticks the box.
+     */
+    fun showPassingExplanationOnFirstUse(profileId: String?, fixedPair: Boolean) {
+        if (profileId != null) {
+            if (profileId in passingExplanationShownProfileIds) return
+            if (playerProfiles.firstOrNull { it.id == profileId }?.passingIntroduced == true) return
+            passingExplanationShownProfileIds = passingExplanationShownProfileIds + profileId
+            // A failure to save only means that the explanation opens once more another day.
+            coroutineScope.launch {
+                playerProfilePersistence.mutateAndApply(
+                    profileId = profileId,
+                    currentProfiles = { playerProfiles },
+                    mutation = { latestProfile ->
+                        latestProfile.withPassingIntroduced(System.currentTimeMillis())
+                    },
+                    onPersisted = { persistedProfile ->
+                        applyPlayerProfileToState(persistedProfile, recordAudit = false)
+                    }
+                )
+            }
+        }
+        passingIntroduction = fixedPair to true
+    }
+
+    /** The explanation opened from the question mark: no countdown. */
+    fun showPassingDetails(fixedPair: Boolean) {
+        passingIntroduction = fixedPair to false
+    }
+
+    /** The 单人游玩 choice to let others pass, while joining a machine that takes two players. */
+    fun soloPassingJoinOption(profileId: String?): SoloPassingOption? {
+        val machineId = selectedMachine ?: return null
+        if (queueRuleSettings.machineConfiguration(machineId).capacity != 2) return null
+        return SoloPassingOption(
+            checked = joinAllowsPassing,
+            onToggle = {
+                joinAllowsPassing = !joinAllowsPassing
+                if (joinAllowsPassing) showPassingExplanationOnFirstUse(profileId, fixedPair = false)
+            },
+            onShowDetails = { showPassingDetails(fixedPair = false) }
+        )
+    }
+
+    /**
+     * The tick box asked while a fixed pair is formed (maintainer, 2026-11-27: “创建固定组合的
+     * 时候询问”). [profileId] is the profile of the registration that starts the pair.
+     */
+    fun fixedPairPassingFormationOption(machineId: MachineId, profileId: String?): SoloPassingOption? {
+        if (queueRuleSettings.machineConfiguration(machineId).capacity != 2) return null
+        return SoloPassingOption(
+            checked = friendPairAllowsPassing,
+            onToggle = {
+                friendPairAllowsPassing = !friendPairAllowsPassing
+                if (friendPairAllowsPassing) showPassingExplanationOnFirstUse(profileId, fixedPair = true)
+            },
+            fixedPair = true,
+            onShowDetails = { showPassingDetails(fixedPair = true) }
+        )
+    }
+
+    /** Turns the choice of the fixed pair of [registrationKey] on or off, from any of its entries. */
+    fun setFixedPairPassing(machineId: MachineId, registrationKey: Int, enabled: Boolean, profileId: String?) {
+        val changed = updateQueueByAction(
+            action = QueueAction.SetAllowsPassing(machineId.name, registrationKey, enabled),
+            surfaceHomeFeedback = true,
+            homeFeedbackTitle = "游玩偏好已更改"
+        )
+        // The choice of a pair is not remembered by a profile: it is made by two.
+        if (changed && enabled) showPassingExplanationOnFirstUse(profileId, fixedPair = true)
+    }
+
     fun completePlayerProfileRegistration() {
         val requestedQueueId = queueId
         val machineId = selectedMachine ?: return
@@ -3418,9 +3758,14 @@ internal fun RegistrationApp() {
                 profile.defaultPreference == ProfilePlayPreference.ASK_EVERY_TIME &&
                     rememberProfileJoinPreference
             }
+        // The answer to the passing tick box, where it was offered, is remembered for next time.
+        val passingChoice = joinAllowsPassing.takeIf {
+            preference == PlayPreference.SOLO && !singlePlayerMachine
+        }
         val usedProfile = profile.recordUsage(
             atMillis = usageAtMillis,
-            preferenceToRemember = preferenceToRemember
+            preferenceToRemember = preferenceToRemember,
+            passingChoice = passingChoice
         )
         persistPlayerProfileForUser(
             profile = usedProfile,
@@ -3430,7 +3775,8 @@ internal fun RegistrationApp() {
                         usageAtMillis,
                         latestProfile.updatedAtMillis + 1
                     ),
-                    preferenceToRemember = preferenceToRemember
+                    preferenceToRemember = preferenceToRemember,
+                    passingChoice = passingChoice
                 )
             },
             failureDetail = "玩家资料的使用记录未能保存到本机，尚未加入排队；请稍后重试。"
@@ -3453,7 +3799,8 @@ internal fun RegistrationApp() {
                 gender = persistedProfile.gender,
                 playerProfileId = persistedProfile.id,
                 alsoQueuesAtPairedMachine = queuesAtPairedMachine &&
-                    queueRuleSettings.pairedMachine(machineId) != null
+                    queueRuleSettings.pairedMachine(machineId) != null,
+                allowsPassing = joinAllowsPassing && preference == PlayPreference.SOLO && !singlePlayerMachine
             )
             val registrationAdded = updateQueueAfterOnSiteRegistration(
                 machineId = machineId,
@@ -3527,6 +3874,7 @@ internal fun RegistrationApp() {
                     title = "固定组合尚未建立",
                     detail = "队列状态已经变化，请重新选择朋友并确认。",
                     contextLabel = configuredMachineName(selection.machineId),
+                    machineId = selection.machineId,
                     tone = HomeSidePanelFeedbackTone.WARNING
                 )
                 return@persisted
@@ -3551,7 +3899,8 @@ internal fun RegistrationApp() {
                     machineId = selection.machineId.name,
                     registrationKey = latestTarget.key,
                     friend = friend,
-                    advanceWhenPlayingEmpty = shouldFinishCreation
+                    advanceWhenPlayingEmpty = shouldFinishCreation,
+                    allowsPassing = friendPairAllowsPassing
                 )
             )
             if (pairCreated) {
@@ -3564,9 +3913,11 @@ internal fun RegistrationApp() {
                         title = "固定组合已建立",
                         detail = buildString {
                             append("“${latestTarget.displayId}”与“${persistedProfile.nickname}”已组成固定组合。")
+                            if (friendPairAllowsPassing) append("已允许后方的登记越过这组固定组合与前方的登记共同游玩。")
                             fixedPairCreatedStatusDetail(listOf(latestTarget))?.let { append(it) }
                         },
-                        contextLabel = configuredMachineName(selection.machineId)
+                        contextLabel = configuredMachineName(selection.machineId),
+                        machineId = selection.machineId
                     )
                 }
             } else {
@@ -3575,6 +3926,7 @@ internal fun RegistrationApp() {
                     title = "固定组合尚未建立",
                     detail = "队列状态已经变化，请重新选择朋友并确认。",
                     contextLabel = configuredMachineName(selection.machineId),
+                    machineId = selection.machineId,
                     tone = HomeSidePanelFeedbackTone.WARNING
                 )
             }
@@ -3664,6 +4016,7 @@ internal fun RegistrationApp() {
 
     fun continueRegistrationStart(batch: Boolean) {
         isBatchFlow = batch
+        batchFromJoinFlow = false
         selectedMachine = null
         draftId = ""
         temporarySelected = false
@@ -3674,8 +4027,10 @@ internal fun RegistrationApp() {
 
     fun continueRegistrationForMachine(machineId: MachineId) {
         isBatchFlow = false
+        batchFromJoinFlow = false
         selectedMachine = machineId
         joinAlsoQueuesAtPairedMachine = false
+        joinAllowsPassing = false
         mobileRegistrationSession = null
         mobileRegistrationFailureDetail = null
         draftId = ""
@@ -3748,6 +4103,7 @@ internal fun RegistrationApp() {
         playerAccountBindingLoading = true
         playerAccountBindingFailureDetail = null
         playerAccountBindingProfileId = profile.id
+        val requestedOnScreen = screen
         coroutineScope.launch {
             try {
                 val session = queueCommandClient.createPlayerAccountBindingSession(
@@ -3755,6 +4111,9 @@ internal fun RegistrationApp() {
                     profileId = profile.id
                 )
                 if (playerProfiles.none { it.id == profile.id }) return@launch
+                // A slow answer must not put the QR code over the home screen or over the next
+                // player's flow.
+                if (screen != requestedOnScreen || playerAccountBindingProfileId != profile.id) return@launch
                 if (session == null) {
                     playerAccountBindingFailureDetail =
                         queueCommandClient.commandSyncFailureDetail
@@ -3771,6 +4130,7 @@ internal fun RegistrationApp() {
     fun continueSelectedRegistrationMachine(machineId: MachineId) {
         selectedMachine = machineId
         joinAlsoQueuesAtPairedMachine = false
+        joinAllowsPassing = false
         selectedPreference = if (
             queueRuleSettings.machineConfiguration(machineId).capacity == 1
         ) {
@@ -3854,10 +4214,27 @@ internal fun RegistrationApp() {
                 }
             }
         }
+        // With the tick box for the two machines on, the registration may play at the other
+        // machine first: its estimate is shown when it is the earlier one, as the earliest.
+        val pairedEarliestMinutes = machineId
+            ?.takeIf { joinAlsoQueuesAtPairedMachine }
+            ?.let(queueRuleSettings::pairedMachine)
+            ?.takeIf { statusFor(it).isOperational && queueFor(it).registrationCount < 20 }
+            ?.let { waitEstimates.newRegistrationWaitMillis[it.name] }
+            ?.let { WaitEstimator.displayMinutes(it, roundDown = true) }
         val info = machine?.takeIf { page != JoinFlowPage.MACHINE }?.let {
             FlowInfo(
                 "新登记预计等待",
-                newRegistrationEstimateLabel(it, homeNewRegistrationWaits),
+                if (it.queue.registrationCount >= 20) {
+                    newRegistrationEstimateLabel(it, homeNewRegistrationWaits)
+                } else if (waitEstimatesPending) {
+                    WAIT_ESTIMATE_PENDING_LABEL
+                } else {
+                    formatJoinWaitEstimate(
+                        homeNewRegistrationWaits[it.machineId],
+                        pairedEarliestMinutes
+                    )
+                },
                 "按当前队列估算，实际以轮到时为准。"
             )
         }
@@ -3952,6 +4329,41 @@ internal fun RegistrationApp() {
                 )
             ),
             machine?.takeIf { page > 0 }?.let {
+                FlowInfo("当前机台", "${it.queue.registrationCount} 份登记", "每台机台最多 20 份登记。")
+            }
+        )
+    }
+
+    /** Batch creation from the 选择登记方式 page: the join flow continues with 数量 as step 3. */
+    fun startBatchFromJoinFlow() {
+        val machineId = selectedMachine ?: return
+        val remaining = 20 - queueFor(machineId).registrationCount
+        if (remaining < 1) return
+        isBatchFlow = true
+        batchFromJoinFlow = true
+        batchAmount = minOf(2, remaining).toString()
+        screen = Screen.BATCH_AMOUNT
+    }
+
+    /** Back to the 选择登记方式 page of the join flow, or to its machine step. */
+    fun leaveBatchForJoinFlow(toMachine: Boolean) {
+        isBatchFlow = false
+        batchFromJoinFlow = false
+        temporarySelected = false
+        screen = if (toMachine) Screen.MACHINE else Screen.CREATE_REGISTRATION
+    }
+
+    /** The summary pane of batch creation chosen inside the join flow (batch-entry-mockup.html). */
+    fun joinFlowBatchSummary(): FlowSummary {
+        val machine = selectedMachine?.let { id -> configuredMachines.firstOrNull { it.machineId == id } }
+        return FlowSummary(
+            "创建登记并加入排队",
+            listOf(
+                FlowStep("机台", machine?.name, FlowStepState.DONE, onEdit = { leaveBatchForJoinFlow(toMachine = true) }),
+                FlowStep("登记方式", "批量创建登记", FlowStepState.DONE, onEdit = { leaveBatchForJoinFlow(toMachine = false) }),
+                FlowStep("数量", batchAmount.toIntOrNull()?.let { "$it 份" }, FlowStepState.CURRENT)
+            ),
+            machine?.let {
                 FlowInfo("当前机台", "${it.queue.registrationCount} 份登记", "每台机台最多 20 份登记。")
             }
         )
@@ -4056,7 +4468,9 @@ internal fun RegistrationApp() {
                         displayId = normalizedId,
                         preference = preference,
                         alsoQueuesAtPairedMachine = joinAlsoQueuesAtPairedMachine &&
-                            queueRuleSettings.pairedMachine(machineId) != null
+                            queueRuleSettings.pairedMachine(machineId) != null,
+                        allowsPassing = joinAllowsPassing && preference == PlayPreference.SOLO &&
+                            queueRuleSettings.machineConfiguration(machineId).capacity == 2
                     )
                 ),
                 RegistrationPlacement.ADVANCE_IF_UNAMBIGUOUS
@@ -4137,10 +4551,25 @@ internal fun RegistrationApp() {
             showHomeOperationFeedback(
                 title = "批量登记已创建",
                 detail = "已在 ${configuredMachineName(machineId)} 创建 $amount 份登记，并按创建顺序加入队列。",
-                contextLabel = configuredMachineName(machineId)
+                contextLabel = configuredMachineName(machineId),
+                machineId = machineId
             )
         }
         screen = Screen.HOME
+    }
+
+    /**
+     * A tap on another control of home ends “正在调整” first, as “结束调整” does: an adjustment
+     * that was not confirmed is dropped, and the control then acts (approved 2026-11-26; these
+     * taps used to do nothing). A control of the machine that is being adjusted ([ownMachineId])
+     * leaves the adjustment alone, as before.
+     */
+    fun endInlineReorder(ownMachineId: MachineId? = null) {
+        val session = reorderSession ?: return
+        if (!session.explicitEditMode && session.machineId != ownMachineId) {
+            inlineReorderProposal = null
+            reorderSession = null
+        }
     }
 
     fun openRegistration(machineId: MachineId, key: Int) {
@@ -4291,7 +4720,8 @@ internal fun RegistrationApp() {
         managementPolicyRevision = queueRuleSettings.managementPolicyRevision,
         pairedMachineOrders = currentQueueEngineState().pairedMachineOrders,
         pairedArrangements = pairedArrangements,
-        machinePartners = queueRuleSettings.machinePartnerNames
+        machinePartners = queueRuleSettings.machinePartnerNames,
+        machineNames = configuredMachineIds.associate { it.name to configuredMachineName(it) }
     )
 
     // Places held across paired machines depend on the pair settings and on which machines are
@@ -4331,10 +4761,45 @@ internal fun RegistrationApp() {
         nextKey = maxOf(nextKey, result.state.nextRegistrationKey)
         homeSidePanelFeedback = null
         newRegistrationHighlight = null
+        // A transfer is one event with its own wording, as when the terminal does it; read
+        // machine by machine it looked like a removal and a new registration.
+        val transfer = result.action as? QueueAction.TransferRegistrations
+        val transferSource = transfer?.let { action ->
+            MachineId.entries.firstOrNull { it.name == action.sourceMachineId }
+        }
+        val transferDestination = transfer?.let { action ->
+            MachineId.entries.firstOrNull { it.name == action.destinationMachineId }
+        }
+        val transferLogged = if (
+            transfer != null && transferSource != null && transferDestination != null
+        ) {
+            val sourceBefore = beforeQueues.getValue(transferSource.name)
+            createMachineTransferAuditLog(
+                category = auditCategoryFor(transferSource),
+                sourceMachineLabel = configuredMachineName(transferSource),
+                destinationMachineLabel = configuredMachineName(transferDestination),
+                registrations = sourceBefore.allRegistrations
+                    .filter { it.key in transfer.registrationKeys },
+                releasedPartnerRegistrations = sourceBefore.allRegistrations.filter {
+                    it.key !in transfer.registrationKeys &&
+                        it.fixedPartnerKey in transfer.registrationKeys
+                },
+                destinationMachineCapacity = queueRuleSettings
+                    .machineConfiguration(transferDestination)
+                    .capacity,
+                source = AuditLogSource.MANAGEMENT_APP
+            )?.also(::appendAuditLog) != null
+        } else {
+            false
+        }
         result.changedMachineIds.forEach { machineName ->
             val machineId = MachineId.entries.firstOrNull {
                 it.name == machineName
             } ?: return@forEach
+            if (
+                transferLogged &&
+                (machineId == transferSource || machineId == transferDestination)
+            ) return@forEach
             val beforeQueue = beforeQueues.getValue(machineName)
             val afterQueue = result.state.queues.getValue(machineName)
             appendQueueAuditLog(
@@ -4431,10 +4896,13 @@ internal fun RegistrationApp() {
                             CLOUD_PROFILE_REFRESH_INTERVAL_MILLIS
                     }
                 }
+                // The commands are fetched before the lock is taken: the lock only covers applying
+                // them, so that saving settings rarely has to wait (review T-C12, 2026-11-28).
+                val fetchedCommands = queueCommandClient.fetchPendingCommands(
+                    terminalInstallation.expectedServerVenueId
+                )
                 remoteTerminalCommandPollMutex.withLock {
-                    queueCommandClient.fetchPendingCommands(
-                        terminalInstallation.expectedServerVenueId
-                    )?.let { commands ->
+                    fetchedCommands?.let { commands ->
                         for (command in commands) {
                         val existingReceipt = terminalCommandReceipts[command.commandId]
                         if (existingReceipt != null) {
@@ -4463,10 +4931,10 @@ internal fun RegistrationApp() {
                                         "现场已经开始新的队列，请刷新后再提交。"
                                     command.expectedPolicyRevision !=
                                         queueRuleSettings.managementPolicyRevision ->
-                                        "终端敏感策略已经更新，请管理后台刷新后重试。"
+                                        "由管理后台接管的设置已经更新，请管理后台刷新后重试。"
                                     command.nextPolicyRevision !=
                                         command.expectedPolicyRevision + 1L ->
-                                        "终端敏感策略的修改未能应用，请刷新后再提交。"
+                                        "由管理后台接管的设置未能修改，请刷新后再提交。"
                                     else -> null
                                 }
                                 val applied = if (detail == null) {
@@ -4487,12 +4955,12 @@ internal fun RegistrationApp() {
                                 }
                                 val resultDetail = if (applied) {
                                     if (command.managementAppBound) {
-                                        "终端敏感策略已由管理后台更新并接管。"
+                                        "由管理后台接管的设置已更新。"
                                     } else {
-                                        "终端敏感策略已解除管理后台接管。"
+                                        "管理后台已解除对设置的接管。"
                                     }
                                 } else {
-                                    detail ?: "终端敏感策略未能写入本机。"
+                                    detail ?: "由管理后台接管的设置未能写入本机。"
                                 }
                                 if (!persistTerminalCommandReceipt(
                                         TerminalCommandReceipt(
@@ -4531,7 +4999,7 @@ internal fun RegistrationApp() {
                                         "现场终端已解除管理后台接管，请重新绑定后再提交。"
                                     command.expectedPolicyRevision != null &&
                                         command.expectedPolicyRevision != queueRuleSettings.managementPolicyRevision ->
-                                        "终端接管策略已经更新，请管理后台刷新后重试。"
+                                        "由管理后台接管的设置已经更新，请管理后台刷新后重试。"
                                     command.expectedQueueRevision != queueRevision.get() ->
                                         "现场队列已经更新，请刷新后再提交。"
                                     command.expectedMachineConfigurationRevision !=
@@ -4636,7 +5104,7 @@ internal fun RegistrationApp() {
                                         "现场终端已经解除管理后台接管，请重新绑定后再提交。"
                                     command.expectedPolicyRevision != null &&
                                         command.expectedPolicyRevision != queueRuleSettings.managementPolicyRevision ->
-                                        "终端接管策略已经更新，请管理后台刷新后重试。"
+                                        "由管理后台接管的设置已经更新，请管理后台刷新后重试。"
                                     command.machineId !in configuredMachineIds ->
                                         "目标机台已经不存在，请管理后台刷新后重试。"
                                     command.expectedMachineConfigurationRevision !=
@@ -4828,8 +5296,25 @@ internal fun RegistrationApp() {
                                         it.id == command.profileId
                                     }
                                     appendAuditLog(createPlayerProfileDeletionAuditLog(deletedProfile))
-                                    selectedPlayerProfileId = null
-                                    editingPlayerProfileId = null
+                                    // Only what shows the deleted profile. Resetting whatever
+                                    // was open turned another player's editor into "create",
+                                    // which then refused their own nickname and QQ as taken
+                                    // (review 2026-11-27).
+                                    val showsDeletedProfile =
+                                        selectedPlayerProfileId == command.profileId ||
+                                            editingPlayerProfileId == command.profileId
+                                    if (showsDeletedProfile) {
+                                        selectedPlayerProfileId = null
+                                        editingPlayerProfileId = null
+                                        if (screen == Screen.PLAYER_PROFILE_DETAIL || screen == Screen.PLAYER_PROFILE_EDITOR) {
+                                            screen = Screen.PLAYER_LIBRARY
+                                            Toast.makeText(
+                                                context,
+                                                panguSpacing("这份玩家资料已被管理后台删除。"),
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    }
                                 }
                                 if (outcome.persistenceFailed) {
                                     localWriteFailureDetail = outcome.detail
@@ -5495,12 +5980,24 @@ internal fun RegistrationApp() {
         inactivityWarningSeconds = null
         selectedMachine = null
         isBatchFlow = false
+        batchFromJoinFlow = false
         draftId = ""
         temporarySelected = false
         selectedPreference = PlayPreference.OPEN_TO_JOIN
         joinClosingWarningRequest = null
         mobileRegistrationSession = null
         mobileRegistrationFailureDetail = null
+        // The other QR codes and the explanations go as well: they used to stay on top of the
+        // home screen, the account-binding one with a nickname and QQ on it (review 2026-11-27).
+        playerProfileCreationSession = null
+        playerProfileCreationFailureDetail = null
+        playerAccountBindingSession = null
+        playerAccountBindingFailureDetail = null
+        playerAccountBindingProfileId = null
+        pairedMachineQueueIntroduction = null
+        passingIntroduction = null
+        pairedPreviewExplanation = null
+        cloudSyncInfoVisible = false
         selectedPlayerProfileId = null
         playerProfileContext = PlayerProfileContext.JOIN_QUEUE
         editingPlayerProfileId = null
@@ -5539,6 +6036,7 @@ internal fun RegistrationApp() {
         friendPairTarget = null
         friendPairProfileTarget = null
         releaseFixedPairTarget = null
+        fixedPairPreferenceChange = null
         claimPreferenceMismatchProfileId = null
         botFriendPromptQq = null
         playerProfileWriteFailureDetail = null
@@ -5553,6 +6051,14 @@ internal fun RegistrationApp() {
         if (!registrationOpen) {
             returnHomeAndClearTransientState(resetQueueScroll = true)
             pendingNewRegistrationHomeRequests = emptyList()
+        }
+    }
+
+    // The answer about passing belongs to one forming of a pair; the next one starts unticked.
+    LaunchedEffect(friendPairTarget == null && friendPairProfileTarget == null) {
+        if (friendPairTarget == null && friendPairProfileTarget == null) {
+            friendPairAllowsPassing = false
+            friendPairDirectPartnerKey = null
         }
     }
 
@@ -5581,6 +6087,7 @@ internal fun RegistrationApp() {
         returnPlayingRegistrationTarget != null ||
         advanceToPlayingTarget != null ||
         releaseFixedPairTarget != null ||
+        fixedPairPreferenceChange != null ||
         machineTransferTarget != null ||
         noShowTarget != null ||
         groupNoShowTarget != null ||
@@ -5592,6 +6099,12 @@ internal fun RegistrationApp() {
         playerProfileCreationSession != null ||
         playerProfileCreationFailureDetail != null ||
         playerProfileCreationLoading ||
+        playerAccountBindingSession != null ||
+        playerAccountBindingFailureDetail != null ||
+        pairedMachineQueueIntroduction != null ||
+        passingIntroduction != null ||
+        pairedPreviewExplanation != null ||
+        cloudSyncInfoVisible ||
         botFriendPromptQq != null ||
         incompleteCheckInProfileId != null ||
         playerProfileWriteInProgress ||
@@ -5638,14 +6151,32 @@ internal fun RegistrationApp() {
         friendPairTarget != null || stopReasonTarget != null ||
         reorderSession?.explicitEditMode == true || inlineReorderProposal != null ||
         positionReorderProposal != null
+    // 90 seconds while a form is filled in or a QR code is scanned (maintainer, 2026-11-26).
+    val inactivityTimeoutMillis = inactivityTimeoutFor(
+        fillingForm = inactivityNeedsFormWarning,
+        scanningQrCode = mobileRegistrationSession != null ||
+            playerProfileCreationSession != null ||
+            playerAccountBindingSession != null
+    )
+    // A QR code that is answered from the phone closes without a touch here; what follows it
+    // gets the whole shorter time.
+    LaunchedEffect(inactivityTimeoutMillis) { hostActivity?.recordUserInteraction() }
 
+    // Home with nothing open over it and no adjustment in progress.
+    val terminalIdle = !homeSidePanelOccluded && reorderSession == null
+    val heldNewRegistrationArrivals = remember { HeldNewRegistrationArrivals() }
     LaunchedEffect(
         pendingNewRegistrationHomeRequests.firstOrNull()?.highlight?.requestId,
         registrationOpen,
         inactivityNeedsFormWarning,
-        playerProfileWriteInProgress
+        playerProfileWriteInProgress,
+        screen == Screen.HOME,
+        terminalIdle
     ) {
-        val request = pendingNewRegistrationHomeRequests.firstOrNull() ?: return@LaunchedEffect
+        val request = pendingNewRegistrationHomeRequests.firstOrNull() ?: run {
+            heldNewRegistrationArrivals.clear()
+            return@LaunchedEffect
+        }
         val registrationStillExists = registrationOpen &&
             request.highlight.machineId in configuredMachineIds &&
             queueFor(request.highlight.machineId).allRegistrations.any {
@@ -5655,15 +6186,53 @@ internal fun RegistrationApp() {
             pendingNewRegistrationHomeRequests = pendingNewRegistrationHomeRequests.drop(1)
             return@LaunchedEffect
         }
-        if (!request.forceImmediateHome && (inactivityNeedsFormWarning || playerProfileWriteInProgress)) {
+        val handling = newRegistrationArrivalHandling(
+            forceImmediateHome = request.forceImmediateHome,
+            formOpen = inactivityNeedsFormWarning || playerProfileWriteInProgress,
+            homeScreenShown = screen == Screen.HOME,
+            terminalIdle = terminalIdle,
+            raisesConfirmation = request.enterPlayingConfirmation != null
+        )
+        if (handling == NewRegistrationArrivalHandling.HOLD) {
+            heldNewRegistrationArrivals.hold(
+                highlightRequestId = newRegistrationHighlight?.requestId,
+                feedbackId = homeSidePanelFeedback?.id,
+                undoId = queueUndoAction?.id
+            )
             return@LaunchedEffect
         }
-        hostActivity?.recordUserInteraction()
-        returnHomeAndClearTransientState(resetQueueScroll = false)
-        homeSidePanelFeedback = null
-        queueUndoAction = null
-        newRegistrationHighlight = request.highlight
-        enterPlayingConfirmation = request.enterPlayingConfirmation?.let(::queueOperationConfirmation)
+        // What the action that closed the form just produced stays: the player's own new
+        // registration, a question it raised, a banner such as “本次调整未执行”.
+        val localResultShown = !request.forceImmediateHome &&
+            heldNewRegistrationArrivals.localResultShown(
+                highlightRequestId = newRegistrationHighlight?.requestId,
+                feedbackId = homeSidePanelFeedback?.id,
+                undoId = queueUndoAction?.id,
+                confirmationOpen = enterPlayingConfirmation != null
+            )
+        when {
+            localResultShown -> {
+                // Only the highlight of the arrival is given up; its question is still asked.
+                if (terminalIdle) {
+                    request.enterPlayingConfirmation?.let {
+                        enterPlayingConfirmation = queueOperationConfirmation(it)
+                    }
+                }
+            }
+
+            handling == NewRegistrationArrivalHandling.RETURN_HOME -> {
+                hostActivity?.recordUserInteraction()
+                returnHomeAndClearTransientState(resetQueueScroll = false)
+                homeSidePanelFeedback = null
+                queueUndoAction = null
+                newRegistrationHighlight = request.highlight
+                enterPlayingConfirmation =
+                    request.enterPlayingConfirmation?.let(::queueOperationConfirmation)
+            }
+
+            // A dialog, a menu or an adjustment stays as it is.
+            else -> newRegistrationHighlight = request.highlight
+        }
         pendingNewRegistrationHomeRequests = pendingNewRegistrationHomeRequests.drop(1)
     }
 
@@ -5672,7 +6241,8 @@ internal fun RegistrationApp() {
         inactivityNeedsFormWarning,
         pendingQueueRestore,
         reorderSession?.explicitEditMode,
-        playerProfileWriteInProgress
+        playerProfileWriteInProgress,
+        inactivityTimeoutMillis
     ) {
         while (true) {
             delay(250L)
@@ -5687,10 +6257,23 @@ internal fun RegistrationApp() {
                 continue
             }
             val elapsedMillis = hostActivity?.elapsedSinceUserInteraction() ?: 0L
-            if (elapsedMillis >= INACTIVITY_TIMEOUT_MILLIS) {
+            if (elapsedMillis >= inactivityTimeoutMillis) {
                 val savedState = pendingQueueRestore
                 if (savedState != null) {
-                    restorePreviousQueue(savedState)
+                    // A queue from an earlier day is not continued unasked (maintainer,
+                    // 2026-11-27: “开启新队列”).
+                    if (
+                        savedState.totalRegistrationCount > 0 &&
+                        savedQueueIsFromEarlierDay(
+                            queueRuleSettings.businessHours,
+                            savedState.savedAtMillis,
+                            System.currentTimeMillis()
+                        )
+                    ) {
+                        startWithNewQueue(savedState, automatic = true)
+                    } else {
+                        restorePreviousQueue(savedState, automatic = true)
+                    }
                     homeQueueScrollResetToken++
                 } else {
                     returnHomeAfterInactivity()
@@ -5699,16 +6282,11 @@ internal fun RegistrationApp() {
                 hostActivity?.recordUserInteraction()
                 continue
             }
-            inactivityWarningSeconds = if (
-                inactivityNeedsFormWarning &&
-                elapsedMillis >= INACTIVITY_TIMEOUT_MILLIS - INACTIVITY_WARNING_MILLIS
-            ) {
-                ((INACTIVITY_TIMEOUT_MILLIS - elapsedMillis + 999L) / 1_000L)
-                    .coerceIn(1L, INACTIVITY_WARNING_MILLIS / 1_000L)
-                    .toInt()
-            } else {
-                null
-            }
+            inactivityWarningSeconds = inactivityWarningSecondsLeft(
+                elapsedMillis = elapsedMillis,
+                timeoutMillis = inactivityTimeoutMillis,
+                fillingForm = inactivityNeedsFormWarning
+            )
         }
     }
 
@@ -5726,7 +6304,8 @@ internal fun RegistrationApp() {
     Surface(Modifier.fillMaxSize(), color = PageBackground) {
         Box(Modifier.fillMaxSize()) {
             CompositionLocalProvider(
-                LocalGlobalDragOverlayController provides globalDragOverlayController
+                LocalGlobalDragOverlayController provides globalDragOverlayController,
+                LocalWaitEstimatesPending provides waitEstimatesPending
             ) {
                 val activeReorder = reorderSession
                 if (activeReorder?.explicitEditMode == true) {
@@ -5808,25 +6387,7 @@ internal fun RegistrationApp() {
 
                         Screen.HOME -> HomeScreen(
                             newRegistrationWaits = homeNewRegistrationWaits,
-                            pairedArrangementNotices = { machineId ->
-                                // The same record decides what the registration's menu says.
-                                queueRuleSettings.pairedMachine(machineId)?.let { partnerId ->
-                                    // Where the other machine shows the registration's preview,
-                                    // the notice names that position, such as 可能转至 B2
-                                    // (maintainer, 2026-11-25); otherwise the machine.
-                                    queueFor(machineId).waiting
-                                        .filter {
-                                            it.alsoQueuesAtPairedMachine &&
-                                                pairedArrangements[it.key]?.previewSinceMillis != null
-                                        }
-                                        .associate { registration ->
-                                            registration.key to pairedMachineArrangementTileNotice(
-                                                pairedPreviewPosition(machineId, registration.key)
-                                                    ?: "机台 ${partnerId.name}"
-                                            )
-                                        }
-                                }.orEmpty()
-                            },
+                            pairedArrangementNotices = { machineId -> registrationTileNotices(machineId) },
                             pairedPreview = { machineId, queue ->
                                 if (
                                     queueRuleSettings.pairedMachine(machineId) == null ||
@@ -5871,6 +6432,48 @@ internal fun RegistrationApp() {
                             positionReorderResetToken = positionReorderResetToken,
                             queueScrollResetToken = homeQueueScrollResetToken,
                             highlightedRegistration = newRegistrationHighlight,
+                            // The machine of what just happened: the new registration in green,
+                            // the banner with 撤销, or a banner about one machine.
+                            // Not away from a machine that is being adjusted.
+                            scrollTarget = newRegistrationHighlight?.takeIf {
+                                reorderSession == null
+                            }?.let {
+                                HomeScrollTarget(it.machineId, "registration-${it.requestId}")
+                            } ?: queueUndoAction?.let {
+                                HomeScrollTarget(it.machineId, "undo-${it.id}")
+                            } ?: homeSidePanelFeedback?.let { feedback ->
+                                feedback.machineId?.let { HomeScrollTarget(it, "banner-${feedback.id}") }
+                            },
+                            // Dragging registrations or a position onto another machine moves them
+                            // there after the same confirmation as 转至其他机台 (drag-transfer-mockup.html).
+                            dragTransferUnavailableReason = { sourceMachineId, keys, destinationMachineId ->
+                                val sourceQueue = queueFor(sourceMachineId)
+                                val registrations = sourceQueue.allRegistrations.filter { it.key in keys }
+                                val destination = configuredMachines.firstOrNull { it.machineId == destinationMachineId }
+                                when {
+                                    sourceQueue.playing.any { it.key in keys } ->
+                                        "登记已经进入${playingPositionName(sourceMachineId)}，不能转至其他机台。"
+                                    destination == null -> "这台机台已不在当前配置中。"
+                                    else -> machineTransferUnavailableReason(
+                                        machineName = destination.name,
+                                        status = destination.status,
+                                        queue = destination.queue,
+                                        incomingRegistrations = registrations,
+                                        machineCapacity = destination.configuration.capacity,
+                                        destinationIsPairedMachine =
+                                            queueRuleSettings.pairedMachine(sourceMachineId) == destinationMachineId
+                                    )
+                                }
+                            },
+                            onDragTransfer = { sourceMachineId, keys, destinationMachineId ->
+                                machineTransferTarget = MachineTransferRequest(
+                                    sourceMachineId,
+                                    keys,
+                                    confirmationSnapshots = queueFor(sourceMachineId)
+                                        .registrationConfirmationSnapshots(keys.toSet()),
+                                    destinationMachineId = destinationMachineId
+                                )
+                            },
                             onInlineReorderCancel = {
                                 inlineReorderProposal = null
                                 reorderSession = null
@@ -5885,14 +6488,17 @@ internal fun RegistrationApp() {
                             },
                             onEnableRegistration = ::reopenRegistration,
                             onJoin = {
+                                endInlineReorder()
                                 dismissHomeSidePanelContent()
                                 beginRegistration(false)
                             },
                             onJoinMachine = { machineId ->
+                                endInlineReorder(machineId)
                                 dismissHomeSidePanelContent()
                                 beginRegistrationForMachine(machineId)
                             },
                             onCompletedRegistrationClick = { machineId, registrationKey ->
+                                endInlineReorder()
                                 newRegistrationHighlight = null
                                 openRegistration(machineId, registrationKey)
                             },
@@ -5900,14 +6506,17 @@ internal fun RegistrationApp() {
                                 newRegistrationHighlight = null
                             },
                             onMore = {
+                                endInlineReorder()
                                 if (reorderSession == null) moreMenuVisible = true
                             },
                             onFinishRequest = {
+                                endInlineReorder(it)
                                 if (reorderSession == null) {
                                     finishConfirmation = queueOperationConfirmation(it)
                                 }
                             },
                             onEnterPlaying = { machineId ->
+                                endInlineReorder(machineId)
                                 if (reorderSession == null) {
                                     val roundPlan = planQueueAction(
                                         QueueAction.EnterPlayingPosition(machineId.name)
@@ -5926,6 +6535,7 @@ internal fun RegistrationApp() {
                                 }
                             },
                             onRestoreMachine = {
+                                endInlineReorder(it)
                                 if (reorderSession == null && !queueRuleSettings.managementAppBound) {
                                     restoreMachine(it)
                                 } else if (queueRuleSettings.managementAppBound) {
@@ -5938,21 +6548,34 @@ internal fun RegistrationApp() {
                             },
                             onMachineDetails = { machineDetailsTarget = it },
                             onVenueDetails = { venueIdentityDetailsVisible = true },
-                            onRegistrationClick = ::openRegistration,
+                            onRegistrationClick = { machineId, registrationKey ->
+                                endInlineReorder(machineId)
+                                openRegistration(machineId, registrationKey)
+                            },
                             onRegistrationLongPress = { machineId, registrationKey ->
                                 beginReorder(machineId, false, registrationKey)
                             },
                             onPositionClick = {
+                                endInlineReorder(it.machineId)
                                 if (reorderSession == null) selectedPosition = it
                             },
-                            onPositionReorderRequest = { machineId, originalQueue, sourceIndex, destinationIndex ->
+                            onPositionReorderRequest = { machineId, originalQueue, positions, sourceIndex, destinationIndex ->
                                 if (reorderSession == null) {
                                     positionReorderProposal = createPositionReorderProposal(
                                         machineId = machineId,
                                         queue = originalQueue,
+                                        positions = positions,
                                         sourceIndex = sourceIndex,
-                                        destinationIndex = destinationIndex
+                                        destinationIndex = destinationIndex,
+                                        positionsAfter = { proposedQueue, movedKeys ->
+                                            shownHomePositionsAfter(machineId, proposedQueue, movedKeys)
+                                        }
                                     )
+                                    // Nothing would change (for example only a preview was crossed).
+                                    if (positionReorderProposal == null) positionReorderResetToken++
+                                } else {
+                                    // Another machine is being adjusted: nothing is proposed here.
+                                    positionReorderResetToken++
                                 }
                             }
                         )
@@ -5992,6 +6615,7 @@ internal fun RegistrationApp() {
                                 hostActivity?.recordUserInteraction()
                             },
                             onTemporarySelect = { temporarySelected = true },
+                            onBatchCreate = ::startBatchFromJoinFlow,
                             onGenerateId = {
                                 temporarySelected = true
                                 draftId = randomUnusedId()
@@ -6006,6 +6630,7 @@ internal fun RegistrationApp() {
                             mobileRegistrationEnabled = cloudSyncAvailable &&
                                 queueRuleSettings.websiteSyncEnabled &&
                                 queueCommandClient.isConfigured &&
+                                queueRuleSettings.allowOnlineRegistration &&
                                 terminalInstallation.allowsOnlineAccess(
                                     queueRuleSettings.queueSyncEndpoint
                                 ),
@@ -6014,6 +6639,10 @@ internal fun RegistrationApp() {
                                     !queueRuleSettings.websiteSyncEnabled ||
                                     !queueCommandClient.isConfigured ->
                                     "请先在应用设置中配置并开启与服务端同步。"
+                                // R3: the terminal refuses it then (MobileDeviceRegistration), so
+                                // the card says so before it is opened (copy table, 2026-11-28).
+                                !queueRuleSettings.allowOnlineRegistration ->
+                                    "系统规则不允许线上登记，暂不能使用移动设备登记。"
                                 terminalInstallation.registrationState ==
                                     TerminalInstallationRegistrationState.VENUE_MISMATCH ->
                                     "当前服务器属于另一机厅，请先在应用设置中修正连接。"
@@ -6052,6 +6681,7 @@ internal fun RegistrationApp() {
                         Screen.PREFERENCE -> PreferenceScreen(
                             // A temporary registration cannot be arranged between two machines.
                             pairedQueueOption = null,
+                            soloPassingOption = soloPassingJoinOption(profileId = null),
                             selected = selectedPreference,
                             summary = joinFlowSummary(JoinFlowPage.PREFERENCE),
                             onSelect = { selectedPreference = it },
@@ -6069,11 +6699,13 @@ internal fun RegistrationApp() {
                                 PlayerProfileContext.CLAIM_REGISTRATION -> claimFlowSummary(1)
                                 PlayerProfileContext.FRIEND_PAIR -> friendPairFlowSummary(0)
                                 PlayerProfileContext.JOIN_QUEUE -> joinFlowSummary(JoinFlowPage.PROFILE)
+                                PlayerProfileContext.BROWSE -> null
                             },
                             title = when (playerProfileContext) {
                                 PlayerProfileContext.CLAIM_REGISTRATION -> "选择玩家资料"
                                 PlayerProfileContext.FRIEND_PAIR -> "选择朋友的玩家资料"
                                 PlayerProfileContext.JOIN_QUEUE -> "选择玩家资料"
+                                PlayerProfileContext.BROWSE -> "玩家资料库"
                             },
                             subtitle = when (playerProfileContext) {
                                 PlayerProfileContext.CLAIM_REGISTRATION ->
@@ -6082,7 +6714,11 @@ internal fun RegistrationApp() {
                                     "选择朋友的玩家资料，确认后创建登记并组成固定组合。"
                                 PlayerProfileContext.JOIN_QUEUE ->
                                     "选择玩家资料后，确认本次游玩偏好即可加入排队。"
+                                PlayerProfileContext.BROWSE ->
+                                    "共 ${playerProfiles.size} 份玩家资料。点击资料可以查看和编辑。"
                             },
+                            queuedProfilesOpen = playerProfileContext == PlayerProfileContext.BROWSE,
+                            columns = if (playerProfileContext == PlayerProfileContext.BROWSE) 4 else 3,
                             onSearchQueryChange = {
                                 playerProfileSearch = it
                                 hostActivity?.recordUserInteraction()
@@ -6090,14 +6726,35 @@ internal fun RegistrationApp() {
                             onSortModeChange = { playerProfileSort = it },
                             onNewProfile = ::openNewPlayerProfile,
                             onProfileClick = ::openPlayerProfile,
+                            // A profile that already has a registration is refused here, with
+                            // the sentence its confirmation page gives (approved 2026-11-26).
+                            queuedLine = queuedPlayerProfileLines(
+                                exceptKey = claimTarget?.registrationKey.takeIf {
+                                    playerProfileContext == PlayerProfileContext.CLAIM_REGISTRATION
+                                }
+                            ),
+                            queuedReason = when (playerProfileContext) {
+                                PlayerProfileContext.CLAIM_REGISTRATION ->
+                                    "这份玩家资料已经关联到另一份有效登记，不能重复使用。"
+                                PlayerProfileContext.FRIEND_PAIR ->
+                                    "这名玩家已经有一份有效登记，不能重复创建。"
+                                PlayerProfileContext.JOIN_QUEUE ->
+                                    "这名玩家已经有一份有效登记，不能重复加入。"
+                                PlayerProfileContext.BROWSE -> null
+                            },
                             onBack = {
                                 when (playerProfileContext) {
                                     PlayerProfileContext.CLAIM_REGISTRATION ->
                                         screen = Screen.CLAIM_REGISTRATION
                                     PlayerProfileContext.FRIEND_PAIR ->
                                         returnToFriendPairDialog()
-                                    PlayerProfileContext.JOIN_QUEUE ->
+                                    PlayerProfileContext.JOIN_QUEUE -> {
+                                        // The tick box followed the profile that was looked
+                                        // at; a temporary registration starts without it.
+                                        joinAllowsPassing = false
                                         screen = Screen.CREATE_REGISTRATION
+                                    }
+                                    PlayerProfileContext.BROWSE -> screen = Screen.HOME
                                 }
                             }
                         )
@@ -6185,6 +6842,56 @@ internal fun RegistrationApp() {
                                     },
                                     onBack = { screen = Screen.PLAYER_LIBRARY }
                                 )
+                            } else if (playerProfileContext == PlayerProfileContext.BROWSE) {
+                                // Opened from the More menu: the profile on its own page.
+                                if (profile == null) {
+                                    LaunchedEffect(Unit) { screen = Screen.PLAYER_LIBRARY }
+                                } else {
+                                    val registration = registrationOfPlayerProfile(
+                                        profile,
+                                        configuredMachineIds.flatMap { queueFor(it).allRegistrations }
+                                    )
+                                    val registrationMachine = registration?.let { found ->
+                                        configuredMachineIds.firstOrNull { machineId ->
+                                            queueFor(machineId).allRegistrations.any { it.key == found.key }
+                                        }
+                                    }
+                                    PlayerProfileBrowseScreen(
+                                        profile = profile,
+                                        registrationLine = if (registration != null && registrationMachine != null) {
+                                            val position = shownQueue(registrationMachine).first
+                                                .registrationPositionName(registrationMachine, registration.key)
+                                            "${configuredMachineName(registrationMachine)} 的" +
+                                                (position ?: "等待顺序")
+                                        } else {
+                                            "当前没有登记"
+                                        },
+                                        webAccountBindingEnabled = cloudSyncAvailable &&
+                                            queueRuleSettings.websiteSyncEnabled &&
+                                            queueCommandClient.isConfigured &&
+                                            terminalInstallation.allowsOnlineAccess(
+                                                queueRuleSettings.queueSyncEndpoint
+                                            ),
+                                        webAccountBindingLoading =
+                                            playerAccountBindingLoading &&
+                                                playerAccountBindingProfileId == profile.id,
+                                        webAccountBindingDisabledReason = when {
+                                            !cloudSyncAvailable ||
+                                                !queueRuleSettings.websiteSyncEnabled ||
+                                                !queueCommandClient.isConfigured ->
+                                                "请先在应用设置中配置并开启与服务端同步。"
+                                            terminalInstallation.registrationState ==
+                                                TerminalInstallationRegistrationState.VENUE_MISMATCH ->
+                                                "当前服务器属于另一机厅，请先在应用设置中修正连接。"
+                                            else -> "正在核对服务器所属机厅，完成后才能绑定网页账户。"
+                                        },
+                                        onEditProfile = {
+                                            openEditPlayerProfile(profile, Screen.PLAYER_PROFILE_DETAIL)
+                                        },
+                                        onBindWebAccount = { requestPlayerAccountBinding(profile) },
+                                        onBack = { screen = Screen.PLAYER_LIBRARY }
+                                    )
+                                }
                             } else if (playerProfileContext == PlayerProfileContext.FRIEND_PAIR) {
                                 val selection = friendPairProfileTarget
                                 val queue = selection?.let { queueFor(it.machineId) }
@@ -6215,6 +6922,12 @@ internal fun RegistrationApp() {
                                             statusFor(selected.machineId).isOperational &&
                                             queueFor(selected.machineId).registrationCount < 20
                                     } == true,
+                                    passingOption = selection?.let { selected ->
+                                        fixedPairPassingFormationOption(
+                                            selected.machineId,
+                                            registration?.playerProfileId
+                                        )
+                                    },
                                     onEditProfile = {
                                         profile?.let {
                                             openEditPlayerProfile(it, Screen.PLAYER_PROFILE_DETAIL)
@@ -6228,6 +6941,7 @@ internal fun RegistrationApp() {
                                     profile = profile,
                                     summary = joinFlowSummary(JoinFlowPage.CONFIRM),
                                     pairedQueueOption = pairedQueueJoinOption(profileId = profile?.id),
+                                    soloPassingOption = soloPassingJoinOption(profileId = profile?.id),
                                     selectedPreference = profileJoinPreference,
                                     rememberPreference = rememberProfileJoinPreference,
                                     alreadyRegistered = profile?.let(::playerProfileAlreadyRegistered) == true,
@@ -6280,7 +6994,10 @@ internal fun RegistrationApp() {
                         Screen.BATCH_AMOUNT -> BatchAmountScreen(
                             amount = batchAmount,
                             maximum = selectedMachine?.let { 20 - queueFor(it).registrationCount } ?: 20,
-                            summary = batchFlowSummary(1),
+                            summary = if (batchFromJoinFlow) joinFlowBatchSummary() else batchFlowSummary(1),
+                            singlePlayerMachine = selectedMachine?.let {
+                                queueRuleSettings.machineConfiguration(it).capacity == 1
+                            } == true,
                             onDecrease = {
                                 batchAmount = ((batchAmount.toIntOrNull() ?: 2) - 1).coerceAtLeast(1).toString()
                             },
@@ -6288,7 +7005,10 @@ internal fun RegistrationApp() {
                                 val maximum = selectedMachine?.let { 20 - queueFor(it).registrationCount } ?: 20
                                 batchAmount = ((batchAmount.toIntOrNull() ?: 1) + 1).coerceAtMost(maximum).toString()
                             },
-                            onBack = { screen = Screen.MACHINE },
+                            onBack = {
+                                if (batchFromJoinFlow) leaveBatchForJoinFlow(toMachine = false)
+                                else screen = Screen.MACHINE
+                            },
                             onComplete = ::completeBatch
                         )
 
@@ -6352,6 +7072,12 @@ internal fun RegistrationApp() {
                     )
                 }
 
+                // However the confirmation goes away (kept, confirmed, refused, the return to
+                // home after 30 seconds, a remote registration), the lane goes back to the real
+                // order; it used to keep showing the dragged one (review 2026-11-27).
+                LaunchedEffect(positionReorderProposal == null) {
+                    if (positionReorderProposal == null) positionReorderResetToken++
+                }
                 positionReorderProposal?.let { proposal ->
                     PositionReorderConfirmation(
                         proposal = proposal,
@@ -6381,7 +7107,7 @@ internal fun RegistrationApp() {
                                     ),
                                     message = "${configuredMachineName(proposal.machineId)} 的队列位置已调整",
                                     feedbackTitle = "队列位置已调整",
-                                    feedbackDetail = "两个位置已经交换，位置编号已同步更新。"
+                                    feedbackDetail = "等待位置已经按照确认后的顺序重新排列，位置编号已同步更新。"
                                 )
                             if (!changed) showQueueAdjustmentNotApplied(proposal.machineId)
                             positionReorderProposal = null
@@ -6404,9 +7130,8 @@ internal fun RegistrationApp() {
                                         selection.machineId
                                     ).capacity == 2
                         )
-                        val isInFirstWaitingPosition = queue.waitingPositions()
-                            .getOrNull(queue.firstAvailableWaitingPositionIndex() ?: -1)
-                            ?.any { it.key == registration.key } == true
+                        val isInFirstWaitingPosition = queue.nextWaitingGroup().any { it.key == registration.key } &&
+                            registration.key in nextEnteringKeys(selection.machineId)
                         val linkedPlayerProfile = registration.playerProfileId?.let { profileId ->
                             playerProfiles.firstOrNull { it.id == profileId }
                         }
@@ -6441,8 +7166,49 @@ internal fun RegistrationApp() {
                             } -> "其他机台当前都不能接收这份登记。"
                             else -> null
                         }
+                        // The registration's wait as its position shows it; none while it plays,
+                        // is away, or its machine is stopped.
+                        val registrationWait = if (
+                            playArrangement?.isPlayingPosition == true ||
+                            registration.absenceStatus == QueueAbsenceStatus.TEMPORARILY_AWAY ||
+                            !statusFor(selection.machineId).isOperational
+                        ) {
+                            null
+                        } else {
+                            shownPositionWait(
+                                waitEstimates,
+                                queue.waitingProjection().positions.map { position ->
+                                    position.registrations.mapTo(mutableSetOf()) { it.key }
+                                },
+                                setOf(registration.key)
+                            )
+                        }
+                        val earlierThanAhead = registrationWait?.let { wait ->
+                            earlierThanAheadNote(
+                                "这份登记",
+                                waitEstimates,
+                                queue.waitingProjection().positions.map { position ->
+                                    position.registrations.mapTo(mutableSetOf()) { it.key }
+                                },
+                                setOf(registration.key),
+                                wait.minutes
+                            )
+                        }
                         RegistrationActions(
+                            waitEstimatesPending = waitEstimatesPending,
                             registration = registration,
+                            waitLabel = registrationWait?.let {
+                                formatPositionWaitEstimate(it.minutes, it.uncertain)
+                            },
+                            noArrangementNote = listOfNotNull(
+                                noArrangementWaitNote("这份登记", registrationWait?.upperMinutes),
+                                earlierThanAhead
+                            ).joinToString("\n").ifEmpty { null },
+                            onlineMissingNote = onlineMissingWaitNote(
+                                "这份登记",
+                                waitEstimates.earlierIfOnlineMissing[registration.key],
+                                registrationWait?.minutes
+                            ),
                             playerProfileGender = linkedPlayerProfile?.gender ?: registration.gender,
                             playerProfileQqNumber = linkedPlayerProfile?.qqNumber,
                             playerProfile = linkedPlayerProfile,
@@ -6459,7 +7225,7 @@ internal fun RegistrationApp() {
                                 ).capacity == 2 &&
                                 isInFirstWaitingPosition &&
                                 registration.canEnterPlayingPosition,
-                            canReportNoShow = queue.canMarkNoShow(registration.key),
+                            canReportNoShow = canMarkNoShowNow(selection.machineId, registration.key),
                             allowDeferOneRound = queueRuleSettings.allowDeferOneRound,
                             allowTemporaryLeave = queueRuleSettings.allowTemporaryLeave,
                             allowsSharedPlay = queueRuleSettings.machineConfiguration(
@@ -6594,7 +7360,7 @@ internal fun RegistrationApp() {
                                                     partnerLabel
                                                 )
                                             }
-                                            selectedRegistration = null
+                                            // 更改游玩偏好 stays open; the explanation opens above it.
                                         },
                                         onShowDetails = {
                                             pairedMachineQueueIntroductionCountsDown = false
@@ -6630,19 +7396,67 @@ internal fun RegistrationApp() {
                                         )?.takeIf { turnedOn }
                                     )
                                 },
+                            soloPassingStatus = soloPassingState(
+                                shownQueue(selection.machineId).first,
+                                registration.key
+                            )?.let { soloPassingStatusText(it, fixedPair = registration.fixedPartnerKey != null) },
+                            onAllowsPassingToggle = {
+                                val enabled = !registration.allowsPassing
+                                if (registration.fixedPartnerKey != null) {
+                                    setFixedPairPassing(
+                                        selection.machineId,
+                                        registration.key,
+                                        enabled,
+                                        registration.playerProfileId
+                                    )
+                                } else {
+                                    val changed = updateQueueByAction(
+                                        action = QueueAction.SetAllowsPassing(
+                                            selection.machineId.name,
+                                            registration.key,
+                                            enabled
+                                        ),
+                                        surfaceHomeFeedback = true,
+                                        homeFeedbackTitle = "游玩偏好已更改"
+                                    )
+                                    if (changed) {
+                                        rememberPassingChoice(registration.playerProfileId, enabled)
+                                        if (enabled) {
+                                            showPassingExplanationOnFirstUse(
+                                                registration.playerProfileId,
+                                                fixedPair = false
+                                            )
+                                        }
+                                    }
+                                }
+                            },
+                            onShowPassingDetails = ::showPassingDetails,
                             onChangePreference = {
                                 registrationActionMode = RegistrationActionMode.PREFERENCE
                             },
                             onPreferenceSelected = { preference ->
-                                updateQueueByAction(
-                                    action = QueueAction.ChangePreference(
-                                        selection.machineId.name,
-                                        registration.key,
+                                // Saved at once; the dialog stays open for the next choice, such as
+                                // the tick box that appears under 单人游玩 (maintainer, 2026-11-26).
+                                // A fixed pair is released only after the same question the
+                                // position menu asks.
+                                val fixedPartnerKey = registration.fixedPartnerKey
+                                if (fixedPartnerKey != null) {
+                                    fixedPairPreferenceChange = FixedPairPreferenceChange(
+                                        selection,
+                                        fixedPartnerKey,
                                         preference
-                                    ),
-                                    surfaceHomeFeedback = true
-                                )
-                                selectedRegistration = null
+                                    )
+                                    selectedRegistration = null
+                                } else if (registration.preference != preference) {
+                                    updateQueueByAction(
+                                        action = QueueAction.ChangePreference(
+                                            selection.machineId.name,
+                                            registration.key,
+                                            preference
+                                        ),
+                                        surfaceHomeFeedback = true
+                                    )
+                                }
                             },
                             onFriendPair = {
                                 friendPairTarget = selection
@@ -6693,7 +7507,7 @@ internal fun RegistrationApp() {
                             },
                             onNoShow = {
                                 val currentQueue = queueFor(selection.machineId)
-                                if (currentQueue.canMarkNoShow(selection.registrationKey)) {
+                                if (canMarkNoShowNow(selection.machineId, selection.registrationKey)) {
                                     val registration = currentQueue.allRegistrations
                                         .firstOrNull { it.key == selection.registrationKey }
                                     val wasPlaying = currentQueue.playing
@@ -6712,7 +7526,9 @@ internal fun RegistrationApp() {
                                             label = if (wasPlaying) {
                                                 playingPositionName(selection.machineId)
                                             } else {
-                                                "位置 ${selection.machineId.name}${waitingIndex + 1}·固定组合"
+                                                val name = shownPositionNames(selection.machineId)[selection.registrationKey]
+                                                    ?: "${selection.machineId.name}${waitingIndex + 1}"
+                                                "位置 $name·固定组合"
                                             },
                                             registrationKeys = groupKeys.toList(),
                                             isPlayingPosition = wasPlaying,
@@ -6768,9 +7584,8 @@ internal fun RegistrationApp() {
                 moveIntoPlayingTarget?.let { selection ->
                     val queue = queueFor(selection.machineId)
                     val currentPlayer = queue.playing.singleOrNull()
-                    val joiningPlayer = queue.waitingPositions()
-                        .getOrNull(queue.firstAvailableWaitingPositionIndex() ?: -1)
-                        ?.firstOrNull { it.key == selection.registrationKey }
+                    val joiningPlayer = queue.nextWaitingGroup().firstOrNull { it.key == selection.registrationKey }
+                        ?.takeIf { it.key in nextEnteringKeys(selection.machineId) }
                     if (
                         currentPlayer != null &&
                         joiningPlayer != null &&
@@ -7003,8 +7818,14 @@ internal fun RegistrationApp() {
                             machineId = selection.machineId,
                             registration = registration,
                             queue = queue,
+                            directPartnerKey = friendPairDirectPartnerKey,
+                            positionNames = shownPositionNames(selection.machineId),
                             allowCreateFriend = acceptingNewRegistrations,
                             machineOperational = statusFor(selection.machineId).isOperational,
+                            passingOption = fixedPairPassingFormationOption(
+                                selection.machineId,
+                                registration.playerProfileId
+                            ),
                             idAlreadyExists = ::idAlreadyExists,
                             onGenerateFriendId = ::randomUnusedId,
                             onDismiss = {
@@ -7035,7 +7856,8 @@ internal fun RegistrationApp() {
                                         firstRegistrationKey = plan.firstRegistration.key,
                                         secondRegistrationKey = plan.secondRegistration.key,
                                         expectedPlan = plan,
-                                        advanceWhenPlayingEmpty = shouldFinishCreation
+                                        advanceWhenPlayingEmpty = shouldFinishCreation,
+                                        allowsPassing = friendPairAllowsPassing
                                     )
                                 )
                                 if (shouldFinishCreation && pairCreated) {
@@ -7049,11 +7871,13 @@ internal fun RegistrationApp() {
                                         title = "固定组合已建立",
                                         detail = buildString {
                                             append("“${plan.firstRegistration.displayId}”与“${plan.secondRegistration.displayId}”已组成固定组合。")
+                                            if (friendPairAllowsPassing) append("已允许后方的登记越过这组固定组合与前方的登记共同游玩。")
                                             fixedPairCreatedStatusDetail(
                                                 listOf(plan.firstRegistration, plan.secondRegistration)
                                             )?.let { append(it) }
                                         },
-                                        contextLabel = configuredMachineName(selection.machineId)
+                                        contextLabel = configuredMachineName(selection.machineId),
+                                        machineId = selection.machineId
                                     )
                                 }
                                 friendPairTarget = null
@@ -7084,7 +7908,8 @@ internal fun RegistrationApp() {
                                             machineId = selection.machineId.name,
                                             registrationKey = registration.key,
                                             friend = friend,
-                                            advanceWhenPlayingEmpty = shouldFinishCreation
+                                            advanceWhenPlayingEmpty = shouldFinishCreation,
+                                            allowsPassing = friendPairAllowsPassing
                                         )
                                     )
                                     if (shouldFinishCreation && pairCreated) {
@@ -7098,10 +7923,12 @@ internal fun RegistrationApp() {
                                             title = "固定组合已建立",
                                             detail = buildString {
                                                 append("“${registration.displayId}”与“${friend.displayId}”已组成固定组合。")
+                                                if (friendPairAllowsPassing) append("已允许后方的登记越过这组固定组合与前方的登记共同游玩。")
                                                 fixedPairCreatedStatusDetail(listOf(registration))
                                                     ?.let { append(it) }
                                             },
-                                            contextLabel = configuredMachineName(selection.machineId)
+                                            contextLabel = configuredMachineName(selection.machineId),
+                                            machineId = selection.machineId
                                         )
                                     }
                                     friendPairTarget = null
@@ -7165,7 +7992,13 @@ internal fun RegistrationApp() {
                             "“${it.displayId}”"
                         },
                         nextPlayingNotice = nextPlayingNotice,
-                        nextGroup = roundEndNextGroup(machineId, sourceQueue, finishPreview),
+                        nextGroup = roundEndNextGroup(
+                            machineId,
+                            sourceQueue,
+                            finishPreview,
+                            shownQueue = shownQueue(machineId).first
+                        ),
+                        nextGroupTileNotices = registrationTileNotices(machineId),
                         closingGracePeriod = activeClosingGracePeriod,
                         onDismiss = { finishConfirmation = null },
                         onConfirm = {
@@ -7327,6 +8160,13 @@ internal fun RegistrationApp() {
                         PrimaryButton("我知道了", { pairedPreviewExplanation = null }, Modifier.fillMaxWidth())
                     }
                 }
+                passingIntroduction?.let { (fixedPair, countsDown) ->
+                    PassingIntroductionDialog(
+                        fixedPair = fixedPair,
+                        countsDown = countsDown,
+                        onDismiss = { passingIntroduction = null }
+                    )
+                }
                 pairedMachineQueueIntroduction?.let { (_, partnerLabel) ->
                     PairedMachineQueueIntroductionDialog(
                         pairedMachineLabel = partnerLabel,
@@ -7363,6 +8203,13 @@ internal fun RegistrationApp() {
                         EnterPlayingConfirmation(
                             playingPositionLabel = playingPositionName(machineId),
                             notice = notice,
+                            nextGroup = roundEndNextGroup(
+                                machineId,
+                                queue,
+                                preview,
+                                shownQueue = shownQueue(machineId).first
+                            ),
+                            nextGroupTileNotices = registrationTileNotices(machineId),
                             onDismiss = { enterPlayingConfirmation = null },
                             onConfirm = {
                                 if (!request.queueSnapshot.hasSameQueueOperationState(queueFor(machineId))) {
@@ -7433,6 +8280,10 @@ internal fun RegistrationApp() {
                             moreMenuVisible = false
                             screen = Screen.AUDIT_LOG
                         },
+                        onOpenPlayerLibrary = {
+                            moreMenuVisible = false
+                            openPlayerLibrary(PlayerProfileContext.BROWSE)
+                        },
                         onOpenSettings = {
                             moreMenuVisible = false
                             screen = Screen.SETTINGS
@@ -7462,6 +8313,19 @@ internal fun RegistrationApp() {
                 if (appDetailsVisible) {
                     AppDetailsDialog(
                         cloudSyncStatus = displayedCloudSyncStatus.takeIf { cloudSyncAvailable },
+                        syncSummary = if (!cloudSyncAvailable) {
+                            null
+                        } else if (!queueRuleSettings.websiteSyncEnabled) {
+                            "未开启"
+                        } else {
+                            listOfNotNull(
+                                queueSyncModeLabel(queueRuleSettings.syncMode),
+                                runCatching { java.net.URI(queueRuleSettings.queueSyncEndpoint).host }
+                                    .getOrNull()?.takeIf { it.isNotBlank() }
+                            ).joinToString("·")
+                        },
+                        playerProfileCount = playerProfiles.size,
+                        auditLogCount = auditLogs.size,
                         terminalInstallation = terminalInstallation,
                         onOpenVersionHistory = {
                             appDetailsVisible = false
@@ -7569,6 +8433,20 @@ internal fun RegistrationApp() {
                 selectedPosition?.let { selection ->
                     val selectedPositionRegistrations = queueFor(selection.machineId)
                         .allRegistrations.filter { it.key in selection.registrationKeys }
+                    // The menu was opened for these registrations where they stood. Once one
+                    // of them has left, or has entered or left the playing position, it would
+                    // go on naming a position that no longer exists (review 2026-11-27).
+                    val selectionQueue = queueFor(selection.machineId)
+                    val selectionStillThere = selection.registrationKeys.all { key ->
+                        if (selection.isPlayingPosition) {
+                            selectionQueue.playing.any { it.key == key }
+                        } else {
+                            selectionQueue.waiting.any { it.key == key }
+                        }
+                    }
+                    LaunchedEffect(selectionStillThere) {
+                        if (!selectionStillThere) selectedPosition = null
+                    }
                     val transferDestinations = configuredMachines.filter {
                         it.machineId != selection.machineId
                     }
@@ -7602,6 +8480,7 @@ internal fun RegistrationApp() {
                     }
                     PositionActions(
                         waitEstimates = waitEstimates,
+                        nextEnteringKeys = nextEnteringKeys(selection.machineId),
                         selection = selection,
                         queue = queueFor(selection.machineId),
                         machineConfiguration = queueRuleSettings.machineConfiguration(
@@ -7662,6 +8541,34 @@ internal fun RegistrationApp() {
                         onReleaseFixedPair = {
                             releaseFixedPairTarget = selection
                             selectedPosition = null
+                        },
+                        onTogglePairPassing = {
+                            val pair = queueFor(selection.machineId).allRegistrations
+                                .filter { it.key in selection.registrationKeys }
+                            val first = pair.firstOrNull()
+                            if (first != null) {
+                                setFixedPairPassing(
+                                    selection.machineId,
+                                    first.key,
+                                    enabled = !pair.all(Registration::allowsPassing),
+                                    profileId = pair.firstNotNullOfOrNull(Registration::playerProfileId)
+                                )
+                            }
+                            // A tick box: the menu stays open and shows the new state.
+                        },
+                        onShowPassingDetails = { showPassingDetails(fixedPair = true) },
+                        onFormFixedPair = {
+                            val pair = queueFor(selection.machineId).allRegistrations
+                                .filter { it.key in selection.registrationKeys }
+                            if (pair.size == 2) {
+                                friendPairDirectPartnerKey = pair[1].key
+                                friendPairTarget = SelectedRegistration(selection.machineId, pair[0].key)
+                            }
+                            selectedPosition = null
+                        },
+                        pairPassingStatus = selection.registrationKeys.firstOrNull()?.let { key ->
+                            soloPassingState(shownQueue(selection.machineId).first, key)
+                                ?.let { soloPassingStatusText(it, fixedPair = true) }
                         },
                         onNoShow = {
                             val currentQueue = queueFor(selection.machineId)
@@ -7785,7 +8692,7 @@ internal fun RegistrationApp() {
                                             setOf(selection.registrationKey)
                                         ),
                                         surfaceHomeFeedback = true,
-                                        homeFeedbackTitle = "已撤回至等待顺序"
+                                        homeFeedbackTitle = "登记已撤回至等待顺序"
                                     )
                                 } else {
                                     showStalePositionActionNotApplied(selection.machineId)
@@ -7905,6 +8812,54 @@ internal fun RegistrationApp() {
                     }
                 }
 
+                fixedPairPreferenceChange?.let { change ->
+                    val selection = change.selection
+                    val queue = queueFor(selection.machineId)
+                    val registration = queue.allRegistrations
+                        .firstOrNull { it.key == selection.registrationKey }
+                    val partner = queue.allRegistrations.firstOrNull { it.key == change.partnerKey }
+                    // Back to 更改游玩偏好, where the choice was made and the next one follows.
+                    val reopenPreferenceChoice = {
+                        fixedPairPreferenceChange = null
+                        selectedRegistration = selection
+                        registrationActionMode = RegistrationActionMode.PREFERENCE
+                    }
+                    if (
+                        registration != null && partner != null &&
+                        registration.fixedPartnerKey == partner.key
+                    ) {
+                        ReleaseFixedPairConfirmation(
+                            registrations = listOf(registration, partner),
+                            onDismiss = reopenPreferenceChoice,
+                            onConfirm = {
+                                val current = queueFor(selection.machineId).allRegistrations
+                                    .firstOrNull { it.key == selection.registrationKey }
+                                if (current?.fixedPartnerKey == change.partnerKey) {
+                                    updateQueueByAction(
+                                        action = QueueAction.ChangePreference(
+                                            selection.machineId.name,
+                                            selection.registrationKey,
+                                            change.preference
+                                        ),
+                                        surfaceHomeFeedback = true
+                                    )
+                                    reopenPreferenceChoice()
+                                } else {
+                                    fixedPairPreferenceChange = null
+                                    showStalePositionActionNotApplied(selection.machineId)
+                                }
+                            },
+                            chosenPreference = change.preference,
+                            inPlayingPosition = queue.playing.any { it.key == registration.key }
+                        )
+                    } else {
+                        LaunchedEffect(change, queue) {
+                            fixedPairPreferenceChange = null
+                            showStalePositionActionNotApplied(selection.machineId)
+                        }
+                    }
+                }
+
                 machineTransferTarget?.let { request ->
                     val sourceQueue = queueFor(request.sourceMachineId)
                     val requestedKeys = request.registrationKeys.toSet()
@@ -7935,6 +8890,7 @@ internal fun RegistrationApp() {
                                 sourceUnavailableReason = sourceUnavailableReason,
                                 pairedMachineId =
                                     queueRuleSettings.pairedMachine(request.sourceMachineId),
+                                newRegistrationWaits = homeNewRegistrationWaits,
                                 onDismiss = { machineTransferTarget = null },
                                 onSelect = { selectedDestination ->
                                     machineTransferTarget = request.copy(
@@ -7993,6 +8949,7 @@ internal fun RegistrationApp() {
                                             title = "转至其他机台未执行",
                                             detail = "原位置、登记状态或目标机台状态已经变化，请核对当前队列后重试。",
                                             contextLabel = configuredMachineName(request.sourceMachineId),
+                                            machineId = request.sourceMachineId,
                                             tone = HomeSidePanelFeedbackTone.WARNING
                                         )
                                     }
@@ -8006,6 +8963,7 @@ internal fun RegistrationApp() {
                                     title = "转至其他机台未执行",
                                     detail = "目标机台已经不在当前配置中，请重新选择。",
                                     contextLabel = configuredMachineName(request.sourceMachineId),
+                                    machineId = request.sourceMachineId,
                                     tone = HomeSidePanelFeedbackTone.WARNING
                                 )
                             }
@@ -8022,9 +8980,13 @@ internal fun RegistrationApp() {
                     val queue = queueFor(selection.machineId)
                     val registration = queue.allRegistrations
                         .firstOrNull { it.key == selection.registrationKey }
-                    if (registration != null && queue.matchesNoShowLocation(selection)) {
+                    if (
+                        registration != null &&
+                        queue.matchesNoShowLocation(selection, nextEnteringKeys(selection.machineId))
+                    ) {
                         fun currentTargetStillMatches(): Boolean =
-                            queueFor(selection.machineId).matchesNoShowLocation(selection)
+                            queueFor(selection.machineId)
+                                .matchesNoShowLocation(selection, nextEnteringKeys(selection.machineId))
                         val startNextWhenPlayingBecomesEmpty = !selection.fromPlayingPosition
                         fun noShowPlan(resolution: NoShowResolution) = planQueueAction(
                             QueueAction.MarkNoShow(
@@ -8660,11 +9622,21 @@ internal fun RegistrationApp() {
                             machineNames = savedState.configuredMachineIds.associateWith(
                                 ::configuredMachineName
                             ),
+                            fromEarlierDay = savedState.totalRegistrationCount > 0 &&
+                                savedQueueIsFromEarlierDay(
+                                    queueRuleSettings.businessHours,
+                                    savedState.savedAtMillis,
+                                    nowMillis
+                                ),
                             onRestore = { restorePreviousQueue(savedState) },
                             onStartNew = { startWithNewQueue(savedState) }
                         )
                     }
                 }
+                }
+                // Outside the branch above, so that the whole-page 调整等待顺序 gets the countdown
+                // too: its seconds were counted but never shown, and the adjustment was dropped
+                // without a word (review 2026-11-27).
                 inactivityWarningSeconds?.let { remainingSeconds ->
                     InactivityReturnWarningDialog(
                         remainingSeconds = remainingSeconds,
@@ -8678,7 +9650,6 @@ internal fun RegistrationApp() {
                             inactivityWarningSeconds = null
                         }
                     )
-                }
                 }
                 GlobalDragOverlay(globalDragOverlayController)
             }
@@ -8866,7 +9837,21 @@ private fun QueueRuleSettingsScreen(
 ) {
     val context = LocalContext.current
     val hostActivity = context as? MainActivity
-    var settings by remember(persistedSettings) { mutableStateOf(persistedSettings) }
+    val saveScope = rememberCoroutineScope()
+    // The draft is not thrown away when the saved settings change while the page is open (a
+    // management command, for example): the change is merged in, and the operator's own edits
+    // stay (review T-C12, 2026-11-28; mergeRemoteSettingsIntoDraft).
+    var draftBase by remember { mutableStateOf(persistedSettings) }
+    var settings by remember { mutableStateOf(persistedSettings) }
+    LaunchedEffect(persistedSettings) {
+        if (persistedSettings != draftBase) {
+            settings = mergeRemoteSettingsIntoDraft(base = draftBase, draft = settings, remote = persistedSettings)
+            draftBase = persistedSettings
+        }
+    }
+    // Saving while the terminal applies remote commands waits for them and then saves, instead
+    // of refusing (review T-C12).
+    var savingAfterRemoteCommands by remember { mutableStateOf(false) }
     var addingMachinePair by remember { mutableStateOf(false) }
     var selectedMachineConfigurationId by remember { mutableStateOf(MachineId.A) }
     var machineDeletionTarget by remember { mutableStateOf<MachineId?>(null) }
@@ -9083,7 +10068,7 @@ private fun QueueRuleSettingsScreen(
                 Spacer(Modifier.height(4.dp))
                 Text(
                     if (BuildConfig.CLOUD_SYNC_AVAILABLE) {
-                        "名称会显示在现场终端、网站和 QQ Bot。修改名称不会改变机厅 ID、队列、玩家资料或历史记录，也不要求关闭登记排队。"
+                        "名称会显示在现场终端、网页端和 QQ Bot。修改名称不会改变机厅 ID、队列、玩家资料或历史记录，也不要求关闭登记排队。"
                     } else {
                         "名称会显示在现场终端。修改名称不会改变机厅 ID、队列、玩家资料或历史记录，也不要求关闭登记排队。"
                     },
@@ -9295,7 +10280,7 @@ private fun QueueRuleSettingsScreen(
                             !queueConnectionConfigured ->
                                 "请先填写有效的服务器地址与终端同步令牌。"
                             settings.websiteSyncEnabled ->
-                                "上传最新队列和玩家资料，并接收服务端待执行的修改。只有允许网站显示的 QQ 才会显示在网站登记详情中。"
+                                "上传最新队列和玩家资料，并接收服务端待执行的修改。只有允许网页端显示的 QQ 才会显示在网页端登记详情中。"
                             else ->
                                 "队列与玩家资料只在本机更新。重新开启后，会同步当前完整数据。"
                         },
@@ -9330,9 +10315,9 @@ private fun QueueRuleSettingsScreen(
                             !settings.websiteSyncEnabled ->
                                 "与服务端同步关闭期间不会接收新的线上登记；重新开启后将按照此设置执行。"
                             settings.allowOnlineRegistration ->
-                                "允许玩家通过网站和 QQ Bot 创建线上登记；到场后仍需在终端完成签到。"
+                                "允许玩家通过网页端和 QQ Bot 创建线上登记；到场后仍需在终端完成签到。"
                             else ->
-                                "网站和 QQ Bot 仍可查询队列、管理已有登记；不能创建新的线上登记。"
+                                "网页端和 QQ Bot 仍可查询队列、管理已有登记；不能创建新的线上登记。"
                         },
                         checked = settings.allowOnlineRegistration,
                         enabled = !managementSensitiveControlsLocked,
@@ -9532,7 +10517,7 @@ private fun QueueRuleSettingsScreen(
             ) {
                 if (managementSensitiveControlsLocked) {
                     Text(
-                        "暂缓一次、暂时离开等终端敏感策略已由管理后台接管，只能从管理后台修改；终端仍可拖动调整等待顺序。",
+                        "暂缓一次、暂时离开等设置已由管理后台接管，只能从管理后台修改；终端仍可拖动调整等待顺序。",
                         color = WarningText,
                         fontSize = 11.sp,
                         lineHeight = 16.sp,
@@ -9570,8 +10555,15 @@ private fun QueueRuleSettingsScreen(
                 HorizontalDivider(color = Separator.copy(alpha = .72f))
                 QueueRuleSettingRow(
                     title = "显示共同游玩预览",
-                    description = "在开放单人位置中显示按当前轮换规则预计的共同游玩玩家。预览不会改变真实队列。",
+                    // R1: locked like the other settings the management app holds; saving a change
+                    // was refused before, after the switch had moved (copy table, 2026-11-28).
+                    description = if (managementSensitiveControlsLocked) {
+                        "已由管理后台接管，只能从管理后台修改。"
+                    } else {
+                        "等待位置中只有一份允许他人加入的登记时，显示按当前轮换规则预计与其共同游玩的玩家。预览不会改变真实队列。"
+                    },
                     checked = settings.showCommonPlayPreview,
+                    enabled = !managementSensitiveControlsLocked,
                     onCheckedChange = {
                         updateDraft(settings.copy(showCommonPlayPreview = it))
                     }
@@ -9707,9 +10699,7 @@ private fun QueueRuleSettingsScreen(
                     modifier = Modifier.weight(1f).padding(end = 16.dp)
                 )
             }
-            PrimaryButton(
-                text = "保存设置",
-                onClick = {
+            fun saveNow() {
                     val queueSettingsSaved = !queueSettingsChanged ||
                         onSettingsChange(settingsToSave)
                     val installationNamesSaved = queueSettingsSaved &&
@@ -9731,13 +10721,31 @@ private fun QueueRuleSettingsScreen(
                             Toast.LENGTH_LONG
                         ).show()
                     }
+            }
+            val latestSaveNow by rememberUpdatedState(::saveNow)
+            PrimaryButton(
+                text = "保存设置",
+                onClick = {
+                    if (!remoteTerminalCommandPollMutex.isLocked) {
+                        saveNow()
+                    } else {
+                        savingAfterRemoteCommands = true
+                        saveScope.launch {
+                            // Wait for the commands being applied, then save at once: this runs
+                            // on the main thread, so no command can start in between.
+                            remoteTerminalCommandPollMutex.withLock { }
+                            savingAfterRemoteCommands = false
+                            latestSaveNow()
+                        }
+                    }
                 },
                 modifier = Modifier.width(220.dp),
-                enabled = settingsChanged && settingsValid,
+                enabled = settingsChanged && settingsValid && !savingAfterRemoteCommands,
                 disabledReason = when {
+                    savingAfterRemoteCommands -> "终端正在处理远程操作，处理完成后会自动保存设置。"
                     !settingsChanged -> "当前没有未保存的设置。"
                     !installationNamesValid -> "请填写有效的机厅名称和终端名称。"
-                    !remarksValid -> "请填写所有已启用机台的备注。"
+                    !remarksValid -> "请填写所有机台的备注。"
                     !machineDetailsValid -> "请填写选择为“其他”的机台类型或服务器名称。"
                     !machineGroupsValid -> "请填写所有机台分组的名称。"
                     !connectionChangeValid -> "请填写有效的服务器地址和终端同步令牌。"
@@ -9749,7 +10757,7 @@ private fun QueueRuleSettingsScreen(
     if (showTakeoverConfirmation) {
         RemoveRegistrationConfirmation(
             title = "接管同步身份？",
-            message = "接管后，网站和 QQ Bot 将以本机队列作为正式数据。请仅在确实需要用本机替代当前同步终端时继续。",
+            message = "接管后，网页端和 QQ Bot 将以本机队列作为正式数据。请仅在确实需要用本机替代当前同步终端时继续。",
             confirmText = "确认接管",
             onDismiss = { showTakeoverConfirmation = false },
             onConfirm = {
@@ -9968,7 +10976,7 @@ private fun TerminalOnboardingScreen(
         1 -> StepFlowPage(
             summary = summary,
             title = "连接服务端",
-            subtitle = "联网后，网站和 QQ Bot 可以读取队列，并按照终端规则提交线上操作。也可以暂时跳过，之后在应用设置中连接。",
+            subtitle = "联网后，网页端和 QQ Bot 可以读取队列，并按照终端规则提交线上操作。也可以暂时跳过，之后在应用设置中连接。",
             onBack = goBack
         ) {
             Spacer(Modifier.height(18.dp))
@@ -10054,7 +11062,7 @@ private fun TerminalOnboardingScreen(
             summary = summary,
             title = "设置机厅身份",
             subtitle = if (BuildConfig.CLOUD_SYNC_AVAILABLE) {
-                "机厅名称会显示在现场终端、网站和 QQ Bot；终端名称用于区分同一机厅内的现场终端。两者都可以在应用设置中修改。"
+                "机厅名称会显示在现场终端、网页端和 QQ Bot；终端名称用于区分同一机厅内的现场终端。两者都可以在应用设置中修改。"
             } else {
                 "机厅名称会显示在现场终端；终端名称用于区分同一机厅内的现场终端。两者都可以在应用设置中修改。"
             },
@@ -10191,9 +11199,9 @@ private fun QueueSyncModeSetting(
         QueueSyncMode.UNSPECIFIED ->
             "沿用当前同步身份；发现其他终端的数据时不会自动接管。需要切换终端时，请选择测试同步或接管同步。"
         QueueSyncMode.TEST ->
-            "网站和 QQ Bot 完整使用本机数据，并标记为测试数据；主终端恢复联网后，正式队列会重新生效。"
+            "网页端和 QQ Bot 完整使用本机数据，并标记为测试数据；主终端恢复联网后，正式队列会重新生效。"
         QueueSyncMode.TAKEOVER ->
-            "网站和 QQ Bot 将本机队列作为正式数据；仅适合确实更换现场同步终端时使用。"
+            "网页端和 QQ Bot 将本机队列作为正式数据；仅适合确实更换现场同步终端时使用。"
     }
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp)) {
         Text(
@@ -10505,10 +11513,10 @@ private fun MachineGroupTable(
             Modifier.heightIn(min = MinTouchTarget).clip(RoundedCornerShape(ControlRadius))
                 .clickable {
                     when {
-                        !enabled -> showDisabledActionReason(context, "新建分组", disabledReason)
+                        !enabled -> showDisabledActionReason(context, "创建分组", disabledReason)
                         !canAdd -> showDisabledActionReason(
                             context,
-                            "新建分组",
+                            "创建分组",
                             "分组数量不能超过机台数量。"
                         )
                         else -> addEmptyMachineGroup(settings)?.let(onSettingsChange)
@@ -10525,7 +11533,7 @@ private fun MachineGroupTable(
             )
             Spacer(Modifier.width(4.dp))
             Text(
-                "新建分组",
+                "创建分组",
                 color = if (enabled && canAdd) SystemBlue else TertiaryText,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.SemiBold
@@ -11293,6 +12301,10 @@ private fun remoteQueueOperationFeedbackTitle(operation: RemoteQueueOperation): 
         RemoteQueueOperation.CREATE_REGISTRATION -> "管理后台已创建登记"
         RemoteQueueOperation.REORDER_QUEUE -> "等待顺序已调整"
         RemoteQueueOperation.SET_PAIRED_MACHINE_QUEUEING -> "两台机台之间的安排已更改"
+        // The choice belongs to the play preference; no short name is made up for it.
+        RemoteQueueOperation.SET_ALLOWS_PASSING -> "游玩偏好已更改"
+        RemoteQueueOperation.CREATE_FIXED_PAIR -> "固定组合已建立"
+        RemoteQueueOperation.RENAME_REGISTRATION -> "登记昵称已修改"
     }
 
 private fun remoteQueueOperationSourceLabel(source: RemoteQueueOperationSource): String =
@@ -11352,6 +12364,12 @@ private fun HomeScreen(
     positionReorderResetToken: Int,
     queueScrollResetToken: Int,
     highlightedRegistration: NewRegistrationHighlight?,
+    /** Brought into view: switches to its group and scrolls the machines to it. */
+    scrollTarget: HomeScrollTarget? = null,
+    /** Why registrations dragged from one machine cannot go to another; null when they can. */
+    dragTransferUnavailableReason: (MachineId, List<Int>, MachineId) -> String? = { _, _, _ -> null },
+    /** Registrations dropped on another machine: opens the confirmation of 转至其他机台. */
+    onDragTransfer: (MachineId, List<Int>, MachineId) -> Unit = { _, _, _ -> },
     onInlineReorderCancel: () -> Unit,
     onInlineReorderProposal: (MachineId, MachineQueue, List<Registration>, Int) -> Unit,
     onEnableRegistration: () -> Unit,
@@ -11368,7 +12386,7 @@ private fun HomeScreen(
     onRegistrationClick: (MachineId, Int) -> Unit,
     onRegistrationLongPress: (MachineId, Int) -> Unit,
     onPositionClick: (PositionSelection) -> Unit,
-    onPositionReorderRequest: (MachineId, MachineQueue, Int, Int) -> Unit
+    onPositionReorderRequest: (MachineId, MachineQueue, DragPositions, Int, Int) -> Unit
 ) {
     val activeMachineGroups = machineGroups.mapNotNull { group ->
         val groupMachines = machines.filter { machine ->
@@ -11388,6 +12406,20 @@ private fun HomeScreen(
         activeMachineGroups.size
     }
     val groupPagerScope = rememberCoroutineScope()
+    val latestDragTransferUnavailableReason by rememberUpdatedState(dragTransferUnavailableReason)
+    val latestOnDragTransfer by rememberUpdatedState(onDragTransfer)
+    val latestMachineCount by rememberUpdatedState(machines.size)
+    val machineDropTargets = remember {
+        MachineDropTargets(
+            unavailableReason = { drag, destination ->
+                latestDragTransferUnavailableReason(drag.sourceMachineId, drag.registrationKeys, destination)
+            },
+            onTransfer = { drag, destination ->
+                latestOnDragTransfer(drag.sourceMachineId, drag.registrationKeys, destination)
+            },
+            machineCount = { latestMachineCount }
+        )
+    }
     val isEmpty = machines.all { it.queue.registrationCount == 0 }
     val hasStoppedMachine = machines.any { !it.status.isOperational }
     val nowMillis = rememberCurrentTimeMillis()
@@ -11397,7 +12429,9 @@ private fun HomeScreen(
         val queue = machine.queue
         val registration = queue.allRegistrations
             .firstOrNull { it.key == highlight.registrationKey }
-        val positionLabel = queue.registrationPositionName(
+        // Named as the lane below numbers it, previews of the other machine included (found
+        // 2026-11-27: the banner said 查看位置 B2 for a registration shown at B5).
+        val positionLabel = pairedPreview(highlight.machineId, queue).first.registrationPositionName(
             highlight.machineId,
             highlight.registrationKey
         )
@@ -11423,18 +12457,21 @@ private fun HomeScreen(
         activeMachineGroups.map { it.first.id }
     ) {
         if (groupPagerState.currentPage != defaultGroupIndex) {
+            // Never away from a registration being dragged (see the pager below).
+            snapshotFlow { machineDropTargets.active }.first { it == null }
             groupPagerState.animateScrollToPage(defaultGroupIndex)
         }
     }
     LaunchedEffect(
         activeMachineGroups.map { it.first.id },
-        highlightedRegistration?.requestId
+        scrollTarget?.key
     ) {
-        val highlightedMachineId = highlightedRegistration?.machineId ?: return@LaunchedEffect
+        val highlightedMachineId = scrollTarget?.machineId ?: return@LaunchedEffect
         val highlightedGroupIndex = activeMachineGroups.indexOfFirst { (_, groupMachines) ->
             groupMachines.any { it.machineId == highlightedMachineId }
         }
         if (highlightedGroupIndex >= 0 && groupPagerState.currentPage != highlightedGroupIndex) {
+            snapshotFlow { machineDropTargets.active }.first { it == null }
             groupPagerState.animateScrollToPage(highlightedGroupIndex)
         }
     }
@@ -11456,7 +12493,7 @@ private fun HomeScreen(
             key = "undo-${queueUndoAction.id}",
             tone = queueUndoAction.feedbackTone,
             title = queueUndoAction.feedbackTitle,
-            contextLabel = "${queueUndoAction.contextLabel}·可在 10 秒内撤销",
+            contextLabel = queueUndoAction.contextLabel,
             detail = queueUndoAction.feedbackDetail,
             actionText = "撤销本次操作",
             onAction = onUndoQueueAction,
@@ -11497,10 +12534,40 @@ private fun HomeScreen(
         )
         else -> null
     }
-    LaunchedEffect(banner?.key) {
-        if (banner == null) bannerDetail = null
+    // The detail stays open after its banner has timed out behind it (it used to close itself
+    // a few seconds after it was opened, review 2026-11-27); the return to home closes it.
+    LaunchedEffect(queueScrollResetToken) { bannerDetail = null }
+    // Fingers on the screen, counted without taking any touch away from what is under them.
+    var pressedPointers by remember { mutableIntStateOf(0) }
+    // A second finger can swipe to another group page during a drag. The pager then follows the
+    // dragging finger once the other one lifts and so never settles; it is settled here, to the
+    // nearer page, as soon as only the dragging finger is left.
+    LaunchedEffect(machineDropTargets.active != null) {
+        if (machineDropTargets.active == null) return@LaunchedEffect
+        snapshotFlow { pressedPointers <= 1 && groupPagerState.currentPageOffsetFraction != 0f }
+            .collect { unsettled ->
+                if (!unsettled || machineDropTargets.active == null) return@collect
+                val pageWidth = groupPagerState.layoutInfo.pageSize + groupPagerState.layoutInfo.pageSpacing
+                val distance = -groupPagerState.currentPageOffsetFraction * pageWidth
+                groupPagerState.scroll(MutatePriority.PreventUserInput) {
+                    var moved = 0f
+                    animate(0f, distance, animationSpec = tween(220)) { value, _ ->
+                        scrollBy(value - moved)
+                        moved = value
+                    }
+                }
+            }
     }
-    Box(Modifier.fillMaxSize()) {
+    Box(
+        Modifier.fillMaxSize().pointerInput(Unit) {
+            awaitPointerEventScope {
+                while (true) {
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                    pressedPointers = event.changes.count { it.pressed }
+                }
+            }
+        }
+    ) {
         Column(Modifier.fillMaxSize().padding(horizontal = 32.dp, vertical = 20.dp)) {
             AppHeader(
                 nowMillis = nowMillis,
@@ -11526,11 +12593,18 @@ private fun HomeScreen(
                 )
             } else {
                 Column(Modifier.fillMaxWidth().weight(1f)) {
+                    CompositionLocalProvider(LocalMachineDropTargets provides machineDropTargets) {
                         HorizontalPager(
                             state = groupPagerState,
                             key = { page -> activeMachineGroups[page].first.id },
                             modifier = Modifier.fillMaxWidth().weight(1f),
-                            userScrollEnabled = activeMachineGroups.size > 1
+                            userScrollEnabled = activeMachineGroups.size > 1,
+                            // Every group page stays composed, so a drag goes on while another
+                            // finger turns the page or taps a group, and can end on a machine of
+                            // that group. Composed only while visible, the machine the drag started
+                            // on left the screen and the drag ended as if released there (reported
+                            // 2026-11-27).
+                            beyondViewportPageCount = (activeMachineGroups.size - 1).coerceAtLeast(0)
                         ) { page ->
                             val groupMachines = activeMachineGroups[page].second
                             val machineLaneScrollState = rememberScrollState()
@@ -11539,6 +12613,7 @@ private fun HomeScreen(
                                     machineLaneScrollState.animateScrollTo(0)
                                 }
                             }
+                            val laneScrollDensity = LocalDensity.current
                             val laneColumnModifier = Modifier.fillMaxSize().let {
                                 if (groupMachines.size > 2) {
                                     it.verticalScroll(machineLaneScrollState)
@@ -11546,10 +12621,65 @@ private fun HomeScreen(
                                     it
                                 }
                             }
-                            BoxWithConstraints(Modifier.fillMaxSize()) {
+                            var laneViewport by remember { mutableStateOf<Rect?>(null) }
+                            BoxWithConstraints(
+                                Modifier.fillMaxSize().onGloballyPositioned { laneViewportCoordinates ->
+                                    laneViewport = laneViewportCoordinates.boundsInRoot()
+                                }
+                            ) {
                                 val laneHeight = (
                                     maxHeight - ((groupMachines.size - 1).coerceAtLeast(0) * 12).dp
                                     ) / groupMachines.size.coerceAtLeast(1)
+                                // While dragging toward a machine out of sight, the list follows the
+                                // pointer near its top or bottom edge, but not while the pointer is
+                                // still on the machine the drag started on.
+                                val dragActive = machineDropTargets.active != null
+                                LaunchedEffect(dragActive, groupMachines.size) {
+                                    if (!dragActive || groupMachines.size <= 2) return@LaunchedEffect
+                                    val edgeZone = with(laneScrollDensity) { 72.dp.toPx() }
+                                    val maximumStep = with(laneScrollDensity) { 9.dp.toPx() }
+                                    while (machineDropTargets.active != null) {
+                                        val at = machineDropTargets.pointer
+                                        val viewport = laneViewport
+                                        val step = when {
+                                            // Only the group page under the pointer; the others stay
+                                            // composed out of sight while a drag goes on.
+                                            at == null || viewport == null || viewport.width <= 0f ||
+                                                at.x < viewport.left || at.x > viewport.right ||
+                                                machineDropTargets.overSource -> 0f
+                                            at.y > viewport.bottom - edgeZone ->
+                                                maximumStep * ((at.y - (viewport.bottom - edgeZone)) / edgeZone).coerceIn(0f, 1f)
+                                            at.y < viewport.top + edgeZone ->
+                                                -maximumStep * ((viewport.top + edgeZone - at.y) / edgeZone).coerceIn(0f, 1f)
+                                            else -> 0f
+                                        }
+                                        if (kotlin.math.abs(step) > .1f) machineLaneScrollState.scrollBy(step)
+                                        delay(16L)
+                                    }
+                                }
+                                // With three or more machines the lanes scroll: bring the machine of
+                                // what just happened fully into view (maintainer, 2026-11-26). Declared
+                                // after the reset to the top, so it wins when both happen at once.
+                                val viewportHeight = maxHeight
+                                LaunchedEffect(scrollTarget?.key) {
+                                    val target = scrollTarget ?: return@LaunchedEffect
+                                    if (groupMachines.size <= 2) return@LaunchedEffect
+                                    val index = groupMachines.indexOfFirst { it.machineId == target.machineId }
+                                    if (index < 0) return@LaunchedEffect
+                                    with(laneScrollDensity) {
+                                        val laneHeightPx = laneHeight.coerceAtLeast(HomeMachineLaneMinHeight).toPx()
+                                        val top = index * (laneHeightPx + QueueSpacing.M.toPx())
+                                        val bottom = top + laneHeightPx
+                                        val viewport = viewportHeight.toPx()
+                                        val current = machineLaneScrollState.value
+                                        val destination = when {
+                                            top < current -> top
+                                            bottom > current + viewport -> bottom - viewport
+                                            else -> return@LaunchedEffect
+                                        }
+                                        machineLaneScrollState.animateScrollTo(destination.roundToInt())
+                                    }
+                                }
                                 Column(laneColumnModifier) {
                                     groupMachines.forEachIndexed { index, machine ->
                                     val machineId = machine.machineId
@@ -11559,7 +12689,11 @@ private fun HomeScreen(
                                         newRegistrationEstimate = if (
                                             acceptingNewRegistrations && machine.status.isOperational
                                         ) {
-                                            newRegistrationEstimateLabel(machine, newRegistrationWaits)
+                                            newRegistrationEstimateLabel(
+                                                machine,
+                                                newRegistrationWaits,
+                                                LocalWaitEstimatesPending.current
+                                            )
                                         } else {
                                             null
                                         },
@@ -11609,11 +12743,13 @@ private fun HomeScreen(
                                         onPositionClick = onPositionClick,
                                         onPositionReorderRequest = {
                                                 queue,
+                                                positions,
                                                 sourceIndex,
                                                 destinationIndex ->
                                             onPositionReorderRequest(
                                                 machineId,
                                                 queue,
+                                                positions,
                                                 sourceIndex,
                                                 destinationIndex
                                             )
@@ -11629,8 +12765,30 @@ private fun HomeScreen(
                                     }
                                 }
                             }
+                            // More machines below: the bottom fades into the page, as the end of a
+                            // long queue row does beside 还有 N 个位置 (maintainer, 2026-11-26).
+                            if (groupMachines.size > 2) {
+                                val fadeAlpha by animateFloatAsState(
+                                    if (machineLaneScrollState.canScrollForward) 1f else 0f,
+                                    tween(180),
+                                    label = "机台列表底部渐隐"
+                                )
+                                if (fadeAlpha > 0f) {
+                                    Box(
+                                        Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(72.dp)
+                                            .graphicsLayer { alpha = fadeAlpha }
+                                            .background(
+                                                Brush.verticalGradient(
+                                                    0f to PageBackground.copy(alpha = 0f),
+                                                    1f to PageBackground
+                                                )
+                                            )
+                                    )
+                                }
+                            }
                         }
                         }
+                    }
                         if (activeMachineGroups.size > 1) {
                             Spacer(Modifier.height(QueueSpacing.M))
                             MachineGroupPageSelector(
@@ -11642,7 +12800,17 @@ private fun HomeScreen(
                                         targetPage != groupPagerState.currentPage
                                     ) {
                                         groupPagerScope.launch {
-                                            groupPagerState.animateScrollToPage(targetPage)
+                                            // During a drag the pager holds its scrolling for
+                                            // the finger on the page, which refuses an ordinary
+                                            // turn ("Current mutation had a higher priority").
+                                            // The turn then takes precedence and is made at once.
+                                            if (machineDropTargets.active != null) {
+                                                groupPagerState.scroll(MutatePriority.PreventUserInput) {
+                                                    with(groupPagerState) { updateCurrentPage(targetPage) }
+                                                }
+                                            } else {
+                                                groupPagerState.animateScrollToPage(targetPage)
+                                            }
                                         }
                                     }
                                 }
@@ -12079,11 +13247,20 @@ private fun HomeBannerDetailDialog(content: HomeBannerContent, onDismiss: () -> 
  */
 private fun newRegistrationEstimateLabel(
     machine: MachineDisplayState,
-    newRegistrationWaits: Map<MachineId, Long?>
+    newRegistrationWaits: Map<MachineId, Long?>,
+    /** The estimates are being worked out for a changed queue: 正在估算, no old value. */
+    pending: Boolean = false
 ): String = when {
     machine.queue.registrationCount >= 20 -> "登记已满"
+    pending -> WAIT_ESTIMATE_PENDING_LABEL
     else -> formatJoinWaitEstimate(newRegistrationWaits[machine.machineId])
 }
+
+/** Said where a wait is shown while the estimates of a changed queue are being worked out. */
+internal const val WAIT_ESTIMATE_PENDING_LABEL = "正在估算"
+
+/** True while the wait estimates are being worked out for a changed queue. */
+private val LocalWaitEstimatesPending = compositionLocalOf { false }
 
 @Composable
 private fun ClosedHome(
@@ -12191,17 +13368,34 @@ private fun MachineLane(
     onRegistrationClick: (Int) -> Unit,
     onRegistrationLongPress: (Int) -> Unit,
     onPositionClick: (PositionSelection) -> Unit,
-    onPositionReorderRequest: (MachineQueue, Int, Int) -> Unit,
+    onPositionReorderRequest: (MachineQueue, DragPositions, Int, Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val letter = machineId.name
-    val displayedWaitingPositionCount = queue.waitingProjection(
-        includeCommonPlayPreview = false
-    ).positions.size
+    // The queue as it is now, for content that is still drawing an earlier one while it fades.
+    val latestLaneQueue by rememberUpdatedState(queue)
+    val rowScrollMemory = remember { QueueRowScrollMemory() }
+    // The positions shown below that hold a registration of this machine, as the website counts
+    // them: one that holds only a preview of the other machine is a forecast, not a place taken
+    // here. Counted on the queue as shown, where a preview can split or join positions (found
+    // 2026-11-27: “3 个等待位置” above four positions of this machine).
+    val displayedWaitingPositionCount = pairedPreview(queue).let { (shownQueue, previewKeys) ->
+        shownQueue.waitingProjection(includeCommonPlayPreview = false).positions.count { position ->
+            position.registrations.any { it.key !in previewKeys }
+        }
+    }
     val queueCountSummary =
         "$displayedWaitingPositionCount 个等待位置·${queue.registrationCount} 份登记"
+    val dropTargets = LocalMachineDropTargets.current
+    // Any other machine, on this group page or another (maintainer, 2026-11-27: “即使机台里只有一组
+    // 位置，也显示拖动条，因为可以提供转至其他机台的功能”).
+    val canDropOnOtherMachine = dropTargets?.otherMachinesExist == true
+    DisposableEffect(dropTargets, machineId) {
+        onDispose { dropTargets?.forget(machineId) }
+    }
+    Box(modifier.onGloballyPositioned { coordinates -> dropTargets?.report(machineId, coordinates.boundsInRoot()) }) {
     Column(
-        modifier.clip(RoundedCornerShape(CardRadius))
+        Modifier.fillMaxSize().clip(RoundedCornerShape(CardRadius))
             .background(CardBackground)
             .border(1.dp, Separator.copy(alpha = .72f), RoundedCornerShape(CardRadius))
             .padding(start = QueueSpacing.L, end = QueueSpacing.L, top = QueueSpacing.M, bottom = 14.dp),
@@ -12254,8 +13448,9 @@ private fun MachineLane(
                     when {
                         queue.registrationCount > 0 && inlineReorderSession != null ->
                             "$queueCountSummary·正在调整"
+                        // The written reason too: it now stands instead of 其他原因 (2026-11-28).
                         queue.registrationCount > 0 && !status.isOperational ->
-                            "$queueCountSummary·停止原因：${machineStopReasonLabel(status.stopReason, null)}"
+                            "$queueCountSummary·停止原因：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}"
                         queue.registrationCount > 0 -> queueCountSummary
                         !status.isOperational ->
                             "停止原因：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}"
@@ -12263,7 +13458,10 @@ private fun MachineLane(
                     },
                     color = if (status.isOperational) SecondaryText else MachineStoppedColor,
                     fontSize = 13.sp,
-                    fontWeight = if (status.isOperational) FontWeight.Normal else FontWeight.Medium
+                    fontWeight = if (status.isOperational) FontWeight.Normal else FontWeight.Medium,
+                    // A long written reason ends in an ellipsis rather than pushing the header.
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
             Spacer(Modifier.weight(1f))
@@ -12353,6 +13551,8 @@ private fun MachineLane(
         ) { reorderSession ->
             if (reorderSession != null) {
                 InlineReorderContent(
+                    machineId = machineId,
+                    onDroppedOnOtherMachine = onInlineReorderCancel,
                     initialQueue = reorderSession.queueSnapshot,
                     initialRegistrationKey = reorderSession.initialRegistrationKey,
                     resetToken = inlineReorderResetToken,
@@ -12388,6 +13588,21 @@ private fun MachineLane(
                     val projectedWaitingPositions = projectionQueue.waitingProjection(
                         includeCommonPlayPreview = showCommonPlayPreview
                     ).positions
+                    // What a position drag works on: this machine's registrations grouped as the
+                    // positions above show them, in their real order (DragPositions).
+                    val dragPositions = remember(projectedWaitingPositions, pairedPreviewKeys, displayedQueue.waiting) {
+                        val realIndex = displayedQueue.waiting.mapIndexed { index, registration ->
+                            registration.key to index
+                        }.toMap()
+                        val shown = projectedWaitingPositions.mapIndexedNotNull { index, position ->
+                            position.registrations
+                                .filter { it.key !in pairedPreviewKeys && it.key in realIndex }
+                                .takeIf { it.isNotEmpty() }
+                                ?.let { it to "$letter${index + 1}" }
+                        }.sortedBy { (registrations, _) -> registrations.minOf { realIndex.getValue(it.key) } }
+                        DragPositions(shown.map { it.first }, shown.map { it.second })
+                    }
+                    val dragWaitingPositions = dragPositions.positions
                     // A status, preference, nickname, or pair change can regroup or relabel
                     // a position even when the registration keys remain in the same order.
                     val waitingPositionSignature = Triple(
@@ -12423,7 +13638,15 @@ private fun MachineLane(
                     var edgeScrollPerFramePx by remember(waitingPositionSignature) {
                         mutableFloatStateOf(0f)
                     }
-                    val queueListState = rememberLazyListState()
+                    val queueListState = rememberLazyListState(rowScrollMemory.index, rowScrollMemory.offset)
+                    LaunchedEffect(queueListState) {
+                        snapshotFlow {
+                            queueListState.firstVisibleItemIndex to queueListState.firstVisibleItemScrollOffset
+                        }.collect { (index, offset) ->
+                            rowScrollMemory.index = index
+                            rowScrollMemory.offset = offset
+                        }
+                    }
                     val density = LocalDensity.current
                     val edgeZonePx = with(density) { 62.dp.toPx() }
                     val maximumEdgeScrollPx = with(density) { 7.dp.toPx() }
@@ -12433,8 +13656,27 @@ private fun MachineLane(
                     }
 
                     LaunchedEffect(queueScrollResetToken) {
-                        if (queueListState.firstVisibleItemIndex > 0 ||
-                            queueListState.firstVisibleItemScrollOffset > 0
+                        // Once for each request, not again for every new content.
+                        if (rowScrollMemory.handledResetToken != queueScrollResetToken) {
+                            rowScrollMemory.handledResetToken = queueScrollResetToken
+                            if (queueListState.firstVisibleItemIndex > 0 ||
+                                queueListState.firstVisibleItemScrollOffset > 0
+                            ) {
+                                queueListState.animateScrollToItem(0)
+                            }
+                        }
+                    }
+                    // Other players in the playing position: show them, they stand at the
+                    // start of the row. Every other change keeps the row where it is.
+                    val playingKeysNow = displayedQueue.playing.map(Registration::key)
+                    LaunchedEffect(playingKeysNow) {
+                        val seen = rowScrollMemory.playingKeys
+                        rowScrollMemory.playingKeys = playingKeysNow
+                        if (
+                            seen != null && seen != playingKeysNow && playingKeysNow.isNotEmpty() &&
+                            draggedPositionKey == null &&
+                            (queueListState.firstVisibleItemIndex > 0 ||
+                                queueListState.firstVisibleItemScrollOffset > 0)
                         ) {
                             queueListState.animateScrollToItem(0)
                         }
@@ -12475,6 +13717,8 @@ private fun MachineLane(
 
                     fun reorderDraggedPosition() {
                         val draggedKey = draggedPositionKey ?: return
+                        // Over another machine the order here stays as it is.
+                        if (dropTargets?.hovered != null) return
                         val sourceIndex = visualWaitingPositions.indexOfFirst {
                             waitingPositionKey(it.registrations) == draggedKey
                         }
@@ -12519,12 +13763,23 @@ private fun MachineLane(
                         if (validDrop) {
                             onPositionReorderRequest(
                                 displayedQueue,
+                                dragPositions,
                                 originalIndex,
                                 destinationIndex
                             )
                         } else {
                             restoreWaitingPositionOrder()
                         }
+                    }
+
+                    /** Dropped on another machine: the position goes back; the confirmation decides. */
+                    fun endPositionDragForTransfer() {
+                        edgeScrollPerFramePx = 0f
+                        draggedPositionKey = null
+                        draggedOriginalIndex = null
+                        positionDragOffset = Offset.Zero
+                        dragPointerInRoot = null
+                        restoreWaitingPositionOrder()
                     }
 
                     LaunchedEffect(positionReorderResetToken, waitingPositionSignature) {
@@ -12578,12 +13833,15 @@ private fun MachineLane(
                             machineId = machineId,
                             rowHeight = queueRowHeight,
                             displayedQueue = displayedQueue,
+                            latestQueue = { latestLaneQueue },
+                            scrollMemory = rowScrollMemory,
                             playingTime = playingTimeLabel,
                             playingOvertime = playingOvertime,
                             playingWarningTitle = playingWarningTitle,
                             playingWarningDescription = playingWarningDescription,
                             projectedWaitingPositions = projectedWaitingPositions,
                             actualWaitingPositions = actualWaitingPositions,
+                            dragWaitingPositions = dragWaitingPositions,
                             waitingPositionSignature = waitingPositionSignature,
                             pairedPreviewKeys = pairedPreviewKeys,
                             pairedArrangementNotices = pairedArrangementNotices,
@@ -12608,7 +13866,7 @@ private fun MachineLane(
                             onRegistrationLongPress = registrationLongPress,
                             onPositionClick = onPositionClick,
                             onPositionReorderRequest = { from, to ->
-                                onPositionReorderRequest(displayedQueue, from, to)
+                                onPositionReorderRequest(displayedQueue, dragPositions, from, to)
                             }
                         )
                     } else {
@@ -12660,6 +13918,9 @@ private fun MachineLane(
                                 actual.map { it.key }.toSet() == registrations.map { it.key }.toSet()
                             }
                             val mapsToSingleActualPosition = actualPositionIndex >= 0
+                            val dragPositionIndex = dragWaitingPositions.indexOfFirst { shown ->
+                                shown.map { it.key }.toSet() == registrations.map { it.key }.toSet()
+                            }
                             val isDraggingPosition = draggedPositionKey == positionKey
                             QueuePosition(
                                 label = positionLabel,
@@ -12670,33 +13931,61 @@ private fun MachineLane(
                                 onPairedPreviewClick = onPairedPreviewClick,
                                 isPlaying = false,
                                 overtimeWarning = false,
-                                dragEnabled = !machineStopped && mapsToSingleActualPosition &&
-                                    actualWaitingPositions.size > 1,
+                                // A single waiting position can still be dragged to another machine.
+                                dragEnabled = !machineStopped && dragPositionIndex >= 0 &&
+                                    (dragWaitingPositions.size > 1 || canDropOnOtherMachine),
                                 isDragging = isDraggingPosition,
                                 dragOverlayOwner = positionDragOverlayOwner,
                                 highlightedRegistrationKey = highlightedRegistrationKey,
                                 onPositionDragStart = { pointerInRoot ->
                                     visualWaitingPositions.clear()
                                     visualWaitingPositions.addAll(
-                                        actualWaitingPositions.map { WaitingPositionProjection(it) }
+                                        dragWaitingPositions.map { WaitingPositionProjection(it) }
                                     )
                                     draggedPositionKey = positionKey
-                                    draggedOriginalIndex = actualPositionIndex
+                                    draggedOriginalIndex = dragPositionIndex
                                     positionDragOffset = Offset.Zero
                                     dragPointerInRoot = pointerInRoot
                                     edgeScrollPerFramePx = 0f
+                                    dropTargets?.begin(DragTransfer(machineId, registrations.map { it.key }), pointerInRoot)
                                 },
                                 onPositionDrag = { dragAmount ->
                                     positionDragOffset += dragAmount
                                     dragPointerInRoot = dragPointerInRoot?.plus(dragAmount)
-                                    reorderDraggedPosition()
-                                    updatePositionEdgeScroll()
+                                    dragPointerInRoot?.let { dropTargets?.move(it) }
+                                    // Over another machine, or on another group page: this
+                                    // machine's order stays as it was.
+                                    if (dropTargets?.hovered != null || dropTargets?.sourceVisible == false) {
+                                        edgeScrollPerFramePx = 0f
+                                    } else {
+                                        reorderDraggedPosition()
+                                        updatePositionEdgeScroll()
+                                    }
                                 },
-                                onPositionDragEnd = { finishPositionDrag(positionKey) },
+                                onPositionDragEnd = {
+                                    if (draggedPositionKey == positionKey) {
+                                        if ((dropTargets?.finish() ?: DragDropResult.NONE) != DragDropResult.NONE) endPositionDragForTransfer()
+                                        else finishPositionDrag(positionKey)
+                                    }
+                                },
                                 // A lazy item can be disposed when the pointer moves beyond the
                                 // viewport. Treat that cancellation like a release so a valid
-                                // placement still reaches the existing confirmation flow.
-                                onPositionDragCancel = { finishPositionDrag(positionKey) },
+                                // placement still reaches the existing confirmation flow. But
+                                // when the queue itself changed under the drag (somebody joined
+                                // from the website, a round ended), nothing is proposed: the
+                                // order the finger was working on is gone.
+                                onPositionDragCancel = {
+                                    if (draggedPositionKey == positionKey) {
+                                        if (latestLaneQueue != displayedQueue) {
+                                            dropTargets?.cancel()
+                                            endPositionDragForTransfer()
+                                        } else if ((dropTargets?.finish() ?: DragDropResult.NONE) != DragDropResult.NONE) {
+                                            endPositionDragForTransfer()
+                                        } else {
+                                            finishPositionDrag(positionKey)
+                                        }
+                                    }
+                                },
                                 onRegistrationClick = onRegistrationClick,
                                 onRegistrationLongPress = registrationLongPress,
                                 onPositionClick = {
@@ -12749,6 +14038,12 @@ private fun MachineLane(
         }
         }
     }
+    MachineDropMask(
+        dropTargets = dropTargets,
+        machineId = machineId,
+        machineName = if (remark.isBlank()) "机台 $letter" else "$remark·机台 $letter"
+    )
+    }
 }
 
 /** The corner of a position card and the 加入 card on the home page, as in the home mockup (14). */
@@ -12778,12 +14073,17 @@ private fun TwoRowQueuePositions(
     machineId: MachineId,
     rowHeight: Dp,
     displayedQueue: MachineQueue,
+    /** The machine's queue as it is now; [displayedQueue] may be an earlier one fading out. */
+    latestQueue: () -> MachineQueue,
+    scrollMemory: QueueRowScrollMemory,
     playingTime: String?,
     playingOvertime: Boolean,
     playingWarningTitle: String?,
     playingWarningDescription: String?,
     projectedWaitingPositions: List<WaitingPositionProjection>,
     actualWaitingPositions: List<List<Registration>>,
+    /** What a position drag works on; see DragPositions. */
+    dragWaitingPositions: List<List<Registration>>,
     waitingPositionSignature: Any,
     pairedPreviewKeys: Set<Int>,
     pairedArrangementNotices: Map<Int, String>,
@@ -12801,6 +14101,10 @@ private fun TwoRowQueuePositions(
     val letter = machineId.name
     val density = LocalDensity.current
     val coroutineScope = rememberCoroutineScope()
+    val dropTargets = LocalMachineDropTargets.current
+    // Any other machine, on this group page or another (maintainer, 2026-11-27: “即使机台里只有一组
+    // 位置，也显示拖动条，因为可以提供转至其他机台的功能”).
+    val canDropOnOtherMachine = dropTargets?.otherMachinesExist == true
     val dragOverlayController = LocalGlobalDragOverlayController.current
     val dragOverlayOwner = remember(waitingPositionSignature) { Any() }
     val visualPositions = remember(waitingPositionSignature) {
@@ -12813,7 +14117,8 @@ private fun TwoRowQueuePositions(
     var pointer by remember(waitingPositionSignature) { mutableStateOf<Offset?>(null) }
     var edgeScrollPerFrame by remember(waitingPositionSignature) { mutableFloatStateOf(0f) }
     var layoutBounds by remember { mutableStateOf<Rect?>(null) }
-    var secondRowScroll by remember { mutableIntStateOf(0) }
+    var secondRowScroll by remember { mutableIntStateOf(scrollMemory.secondRowOffset) }
+    SideEffect { scrollMemory.secondRowOffset = secondRowScroll }
     var secondRowExtent by remember { mutableStateOf(SecondRowExtent(emptyList(), 0, 0)) }
     var swipingSecondRow by remember { mutableStateOf(false) }
     val spacing = 10.dp
@@ -12835,7 +14140,7 @@ private fun TwoRowQueuePositions(
     fun scrollSecondRowTo(target: Int) {
         val end = target.coerceIn(0, secondRowExtent.maxScroll)
         coroutineScope.launch {
-            animate(secondRowScroll.toFloat(), end.toFloat(), animationSpec = tween(320)) { value, _ ->
+            animate(secondRowScroll.toFloat(), end.toFloat(), animationSpec = QueueOverflowGlide) { value, _ ->
                 secondRowScroll = value.roundToInt()
             }
         }
@@ -12846,6 +14151,8 @@ private fun TwoRowQueuePositions(
     fun moveDraggedPosition() {
         val key = draggedKey ?: return
         val at = pointer ?: return
+        // Over another machine the order here stays as it is.
+        if (dropTargets?.hovered != null) return
         val sourceIndex = visualPositions.indexOfFirst { waitingPositionKey(it.registrations) == key }
         val sourceBounds = positionBounds[key]
         if (sourceIndex < 0 || sourceBounds == null) return
@@ -12875,6 +14182,15 @@ private fun TwoRowQueuePositions(
         }
     }
 
+    /** Dropped on another machine: the position goes back; the confirmation decides. */
+    fun endDragForTransfer() {
+        edgeScrollPerFrame = 0f
+        draggedKey = null
+        draggedOriginalIndex = null
+        pointer = null
+        restoreOrder()
+    }
+
     fun finishDrag(positionKey: String) {
         val originalIndex = draggedOriginalIndex
         val destinationIndex = visualPositions.indexOfFirst {
@@ -12898,7 +14214,10 @@ private fun TwoRowQueuePositions(
         }
     }
     LaunchedEffect(queueScrollResetToken) {
-        if (secondRowScroll != 0) scrollSecondRowTo(0)
+        if (scrollMemory.handledResetToken != queueScrollResetToken) {
+            scrollMemory.handledResetToken = queueScrollResetToken
+            if (secondRowScroll != 0) scrollSecondRowTo(0)
+        }
     }
     LaunchedEffect(draggedKey) {
         while (draggedKey != null) {
@@ -12963,6 +14282,9 @@ private fun TwoRowQueuePositions(
                             actual.map { it.key }.toSet() == registrations.map { it.key }.toSet()
                         }
                         val mapsToSingleActualPosition = actualPositionIndex >= 0
+                        val dragPositionIndex = dragWaitingPositions.indexOfFirst { shown ->
+                            shown.map { it.key }.toSet() == registrations.map { it.key }.toSet()
+                        }
                         QueuePosition(
                             label = positionLabel,
                             registrations = registrations,
@@ -12972,28 +14294,50 @@ private fun TwoRowQueuePositions(
                             onPairedPreviewClick = onPairedPreviewClick,
                             isPlaying = false,
                             overtimeWarning = false,
-                            dragEnabled = !machineStopped && mapsToSingleActualPosition &&
-                                actualWaitingPositions.size > 1,
+                            // A single waiting position can still be dragged to another machine.
+                            dragEnabled = !machineStopped && dragPositionIndex >= 0 &&
+                                (dragWaitingPositions.size > 1 || canDropOnOtherMachine),
                             isDragging = draggedKey == positionKey,
                             dragOverlayOwner = dragOverlayOwner,
                             highlightedRegistrationKey = highlightedRegistrationKey,
                             onPositionDragStart = { pointerInRoot ->
                                 visualPositions.clear()
                                 visualPositions.addAll(
-                                    actualWaitingPositions.map { WaitingPositionProjection(it) }
+                                    dragWaitingPositions.map { WaitingPositionProjection(it) }
                                 )
                                 draggedKey = positionKey
-                                draggedOriginalIndex = actualPositionIndex
+                                draggedOriginalIndex = dragPositionIndex
                                 pointer = pointerInRoot
                                 edgeScrollPerFrame = 0f
+                                dropTargets?.begin(DragTransfer(machineId, registrations.map { it.key }), pointerInRoot)
                             },
                             onPositionDrag = { dragAmount ->
                                 pointer = pointer?.plus(dragAmount)
-                                moveDraggedPosition()
-                                updateEdgeScroll()
+                                pointer?.let { dropTargets?.move(it) }
+                                if (dropTargets?.hovered != null || dropTargets?.sourceVisible == false) {
+                                    edgeScrollPerFrame = 0f
+                                } else {
+                                    moveDraggedPosition()
+                                    updateEdgeScroll()
+                                }
                             },
-                            onPositionDragEnd = { finishDrag(positionKey) },
-                            onPositionDragCancel = { finishDrag(positionKey) },
+                            onPositionDragEnd = {
+                                if (draggedKey == positionKey) {
+                                    if ((dropTargets?.finish() ?: DragDropResult.NONE) != DragDropResult.NONE) endDragForTransfer() else finishDrag(positionKey)
+                                }
+                            },
+                            onPositionDragCancel = {
+                                if (draggedKey == positionKey) {
+                                    if (latestQueue() != displayedQueue) {
+                                        dropTargets?.cancel()
+                                        endDragForTransfer()
+                                    } else if ((dropTargets?.finish() ?: DragDropResult.NONE) != DragDropResult.NONE) {
+                                        endDragForTransfer()
+                                    } else {
+                                        finishDrag(positionKey)
+                                    }
+                                }
+                            },
                             onRegistrationClick = onRegistrationClick,
                             onRegistrationLongPress = onRegistrationLongPress,
                             onPositionClick = {
@@ -13082,11 +14426,26 @@ private fun TwoRowQueuePositions(
         // 还有 N 个位置 at the end of the second row, as at the end of a single row.
         val extent = secondRowExtent
         val scroll = secondRowScroll.coerceIn(0, extent.maxScroll)
-        if (draggedKey == null && scroll < extent.maxScroll) {
-            val trailing = if (joinPosition != null) 1 else 0
-            val hidden = extent.rights.dropLast(trailing).count { it > scroll + extent.width }
+        val moreToTheRight = draggedKey == null && scroll < extent.maxScroll
+        // Fades out gradually at the end of the row, as the single row does.
+        val fadeAlpha by animateFloatAsState(
+            if (moreToTheRight) 1f else 0f,
+            tween(180),
+            label = "第二行末端渐隐"
+        )
+        val trailing = if (joinPosition != null) 1 else 0
+        val hiddenNow = if (moreToTheRight) {
+            extent.rights.dropLast(trailing).count { it > scroll + extent.width }
+        } else {
+            0
+        }
+        var shownHidden by remember { mutableIntStateOf(0) }
+        SideEffect { if (hiddenNow > 0) shownHidden = hiddenNow }
+        if (fadeAlpha > 0f && (moreToTheRight || draggedKey == null)) {
+            val hidden = if (hiddenNow > 0) hiddenNow else shownHidden
             Box(
                 Modifier.align(Alignment.BottomEnd).height(rowHeight).width(150.dp)
+                    .graphicsLayer { alpha = fadeAlpha }
                     .background(
                         Brush.horizontalGradient(
                             0f to CardBackground.copy(alpha = 0f),
@@ -13105,7 +14464,7 @@ private fun TwoRowQueuePositions(
                             .clip(RoundedCornerShape(100.dp))
                             .background(CardBackground)
                             .border(1.dp, Separator, RoundedCornerShape(100.dp))
-                            .clickable { scrollSecondRowTo(extent.maxScroll) }
+                            .clickable(enabled = moreToTheRight) { scrollSecondRowTo(extent.maxScroll) }
                             .padding(horizontal = 14.dp, vertical = 14.dp)
                     )
                 }
@@ -13136,9 +14495,22 @@ private fun BoxScope.QueueOverflowHint(listState: LazyListState, trailingItems: 
             }
         }
     }
-    if (!listState.canScrollForward) return
+    // At the end of the row the fade goes out gradually, as the bottom fade of the machine list
+    // does (maintainer, 2026-11-27: “当翻到底时不要立刻消失，而是慢慢消失……照这个做”).
+    val canScrollForward = listState.canScrollForward
+    val fadeAlpha by animateFloatAsState(
+        if (canScrollForward) 1f else 0f,
+        tween(180),
+        label = "队列行末端渐隐"
+    )
+    // While it fades out the count stays as it last was.
+    var shownCount by remember { mutableIntStateOf(0) }
+    SideEffect { if (hiddenPositions > 0) shownCount = hiddenPositions }
+    if (fadeAlpha <= 0f) return
+    val count = if (hiddenPositions > 0) hiddenPositions else shownCount
     Box(
         Modifier.align(Alignment.CenterEnd).fillMaxHeight().width(150.dp)
+            .graphicsLayer { alpha = fadeAlpha }
             .background(
                 Brush.horizontalGradient(
                     0f to CardBackground.copy(alpha = 0f),
@@ -13147,9 +14519,9 @@ private fun BoxScope.QueueOverflowHint(listState: LazyListState, trailingItems: 
             ),
         contentAlignment = Alignment.CenterEnd
     ) {
-        if (hiddenPositions > 0) {
+        if (count > 0) {
             Text(
-                "还有 $hiddenPositions 个位置 ›",
+                "还有 $count 个位置 ›",
                 color = SystemBlue,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
@@ -13157,15 +14529,32 @@ private fun BoxScope.QueueOverflowHint(listState: LazyListState, trailingItems: 
                     .clip(RoundedCornerShape(100.dp))
                     .background(CardBackground)
                     .border(1.dp, Separator, RoundedCornerShape(100.dp))
-                    .clickable {
-                        coroutineScope.launch {
-                            listState.animateScrollToItem(listState.layoutInfo.totalItemsCount - 1)
-                        }
-                    }
+                    .clickable(enabled = canScrollForward) { coroutineScope.launch { listState.glideToEnd() } }
                     .padding(horizontal = 14.dp, vertical = 14.dp)
             )
         }
     }
+}
+
+/** How a machine's queue glides to its end when 还有 N 个位置 is tapped. */
+private val QueueOverflowGlide = tween<Float>(durationMillis = 450, easing = FastOutSlowInEasing)
+
+/**
+ * Glides a row of positions to its end in one smooth movement. The distance to the last item
+ * is estimated from the items in view, so the row moves continuously instead of jumping; a
+ * final short scroll settles it exactly at the end.
+ */
+private suspend fun LazyListState.glideToEnd() {
+    val info = layoutInfo
+    val visible = info.visibleItemsInfo
+    val lastIndex = info.totalItemsCount - 1
+    val lastVisible = visible.lastOrNull() ?: return
+    if (lastIndex < 0) return
+    val averageItem = visible.sumOf { it.size }.toFloat() / visible.size + info.mainAxisItemSpacing
+    val remaining = (lastVisible.offset + lastVisible.size - info.viewportEndOffset) +
+        (lastIndex - lastVisible.index) * averageItem
+    if (remaining > 0f) animateScrollBy(remaining, QueueOverflowGlide)
+    animateScrollToItem(lastIndex)
 }
 
 @Composable
@@ -13426,8 +14815,13 @@ private fun InlineReorderContent(
     initialQueue: MachineQueue,
     initialRegistrationKey: Int?,
     resetToken: Int,
-    onProposal: (MachineQueue, List<Registration>, Int) -> Unit
+    onProposal: (MachineQueue, List<Registration>, Int) -> Unit,
+    /** The machine being adjusted; a registration can be dragged from it onto another machine. */
+    machineId: MachineId? = null,
+    /** Ends the adjustment once a registration has been dropped on another machine. */
+    onDroppedOnOtherMachine: () -> Unit = {}
 ) {
+    val dropTargets = LocalMachineDropTargets.current
     val registrations = remember(initialQueue) {
         mutableStateListOf<Registration>().apply { addAll(initialQueue.allRegistrations) }
     }
@@ -13452,7 +14846,14 @@ private fun InlineReorderContent(
     val maximumEdgeScrollPx = with(density) { 7.dp.toPx() }
 
     DisposableEffect(dragOverlayController, dragOverlayOwner) {
-        onDispose { dragOverlayController.clear(dragOverlayOwner) }
+        onDispose {
+            dragOverlayController.clear(dragOverlayOwner)
+            // The strip can be taken away in the middle of a drag (a remote registration returns
+            // the terminal to home, registration closes). The drag towards another machine ends
+            // with it; left standing, the home screen never went back to its default group and a
+            // mask could stay on a machine (review 2026-11-27).
+            if (machineId != null && dropTargets?.active?.sourceMachineId == machineId) dropTargets.cancel()
+        }
     }
 
     fun updateEdgeScroll() {
@@ -13476,6 +14877,8 @@ private fun InlineReorderContent(
 
     fun reorderDraggedRegistration() {
         val key = draggedKey ?: return
+        // Over another machine the order here stays as it is (drag-transfer-mockup.html).
+        if (dropTargets?.hovered != null) return
         val sourceIndex = registrations.indexOfFirst { it.key == key }
         if (sourceIndex < playingCount) return
         val update = calculateDragReorder(
@@ -13483,7 +14886,7 @@ private fun InlineReorderContent(
             dragOffset = registrationDragOffset.x,
             itemSizes = registrations.map {
                 measuredItemWidths[it.key]
-                    ?: with(density) { inlineReorderRegistrationTileWidth(it.displayId).toPx() }
+                    ?: with(density) { inlineReorderRegistrationTileWidth(it).toPx() }
             },
             spacing = with(density) { 8.dp.toPx() },
             minimumIndex = playingCount
@@ -13563,7 +14966,7 @@ private fun InlineReorderContent(
         userScrollEnabled = draggedKey == null
     ) {
         itemsIndexed(registrations, key = { _, registration -> registration.key }) { index, registration ->
-            val width = inlineReorderRegistrationTileWidth(registration.displayId)
+            val width = inlineReorderRegistrationTileWidth(registration)
             val locked = registration.key in playingKeys
             val dragging = draggedKey == registration.key
             InlineReorderRegistrationTile(
@@ -13588,16 +14991,77 @@ private fun InlineReorderContent(
                     registrationDragOffset = Offset.Zero
                     dragPointerInRoot = pointerInRoot
                     edgeScrollPerFramePx = 0f
+                    machineId?.let { dropTargets?.begin(DragTransfer(it, listOf(registration.key)), pointerInRoot) }
                 },
                 onDrag = { dragAmount ->
                     registrationDragOffset += dragAmount
                     dragPointerInRoot = dragPointerInRoot?.plus(dragAmount)
-                    reorderDraggedRegistration()
-                    updateEdgeScroll()
+                    dragPointerInRoot?.let { dropTargets?.move(it) }
+                    if (dropTargets?.hovered != null || dropTargets?.sourceVisible == false) {
+                        edgeScrollPerFramePx = 0f
+                    } else {
+                        reorderDraggedRegistration()
+                        updateEdgeScroll()
+                    }
                 },
-                onDragEnd = { finishRegistrationDrag(registration.key) },
-                onDragCancel = { cancelRegistrationDrag() }
+                onDragEnd = {
+                    when (dropTargets?.finish() ?: DragDropResult.NONE) {
+                        DragDropResult.NONE -> finishRegistrationDrag(registration.key)
+                        // Back where it was; a machine that cannot take it leaves the adjustment as it was.
+                        DragDropResult.REFUSED,
+                        DragDropResult.RETURNED -> cancelRegistrationDrag()
+                        DragDropResult.TRANSFER -> {
+                            cancelRegistrationDrag()
+                            onDroppedOnOtherMachine()
+                        }
+                    }
+                },
+                onDragCancel = {
+                    dropTargets?.cancel()
+                    cancelRegistrationDrag()
+                }
             )
+        }
+    }
+}
+
+/**
+ * Covers a whole machine while a registration or position dragged from another machine is over
+ * it (drag-transfer-mockup.html): blue when releasing there opens the confirmation of 转至其他机台,
+ * grey with the reason when the machine cannot take them. Nothing under it makes room.
+ */
+@Composable
+private fun BoxScope.MachineDropMask(
+    dropTargets: MachineDropTargets?,
+    machineId: MachineId,
+    machineName: String
+) {
+    val hovered = dropTargets != null && dropTargets.hovered == machineId
+    // What the mask last said, so it can fade out without changing its words.
+    var unavailableReason by remember { mutableStateOf<String?>(null) }
+    if (hovered) unavailableReason = dropTargets?.reasonFor(machineId)
+    val alpha by animateFloatAsState(if (hovered) 1f else 0f, tween(140), label = "转至机台蒙版")
+    if (alpha <= 0f) return
+    val shape = RoundedCornerShape(CardRadius)
+    val available = unavailableReason == null
+    Column(
+        Modifier.matchParentSize().graphicsLayer { this.alpha = alpha }.clip(shape)
+            .background(if (available) SoftBlue.copy(alpha = .86f) else Color(0xFFF2F2F7).copy(alpha = .9f))
+            .border(2.dp, if (available) SystemBlue else Color(0xFFC7C7CC), shape)
+            .padding(horizontal = QueueSpacing.L),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            if (available) "松开后转至 $machineName" else "不能转至 $machineName",
+            color = if (available) SystemBlue else SecondaryText,
+            fontSize = 20.sp,
+            fontWeight = FontWeight.SemiBold,
+            textAlign = TextAlign.Center
+        )
+        unavailableReason?.let { reason ->
+            Spacer(Modifier.height(6.dp))
+            Text(reason, color = SecondaryText, fontSize = 13.sp, lineHeight = 19.sp, textAlign = TextAlign.Center)
         }
     }
 }
@@ -13749,10 +15213,23 @@ private fun measureQueuePosition(
     hasWarning: Boolean
 ): QueuePositionMeasure {
     val displayedRegistrations = registrations + listOfNotNull(commonPlayPreview)
+    fun measuredWidth(text: String, style: TextStyle): Dp = with(density) {
+        textMeasurer.measure(text = appDisplayText(text), style = style, softWrap = false, maxLines = 1)
+            .size.width.toDp()
+    }
+    // The same sizes as [RegistrationTile]. Lines are measured in the heavier of the weights a
+    // line can take, so that either weight fits.
+    val nicknameStyle = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.Medium)
+    val statusStyle = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium)
+    val arrowWidth = measuredWidth("›", TextStyle(fontSize = 15.sp))
+    val tilePadding = RegistrationTilePadding * 2 + RegistrationTileFitMargin
+    // Every tile has room for 允许他人加入, so tiles of one queue look alike.
+    val narrowestTile = maxOf(RegistrationTileMinWidth, measuredWidth("允许他人加入", statusStyle) + tilePadding)
     val tileWidths = displayedRegistrations.map { registration ->
-        // A tile is as wide as its nickname needs, or as its status line needs when that is
-        // longer (a short nickname with 允许他人加入, or a notice such as 可能转至 B1), so that
-        // neither line is ever cut off.
+        // A tile is as wide as the longer of its two lines: the nickname with its arrow, or the
+        // status line (a play preference, or a state such as 线上登记·待签到 or 可能转至 B1).
+        // Neither line is ever cut off; nicknames longer than six characters are already
+        // shortened by [queueDisplayId].
         val isCommonPlayPreview = registration.key == commonPlayPreview?.key
         val isPairedPreview = registration.key in pairedPreviewKeys
         val status = registrationTileStatus(
@@ -13762,16 +15239,9 @@ private fun measureQueuePosition(
             pairedArrangementNotice = pairedArrangementNotices[registration.key]
                 ?.takeIf { !isPairedPreview && !isCommonPlayPreview }
         )
-        val statusWidth = with(density) {
-            textMeasurer.measure(
-                text = AnnotatedString(panguSpacing(status)),
-                // The same size as the status line of [RegistrationTile]; measured in the
-                // heavier weight so that either weight fits.
-                style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium)
-            ).size.width.toDp()
-        }
-        maxOf(registrationTileWidth(registration.displayId), statusWidth + RegistrationTilePadding * 2)
-            .coerceAtMost(RegistrationTileMaxWidth)
+        val nicknameLine = measuredWidth(queueDisplayId(registration.displayId), nicknameStyle) +
+            6.dp + if (isCommonPlayPreview) 0.dp else arrowWidth
+        maxOf(narrowestTile, nicknameLine + tilePadding, measuredWidth(status, statusStyle) + tilePadding)
     }
     val registrationContentWidth = tileWidths.fold(0.dp) { total, width -> total + width } +
         if (tileWidths.size > 1) 8.dp * (tileWidths.size - 1) else 0.dp
@@ -13850,6 +15320,10 @@ private fun QueuePosition(
     val textMeasurer = rememberTextMeasurer()
     val density = LocalDensity.current
     val displayedRegistrations = registrations + listOfNotNull(commonPlayPreview)
+    // R4: a position that shows a preview of the other machine is not yet a position of this
+    // machine and has no menu, so it does not look as if it had one (copy table, 2026-11-28).
+    // The preview block itself still opens its explanation.
+    val positionOpens = registrations.none { it.key in pairedPreviewKeys }
     val viewportHeight = LocalQueueViewportHeight.current
     val hasWarning = warningTitle != null
     val measure = measureQueuePosition(
@@ -13893,6 +15367,7 @@ private fun QueuePosition(
     var dragSurfaceCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
     var positionCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
     val activeDragOverlayOwner = dragOverlayOwner
+    val latestIsDragging by rememberUpdatedState(isDragging)
     val dragHeaderModifier = if (dragEnabled && activeDragOverlayOwner != null) {
         Modifier.pointerInput(dragEnabled) {
             detectDragGesturesAfterLongPress(
@@ -13925,18 +15400,27 @@ private fun QueuePosition(
                     }
                     onPositionDragStart(pointerInRoot)
                 },
+                // The detector also reports a cancel for a header that was merely touched and
+                // then leaves the composition; only the position being dragged may end the drag
+                // (review 2026-11-27: another position scrolling out of sight released it).
                 onDragCancel = {
-                    dragOverlayController.clear(activeDragOverlayOwner)
-                    onPositionDragCancel()
+                    if (latestIsDragging) {
+                        dragOverlayController.clear(activeDragOverlayOwner)
+                        onPositionDragCancel()
+                    }
                 },
                 onDragEnd = {
-                    dragOverlayController.clear(activeDragOverlayOwner)
-                    onPositionDragEnd()
+                    if (latestIsDragging) {
+                        dragOverlayController.clear(activeDragOverlayOwner)
+                        onPositionDragEnd()
+                    }
                 },
                 onDrag = { change, dragAmount ->
                     change.consume()
-                    dragOverlayController.moveBy(activeDragOverlayOwner, dragAmount)
-                    onPositionDrag(dragAmount)
+                    if (latestIsDragging) {
+                        dragOverlayController.moveBy(activeDragOverlayOwner, dragAmount)
+                        onPositionDrag(dragAmount)
+                    }
                 }
             )
         }
@@ -13954,7 +15438,7 @@ private fun QueuePosition(
             }
             .clip(RoundedCornerShape(PositionCardRadius))
             .clickable(
-                enabled = interactive && registrations.isNotEmpty() && !isDragging,
+                enabled = interactive && registrations.isNotEmpty() && !isDragging && positionOpens,
                 onClick = onPositionClick
             )
             .background(positionBackground)
@@ -13963,12 +15447,19 @@ private fun QueuePosition(
                 positionBorder,
                 RoundedCornerShape(PositionCardRadius)
             )
-            .padding(10.dp)
+            .padding(start = 10.dp, end = 10.dp, bottom = 10.dp)
     ) {
         Row(
-            Modifier.fillMaxWidth().height(22.dp).onGloballyPositioned {
+            // The long press that drags the position takes everything above the tiles: the
+            // padding of the card over the heading and the gap under it belong to this row, so
+            // nothing moves on screen and the surface is 40 high instead of 22.
+            // The heading itself is at least 22 high; taller only when a large system font size
+            // needs it, so that the round time in its tag is never cut off.
+            Modifier.fillMaxWidth().onGloballyPositioned {
                 dragSurfaceCoordinates = it
-            }.then(dragHeaderModifier),
+            }.then(dragHeaderModifier)
+                .padding(top = 10.dp, bottom = QueueSpacing.S)
+                .heightIn(min = 22.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
@@ -14011,15 +15502,16 @@ private fun QueuePosition(
                         fontWeight = FontWeight.Medium
                     )
                 }
-                Spacer(Modifier.width(if (isPlaying) 8.dp else 5.dp))
-                Text(
-                    "›",
-                    color = if (isPlaying) SystemBlue.copy(alpha = .58f) else TertiaryText,
-                    fontSize = 15.sp
-                )
+                if (positionOpens) {
+                    Spacer(Modifier.width(if (isPlaying) 8.dp else 5.dp))
+                    Text(
+                        "›",
+                        color = if (isPlaying) SystemBlue.copy(alpha = .58f) else TertiaryText,
+                        fontSize = 15.sp
+                    )
+                }
             }
         }
-        Spacer(Modifier.height(QueueSpacing.S))
         if (registrations.isEmpty() && !hasWarning) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("暂无登记", color = TertiaryText, fontSize = 12.sp)
@@ -14102,10 +15594,10 @@ private val RegistrationTilePadding = QueueSpacing.M
 private val RegistrationTileMinWidth = 96.dp
 
 /**
- * The widest tile: a nickname of six characters, the most the queue shows (see
- * [queueDisplayId]). A longer status line ends with an ellipsis; the full text is in the menu.
+ * Room added to the measured lines of a tile, so that a font whose glyphs are drawn a little
+ * wider than measured (rounding, a vendor font) never ends in an ellipsis.
  */
-private val RegistrationTileMaxWidth = 142.dp
+private val RegistrationTileFitMargin = 4.dp
 
 /** The state a registration tile shows in place of its play preference; null when none. */
 private fun registrationTileState(
@@ -14413,13 +15905,16 @@ private val MinusIcon: ImageVector by lazy { pathIcon("Minus", "M5 11h14v2H5z") 
  */
 @Composable
 private fun StepFlowPage(
-    summary: FlowSummary,
+    /** Null on a page of its own, outside a flow: no step pane, the content takes the width. */
+    summary: FlowSummary?,
     title: String,
     subtitle: String,
     /** Null on the first page of a flow that cannot be left, such as first-run setup. */
     onBack: (() -> Unit)?,
     /** False when the content holds its own scrolling list. */
     scrollable: Boolean = true,
+    /** The back button's words, such as 返回玩家资料库. */
+    backText: String = "返回",
     content: @Composable ColumnScope.() -> Unit
 ) {
     if (onBack != null) BackHandler(onBack = onBack)
@@ -14429,7 +15924,7 @@ private fun StepFlowPage(
             .padding(start = 32.dp, end = 32.dp, top = 20.dp, bottom = QueueSpacing.XL)
     ) {
         Row(Modifier.fillMaxWidth().height(MinTouchTarget), verticalAlignment = Alignment.CenterVertically) {
-            if (onBack != null) AppBackButton(onBack)
+            if (onBack != null) AppBackButton(onBack, backText)
             Spacer(Modifier.weight(1f))
             Text(
                 SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(nowMillis)),
@@ -14440,16 +15935,20 @@ private fun StepFlowPage(
         }
         Spacer(Modifier.height(QueueSpacing.M))
         Row(Modifier.fillMaxWidth().weight(1f)) {
-            FlowSummaryPane(summary, Modifier.width(340.dp).fillMaxHeight())
-            Spacer(Modifier.width(QueueSpacing.XL))
+            if (summary != null) {
+                FlowSummaryPane(summary, Modifier.width(340.dp).fillMaxHeight())
+                Spacer(Modifier.width(QueueSpacing.XL))
+            }
             Column(
                 Modifier.weight(1f).fillMaxHeight().let {
                     if (scrollable) it.verticalScroll(rememberScrollState()) else it
                 }
             ) {
                 Text(title, color = PrimaryText, fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(6.dp))
-                Text(subtitle, color = SecondaryText, fontSize = QueueTextSize.Body, lineHeight = 20.sp)
+                if (subtitle.isNotEmpty()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(subtitle, color = SecondaryText, fontSize = QueueTextSize.Body, lineHeight = 20.sp)
+                }
                 content()
             }
         }
@@ -14585,17 +16084,24 @@ private fun FlowListRow(
     /** What the explanation of a grey row is about; the title unless that reads badly. */
     disabledActionTitle: String = title,
     titleBadge: String? = null,
-    trailing: (@Composable () -> Unit)? = null
+    trailing: (@Composable () -> Unit)? = null,
+    /** A nested tick box follows inside the same row, 10 dp below its text block. */
+    continuesBelow: Boolean = false
 ) {
     val context = LocalContext.current
     Box(Modifier.fillMaxWidth()) {
         Row(
-            Modifier.fillMaxWidth().heightIn(min = 80.dp)
+            Modifier.fillMaxWidth().heightIn(min = if (continuesBelow) 78.dp else 80.dp)
                 .background(if (selected) SelectedRowBackground else Color.Transparent)
                 .clickable {
                     if (enabled) onClick() else showDisabledActionReason(context, disabledActionTitle, disabledReason)
                 }
-                .padding(horizontal = QueueSpacing.L, vertical = QueueSpacing.M),
+                .padding(
+                    start = QueueSpacing.L,
+                    end = QueueSpacing.L,
+                    top = QueueSpacing.M,
+                    bottom = if (continuesBelow) 10.dp else QueueSpacing.M
+                ),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
@@ -14880,6 +16386,95 @@ private fun FlowProfileCard(
 
 /** 编辑 on a [FlowProfileCard]: a small tinted button, greyed when the profile is locked. */
 @Composable
+private fun WebAccountBindingButton(
+    enabled: Boolean,
+    loading: Boolean,
+    disabledReason: String,
+    onBind: () -> Unit
+) {
+    val context = LocalContext.current
+    val bindingEnabled = enabled && !loading
+    val bindingLabel = if (loading) "正在创建绑定页面" else "绑定网页账户"
+    Box(
+        Modifier.height(40.dp).clip(RoundedCornerShape(10.dp))
+            .clickable {
+                if (bindingEnabled) onBind()
+                else showDisabledActionReason(
+                    context,
+                    bindingLabel,
+                    if (loading) "正在向服务端创建一次性绑定页面。" else disabledReason
+                )
+            }
+            .padding(horizontal = 10.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            bindingLabel,
+            color = if (bindingEnabled) SystemBlue else TertiaryText,
+            fontSize = QueueTextSize.Body,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+}
+
+/**
+ * A player profile opened from the library on its own (More menu, profile-library-mockup.html,
+ * approved 2026-11-28): the profile card with 编辑 and 绑定网页账户, and the main facts of the
+ * profile. Nothing is joined from here, and profiles are deleted only in the management app.
+ */
+@Composable
+private fun PlayerProfileBrowseScreen(
+    profile: PlayerProfile,
+    /** Where the profile's registration waits, such as 左侧·机台 A 的位置 A1, or 当前没有登记. */
+    registrationLine: String,
+    webAccountBindingEnabled: Boolean,
+    webAccountBindingLoading: Boolean,
+    webAccountBindingDisabledReason: String,
+    onEditProfile: () -> Unit,
+    onBindWebAccount: () -> Unit,
+    onBack: () -> Unit
+) {
+    StepFlowPage(
+        summary = null,
+        title = "玩家资料",
+        subtitle = "",
+        onBack = onBack,
+        backText = "返回玩家资料库"
+    ) {
+        FlowProfileCard(profile, flowProfileDetails(profile)) {
+            FlowProfileEditButton(profile, onEditProfile)
+            if (!profile.webAccountBound) {
+                WebAccountBindingButton(
+                    enabled = webAccountBindingEnabled,
+                    loading = webAccountBindingLoading,
+                    disabledReason = webAccountBindingDisabledReason,
+                    onBind = onBindWebAccount
+                )
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        FlowListGroup {
+            FlowDetailRow("当前登记", registrationLine, first = true)
+            // What the profile records is when it last joined a queue, not when it last played.
+            FlowDetailRow(
+                "上次加入排队",
+                profile.lastUsedAtMillis?.takeIf { it > 0L }?.let(::formatRegistrationTime) ?: "尚无记录"
+            )
+            FlowDetailRow("QQ 显示范围", qqVisibilityLabel(profile.qqVisibility))
+            FlowDetailRow("排队通知", if (profile.notificationPreferences.enabled) "已开启" else "已关闭")
+            FlowDetailRow(
+                "网页账户",
+                when {
+                    !profile.webAccountBound -> "未绑定"
+                    profile.canEditOnTerminal -> "已绑定"
+                    else -> "已绑定，现场终端不能编辑"
+                }
+            )
+        }
+    }
+}
+
+@Composable
 private fun FlowProfileEditButton(profile: PlayerProfile, onEditProfile: () -> Unit) {
     val context = LocalContext.current
     Box(
@@ -14906,8 +16501,13 @@ private fun flowProfileDetails(profile: PlayerProfile, preferenceCaption: String
     listOfNotNull(
         profile.normalizedQqNumber()?.let { "QQ：$it" },
         profile.publicPlayerId?.let { "玩家编号 $it" },
-        "$preferenceCaption：${profilePreferenceLabel(profile.defaultPreference)}"
+        "$preferenceCaption：${profilePreferenceLabel(profile.defaultPreference)}",
+        // U6 (approved mockup bound-profile-mockup.html, 2026-11-28).
+        BOUND_PROFILE_FACT.takeIf { profile.webAccountBound }
     ).joinToString("·")
+
+/** Says that a profile is bound to a web account, on the profile cards (usability U6). */
+internal const val BOUND_PROFILE_FACT = "已绑定网页账户"
 
 /**
  * A single choice laid out across one row of a white group, for short options such as gender.
@@ -14998,7 +16598,11 @@ private fun MachineSelectionScreen(
                                 Column(horizontalAlignment = Alignment.End) {
                                     Text("新登记预计等待", color = TertiaryText, fontSize = QueueTextSize.Caption)
                                     Text(
-                                        newRegistrationEstimateLabel(machine, newRegistrationWaits),
+                                        newRegistrationEstimateLabel(
+                                            machine,
+                                            newRegistrationWaits,
+                                            LocalWaitEstimatesPending.current
+                                        ),
                                         color = PrimaryText,
                                         fontSize = QueueTextSize.Control,
                                         fontWeight = FontWeight.SemiBold
@@ -15014,14 +16618,16 @@ private fun MachineSelectionScreen(
     }
 }
 
-/** One of the two recommended ways to register, as a large card. */
+/**
+ * One of the two ways to register with a player profile, as a large card. The two are of the
+ * same standing (maintainer, 2026-11-26): neither is outlined as the default.
+ */
 @Composable
 private fun RegistrationMethodCard(
     title: String,
     description: String,
     actionLabel: String,
     icon: ImageVector,
-    primary: Boolean,
     enabled: Boolean,
     unavailableLabel: String,
     disabledReason: String,
@@ -15032,44 +16638,20 @@ private fun RegistrationMethodCard(
     val shape = RoundedCornerShape(CardRadius)
     Column(
         modifier.heightIn(min = 176.dp).clip(shape)
-            .background(
-                when {
-                    !enabled -> PageBackground
-                    primary -> SelectedRowBackground
-                    else -> CardBackground
-                }
-            )
-            .border(
-                if (primary && enabled) 2.dp else 1.dp,
-                when {
-                    !enabled -> Separator.copy(alpha = .72f)
-                    primary -> SystemBlue
-                    else -> Separator
-                },
-                shape
-            )
+            .background(if (enabled) CardBackground else PageBackground)
+            .border(1.dp, if (enabled) Separator else Separator.copy(alpha = .72f), shape)
             .clickable { if (enabled) onClick() else showDisabledActionReason(context, title, disabledReason) }
             .padding(18.dp)
     ) {
         Box(
             Modifier.size(48.dp).clip(RoundedCornerShape(14.dp))
-                .background(
-                    when {
-                        !enabled -> NeutralBadgeBackground
-                        primary -> SystemBlue
-                        else -> SoftBlue
-                    }
-                ),
+                .background(if (enabled) SoftBlue else NeutralBadgeBackground),
             contentAlignment = Alignment.Center
         ) {
             Icon(
                 imageVector = icon,
                 contentDescription = null,
-                tint = when {
-                    !enabled -> TertiaryText
-                    primary -> Color.White
-                    else -> SystemBlue
-                },
+                tint = if (enabled) SystemBlue else TertiaryText,
                 modifier = Modifier.size(28.dp)
             )
         }
@@ -15121,6 +16703,8 @@ private fun CreateRegistrationScreen(
     summary: FlowSummary,
     pairedQueueOption: PairedMachineQueueJoinOption? = null,
     onMobileRegistration: () -> Unit,
+    /** 批量创建登记 for the chosen machine; null where the page offers no batch. */
+    onBatchCreate: (() -> Unit)? = null,
     onBack: () -> Unit,
     onContinue: () -> Unit
 ) {
@@ -15167,7 +16751,6 @@ private fun CreateRegistrationScreen(
                 description = "从本机保存的玩家资料中选择，并沿用其默认游玩偏好。第一次使用时，可以在资料库中创建玩家资料。",
                 actionLabel = "选择资料",
                 icon = PersonRoundIcon,
-                primary = true,
                 enabled = true,
                 unavailableLabel = "",
                 disabledReason = "",
@@ -15179,9 +16762,12 @@ private fun CreateRegistrationScreen(
                 description = "扫码后，在移动设备上选择或创建玩家资料，无需在终端上输入。",
                 actionLabel = "显示二维码",
                 icon = SmartphoneRoundIcon,
-                primary = false,
                 enabled = mobileRegistrationEnabled && !mobileRegistrationLoading,
-                unavailableLabel = if (mobileRegistrationLoading) "正在创建二维码" else "需要与服务端同步",
+                unavailableLabel = when {
+                    mobileRegistrationLoading -> "正在创建二维码"
+                    mobileRegistrationDisabledReason.startsWith("系统规则不允许线上登记") -> "不允许线上登记"
+                    else -> "需要与服务端同步"
+                },
                 disabledReason = if (mobileRegistrationLoading) {
                     "登记二维码正在创建，请稍候。"
                 } else {
@@ -15200,6 +16786,16 @@ private fun CreateRegistrationScreen(
                 onClick = onTemporarySelect,
                 trailing = { FlowChevron() }
             )
+            // Beside it, for several players who are already waiting (batch-entry-mockup.html).
+            if (onBatchCreate != null) {
+                FlowListRow(
+                    title = "批量创建登记",
+                    description = "现场已有多名玩家等待时，可以先按人数创建临时登记，再由玩家按到场先后分别认领。",
+                    onClick = onBatchCreate,
+                    dividerInset = FlowTextDividerInset,
+                    trailing = { FlowChevron() }
+                )
+            }
         }
     }
 }
@@ -15441,17 +17037,29 @@ private fun PlayerLibraryScreen(
     searchQuery: String,
     sortMode: ProfileSortMode,
     listState: LazyListState,
-    summary: FlowSummary,
+    /** Null when the library is opened on its own from the More menu (no step pane). */
+    summary: FlowSummary?,
     title: String,
     subtitle: String,
     onSearchQueryChange: (String) -> Unit,
     onSortModeChange: (ProfileSortMode) -> Unit,
     onNewProfile: () -> Unit,
     onProfileClick: (PlayerProfile) -> Unit,
+    /** “排队中·位置 A7” for a profile that already has a registration; such a card is grey. */
+    queuedLine: (PlayerProfile) -> String? = { null },
+    /** Shown when such a card is tapped, in place of opening the profile. */
+    queuedReason: String? = null,
+    /**
+     * Opened on its own to look at profiles: a queued profile is not grey and opens as any
+     * other, its line only says where it waits (profile-library-mockup.html, 2026-11-28).
+     */
+    queuedProfilesOpen: Boolean = false,
+    /** Cards per row: 3 beside the step pane, 4 across the whole width. */
+    columns: Int = 3,
     onBack: () -> Unit
 ) {
+    val context = LocalContext.current
     val displayedProfiles = filterAndSortPlayerProfiles(profiles, searchQuery, sortMode)
-    val nowMillis = rememberCurrentTimeMillis()
     StepFlowPage(
         summary = summary,
         title = title,
@@ -15509,26 +17117,35 @@ private fun PlayerLibraryScreen(
                 }
             }
         } else {
-            val profileRows = displayedProfiles.chunked(3)
+            val profileRows = displayedProfiles.chunked(columns)
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxWidth().weight(1f),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 itemsIndexed(profileRows, key = { _, row -> row.joinToString("|") { it.id } }) { _, row ->
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
                         row.forEach { profile ->
+                            val profileQueuedLine = queuedLine(profile)
                             PlayerProfileCard(
                                 profile = profile,
                                 needsCompletion = profile.needsCompletionBeforeUse(),
-                                recentlyUsed = profile.lastUsedAtMillis?.let {
-                                    nowMillis - it in 0..RECENTLY_USED_PROFILE_MILLIS
-                                } == true,
-                                onClick = { onProfileClick(profile) },
-                                modifier = Modifier.weight(1f)
+                                queuedLine = profileQueuedLine,
+                                queuedGrey = !queuedProfilesOpen,
+                                onClick = {
+                                    if (profileQueuedLine == null || queuedProfilesOpen) {
+                                        onProfileClick(profile)
+                                    } else {
+                                        showDisabledActionReason(context, profile.nickname, queuedReason)
+                                    }
+                                },
+                                modifier = Modifier.weight(1f).fillMaxHeight()
                             )
                         }
-                        repeat(3 - row.size) {
+                        repeat(columns - row.size) {
                             Spacer(Modifier.weight(1f))
                         }
                     }
@@ -15537,9 +17154,6 @@ private fun PlayerLibraryScreen(
         }
     }
 }
-
-/** A profile used within this time is marked 最近使用 in the library. */
-private const val RECENTLY_USED_PROFILE_MILLIS = 7L * 24L * 60L * 60L * 1_000L
 
 @Composable
 private fun ProfileSortControl(
@@ -15572,61 +17186,72 @@ private fun ProfileSortControl(
     }
 }
 
+/**
+ * One profile in the library: avatar, nickname, gender mark in the top-right corner and the
+ * default play preference. The nickname takes the whole width and may use two lines; the
+ * player number is left to search and to the profile itself.
+ */
 @Composable
 private fun PlayerProfileCard(
     profile: PlayerProfile,
     needsCompletion: Boolean,
-    recentlyUsed: Boolean,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    /** Where the profile is already queueing; the card is then grey, as a row that cannot be used. */
+    queuedLine: String? = null,
+    /** False where a queued profile can still be opened (the library on its own). */
+    queuedGrey: Boolean = true
 ) {
+    val grey = queuedLine != null && queuedGrey
     val shape = RoundedCornerShape(14.dp)
     Row(
-        modifier.height(72.dp).clip(shape).background(CardBackground)
+        modifier.heightIn(min = 72.dp).clip(shape).background(CardBackground)
             .border(1.dp, Separator, shape)
             .clickable(onClick = onClick)
-            .padding(horizontal = 14.dp),
+            .padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         PlayerAvatar(profile, 44.dp)
         Spacer(Modifier.width(QueueSpacing.M))
         Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(verticalAlignment = Alignment.Top) {
                 Text(
                     profile.nickname,
-                    color = PrimaryText,
+                    color = if (!grey) PrimaryText else TertiaryText,
                     fontSize = 16.sp,
                     fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
+                    lineHeight = 21.sp,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false)
+                    modifier = Modifier.weight(1f)
                 )
                 if (profile.gender != PlayerGender.UNDISCLOSED) {
                     Spacer(Modifier.width(6.dp))
-                    PlayerGenderMark(profile.gender, hideUndisclosed = true, fontSize = 14.sp)
-                }
-                if (recentlyUsed) {
-                    Spacer(Modifier.width(6.dp))
                     Text(
-                        "最近使用",
-                        color = SuccessText,
-                        fontSize = QueueTextSize.Label,
+                        playerGenderSymbol(profile.gender),
+                        color = if (!grey) playerGenderColor(profile.gender) else TertiaryText,
+                        fontSize = 15.sp,
                         fontWeight = FontWeight.SemiBold,
-                        lineHeight = 15.sp,
-                        maxLines = 1,
-                        modifier = Modifier.clip(RoundedCornerShape(100.dp)).background(SuccessBackground)
-                            .padding(horizontal = 7.dp, vertical = 1.dp)
+                        lineHeight = 21.sp,
+                        maxLines = 1
                     )
                 }
             }
             Spacer(Modifier.height(3.dp))
             Text(
-                if (needsCompletion) {
-                    "需要补全玩家资料"
-                } else {
-                    "${profilePreferenceLabel(profile.defaultPreference)}·编号 ${profile.publicPlayerId ?: "—"}"
+                when {
+                    queuedLine != null -> queuedLine
+                    needsCompletion -> "需要补全玩家资料"
+                    // Not 已绑定网页账户 here: the cards of the library are narrow and it ended in
+                    // an ellipsis (maintainer, 2026-11-28). The profile card on the next page says it.
+                    else -> profilePreferenceLabel(profile.defaultPreference)
                 },
-                color = if (needsCompletion) WarningText else SecondaryText,
+                color = when {
+                    grey -> TertiaryText
+                    queuedLine != null -> SecondaryText
+                    needsCompletion -> WarningText
+                    else -> SecondaryText
+                },
                 fontSize = QueueTextSize.Caption,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -15881,7 +17506,7 @@ private fun PlayerProfileEditorScreen(
                     FlowSectionLabel("QQ 显示范围")
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "终端登记详情始终可以查看 QQ；网站只会按照这里的选择显示。",
+                        "终端登记详情始终可以查看 QQ；网页端只会按照这里的选择显示。",
                         color = SecondaryText,
                         fontSize = 12.sp,
                         lineHeight = 18.sp
@@ -15890,14 +17515,14 @@ private fun PlayerProfileEditorScreen(
                     FlowListGroup {
                         FlowListRow(
                             title = "仅终端显示",
-                            description = "网站登记详情不会显示 QQ。",
+                            description = "网页端登记详情不会显示 QQ。",
                             onClick = { onQqVisibilityChange(QqVisibility.TERMINAL_ONLY) },
                             leading = { RadioDot(qqVisibility == QqVisibility.TERMINAL_ONLY) },
                             selected = qqVisibility == QqVisibility.TERMINAL_ONLY
                         )
                         FlowListRow(
-                            title = "允许网站显示",
-                            description = "网站登记详情可以显示 QQ，便于现场联系。",
+                            title = "允许网页端显示",
+                            description = "网页端登记详情可以显示 QQ，便于现场联系。",
                             onClick = { onQqVisibilityChange(QqVisibility.PUBLIC_WEBSITE) },
                             leading = { RadioDot(qqVisibility == QqVisibility.PUBLIC_WEBSITE) },
                             dividerInset = FlowTextDividerInset,
@@ -16087,7 +17712,7 @@ private fun playerGenderLabel(gender: PlayerGender): String = when (gender) {
 
 private fun qqVisibilityLabel(visibility: QqVisibility): String = when (visibility) {
     QqVisibility.TERMINAL_ONLY -> "仅终端显示"
-    QqVisibility.PUBLIC_WEBSITE -> "允许网站显示"
+    QqVisibility.PUBLIC_WEBSITE -> "允许网页端显示"
 }
 
 /** The notification line on the profile summary, in the order of the switches. */
@@ -16174,6 +17799,7 @@ private fun PlayerProfileDetailScreen(
     profile: PlayerProfile?,
     summary: FlowSummary,
     pairedQueueOption: PairedMachineQueueJoinOption? = null,
+    soloPassingOption: SoloPassingOption? = null,
     selectedPreference: PlayPreference?,
     rememberPreference: Boolean,
     alreadyRegistered: Boolean,
@@ -16225,32 +17851,12 @@ private fun PlayerProfileDetailScreen(
         FlowProfileCard(profile, flowProfileDetails(profile)) {
             FlowProfileEditButton(profile, onEditProfile)
             if (!profile.webAccountBound) {
-                val bindingEnabled = webAccountBindingEnabled && !webAccountBindingLoading
-                val bindingLabel = if (webAccountBindingLoading) "正在创建绑定页面" else "绑定网页账户"
-                Box(
-                    Modifier.height(40.dp).clip(RoundedCornerShape(10.dp))
-                        .clickable {
-                            if (bindingEnabled) onBindWebAccount()
-                            else showDisabledActionReason(
-                                context,
-                                bindingLabel,
-                                if (webAccountBindingLoading) {
-                                    "正在向服务端创建一次性绑定页面。"
-                                } else {
-                                    webAccountBindingDisabledReason
-                                }
-                            )
-                        }
-                        .padding(horizontal = 10.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        bindingLabel,
-                        color = if (bindingEnabled) SystemBlue else TertiaryText,
-                        fontSize = QueueTextSize.Body,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
+                WebAccountBindingButton(
+                    enabled = webAccountBindingEnabled,
+                    loading = webAccountBindingLoading,
+                    disabledReason = webAccountBindingDisabledReason,
+                    onBind = onBindWebAccount
+                )
             }
         }
         if (singlePlayerMachine) {
@@ -16259,15 +17865,24 @@ private fun PlayerProfileDetailScreen(
             Spacer(Modifier.height(QueueSpacing.XS))
             FlowSectionLabel("本次游玩偏好")
             Spacer(Modifier.height(10.dp))
-            PlayPreferenceChoiceGroup(selected = selectedPreference, onSelect = onPreferenceChange)
+            PlayPreferenceChoiceGroup(
+                selected = selectedPreference,
+                onSelect = onPreferenceChange,
+                passing = soloPassingOption
+            )
             Spacer(Modifier.height(14.dp))
             FlowCheckRow(
                 checked = rememberPreference,
-                text = "将本次选择保存为默认偏好，以后不再询问。",
+                text = "将本次选择保存为默认游玩偏好，以后不再询问。",
                 onToggle = { onRememberPreferenceChange(!rememberPreference) }
             )
         } else {
             FlowNote("本次将使用“${profilePreferenceLabel(profile.defaultPreference)}”。")
+            // A profile that always plays alone gets the same choice, on its own.
+            if (profile.defaultPreference == ProfilePlayPreference.SOLO && soloPassingOption != null) {
+                Spacer(Modifier.height(QueueSpacing.M))
+                FlowListGroup { SoloPassingChoice(soloPassingOption, nested = false) }
+            }
         }
         // The tick box belongs to the play preference of this one registration.
         if (pairedQueueOption != null) {
@@ -16314,6 +17929,8 @@ private fun FriendPairPlayerProfileDetailScreen(
     alreadyRegistered: Boolean,
     machineAvailable: Boolean,
     machineLabel: String,
+    /** Asked while the pair is formed: whether it lets the registrations behind it pass. */
+    passingOption: SoloPassingOption? = null,
     onEditProfile: () -> Unit,
     onComplete: () -> Unit,
     onBack: () -> Unit
@@ -16377,6 +17994,10 @@ private fun FriendPairPlayerProfileDetailScreen(
                 },
                 Destructive
             )
+        }
+        passingOption?.let { option ->
+            Spacer(Modifier.height(14.dp))
+            FlowListGroup { SoloPassingChoice(option, nested = false, alignedWithCheckRow = true) }
         }
         Spacer(Modifier.height(14.dp))
         FlowCheckRow(
@@ -16644,6 +18265,7 @@ private fun playerProfileTextFieldColors() = OutlinedTextFieldDefaults.colors(
 @Composable
 private fun PreferenceScreen(
     pairedQueueOption: PairedMachineQueueJoinOption? = null,
+    soloPassingOption: SoloPassingOption? = null,
     selected: PlayPreference?,
     summary: FlowSummary,
     onSelect: (PlayPreference) -> Unit,
@@ -16658,7 +18280,7 @@ private fun PreferenceScreen(
         onBack = onBack
     ) {
         Spacer(Modifier.height(18.dp))
-        PlayPreferenceChoiceGroup(selected = selected, onSelect = onSelect)
+        PlayPreferenceChoiceGroup(selected = selected, onSelect = onSelect, passing = soloPassingOption)
         // The tick box belongs to the play preference of this one registration.
         if (pairedQueueOption != null) {
             Spacer(Modifier.height(QueueSpacing.M))
@@ -16690,17 +18312,41 @@ private fun PreferenceScreen(
     }
 }
 
-/** 单人游玩 and 允许他人加入 as single-choice rows with a radio dot. */
+/** The 单人游玩 choice to let the registrations around it pass, as a tick box. */
+internal data class SoloPassingOption(
+    val checked: Boolean,
+    val onToggle: () -> Unit,
+    val enabled: Boolean = true,
+    val disabledReason: String? = null,
+    /** The choice of a fixed pair, worded for both registrations. */
+    val fixedPair: Boolean = false,
+    /** Opens the explanation of the choice; the question mark is left out without it. */
+    val onShowDetails: (() -> Unit)? = null
+)
+
+/**
+ * 单人游玩 and 允许他人加入 as single-choice rows with a radio dot. While 单人游玩 is chosen and
+ * [passing] is offered, its tick box sits inside the 单人游玩 row (solo-pass-mockup.html).
+ */
 @Composable
-private fun PlayPreferenceChoiceGroup(selected: PlayPreference?, onSelect: (PlayPreference) -> Unit) {
+private fun PlayPreferenceChoiceGroup(
+    selected: PlayPreference?,
+    onSelect: (PlayPreference) -> Unit,
+    passing: SoloPassingOption? = null
+) {
     FlowListGroup {
+        val showsPassing = selected == PlayPreference.SOLO && passing != null
         FlowListRow(
             title = "单人游玩",
             description = "这份登记将独自占用一个等待位置。",
             onClick = { onSelect(PlayPreference.SOLO) },
             leading = { RadioDot(selected == PlayPreference.SOLO) },
-            selected = selected == PlayPreference.SOLO
+            selected = selected == PlayPreference.SOLO,
+            continuesBelow = showsPassing
         )
+        if (showsPassing && passing != null) {
+            SoloPassingChoice(passing, nested = true)
+        }
         FlowListRow(
             title = "允许他人加入",
             description = "与其他允许他人加入的登记组成共同游玩，通常可以缩短等待时间；每轮最多两人。",
@@ -16713,11 +18359,105 @@ private fun PlayPreferenceChoiceGroup(selected: PlayPreference?, onSelect: (Play
     }
 }
 
+/**
+ * The tick box that lets the registrations around a 单人游玩 registration pass: a full sentence
+ * in regular weight with the small text under it, never ticked in advance. [nested] places it
+ * inside the chosen 单人游玩 row, under a hairline that starts at the text; otherwise it is a row
+ * of its own.
+ */
+@Composable
+private fun SoloPassingChoice(
+    option: SoloPassingOption,
+    nested: Boolean,
+    /** Above a consent tick row: the tick box and the text start where that row's do. */
+    alignedWithCheckRow: Boolean = false,
+    /** Nested: where the title of the row above starts, so that the tick box stands under it. */
+    nestedStart: Dp = 52.dp
+) {
+    val context = LocalContext.current
+    Column(
+        Modifier.fillMaxWidth()
+            .background(if (nested) SelectedRowBackground else Color.Transparent)
+            .clickable {
+                if (option.enabled) option.onToggle()
+                else showDisabledActionReason(context, "更改这项选择", option.disabledReason)
+            }
+            .padding(
+                start = when {
+                    nested -> nestedStart
+                    alignedWithCheckRow -> 13.dp
+                    else -> QueueSpacing.L
+                },
+                end = QueueSpacing.L,
+                top = if (nested) 0.dp else QueueSpacing.M,
+                bottom = 14.dp
+            )
+    ) {
+        if (nested) {
+            HorizontalDivider(color = SelectedRowDivider)
+            Spacer(Modifier.height(QueueSpacing.M))
+        }
+        // Nested: 10 as in the mockup; on its own: 14, so that the text lines up with the tick box
+        // row of the paired machines under it.
+        Row(
+            verticalAlignment = Alignment.Top,
+            horizontalArrangement = Arrangement.spacedBy(if (nested || alignedWithCheckRow) 10.dp else 14.dp)
+        ) {
+            TickBox(option.checked, enabled = option.enabled)
+            Column(Modifier.weight(1f)) {
+                Text(
+                    if (option.fixedPair) FIXED_PAIR_PASSING_CHOICE else SOLO_PASSING_CHOICE,
+                    color = if (option.enabled) PrimaryText else TertiaryText,
+                    fontSize = QueueTextSize.Body,
+                    lineHeight = 20.sp
+                )
+                Spacer(Modifier.height(QueueSpacing.XS))
+                Text(
+                    option.disabledReason?.takeIf { !option.enabled }
+                        ?: if (option.fixedPair) FIXED_PAIR_PASSING_HINT else SOLO_PASSING_HINT,
+                    color = if (option.enabled) SecondaryText else TertiaryText,
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp
+                )
+            }
+            // The same question mark as beside the tick box for two machines.
+            option.onShowDetails?.let { showDetails ->
+                Box(Modifier.offset(y = (-11).dp)) { PairedMachineHelpButton(showDetails) }
+            }
+        }
+    }
+}
+
+/**
+ * A line under the tags of a registration's menu while one of its choices is on; the part about
+ * what is happening now is set in blue (solo-pass-mockup.html, 四).
+ */
+@Composable
+private fun RegistrationMenuStatusLine(status: PairedMachineArrangementStatusText, textAlign: TextAlign) {
+    Text(
+        buildAnnotatedString {
+            append(status.before)
+            status.highlighted?.let { highlighted ->
+                withStyle(
+                    SpanStyle(color = PairedArrangementNoticeColor, fontWeight = FontWeight.Medium)
+                ) { append(highlighted) }
+            }
+            append(status.after)
+        },
+        color = SecondaryText,
+        fontSize = 12.sp,
+        lineHeight = 18.sp,
+        textAlign = textAlign,
+        modifier = Modifier.fillMaxWidth()
+    )
+}
+
 @Composable
 private fun BatchAmountScreen(
     amount: String,
     maximum: Int,
     summary: FlowSummary,
+    singlePlayerMachine: Boolean = false,
     onDecrease: () -> Unit,
     onIncrease: () -> Unit,
     onBack: () -> Unit,
@@ -16727,7 +18467,10 @@ private fun BatchAmountScreen(
     StepFlowPage(
         summary = summary,
         title = "创建临时登记",
-        subtitle = "这些登记将使用“允许他人加入”，并按创建先后排列在队尾。",
+        // How the players then take their registrations (maintainer, 2026-11-26). A machine for
+        // one player gives every registration 单人游玩 (usability U12).
+        subtitle = "这些登记将使用“${if (singlePlayerMachine) "单人游玩" else "允许他人加入"}”，并按创建先后排列在队尾。" +
+            "创建后，玩家可以在各自登记的菜单中点击“认领”。",
         onBack = onBack
     ) {
         val shape = RoundedCornerShape(CardRadius)
@@ -16807,7 +18550,6 @@ private fun ClaimRegistrationScreen(
                 description = "选择本机保存的玩家资料来认领这份登记。还没有资料时，可以在资料库中创建。",
                 actionLabel = "选择资料",
                 icon = PersonRoundIcon,
-                primary = true,
                 enabled = true,
                 unavailableLabel = "",
                 disabledReason = "",
@@ -16819,7 +18561,6 @@ private fun ClaimRegistrationScreen(
                 description = "扫码后，在移动设备上选择或创建玩家资料。",
                 actionLabel = "",
                 icon = SmartphoneRoundIcon,
-                primary = false,
                 enabled = false,
                 unavailableLabel = "暂不支持认领已有登记",
                 disabledReason = "移动设备暂不支持认领已有登记。",
@@ -16835,6 +18576,13 @@ private fun FriendPairFlowDialog(
     machineId: MachineId,
     registration: Registration,
     queue: MachineQueue,
+    /** The names of the waiting positions as the home screen shows them, by registration key. */
+    positionNames: Map<Int, String>,
+    /**
+     * The friend's registration when both are already chosen (组成固定组合 in a position menu):
+     * the flow starts at its confirmation, and cancelling closes it.
+     */
+    directPartnerKey: Int? = null,
     allowCreateFriend: Boolean,
     machineOperational: Boolean,
     idAlreadyExists: (String) -> Boolean,
@@ -16842,11 +18590,17 @@ private fun FriendPairFlowDialog(
     onDismiss: () -> Unit,
     onPlayerLibrary: () -> Unit,
     onPairExisting: (FriendPairPlan) -> Unit,
-    onCreateFriend: (String) -> Unit
+    onCreateFriend: (String) -> Unit,
+    /** Asked while the pair is formed: whether it lets the registrations behind it pass. */
+    passingOption: SoloPassingOption? = null
 ) {
     val hostActivity = LocalContext.current as? MainActivity
-    var step by remember(registration.key) { mutableStateOf(FriendPairStep.METHOD) }
-    var selectedPlan by remember(registration.key) { mutableStateOf<FriendPairPlan?>(null) }
+    var step by remember(registration.key) {
+        mutableStateOf(if (directPartnerKey != null) FriendPairStep.CONFIRM_EXISTING else FriendPairStep.METHOD)
+    }
+    var selectedPlan by remember(registration.key) {
+        mutableStateOf(directPartnerKey?.let { queue.planFriendPair(registration.key, it) })
+    }
     var friendIdDraft by remember(registration.key) { mutableStateOf("") }
     var friendConsentConfirmed by remember(registration.key) { mutableStateOf(false) }
     val isWaiting = queue.waiting.any { it.key == registration.key }
@@ -16858,12 +18612,10 @@ private fun FriendPairFlowDialog(
     } else {
         emptyList()
     }
-    val positionLabels = buildMap {
-        queue.waitingPositions().forEachIndexed { index, registrations ->
-            registrations.forEach { put(it.key, "位置 ${machineId.name}${index + 1}") }
-        }
-    }
+    val positionLabels = positionNames.mapValues { (_, name) -> "位置 $name" }
     val friendIdAlreadyExists = friendIdDraft.isNotBlank() && idAlreadyExists(friendIdDraft)
+    // Postponed registrations form no fixed pair (maintainer, 2026-11-27).
+    val ownPostponedReason = fixedPairPostponedReason(registration.absenceStatus, "与朋友共同游玩")
     val currentPartner = registration.fixedPartnerKey?.let { partnerKey ->
         queue.waiting.firstOrNull { it.key == partnerKey }
     }
@@ -16891,19 +18643,22 @@ private fun FriendPairFlowDialog(
                             "选择现有登记",
                             if (!machineOperational) {
                                 "当前机台已停止使用，恢复正常使用后才能组成固定组合。"
+                            } else if (ownPostponedReason != null) {
+                                ownPostponedReason
                             } else if (candidates.isNotEmpty()) {
                                 "从当前机台的等待登记中选择朋友，并检查顺序变化。"
                             } else {
                                 "当前没有可用于组成固定组合的其他等待登记。"
                             },
                             { step = FriendPairStep.SELECT_EXISTING },
-                            enabled = machineOperational && candidates.isNotEmpty()
+                            enabled = machineOperational && ownPostponedReason == null && candidates.isNotEmpty()
                         ),
                         MenuAction(
                             "为朋友创建登记",
                             when {
                                 !isWaiting -> "处于${playingPositionName(machineId)}的登记不能组成固定组合。"
                                 !machineOperational -> "当前机台已停止使用，暂不能创建朋友登记。"
+                                ownPostponedReason != null -> ownPostponedReason
                                 !allowCreateFriend -> "当前不接收新的排队登记。"
                                 queue.registrationCount >= 20 -> "当前机台已有 20 份登记，不能继续创建登记。"
                                 else -> "使用玩家资料或创建临时登记，并在队尾组成固定组合。"
@@ -16913,7 +18668,7 @@ private fun FriendPairFlowDialog(
                                 step = FriendPairStep.CREATE_FRIEND
                             },
                             enabled = allowCreateFriend && machineOperational && isWaiting &&
-                                queue.registrationCount < 20
+                                ownPostponedReason == null && queue.registrationCount < 20
                         )
                     )
                 )
@@ -16934,20 +18689,28 @@ private fun FriendPairFlowDialog(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     itemsIndexed(candidates, key = { _, candidate -> candidate.key }) { _, candidate ->
+                        // Not yet checked in: said here, instead of a dead end one step later
+                        // ("无法确认固定组合", review 2026-11-27).
+                        val candidatePostponedReason = if (candidate.requiresOnSiteCheckIn) {
+                            "这份线上登记尚未完成现场签到，签到后才能组成固定组合。"
+                        } else {
+                            fixedPairPostponedReason(candidate.absenceStatus, "组成固定组合")
+                        }
                         MenuActionButton(
                             MenuAction(
                                 candidate.displayId,
-                                if (machineOperational) {
-                                    "${positionLabels[candidate.key] ?: "等待顺序"}·${playPreferenceLabel(candidate)}。"
-                                } else {
+                                if (!machineOperational) {
                                     "当前机台已停止使用，恢复正常使用后才能组成固定组合。"
+                                } else {
+                                    candidatePostponedReason
+                                        ?: "${positionLabels[candidate.key] ?: "等待顺序"}·${playPreferenceLabel(candidate)}。"
                                 },
                                 {
                                     selectedPlan = queue.planFriendPair(registration.key, candidate.key)
                                     friendConsentConfirmed = false
                                     step = FriendPairStep.CONFIRM_EXISTING
                                 },
-                                enabled = machineOperational,
+                                enabled = machineOperational && candidatePostponedReason == null,
                                 explained = true
                             ),
                             Modifier.fillMaxWidth()
@@ -17047,6 +18810,10 @@ private fun FriendPairFlowDialog(
                         modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
                             .background(SoftBlue).padding(horizontal = 13.dp, vertical = 10.dp)
                     )
+                    passingOption?.let { option ->
+                        Spacer(Modifier.height(11.dp))
+                        FlowListGroup { SoloPassingChoice(option, nested = false, alignedWithCheckRow = true) }
+                    }
                     Spacer(Modifier.height(11.dp))
                     FriendConsentConfirmation(
                         checked = friendConsentConfirmed,
@@ -17067,7 +18834,9 @@ private fun FriendPairFlowDialog(
                     )
                 }
                 Spacer(Modifier.height(8.dp))
-                CancelAction { step = FriendPairStep.SELECT_EXISTING }
+                CancelAction {
+                    if (directPartnerKey != null) onDismiss() else step = FriendPairStep.SELECT_EXISTING
+                }
             }
 
             FriendPairStep.CREATE_FRIEND -> {
@@ -17147,6 +18916,10 @@ private fun FriendPairFlowDialog(
                         },
                         Modifier.padding(top = 8.dp)
                     )
+                }
+                passingOption?.let { option ->
+                    Spacer(Modifier.height(11.dp))
+                    FlowListGroup { SoloPassingChoice(option, nested = false, alignedWithCheckRow = true) }
                 }
                 Spacer(Modifier.height(11.dp))
                 FriendConsentConfirmation(
@@ -17239,6 +19012,11 @@ private fun FlowCheckRow(checked: Boolean, text: String, onToggle: () -> Unit) {
 
 @Composable
 private fun RegistrationActions(
+    /**
+     * The estimates are being worked out for a changed queue: the wait and its notes are left
+     * out of the facts line rather than showing an old value (maintainer, 2026-11-28).
+     */
+    waitEstimatesPending: Boolean = false,
     registration: Registration,
     playerProfileGender: PlayerGender?,
     playerProfileQqNumber: String?,
@@ -17277,6 +19055,21 @@ private fun RegistrationActions(
      */
     onlineRegistrationNotPlayed: Boolean = false,
     pairedQueueOption: PairedMachineQueueJoinOption? = null,
+    /** This registration's wait as its position shows it, such as 约 25 分钟后可以游玩. */
+    waitLabel: String? = null,
+    /**
+     * For a 最快 wait far from the wait if nobody is moved between the two machines: that other
+     * time, with its condition (noArrangementWaitNote).
+     */
+    noArrangementNote: String? = null,
+    /** The earlier time for when the pending online registrations ahead do not check in. */
+    onlineMissingNote: String? = null,
+    /** The line about letting others pass, for a 单人游玩 registration that allows it. */
+    soloPassingStatus: PairedMachineArrangementStatusText? = null,
+    /** Turns the 单人游玩 choice to let others pass on or off; null where it does not apply. */
+    onAllowsPassingToggle: (() -> Unit)? = null,
+    /** Opens the explanation of letting others pass; the argument says whether for a fixed pair. */
+    onShowPassingDetails: ((Boolean) -> Unit)? = null,
     onChangePreference: () -> Unit,
     onPreferenceSelected: (PlayPreference) -> Unit,
     onFriendPair: () -> Unit,
@@ -17298,13 +19091,19 @@ private fun RegistrationActions(
                 // The same rows as the step that chooses the play preference when joining
                 // (preference-mockup.html): radio rows, the tick row, then 与朋友共同游玩 apart.
                 val isFixedPair = registration.fixedPartnerKey != null
+                val friendPairPostponedReason = fixedPairPostponedReason(registration.absenceStatus, "与朋友共同游玩")
                 Text("更改游玩偏好", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    if (registration.playerProfileId != null) {
-                        "新的选择只用于本次排队，并会立即用于重新划分等待位置；玩家资料中的默认游玩偏好不会改变。"
-                    } else {
-                        "新的选择会立即用于重新划分等待位置。"
+                    // In the playing position nothing changes this round, which can surprise the
+                    // player; worded like the tick box for two machines (maintainer, 2026-11-26).
+                    when {
+                        isPlayingPosition && registration.playerProfileId != null ->
+                            "新的选择只用于本次排队，本轮游玩结束后生效；玩家资料中的默认游玩偏好不会改变。"
+                        isPlayingPosition -> "新的选择在本轮游玩结束后生效。"
+                        registration.playerProfileId != null ->
+                            "新的选择只用于本次排队，并会立即用于重新划分等待位置；玩家资料中的默认游玩偏好不会改变。"
+                        else -> "新的选择会立即用于重新划分等待位置。"
                     },
                     color = SecondaryText,
                     fontSize = QueueTextSize.Body,
@@ -17327,6 +19126,15 @@ private fun RegistrationActions(
                     FlowListGroup {
                         val solo = !isFixedPair && registration.preference == PlayPreference.SOLO
                         val open = !isFixedPair && registration.preference == PlayPreference.OPEN_TO_JOIN
+                        val passing = onAllowsPassingToggle?.takeIf { solo }?.let { toggle ->
+                            SoloPassingOption(
+                                checked = registration.allowsPassing,
+                                onToggle = toggle,
+                                enabled = machineOperational,
+                                disabledReason = stoppedActionReason.takeIf { !machineOperational },
+                                onShowDetails = onShowPassingDetails?.let { show -> { show(false) } }
+                            )
+                        }
                         FlowListRow(
                             title = "单人游玩",
                             description = "这份登记将独自占用一个等待位置。",
@@ -17334,8 +19142,10 @@ private fun RegistrationActions(
                             leading = { RadioDot(solo) },
                             selected = solo,
                             enabled = machineOperational,
-                            disabledReason = stoppedActionReason
+                            disabledReason = stoppedActionReason,
+                            continuesBelow = passing != null
                         )
+                        passing?.let { SoloPassingChoice(it, nested = true) }
                         FlowListRow(
                             title = "允许他人加入",
                             description = "与其他允许他人加入的登记组成共同游玩，通常可以缩短等待时间；每轮最多两人。",
@@ -17369,17 +19179,33 @@ private fun RegistrationActions(
                 if (allowsSharedPlay) {
                     FlowSectionLabel("也可以")
                     Spacer(Modifier.height(10.dp))
+                    // The choice of the fixed pair sits inside its row, as the tick box of 单人游玩
+                    // sits inside that row; either of the two can change it for both.
+                    val pairPassing = onAllowsPassingToggle?.takeIf { isFixedPair }?.let { toggle ->
+                        SoloPassingOption(
+                            checked = registration.allowsPassing,
+                            onToggle = toggle,
+                            enabled = machineOperational,
+                            disabledReason = stoppedActionReason.takeIf { !machineOperational },
+                            fixedPair = true,
+                            onShowDetails = onShowPassingDetails?.let { show -> { show(true) } }
+                        )
+                    }
                     FlowListGroup {
                         FlowListRow(
                             title = "与朋友共同游玩",
                             description = if (isFixedPair && fixedPartnerDisplayId != null) {
                                 "当前与“$fixedPartnerDisplayId”组成固定组合。"
                             } else {
-                                "与朋友组成固定组合，不会延后其他登记应当取得的游玩机会。"
+                                // The reason is read without tapping the greyed row.
+                                friendPairPostponedReason?.takeIf { machineOperational }
+                                    ?: "与朋友组成固定组合，不会延后其他登记应当取得的游玩机会。"
                             },
                             onClick = onFriendPair,
                             leading = {
-                                FlowIconTile(enabled = machineOperational) { color ->
+                                FlowIconTile(
+                                    enabled = machineOperational && (isFixedPair || friendPairPostponedReason == null)
+                                ) { color ->
                                     Icon(
                                         PeopleRoundIcon,
                                         contentDescription = null,
@@ -17389,10 +19215,15 @@ private fun RegistrationActions(
                                 }
                             },
                             selected = isFixedPair,
-                            enabled = machineOperational,
-                            disabledReason = stoppedActionReason,
-                            trailing = { FlowChevron() }
+                            // An existing pair stays open to look at; a new one cannot be
+                            // formed while this registration is postponed.
+                            enabled = machineOperational && (isFixedPair || friendPairPostponedReason == null),
+                            disabledReason = if (machineOperational) friendPairPostponedReason else stoppedActionReason,
+                            trailing = { FlowChevron() },
+                            continuesBelow = pairPassing != null
                         )
+                        // The row above has an icon tile, wider than a radio dot.
+                        pairPassing?.let { SoloPassingChoice(it, nested = true, nestedStart = 72.dp) }
                     }
                 }
             }
@@ -17582,35 +19413,22 @@ private fun RegistrationActions(
                         ?.takeIf { registration.playerProfileId != null }
                         ?.let { qqNumber -> DetailPill("QQ：$qqNumber") }
                 }
-                // Visible at a glance while the tick box is on, with the way to cancel it.
+                // Visible at a glance while a tick box is on, with the way to cancel it.
                 if (pairedQueueOption?.checked == true) {
                     Spacer(Modifier.height(9.dp))
-                    val status = pairedMachineArrangementStatusText(
-                        pairedMachineName = pairedQueueOption.pairedMachineLabel,
-                        waitsForNextRound = registration.skipsPairedMachineThisRound,
-                        announcement = pairedQueueOption.announcement,
-                        previewPosition = pairedQueueOption.previewPosition
+                    RegistrationMenuStatusLine(
+                        pairedMachineArrangementStatusText(
+                            pairedMachineName = pairedQueueOption.pairedMachineLabel,
+                            waitsForNextRound = registration.skipsPairedMachineThisRound,
+                            announcement = pairedQueueOption.announcement,
+                            previewPosition = pairedQueueOption.previewPosition
+                        ),
+                        headingAlign
                     )
-                    Text(
-                        // The sentence about a coming move stands out from the rest of the line.
-                        buildAnnotatedString {
-                            append(status.before)
-                            status.highlighted?.let { announced ->
-                                withStyle(
-                                    SpanStyle(
-                                        color = PairedArrangementNoticeColor,
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                ) { append(announced) }
-                            }
-                            append(status.after)
-                        },
-                        color = SecondaryText,
-                        fontSize = 12.sp,
-                        lineHeight = 18.sp,
-                        textAlign = headingAlign,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                }
+                if (soloPassingStatus != null && allowsSharedPlay) {
+                    Spacer(Modifier.height(9.dp))
+                    RegistrationMenuStatusLine(soloPassingStatus, headingAlign)
                 }
                 Spacer(Modifier.height(QueueSpacing.M))
                 // One line of facts keeps the menu short enough for a 720p screen; the check-in
@@ -17619,15 +19437,18 @@ private fun RegistrationActions(
                     listOfNotNull(
                         // formatRegistrationTime gives 刚刚, “5 分钟前” or a clock time.
                         "${formatRegistrationTime(registration.createdAtMillis)}创建",
-                        registration.lastPlayedAtMillis?.let { "${formatRegistrationTime(it)}游玩过" }
-                            ?: "尚未游玩",
+                        // In the playing position it is playing now: 尚未游玩 would contradict the
+                        // screen (usability U11), so the item is left out there.
+                        (registration.lastPlayedAtMillis?.let { "${formatRegistrationTime(it)}游玩过" }
+                            ?: "尚未游玩").takeUnless { isPlayingPosition },
                         "线上登记，已签到".takeIf {
                             registration.wasOnlineRegistration && !registration.requiresOnSiteCheckIn
                         },
                         registration.noShowCount.takeIf { it > 0 }?.let { count ->
                             "未到场 $count 次，上次为" +
                                 if (registration.lastNoShowActionWasDefer) "暂缓一次" else "移至队尾"
-                        }
+                        },
+                        waitLabel.takeUnless { waitEstimatesPending }
                     ).joinToString("·"),
                     color = SecondaryText,
                     fontSize = QueueTextSize.Caption,
@@ -17635,11 +19456,22 @@ private fun RegistrationActions(
                     textAlign = headingAlign,
                     modifier = Modifier.fillMaxWidth()
                 )
+                listOfNotNull(noArrangementNote, onlineMissingNote).takeUnless { waitEstimatesPending }.orEmpty().forEach { note ->
+                    Spacer(Modifier.height(QueueSpacing.XS))
+                    Text(
+                        note,
+                        color = SecondaryText,
+                        fontSize = QueueTextSize.Caption,
+                        lineHeight = 17.sp,
+                        textAlign = headingAlign,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
                 Spacer(Modifier.height(QueueSpacing.L))
                 if (registration.requiresOnSiteCheckIn) {
                     Text(
                         if (registration.hasRestartedOnSiteCheckInWindow) {
-                            "机台恢复正常使用后，这份登记已重新获得 30 分钟签到时限。请在本次时限内完成现场签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动移除。"
+                            "这份登记的 30 分钟签到时限已重新开始计时。请在本次时限内完成现场签到；超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动移除。"
                         } else {
                             "请在创建线上登记后的 30 分钟内完成现场签到。超过 30 分钟，或轮到进入游玩位置时仍未签到，这份登记会自动移除。"
                         },
@@ -17661,7 +19493,7 @@ private fun RegistrationActions(
                                 if (!machineOperational) {
                                     stoppedActionReason
                                 } else if (registration.hasRestartedOnSiteCheckInWindow) {
-                                    "完成签到后，这份登记会保持当前顺序，并开始正常轮候。请在机台恢复正常使用后重新获得的 30 分钟内操作。"
+                                    "完成签到后，这份登记会保持当前顺序，并开始正常轮候。请在重新开始计时的 30 分钟签到时限内操作。"
                                 } else {
                                     "完成签到后，这份登记会保持当前顺序，并开始正常轮候。请在创建登记后的 30 分钟内操作。"
                                 },
@@ -17807,14 +19639,18 @@ private fun RegistrationActions(
                         notYetTheirTurn = machineOperational &&
                             registration.absenceStatus == QueueAbsenceStatus.NONE &&
                             !canReportNoShow,
-                        alreadyPlaying = isPlayingPosition
+                        alreadyPlaying = isPlayingPosition,
+                        otherwiseUnavailable = !machineOperational ||
+                            registration.absenceStatus != QueueAbsenceStatus.NONE
                     )
                 )
                 }
             }
         }
         Spacer(Modifier.height(if (mode == RegistrationActionMode.PREFERENCE) 18.dp else 13.dp))
-        CancelAction(onDismiss)
+        // 更改游玩偏好 saves each choice as it is made and stays open, so there is nothing to
+        // cancel (maintainer, 2026-11-26).
+        CancelAction(if (mode == RegistrationActionMode.PREFERENCE) "关闭" else "取消", onDismiss)
     }
 }
 
@@ -17941,7 +19777,14 @@ private data class RoundEndNextGroup(
 private fun roundEndNextGroup(
     machineId: MachineId,
     queue: MachineQueue,
-    preview: NextPlayingPositionPreview?
+    preview: NextPlayingPositionPreview?,
+    /**
+     * The queue as the home screen shows it, with the previews of the other machine of a pair.
+     * A position is named only when the group is exactly that position there: a preview that
+     * does not arrive leaves the group short of what the home screen shows as that position
+     * (reported 2026-11-27), and it is then 下一组.
+     */
+    shownQueue: MachineQueue = queue
 ): RoundEndNextGroup? {
     val next = preview?.nextRegistrations.orEmpty()
     if (next.isEmpty()) return null
@@ -17955,7 +19798,7 @@ private fun roundEndNextGroup(
             othersWaiting = queue.waiting.isNotEmpty()
         )
     }
-    val positions = queue.waitingProjection(includeCommonPlayPreview = false).positions
+    val positions = shownQueue.waitingProjection(includeCommonPlayPreview = false).positions
     val index = positions.indexOfFirst { position ->
         position.registrations.map { it.key }.toSet() == nextKeys
     }
@@ -17979,6 +19822,8 @@ private fun RoundEndConfirmation(
     playingRegistrationNames: String,
     nextPlayingNotice: String?,
     nextGroup: RoundEndNextGroup?,
+    /** The small lines the home screen shows on these tiles, such as 将越过“小王”. */
+    nextGroupTileNotices: Map<Int, String> = emptyMap(),
     closingGracePeriod: Boolean,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
@@ -18074,7 +19919,7 @@ private fun RoundEndConfirmation(
                 if (closingGracePeriod) {
                     Spacer(Modifier.height(11.dp))
                     Text(
-                        "闭店收尾期间，需要让现有队列逐步结束，因此只能移除本轮玩家的登记并开始下一轮。其他处理方式暂时不可用。",
+                        "闭店收尾期间，需要让现有队列逐步结束，因此只能移除本轮玩家的登记并开始下一轮。其他处理方式暂不可用。",
                         color = WarningText,
                         fontSize = 12.sp,
                         lineHeight = 19.sp,
@@ -18107,6 +19952,7 @@ private fun RoundEndConfirmation(
                                 registrations = nextGroup.registrations,
                                 isPlaying = false,
                                 overtimeWarning = false,
+                                pairedArrangementNotices = nextGroupTileNotices,
                                 interactive = false,
                                 onRegistrationClick = {},
                                 onRegistrationLongPress = {},
@@ -18164,7 +20010,7 @@ private fun JoinClosingWarningDialog(
     val requestedMachine = request.requestedMachineId
     val description = if (requestedMachine != null) {
         val estimate = estimatedWaitMinutes[requestedMachine]
-        val estimateText = estimate?.let { "约 $it 分钟后才能游玩，" } ?: "游玩时间"
+        val estimateText = estimate?.let { "${formatWaitAmount(it)}后才能游玩，" } ?: "游玩时间"
         val alternativeMachines = request.joinableMachineIds
             .filterNot { it in request.lateMachineIds }
             .joinToString("、") { machineNames.getValue(it) }
@@ -18200,6 +20046,12 @@ private fun JoinClosingWarningDialog(
 private fun EnterPlayingConfirmation(
     playingPositionLabel: String,
     notice: String,
+    /**
+     * The group that enters, drawn as on the home screen, as the round-end confirmation draws it
+     * (maintainer, 2026-11-28: “我使用的是‘进入游玩位置’。这个功能也应该渲染位置组”).
+     */
+    nextGroup: RoundEndNextGroup? = null,
+    nextGroupTileNotices: Map<Int, String> = emptyMap(),
     onDismiss: () -> Unit,
     onConfirm: () -> Unit
 ) {
@@ -18215,6 +20067,27 @@ private fun EnterPlayingConfirmation(
                 .background(AbsenceStatusBackground)
                 .padding(horizontal = 13.dp, vertical = 11.dp)
         )
+        if (nextGroup != null && !nextGroup.keepsCurrentPlayers) {
+            Spacer(Modifier.height(14.dp))
+            // The same drawing as the home screen; here it only shows, it does not open menus.
+            CompositionLocalProvider(
+                LocalGlobalDragOverlayController provides remember { GlobalDragOverlayController() }
+            ) {
+                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    QueuePosition(
+                        label = nextGroup.label,
+                        registrations = nextGroup.registrations,
+                        isPlaying = false,
+                        overtimeWarning = false,
+                        pairedArrangementNotices = nextGroupTileNotices,
+                        interactive = false,
+                        onRegistrationClick = {},
+                        onRegistrationLongPress = {},
+                        onPositionClick = {}
+                    )
+                }
+            }
+        }
         Spacer(Modifier.height(18.dp))
         PrimaryButton("确认进入$playingPositionLabel", onConfirm, Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
@@ -18230,40 +20103,81 @@ private fun MachineTransferDestinationChooser(
     sourceUnavailableReason: String?,
     /** The machine that forms an active pair with the source machine, if any. */
     pairedMachineId: MachineId? = null,
+    newRegistrationWaits: Map<MachineId, Long?> = emptyMap(),
     onDismiss: () -> Unit,
     onSelect: (MachineId) -> Unit
 ) {
-    ModalSurface(onDismiss, width = 480.dp) {
-        Text("选择目标机台", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+    // One list in the style of 选择机台 when joining (maintainer, 2026-11-26). That a moved
+    // registration joins the tail goes without saying, so each row tells what is there instead.
+    ModalSurface(onDismiss, width = 560.dp) {
+        Text("选择要转至的机台", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(6.dp))
         Text(
-            "请选择要从 $sourceMachineName 转至的机台。选择后，还需要再次确认位置变化。",
+            "选择后，还需要再次确认位置变化。",
             color = SecondaryText,
-            fontSize = 12.sp,
-            lineHeight = 18.sp
+            fontSize = QueueTextSize.Body,
+            lineHeight = 20.sp
         )
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(QueueSpacing.L))
         if (destinations.isEmpty()) {
             Text("当前没有其他已配置的机台。", color = Destructive, fontSize = 12.sp)
         } else {
-            destinations.forEachIndexed { index, destination ->
-                if (index > 0) Spacer(Modifier.height(9.dp))
-                val unavailableReason = sourceUnavailableReason
-                    ?: machineTransferUnavailableReason(
-                        machineName = destination.name,
-                        status = destination.status,
-                        queue = destination.queue,
-                        incomingRegistrations = registrations,
-                        machineCapacity = destination.configuration.capacity,
-                        destinationIsPairedMachine = destination.machineId == pairedMachineId
+            FlowListGroup {
+                destinations.forEachIndexed { index, destination ->
+                    val unavailableReason = sourceUnavailableReason
+                        ?: machineTransferUnavailableReason(
+                            machineName = destination.name,
+                            status = destination.status,
+                            queue = destination.queue,
+                            incomingRegistrations = registrations,
+                            machineCapacity = destination.configuration.capacity,
+                            destinationIsPairedMachine = destination.machineId == pairedMachineId
+                        )
+                    val available = unavailableReason == null
+                    val queue = destination.queue
+                    val waitingPositions = queue.waitingProjection(includeCommonPlayPreview = false).positions.size
+                    FlowListRow(
+                        title = destination.name,
+                        description = unavailableReason ?: if (queue.registrationCount == 0) {
+                            "当前没有登记。"
+                        } else {
+                            "$waitingPositions 个等待位置·${queue.registrationCount} 份登记"
+                        },
+                        onClick = { onSelect(destination.machineId) },
+                        leading = {
+                            FlowIconTile(enabled = available) { color ->
+                                Text(
+                                    destination.machineId.name,
+                                    color = color,
+                                    fontSize = 18.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        },
+                        dividerInset = FlowTileDividerInset.takeIf { index > 0 },
+                        enabled = available,
+                        disabledReason = unavailableReason,
+                        disabledActionTitle = "转至 ${destination.name}",
+                        trailing = {
+                            if (available) {
+                                Column(horizontalAlignment = Alignment.End) {
+                                    Text("转入后预计等待", color = TertiaryText, fontSize = QueueTextSize.Caption)
+                                    Text(
+                                        newRegistrationEstimateLabel(
+                                            destination,
+                                            newRegistrationWaits,
+                                            LocalWaitEstimatesPending.current
+                                        ),
+                                        color = PrimaryText,
+                                        fontSize = QueueTextSize.Control,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                                FlowChevron()
+                            }
+                        }
                     )
-                ActionRow(
-                    title = destination.name,
-                    description = unavailableReason
-                        ?: "转入后会加入这台机台的队尾。",
-                    enabled = unavailableReason == null,
-                    onClick = { onSelect(destination.machineId) }
-                )
+                }
             }
         }
         Spacer(Modifier.height(13.dp))
@@ -18401,6 +20315,8 @@ private fun MachineTransferConfirmation(
 private fun PositionActions(
     /** The wait estimates of all machines (docs/releases/wait-estimate-2026-11.md). */
     waitEstimates: WaitEstimator.Result = WaitEstimator.EMPTY,
+    /** Who really enters next, counting an arrival from the paired machine. */
+    nextEnteringKeys: Set<Int>,
     selection: PositionSelection,
     queue: MachineQueue,
     machineConfiguration: MachineConfiguration,
@@ -18416,6 +20332,18 @@ private fun PositionActions(
     onEnterPlaying: () -> Unit,
     onTransfer: () -> Unit,
     onReleaseFixedPair: () -> Unit,
+    /** Turns the fixed pair's choice to let others pass on or off; null where it does not apply. */
+    onTogglePairPassing: (() -> Unit)? = null,
+    /** Opens the explanation of letting others pass (the question mark beside the tick box). */
+    onShowPassingDetails: (() -> Unit)? = null,
+    /** What the pair's choice currently leads to, for the line under the description. */
+    pairPassingStatus: PairedMachineArrangementStatusText? = null,
+    /**
+     * Forms a fixed pair of the two registrations of this position (maintainer, 2026-11-28:
+     * “点击一个有两个登记的位置菜单时，游玩方式里增加一个：组成固定组合”); null where it does
+     * not apply.
+     */
+    onFormFixedPair: (() -> Unit)? = null,
     onNoShow: () -> Unit,
     onRemove: () -> Unit
 ) {
@@ -18430,19 +20358,33 @@ private fun PositionActions(
     val detailPositionLabel = if (selection.isPlayingPosition) {
         playingPositionLabel
     } else {
-        selection.label.replaceFirst("位置 ", "队列位置 ")
+        selection.label
     }
-    val firstAvailablePositionIndex = queue.firstAvailableWaitingPositionIndex()
+    val nextGroupKeys = queue.nextWaitingGroup().map { it.key }.toSet()
+        .takeIf { keys -> keys.all { it in nextEnteringKeys } }
+        .orEmpty()
     val hasPendingCheckIn = registrations.any { it.requiresOnSiteCheckIn }
     val targetPosition = selection.waitingPositionIndex?.let {
         queue.waitingPositions().getOrNull(it)
     }
     val isPhysicalWaitingPosition = !selection.isPlayingPosition &&
         targetPosition?.map { it.key }?.toSet() == selection.registrationKeys.toSet()
-    val showsRoundEndShortcut = isPhysicalWaitingPosition &&
-        selection.waitingPositionIndex == firstAvailablePositionIndex &&
+    // A position as the home screen shows it need not be one of the real positions: beside a
+    // pending online registration or a preview of the other machine the grouping on screen
+    // differs. Whatever works on registrations (moving them to another machine, removing them,
+    // reporting them as not present) is offered for it too; it used to offer nothing and send
+    // the operator to each registration in turn (review 2026-11-27).
+    val isWaitingGroup = !selection.isPlayingPosition &&
+        registrations.size == selection.registrationKeys.size &&
+        registrations.isNotEmpty() &&
+        registrations.all { registration -> queue.waiting.any { it.key == registration.key } }
+    val showsRoundEndShortcut = isWaitingGroup &&
+        selection.registrationKeys.toSet() == nextGroupKeys &&
         queue.playing.isNotEmpty()
-    val canReportNoShow = registrations.isNotEmpty() && registrations.all { queue.canMarkNoShow(it.key) }
+    val canReportNoShow = registrations.isNotEmpty() && registrations.all { registration ->
+        queue.canMarkNoShow(registration.key, nextEnteringKeys) &&
+            (selection.isPlayingPosition || registration.key in nextEnteringKeys)
+    }
     val playingOvertime = queue.playingStartedAtMillis?.let { startedAt ->
         (nowMillis - startedAt).coerceAtLeast(0L) / 60_000L > 20
     } == true
@@ -18476,7 +20418,7 @@ private fun PositionActions(
                         stoppedActionReason
                     },
                     onEnterPlaying,
-                    enabled = machineOperational && firstAvailablePositionIndex != null
+                    enabled = machineOperational && nextGroupKeys.isNotEmpty()
                 )
             )
         }
@@ -18512,7 +20454,7 @@ private fun PositionActions(
         ).takeIf { selection.isPlayingPosition && registrations.isNotEmpty() }
     )
     val queueArrangementActions = buildList {
-        if (registrations.isNotEmpty() && isPhysicalWaitingPosition && !hasPendingCheckIn) {
+        if (registrations.isNotEmpty() && isWaitingGroup && !hasPendingCheckIn) {
             add(
                 MenuAction(
                     transferMachineName?.let { "转至 $it" } ?: "转至其他机台",
@@ -18524,6 +20466,29 @@ private fun PositionActions(
                     },
                     onTransfer,
                     enabled = transferUnavailableReason == null
+                )
+            )
+        }
+        if (
+            registrations.size == 2 && !isFixedPair && isWaitingGroup &&
+            machineConfiguration.capacity == 2 && onFormFixedPair != null
+        ) {
+            val pending = registrations.firstOrNull(Registration::requiresOnSiteCheckIn)
+            val unavailableReason = when {
+                !machineOperational -> "当前机台已停止使用，恢复正常使用后才能组成固定组合。"
+                pending != null -> "“${pending.displayId}”尚未完成现场签到，签到后才能组成固定组合。"
+                else -> registrations.firstNotNullOfOrNull { registration ->
+                    fixedPairPostponedReason(registration.absenceStatus, "组成固定组合")
+                        ?.replace("这份登记", "“${registration.displayId}”")
+                }
+            }
+            add(
+                MenuAction(
+                    "组成固定组合",
+                    unavailableReason
+                        ?: "将这个位置中的两份登记组成固定组合，不会延后其他登记应当取得的游玩机会。",
+                    onFormFixedPair,
+                    enabled = unavailableReason == null
                 )
             )
         }
@@ -18558,11 +20523,15 @@ private fun PositionActions(
                 Spacer(Modifier.width(12.dp))
                 Text(
                     if (machineOperational) {
-                        positionWaitEstimateLabel(
-                            registrations,
-                            shownWait?.minutes,
-                            shownWait?.uncertain == true
-                        )
+                        if (LocalWaitEstimatesPending.current) {
+                            WAIT_ESTIMATE_PENDING_LABEL
+                        } else {
+                            positionWaitEstimateLabel(
+                                registrations,
+                                shownWait?.minutes,
+                                shownWait?.uncertain == true
+                            )
+                        }
                     } else {
                         "机台恢复使用后重新估算"
                     },
@@ -18571,15 +20540,53 @@ private fun PositionActions(
                 )
             }
         }
-        if (machineOperational && !selection.isPlayingPosition && shownWait?.uncertain == true) {
+        val estimatesPending = LocalWaitEstimatesPending.current
+        if (machineOperational && !selection.isPlayingPosition && shownWait?.uncertain == true && !estimatesPending) {
             Spacer(Modifier.height(6.dp))
-            Text(UNCERTAIN_WAIT_NOTE, color = SecondaryText, fontSize = 12.sp, lineHeight = 18.sp)
+            // Where the time if nobody is moved lies far away, that time with its condition says
+            // more than the general note (maintainer, 2026-11-28: “最快约X分钟。如果XXX，约X分钟”).
+            Text(
+                noArrangementWaitNote("这个位置", shownWait.upperMinutes) ?: UNCERTAIN_WAIT_NOTE,
+                color = SecondaryText,
+                fontSize = 12.sp,
+                lineHeight = 18.sp
+            )
+        }
+        val earlierThanAhead = if (machineOperational && !selection.isPlayingPosition && !estimatesPending) {
+            earlierThanAheadNote(
+                "这个位置",
+                waitEstimates,
+                queue.waitingProjection().positions.map { position ->
+                    position.registrations.mapTo(mutableSetOf()) { it.key }
+                },
+                selection.registrationKeys.toSet(),
+                shownWait?.minutes
+            )
+        } else {
+            null
+        }
+        if (earlierThanAhead != null) {
+            Spacer(Modifier.height(6.dp))
+            Text(earlierThanAhead, color = SecondaryText, fontSize = 12.sp, lineHeight = 18.sp)
+        }
+        val onlineMissingNote = if (machineOperational && !selection.isPlayingPosition && !estimatesPending) {
+            onlineMissingWaitNote(
+                "这个位置",
+                waitEstimates.earlierPositionWaitIfOnlineMissing(selection.registrationKeys),
+                shownWait?.minutes
+            )
+        } else {
+            null
+        }
+        if (onlineMissingNote != null) {
+            Spacer(Modifier.height(6.dp))
+            Text(onlineMissingNote, color = SecondaryText, fontSize = 12.sp, lineHeight = 18.sp)
         }
         Spacer(Modifier.height(6.dp))
         Text(
             when {
                 registrations.isEmpty() -> "这个位置当前没有登记。"
-                !selection.isPlayingPosition && !isPhysicalWaitingPosition ->
+                !selection.isPlayingPosition && !isWaitingGroup ->
                     "这是按当前轮换结果合并显示的预计位置。登记仍保留真实等待顺序；请点开单份登记进行操作。"
                 registrations.size == 1 -> "这个位置包含 1 份登记。"
                 else -> "这是一个由 ${registrations.size} 份登记组成的共同游玩位置。以下操作会作用于整组登记。"
@@ -18588,6 +20595,10 @@ private fun PositionActions(
             fontSize = 12.sp,
             lineHeight = 18.sp
         )
+        if (pairPassingStatus != null && isFixedPair) {
+            Spacer(Modifier.height(6.dp))
+            RegistrationMenuStatusLine(pairPassingStatus, TextAlign.Start)
+        }
         val playedMinutes = queue.playingStartedAtMillis?.let { (nowMillis - it).coerceAtLeast(0L) / 60_000L }
         if (
             selection.isPlayingPosition && machineOperational && registrations.isNotEmpty() &&
@@ -18607,7 +20618,7 @@ private fun PositionActions(
             Spacer(Modifier.height(16.dp))
             // Removing goes with the registrations it removes; whoever does it is asked next.
             val canRemove = !hasPendingCheckIn &&
-                (selection.isPlayingPosition || isPhysicalWaitingPosition)
+                (selection.isPlayingPosition || isWaitingGroup)
             MenuSectionHeader(
                 "此位置中的登记",
                 actionText = (if (registrations.size > 1) "移除这组登记" else "移除登记")
@@ -18692,10 +20703,31 @@ private fun PositionActions(
             MenuSectionHeader("游玩进度")
             CompactActionGrid(playActions)
         }
-        if (queueArrangementActions.isNotEmpty()) {
+        // A fixed pair's choice to let others pass is a tick box at the end of 游玩方式, as where
+        // the pair is formed (maintainer, 2026-11-28: “不设计成按钮，而仍然是一个勾选框”).
+        val pairPassingOption = if (
+            isFixedPair && isPhysicalWaitingPosition && !hasPendingCheckIn &&
+            onTogglePairPassing != null && machineConfiguration.capacity == 2
+        ) {
+            SoloPassingOption(
+                checked = registrations.all(Registration::allowsPassing),
+                onToggle = onTogglePairPassing,
+                enabled = machineOperational,
+                disabledReason = stoppedActionReason,
+                fixedPair = true,
+                onShowDetails = onShowPassingDetails
+            )
+        } else {
+            null
+        }
+        if (queueArrangementActions.isNotEmpty() || pairPassingOption != null) {
             Spacer(Modifier.height(QueueSpacing.L))
             MenuSectionHeader("游玩方式")
-            CompactActionGrid(queueArrangementActions)
+            if (queueArrangementActions.isNotEmpty()) CompactActionGrid(queueArrangementActions)
+            pairPassingOption?.let { option ->
+                if (queueArrangementActions.isNotEmpty()) Spacer(Modifier.height(QueueSpacing.S))
+                FlowListGroup { SoloPassingChoice(option, nested = false) }
+            }
         }
         if (correctionActions.isNotEmpty()) {
             SeparateMenuSection(
@@ -18715,7 +20747,7 @@ private fun PositionActions(
         if (
             registrations.isNotEmpty() &&
             !hasPendingCheckIn &&
-            (selection.isPlayingPosition || isPhysicalWaitingPosition)
+            (selection.isPlayingPosition || isWaitingGroup)
         ) {
             SeparateMenuSection(
                 "由现场玩家报告",
@@ -18748,7 +20780,9 @@ private fun PositionActions(
                     notYetTheirTurn = machineOperational &&
                         registrations.none { it.absenceStatus != QueueAbsenceStatus.NONE } &&
                         !canReportNoShow,
-                    alreadyPlaying = selection.isPlayingPosition
+                    alreadyPlaying = selection.isPlayingPosition,
+                    otherwiseUnavailable = !machineOperational ||
+                        registrations.any { it.absenceStatus != QueueAbsenceStatus.NONE }
                 )
             )
         }
@@ -18807,7 +20841,7 @@ private fun ReturnPlayingRegistrationConfirmation(
     onConfirm: () -> Unit
 ) {
     ModalSurface(onDismiss, width = 490.dp) {
-        Text("撤回这份游玩登记？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+        Text("撤回这份登记？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
         Text(
             when {
@@ -18906,16 +20940,25 @@ private fun AdvanceToPlayingConfirmation(
 private fun ReleaseFixedPairConfirmation(
     registrations: List<Registration>,
     onDismiss: () -> Unit,
-    onConfirm: () -> Unit
+    onConfirm: () -> Unit,
+    /** The preference the first registration takes; the other one becomes 允许他人加入. */
+    chosenPreference: PlayPreference = PlayPreference.OPEN_TO_JOIN,
+    inPlayingPosition: Boolean = false
 ) {
-    val names = registrations.joinToString("和") { "“${it.displayId}”" }
     ModalSurface(onDismiss, width = 450.dp) {
         Text("解除固定组合？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
         Text(
             if (registrations.size == 2) {
                 buildString {
-                    append("确认后，${names}的固定组合会解除。两份登记的游玩偏好都会改为允许他人加入，系统会按照等待顺序重新组成等待位置。")
+                    append(
+                        releaseFixedPairConfirmationText(
+                            registrations[0].displayId,
+                            registrations[1].displayId,
+                            chosenPreference,
+                            inPlayingPosition
+                        )
+                    )
                     registrations.firstOrNull()?.let(::fixedPairAbsenceRetentionNotice)
                         ?.let { append(it) }
                 }
@@ -18937,6 +20980,27 @@ private fun ReleaseFixedPairConfirmation(
         Spacer(Modifier.height(8.dp))
         CancelAction(onDismiss)
     }
+}
+
+/**
+ * What releasing a fixed pair does. From the position menu both registrations become 允许他人加入;
+ * from 更改游玩偏好 the first one takes the preference just chosen. In the playing position the
+ * round goes on as it is, so nothing is said about the waiting positions.
+ */
+internal fun releaseFixedPairConfirmationText(
+    firstDisplayId: String,
+    secondDisplayId: String,
+    chosenPreference: PlayPreference = PlayPreference.OPEN_TO_JOIN,
+    inPlayingPosition: Boolean = false
+): String {
+    val preferences = if (chosenPreference == PlayPreference.OPEN_TO_JOIN) {
+        "两份登记的游玩偏好都会改为允许他人加入"
+    } else {
+        "“$firstDisplayId”的游玩偏好会改为${playPreferenceLabel(chosenPreference)}，" +
+            "“$secondDisplayId”的游玩偏好会改为允许他人加入"
+    }
+    val effect = if (inPlayingPosition) "本轮游玩结束后生效" else "系统会按照等待顺序重新组成等待位置"
+    return "确认后，“$firstDisplayId”和“$secondDisplayId”的固定组合会解除。$preferences，$effect。"
 }
 
 /**
@@ -19027,7 +21091,7 @@ private fun NoShowDialog(
                         if (removalOnly) {
                             "这份线上登记已完成签到，尚未游玩。$ONLINE_REGISTRATION_NO_SHOW_REMOVAL_ONLY"
                         } else if (deferUsed) {
-                            "这份登记已暂缓过一次，游玩一轮之前不能再次暂缓。请根据玩家是否仍会回来，选择移至队尾或移除登记。"
+                            "这份登记已暂缓过一次，游玩一轮之后才能再次暂缓。请根据玩家是否仍会回来，选择移至队尾或移除登记。"
                         } else if (occurrence == 1) {
                             "请根据玩家是否仍会回来，选择暂缓一次、移至队尾或移除登记。"
                         } else if (!allowDeferOneRound) {
@@ -19140,7 +21204,7 @@ private fun GroupNoShowDialog(
                                     "需要保留另一份登记时，请分别对两份登记记录未到场。"
                                 }
                         } else if (deferUsed) {
-                            "组内有登记已暂缓过一次，游玩一轮之前不能再次暂缓。请根据玩家是否仍会回来，选择整组移至队尾或移除整组登记。"
+                            "组内有登记已暂缓过一次，游玩一轮之后才能再次暂缓。请根据玩家是否仍会回来，选择整组移至队尾或移除整组登记。"
                         } else if (!anyPreviousNoShow) {
                             "以下操作会同时作用于组内全部登记。请根据玩家是否仍会回来选择处理方式。"
                         } else if (!allowDeferOneRound) {
@@ -19397,7 +21461,7 @@ private fun QueueAbsenceDialog(
                         Spacer(Modifier.height(8.dp))
                         Text(
                             if (fixedPartnerDisplayId == null) {
-                                "暂时不能游玩时，选择一种方式。三种方式的区别如下。"
+                                "暂不能游玩时，请选择一种方式。三种方式的区别如下。"
                             } else {
                                 "${subject}是固定组合，所选方式会同时作用于两份登记。"
                             },
@@ -19708,14 +21772,22 @@ private fun RadioDot(selected: Boolean) {
 /**
  * What the 由现场玩家报告 panel says. While it is not yet the player's turn the button is grey,
  * and the panel says why nobody can act on the registration yet (maintainer, 2026-11-25).
+ * [otherwiseUnavailable]: the button is grey for another reason (the machine is stopped, or the
+ * registration is postponed), which the button states under its title; the panel then keeps its
+ * general description (null) rather than telling the players to record a no-show they cannot.
  */
-internal fun noShowPanelDescription(group: Boolean, notYetTheirTurn: Boolean, alreadyPlaying: Boolean): String {
+internal fun noShowPanelDescription(
+    group: Boolean,
+    notYetTheirTurn: Boolean,
+    alreadyPlaying: Boolean,
+    otherwiseUnavailable: Boolean = false
+): String? {
     val who = if (group) "这组玩家" else "这名玩家"
     val what = if (group) "这组登记" else "这份登记"
-    return if (notYetTheirTurn) {
-        "现在还没有轮到$who，即使其不在现场，现场玩家也不能处理$what。"
-    } else {
-        (if (alreadyPlaying) "已经" else "即将") +
+    return when {
+        notYetTheirTurn -> "现在还没有轮到$who，即使其不在现场，现场玩家也不能处理$what。"
+        otherwiseUnavailable -> null
+        else -> (if (alreadyPlaying) "已经" else "即将") +
             "轮到的${who}不在现场。现场玩家应将其记录为未到场，并选择如何处理$what。"
     }
 }
@@ -19792,7 +21864,7 @@ private fun PlayerProfileSavingOverlay() {
 
 @Composable
 private fun PlayerProfileCreationLoadingDialog() {
-    ModalSurface(onDismiss = {}, width = 430.dp) {
+    ModalSurface(onDismiss = {}, width = 430.dp, dismissible = false) {
         Text(
             "正在准备网页资料二维码",
             color = PrimaryText,
@@ -20283,11 +22355,15 @@ private fun PlayerProfileWriteFailureDialog(detail: String, onDismiss: () -> Uni
 private fun QueueRestoreDialog(
     savedState: PersistedQueueState,
     machineNames: Map<MachineId, String>,
+    /** The queue is from an earlier day: nobody answering starts a new queue. */
+    fromEarlierDay: Boolean,
     onRestore: () -> Unit,
     onStartNew: () -> Unit
 ) {
     var startNewConfirmationVisible by remember { mutableStateOf(false) }
-    ModalSurface(onDismiss = {}, width = 500.dp) {
+    // A tap beside the card or BACK must not close it: it used to fade to nothing while still
+    // covering the screen with its buttons live (review 2026-11-27).
+    ModalSurface(onDismiss = {}, width = 500.dp, dismissible = false) {
         if (startNewConfirmationVisible) {
             Text("开始新的队列？", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(8.dp))
@@ -20331,6 +22407,15 @@ private fun QueueRestoreDialog(
                     )
                 }
             }
+            if (fromEarlierDay) {
+                Spacer(Modifier.height(9.dp))
+                Text(
+                    "上次队列来自之前的营业日。无人操作时，将自动开始新的队列。",
+                    color = WarningText,
+                    fontSize = 11.sp,
+                    lineHeight = 17.sp
+                )
+            }
             if (!savedState.registrationOpen) {
                 Spacer(Modifier.height(9.dp))
                 Text("上次退出时，登记排队处于关闭状态。", color = WarningText, fontSize = 11.sp)
@@ -20343,6 +22428,15 @@ private fun QueueRestoreDialog(
                 Spacer(Modifier.height(9.dp))
                 Text(
                     "本轮计时会沿用原来的开始时间，并包含应用关闭期间经过的时间。",
+                    color = SecondaryText,
+                    fontSize = 11.sp,
+                    lineHeight = 17.sp
+                )
+            }
+            if (savedState.machines.values.any { machine -> machine.queue.waiting.any { it.requiresOnSiteCheckIn } }) {
+                Spacer(Modifier.height(9.dp))
+                Text(
+                    "待签到的线上登记会重新获得 30 分钟签到时限。",
                     color = SecondaryText,
                     fontSize = 11.sp,
                     lineHeight = 17.sp
@@ -20405,7 +22499,7 @@ private fun CloseRegistrationConfirmation(
         Spacer(Modifier.height(8.dp))
         Text(
             if (registrationCount > 0) {
-                "当前共有 $registrationCount 份登记。仅建议在现场已经能够自行辨认排队顺序时关闭；确认后将删除所有机台的全部登记，且无法恢复。"
+                "当前共有 $registrationCount 份登记。仅建议在现场已经能够自行辨认排队顺序时关闭；确认后将移除所有机台的全部登记，且无法恢复。"
             } else {
                 "当前没有登记。确认后会关闭登记排队；重新开启时将载入最新的机台配置和状态，并开始新的空队列。"
             },
@@ -20439,6 +22533,8 @@ private fun MoreMenu(
     onDismiss: () -> Unit,
     onEditRegistrations: () -> Unit,
     onOpenAuditLog: () -> Unit,
+    /** Opens the player library on its own (maintainer, 2026-11-28). */
+    onOpenPlayerLibrary: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenAppDetails: () -> Unit,
     onReportMachineStop: () -> Unit,
@@ -20461,7 +22557,12 @@ private fun MoreMenu(
                     battery.charging -> "正在充电。"
                     else -> "未在充电。"
                 },
-                attention = battery.low,
+                // Green while plugged in, orange when low, grey otherwise (maintainer, 2026-11-26).
+                tone = when {
+                    battery.low -> TerminalStatusTone.ATTENTION
+                    battery.charging -> TerminalStatusTone.GOOD
+                    else -> TerminalStatusTone.NEUTRAL
+                },
                 modifier = Modifier.weight(1f).fillMaxHeight()
             )
             if (cloudSyncStatus != null) {
@@ -20475,7 +22576,14 @@ private fun MoreMenu(
                             "最近一次成功同步：${SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(it))}。"
                         } ?: "尚无成功同步的记录。"
                     },
-                    attention = cloudSyncStatus.needsAttention(),
+                    // The colours the sync state has always had elsewhere; a problem stays orange
+                    // (maintainer, 2026-11-26).
+                    tone = when {
+                        cloudSyncStatus.needsAttention() -> TerminalStatusTone.ATTENTION
+                        cloudSyncStatus.phase == QueueCloudSyncPhase.SYNCED -> TerminalStatusTone.GOOD
+                        cloudSyncStatus.phase == QueueCloudSyncPhase.SYNCING -> TerminalStatusTone.ACTIVE
+                        else -> TerminalStatusTone.NEUTRAL
+                    },
                     onClick = onOpenSyncStatus,
                     modifier = Modifier.weight(1f).fillMaxHeight()
                 )
@@ -20495,14 +22603,19 @@ private fun MoreMenu(
                 ),
                 MenuAction(
                     title = "编辑登记",
-                    description = "调整所选机台的等待顺序。",
+                    // R5: greyed, the line under the title gives the reason (copy table).
+                    description = if (canEditRegistrations) {
+                        "调整所选机台的等待顺序。"
+                    } else {
+                        "当前没有可以调整等待顺序的登记。"
+                    },
                     onClick = onEditRegistrations,
                     enabled = canEditRegistrations
                 ),
                 MenuAction(
                     title = if (registrationOpen) "关闭登记排队" else "重新开启登记排队",
                     description = if (registrationOpen) {
-                        "删除所有机台的当前登记；重新开启后会开始新的空队列。"
+                        "移除所有机台的当前登记；重新开启后会开始新的空队列。"
                     } else {
                         "载入最新机台配置和状态，并开始新的空队列。"
                     },
@@ -20518,10 +22631,11 @@ private fun MoreMenu(
             listOf(
                 MenuAction(
                     title = "报告机台停止使用",
-                    description = if (machineManagementLocked) {
-                        "已由管理后台接管，只能从管理后台修改。"
-                    } else {
-                        "保留所选机台的登记顺序，并暂停该机台的队列操作与计时。"
+                    description = when {
+                        machineManagementLocked -> "已由管理后台接管，只能从管理后台修改。"
+                        // R5: greyed for want of a machine in use.
+                        !canReportMachineStop -> "所有机台都已停止使用。"
+                        else -> "保留所选机台的登记顺序，并暂停该机台的队列操作与计时。"
                     },
                     onClick = onReportMachineStop,
                     destructive = true,
@@ -20535,6 +22649,7 @@ private fun MoreMenu(
         CompactActionGrid(
             listOf(
                 MenuAction("操作日志", "查看队列变动和设置修改的记录。", onOpenAuditLog),
+                MenuAction("玩家资料库", "查看、创建和编辑本机保存的玩家资料。", onOpenPlayerLibrary),
                 MenuAction("应用设置", "机厅与终端、服务端、营业时间、排队规则和机台。", onOpenSettings),
                 MenuAction("应用详情", "版本、机厅与终端信息和运行规格。", onOpenAppDetails)
             )
@@ -20550,15 +22665,30 @@ private fun TerminalStatusTile(
     caption: String,
     value: String,
     detail: String,
-    attention: Boolean,
+    tone: TerminalStatusTone,
     modifier: Modifier = Modifier,
     onClick: (() -> Unit)? = null
 ) {
     val shape = RoundedCornerShape(ControlRadius)
-    val accent = if (attention) WarningText else SecondaryText
+    val accent = when (tone) {
+        TerminalStatusTone.NEUTRAL -> SecondaryText
+        TerminalStatusTone.GOOD -> SuccessText
+        TerminalStatusTone.ACTIVE -> SystemBlue
+        TerminalStatusTone.ATTENTION -> WarningText
+    }
+    val background by animateColorAsState(
+        when (tone) {
+            TerminalStatusTone.NEUTRAL -> PageBackground
+            TerminalStatusTone.GOOD -> SuccessBackground
+            TerminalStatusTone.ACTIVE -> SoftBlue
+            TerminalStatusTone.ATTENTION -> WarningBackground
+        },
+        tween(220),
+        label = "终端状态底色"
+    )
     Column(
         modifier.heightIn(min = 72.dp).clip(shape)
-            .background(if (attention) WarningBackground else PageBackground)
+            .background(background)
             .let { if (onClick != null) it.clickable(onClick = onClick) else it }
             .padding(horizontal = QueueSpacing.M, vertical = 10.dp)
     ) {
@@ -20570,7 +22700,7 @@ private fun TerminalStatusTile(
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
                     contentDescription = null,
-                    tint = if (attention) WarningText else TertiaryText,
+                    tint = if (tone == TerminalStatusTone.NEUTRAL) TertiaryText else accent,
                     modifier = Modifier.size(16.dp)
                 )
             }
@@ -20579,7 +22709,7 @@ private fun TerminalStatusTile(
         // from their fonts and stop lining up across the two tiles.
         Text(
             value,
-            color = if (attention) WarningText else PrimaryText,
+            color = if (tone == TerminalStatusTone.NEUTRAL) PrimaryText else accent,
             fontSize = QueueTextSize.Control,
             fontWeight = FontWeight.SemiBold,
             lineHeight = 22.sp
@@ -20589,55 +22719,79 @@ private fun TerminalStatusTile(
     }
 }
 
+/** The colour of a 终端状态 tile in 更多: grey, green (fine), blue (in progress) or orange. */
+private enum class TerminalStatusTone { NEUTRAL, GOOD, ACTIVE, ATTENTION }
+
 @Composable
 private fun AppDetailsDialog(
     cloudSyncStatus: QueueCloudSyncStatus?,
+    /** Sync mode and server host, 未开启, or null in the local build. */
+    syncSummary: String?,
+    playerProfileCount: Int,
+    auditLogCount: Int,
     terminalInstallation: TerminalInstallationIdentity,
     onOpenVersionHistory: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    // What is useful when checking a terminal on site (app-details-mockup.html, 2026-11-26):
+    // which build is installed and when, who signed it, the sync it uses, the device and screen.
+    val context = LocalContext.current
+    val install = remember(context) { appInstallDetails(context) }
+    val screen = remember(context) {
+        val metrics = context.resources.displayMetrics
+        val configuration = context.resources.configuration
+        val scale = terminalScaleFactor(configuration.screenWidthDp, configuration.screenHeightDp)
+        "${maxOf(metrics.widthPixels, metrics.heightPixels)} × ${minOf(metrics.widthPixels, metrics.heightPixels)}" +
+            "·界面缩放 ${(scale * 100).roundToInt()}%"
+    }
+    val divider = @Composable { HorizontalDivider(color = Separator.copy(alpha = .72f)) }
     ModalSurface(onDismiss, width = 500.dp) {
         Text("应用详情", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(5.dp))
         Text("maimai Q", color = SecondaryText, fontSize = 12.sp)
         Spacer(Modifier.height(18.dp))
         AppDetailSectionTitle("版本信息")
-        AppDetailLinkRow("版本", BuildConfig.VERSION_NAME, "查看更新记录", onOpenVersionHistory)
-        HorizontalDivider(color = Separator.copy(alpha = .72f))
-        AppDetailRow("构建编号", BuildConfig.VERSION_CODE.toString())
-        Spacer(Modifier.height(15.dp))
+        AppDetailLinkRow(
+            "版本",
+            "${BuildConfig.VERSION_NAME}（构建 ${BuildConfig.VERSION_CODE}）·${if (BuildConfig.DEBUG) "测试版" else "正式版"}",
+            "查看更新记录",
+            onOpenVersionHistory,
+            verticalPadding = 10.dp
+        )
+        install.updatedAtMillis?.let { updatedAt ->
+            divider()
+            AppDetailRowCompact("安装时间", SimpleDateFormat("M 月 d 日 HH:mm", Locale.CHINA).format(Date(updatedAt)))
+        }
+        install.certificateFingerprint?.let { fingerprint ->
+            divider()
+            AppDetailRowCompact("签名证书", fingerprint)
+        }
+        Spacer(Modifier.height(12.dp))
         AppDetailSectionTitle("机厅与终端")
-        AppDetailRow("机厅", terminalInstallation.venueName.ifBlank { "尚未填写" })
+        AppDetailRowCompact("机厅", terminalInstallation.venueName.ifBlank { "尚未填写" })
         terminalInstallation.venueCode?.let { code ->
-            HorizontalDivider(color = Separator.copy(alpha = .72f))
-            AppDetailRow("机厅 ID", code)
+            divider()
+            AppDetailRowCompact("机厅 ID", code)
         }
-        HorizontalDivider(color = Separator.copy(alpha = .72f))
-        AppDetailRow("终端", terminalInstallation.terminalName)
-        Spacer(Modifier.height(15.dp))
-        AppDetailSectionTitle("运行规格")
-        AppDetailRow("排队方式", "各机台分别独立排序")
-        HorizontalDivider(color = Separator.copy(alpha = .72f))
-        AppDetailRow("单台上限", "20 份登记")
-        HorizontalDivider(color = Separator.copy(alpha = .72f))
-        AppDetailRow("系统要求", "Android 10 或更高版本")
-        Spacer(Modifier.height(15.dp))
-        AppDetailSectionTitle("数据说明")
-        AppDetailRow("资料与日志", "本机优先保存")
-        HorizontalDivider(color = Separator.copy(alpha = .72f))
-        AppDetailRow("日志保留", "最近 1,000 条操作")
-        HorizontalDivider(color = Separator.copy(alpha = .72f))
-        AppDetailRow("队列恢复", "保留当前及上一份有效状态")
-        if (cloudSyncStatus != null) {
-            HorizontalDivider(color = Separator.copy(alpha = .72f))
-            AppDetailRow("与服务端同步", queueCloudSyncStatusLabel(cloudSyncStatus))
+        divider()
+        AppDetailRowCompact("终端", terminalInstallation.terminalName)
+        syncSummary?.let { summary ->
+            divider()
+            AppDetailRowCompact("与服务端同步", summary)
         }
+        Spacer(Modifier.height(12.dp))
+        AppDetailSectionTitle("设备与数据")
+        AppDetailRowCompact("设备", deviceDescription())
+        divider()
+        AppDetailRowCompact("屏幕", screen)
+        divider()
+        AppDetailRowCompact("本机数据", "$playerProfileCount 份玩家资料·$auditLogCount 条操作日志")
         Spacer(Modifier.height(13.dp))
         Text(
             if (cloudSyncStatus != null) {
-                "队列、玩家资料和日志始终先保存在本机。开启与服务端同步后，只有玩家选择允许网站显示时，当前登记的 QQ 才会显示在网站上；完整的玩家资料、性别、默认游玩偏好和资料内部编号不会在网站公开。"
+                "队列、玩家资料和日志始终先保存在本机，操作日志保留最近 1,000 条。开启与服务端同步后，只有玩家选择允许网页端显示时，当前登记的 QQ 才会显示在网页端；完整的玩家资料、性别、默认游玩偏好和资料内部编号不会在网页端公开。"
             } else {
-                "这是不连接服务端的纯本地版本。队列、玩家资料和日志只保存在本机，不会上传到服务端。"
+                "这是不连接服务端的纯本地版本。队列、玩家资料和日志只保存在本机，不会上传到服务端；操作日志保留最近 1,000 条。"
             },
             color = SecondaryText,
             fontSize = 12.sp,
@@ -20646,6 +22800,38 @@ private fun AppDetailsDialog(
         Spacer(Modifier.height(18.dp))
         SecondaryButton("关闭", onDismiss, Modifier.fillMaxWidth())
     }
+}
+
+private data class AppInstallDetails(val updatedAtMillis: Long?, val certificateFingerprint: String?)
+
+/**
+ * When this build was installed and the start of its signing certificate's SHA-256, in groups of
+ * four as keytool prints it, so it can be compared with the release certificate before an update.
+ */
+private fun appInstallDetails(context: android.content.Context): AppInstallDetails = runCatching {
+    @Suppress("DEPRECATION")
+    val info = context.packageManager.getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+    val signing = info.signingInfo
+    val certificate = when {
+        signing == null -> null
+        signing.hasMultipleSigners() -> signing.apkContentsSigners.firstOrNull()
+        // The history runs from the oldest certificate to the one in use.
+        else -> signing.signingCertificateHistory.lastOrNull()
+    }
+    val fingerprint = certificate?.let { signature ->
+        MessageDigest.getInstance("SHA-256").digest(signature.toByteArray())
+            .joinToString("") { "%02X".format(it) }
+            .take(16).chunked(4).joinToString(" ")
+    }
+    AppInstallDetails(info.lastUpdateTime.takeIf { it > 0L }, fingerprint)
+}.getOrDefault(AppInstallDetails(null, null))
+
+/** Maker and model, without repeating the maker when the model already names it, and Android. */
+private fun deviceDescription(): String {
+    val maker = Build.MANUFACTURER.orEmpty().replaceFirstChar { it.uppercase() }
+    val model = Build.MODEL.orEmpty()
+    val name = if (model.startsWith(maker, ignoreCase = true)) model else "$maker $model".trim()
+    return "$name·Android ${Build.VERSION.RELEASE}"
 }
 
 @Composable
@@ -20701,7 +22887,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "1.0.0",
             "自动安排登记与界面重新设计",
-            "机厅添加一对机台后，玩家确认登记时可以允许系统在两台机台之间安排登记；另一机台能够更早安排游玩时先显示预览，至少 12 分钟后才自动转至。延后这份登记分为暂缓一次、轮空一次和暂时离开，未到场改用同样的对照卡片。等待时间改用新的估算方法。首页、菜单和各个分步流程重新设计，并按屏幕分辨率等比例放大；终端、网站、QQ Bot 和服务端的文案统一。"
+            "机厅添加一对机台后，玩家确认登记时可以允许系统在两台机台之间安排登记；另一机台能够更早安排游玩时先显示预览，至少 12 分钟后才自动转至。延后这份登记分为暂缓一次、轮空一次和暂时离开，未到场改用同样的对照卡片。单人游玩的登记和固定组合可以允许后方的登记越过，真实的等待顺序不变，不会让任何登记晚一轮游玩。等待时间改用新的估算方法。首页、菜单和各个分步流程重新设计，并按屏幕分辨率等比例放大；终端、网页端和服务端的文案统一。QQ Bot 在本版暂时停用，将在重构后随新版本恢复。"
         ),
         Triple(
             "0.13.6",
@@ -20731,7 +22917,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.12.3",
             "跨端反馈与安全刷新",
-            "网页登录玩家显示明确的本人登记状态，并保留最近三条操作结果。风险操作失败时只能刷新最新队列和资料，不会自动重复提交；终端、网站与 QQ Bot 继续统一动作结果和同步状态文案。估时说明展开与队列分享暂不加入。"
+            "网页登录玩家显示明确的本人登记状态，并保留最近三条操作结果。风险操作失败时只能刷新最新队列和资料，不会自动重复提交；终端、网页端与 QQ Bot 继续统一动作结果和同步状态文案。估时说明展开与队列分享暂不加入。"
         ),
         Triple(
             "0.12.1",
@@ -20741,22 +22927,22 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.12.0",
             "网页玩家资料",
-            "玩家可以在现场终端生成一次性二维码绑定网页玩家资料，并在网页管理资料、通知、公开范围、QQ 和密码。登录后可查看和管理本人登记，所有远程操作仍由现场终端按最新状态最终校验；机厅营业时间在终端、网站和 QQ Bot 间统一同步。"
+            "玩家可以在现场终端生成一次性二维码绑定网页玩家资料，并在网页管理资料、通知、公开范围、QQ 和密码。登录后可查看和管理本人登记，所有远程操作仍由现场终端按最新状态最终校验；机厅营业时间在终端、网页端和 QQ Bot 间统一同步。"
         ),
         Triple(
             "0.11.0",
             "机厅身份与跨端资料基础",
-            "建立机厅与终端身份、schema 8 协议和旧终端兼容边界；新增六位玩家编号、玩家编号别名、首次启动引导和机厅名称展示。统一 App、网站、服务端与 QQ Bot 的中点文案、线上登记状态和机厅信息；身份核对完成前暂停私有资料与远程操作，避免更换服务端或跨机厅时误读、误写数据。"
+            "建立机厅与终端身份、schema 8 协议和旧终端兼容边界；新增六位玩家编号、玩家编号别名、首次启动引导和机厅名称展示。统一 App、网页端、服务端与 QQ Bot 的中点文案、线上登记状态和机厅信息；身份核对完成前暂停私有资料与远程操作，避免更换服务端或跨机厅时误读、误写数据。"
         ),
         Triple(
             "0.10.2",
             "公开测试与同步故障修复",
-            "发布可自建的公开测试终端、独立队列网站和部署文档，并增加三端版本状态、查询人数与分组切换细节。修复同步关闭、测试终端接管、移动设备与网站并发登记的竞态；旧日志中错误的系统事件机台字段会自动修复，上传前再次规范化，服务端错误也会准确指出事件、字段和原因。现有闭店、轮换和排队规则不变。"
+            "发布可自建的公开测试终端、独立的网页端和部署文档，并增加三端版本状态、查询人数与分组切换细节。修复同步关闭、测试终端接管、移动设备与网页端并发登记的竞态；旧日志中错误的系统事件机台字段会自动修复，上传前再次规范化，服务端错误也会准确指出事件、字段和原因。现有闭店、轮换和排队规则不变。"
         ),
         Triple(
             "0.10.0",
             "十台机台与分组管理",
-            "机台可以添加、删除并连续配置为 A 至 J，内部稳定身份会让详情、分组和停用状态在重编号后继续跟随原机台。首页支持机台分组分页、默认分组和单机台完整布局；网站、QQ Bot、日志和云端同步同时支持十台及分组信息。添加、删除机台和修改游玩容量仍只能在关闭登记排队后进行，原有轮换、特殊状态、共同游玩预览和撤销规则不变。"
+            "机台可以添加、删除并连续配置为 A 至 J，内部稳定身份会让详情、分组和停用状态在重编号后继续跟随原机台。首页支持机台分组分页、默认分组和单机台完整布局；网页端、QQ Bot、日志和云端同步同时支持十台及分组信息。添加、删除机台和修改游玩容量仍只能在关闭登记排队后进行，原有轮换、特殊状态、共同游玩预览和撤销规则不变。"
         ),
         Triple(
             "0.9.2",
@@ -20771,12 +22957,12 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.9.0",
             "完整机台配置",
-            "每台机台可以配置类型、服务器、游戏版本、1 人或 2 人游玩容量，以及单人和共同游玩的计划时间。容量为 1 时，各端统一将本次登记设为单人游玩，不改变玩家资料默认偏好，并禁用固定组合、共同游玩和不适用的偏好操作。关闭登记会清空原队列，重新开启时载入最新机台配置和状态并开始新的排队批次；网站和终端均可查看机台详情。"
+            "每台机台可以配置类型、服务器、游戏版本、1 人或 2 人游玩容量，以及单人和共同游玩的计划时间。容量为 1 时，各端统一将本次登记设为单人游玩，不改变玩家资料默认偏好，并禁用固定组合、共同游玩和不适用的偏好操作。关闭登记会清空原队列，重新开启时载入最新机台配置和状态并开始新的排队批次；网页端和终端均可查看机台详情。"
         ),
         Triple(
             "0.8.2",
             "多机台同步边界修复",
-            "修复多台机台累计超过 20 份登记时，关闭登记或恢复队列产生的跨机台事件可能被服务器拒绝，导致网站与 QQ Bot 暂时停留在旧队列的问题。事件容量现在按当前四台机台、每台 20 份登记的总上限统一校验。"
+            "修复多台机台累计超过 20 份登记时，关闭登记或恢复队列产生的跨机台事件可能被服务器拒绝，导致网页端与 QQ Bot 暂时停留在旧队列的问题。事件容量现在按当前四台机台、每台 20 份登记的总上限统一校验。"
         ),
         Triple(
             "0.8.1",
@@ -20786,42 +22972,42 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.8.0",
             "机台扩展与拖动可靠性",
-            "机台数量现在可以连续配置为 1 至 4 台，网站、QQ Bot、日志与同步会随现场配置显示机台 A 至 D。进一步修复顺序调整时的跟手、避让和左侧边界行为；高风险确认会核对打开弹窗时的队列状态，避免现场变化后执行过期操作。旧版双机台数据会自动迁移，缩减机台前会保护仍有登记或处于停止使用状态的机台。"
+            "机台数量现在可以连续配置为 1 至 4 台，网页端、QQ Bot、日志与同步会随现场配置显示机台 A 至 D。进一步修复顺序调整时的跟手、避让和左侧边界行为；高风险确认会核对打开弹窗时的队列状态，避免现场变化后执行过期操作。旧版双机台数据会自动迁移，缩减机台前会保护仍有登记或处于停止使用状态的机台。"
         ),
         Triple(
             "0.7.5",
             "拖动交互与跨端执行可靠性",
-            "拖动内容会继续跟随手指，避让空位只在越过相邻项目后移动；远程命令结果与队列状态一同保存，意外退出后不会重复执行。App 与 QQ Bot 的延迟确认会锁定具体搭档、位置及特殊状态；网站和 QQ 通知也会继续跟随线上登记离队或排队批次变化后的真实结果。"
+            "拖动内容会继续跟随手指，避让空位只在越过相邻项目后移动；远程命令结果与队列状态一同保存，意外退出后不会重复执行。App 与 QQ Bot 的延迟确认会锁定具体搭档、位置及特殊状态；网页端和 QQ 通知也会继续跟随线上登记离队或排队批次变化后的真实结果。"
         ),
         Triple(
             "0.7.4",
             "跨端反馈与通知准确性",
-            "修复等待登记可能被误写成正在与游玩位置玩家共同游玩；网站在终端确认线上登记后立即显示成功；远程命令回执写入失败时会保留首次结果并继续重试，避免当前运行周期内重复执行。正常轮换、未到场记录清除和暂缓一次改为按实际结果分别生成通知，顺序调整失效时也会明确说明未执行。"
+            "修复等待登记可能被误写成正在与游玩位置玩家共同游玩；网页端在终端确认线上登记后立即显示成功；远程命令回执写入失败时会保留首次结果并继续重试，避免当前运行周期内重复执行。正常轮换、未到场记录清除和暂缓一次改为按实际结果分别生成通知，顺序调整失效时也会明确说明未执行。"
         ),
         Triple(
             "0.7.3",
             "特殊状态轮换可靠性",
-            "修复待签到、暂缓一次、暂时离开和固定组合在连续轮换、短队列及位置校正中的边界问题。自动处理结果现在分别生成准确的日志和通知；网站与 QQ Bot 的延迟操作会在终端复核登记位置、固定组合和缺席状态，避免旧确认覆盖现场新变化。"
+            "修复待签到、暂缓一次、暂时离开和固定组合在连续轮换、短队列及位置校正中的边界问题。自动处理结果现在分别生成准确的日志和通知；网页端与 QQ Bot 的延迟操作会在终端复核登记位置、固定组合和缺席状态，避免旧确认覆盖现场新变化。"
         ),
         Triple(
             "0.7.2",
             "队列投影与共同游玩预览",
-            "暂缓一次的真实登记会显示在预计下次进入游玩位置的位置，待签到登记也按正常登记参与分组和估时；底层顺序、拖动、保存、撤销及实际轮换保持不变。开放的单人位置会显示灰色、不可操作的共同游玩预览，并可在设置中关闭。App、网站和 QQ Bot 同步使用相同的位置、估时与搭档说明。"
+            "暂缓一次的真实登记会显示在预计下次进入游玩位置的位置，待签到登记也按正常登记参与分组和估时；底层顺序、拖动、保存、撤销及实际轮换保持不变。开放的单人位置会显示灰色、不可操作的共同游玩预览，并可在设置中关闭。App、网页端和 QQ Bot 同步使用相同的位置、估时与搭档说明。"
         ),
         Triple(
             "0.7.1",
             "线上登记开放状态修复",
-            "修复终端关闭登记后再次开放时，网站和 QQ Bot 仍可能被旧状态拒绝加入排队的问题。远程命令轮询现在会持续读取终端最新的登记开放状态，无需重启应用或重新切换同步开关。"
+            "修复终端关闭登记后再次开放时，网页端和 QQ Bot 仍可能被旧状态拒绝加入排队的问题。远程命令轮询现在会持续读取终端最新的登记开放状态，无需重启应用或重新切换同步开关。"
         ),
         Triple(
             "0.7.0",
             "统一队列动作引擎",
-            "现场终端、移动设备、网站和 QQ Bot 的队列操作统一由终端动作引擎校验并执行；跨机台、撤销、本轮处理、固定组合和特殊状态继续沿用既有排队算法，同时增加原子提交、过期计划保护及连续行为对照测试。界面、同步协议和既有数据格式保持兼容。"
+            "现场终端、移动设备、网页端和 QQ Bot 的队列操作统一由终端动作引擎校验并执行；跨机台、撤销、本轮处理、固定组合和特殊状态继续沿用既有排队算法，同时增加原子提交、过期计划保护及连续行为对照测试。界面、同步协议和既有数据格式保持兼容。"
         ),
         Triple(
             "0.6.7",
             "跨端队列动作一致性",
-            "机台停止使用期间会暂停本轮和线上签到计时，恢复后重新计时；终端、网站和 QQ Bot 统一固定组合、特殊状态、估时和通知说明。远程命令会保存首次处理结果，断网重投不再重复执行；后方位置校正也会先按正常轮换模拟，避免无效调整。"
+            "机台停止使用期间会暂停本轮和线上签到计时，恢复后重新计时；终端、网页端和 QQ Bot 统一固定组合、特殊状态、估时和通知说明。远程命令会保存首次处理结果，断网重投不再重复执行；后方位置校正也会先按正常轮换模拟，避免无效调整。"
         ),
         Triple(
             "0.6.6",
@@ -20836,7 +23022,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.6.4",
             "估时表达修正",
-            "预计等待时间不足 1 分钟时恢复显示“预计很快可以游玩”，避免将队列估时表达成精确倒计时；App、网站和 QQ Bot 使用一致文案。"
+            "预计等待时间不足 1 分钟时恢复显示“预计很快可以游玩”，避免将队列估时表达成精确倒计时；App、网页端和 QQ Bot 使用一致文案。"
         ),
         Triple(
             "0.6.3",
@@ -20871,7 +23057,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.5.3",
             "交互收尾与状态一致性",
-            "终端连续 30 秒无操作会返回首页并将队列翻至最左侧，填写页面会先提示；同时完善资料表单保护、远程新登记定位、同步时间详情，以及 App、网站和 QQ Bot 的离线、停机与等待时间表达。"
+            "终端连续 30 秒无操作会返回首页并将队列翻至最左侧，填写页面会先提示；同时完善资料表单保护、远程新登记定位、同步时间详情，以及 App、网页端和 QQ Bot 的离线、停机与等待时间表达。"
         ),
         Triple(
             "0.5.2",
@@ -20896,7 +23082,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.4.0",
             "线上登记与远程排队操作",
-            "网站和 QQ Bot 可以通过玩家资料创建线上登记；玩家到场后需在终端完成签到。QQ Bot 同时支持管理本人当前登记，终端继续负责最终校验和落地。"
+            "网页端和 QQ Bot 可以通过玩家资料创建线上登记；玩家到场后需在终端完成签到。QQ Bot 同时支持管理本人当前登记，终端继续负责最终校验和落地。"
         ),
         Triple(
             "0.3.7",
@@ -20921,17 +23107,17 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.3.3",
             "视觉统一与细节校正",
-            "统一界面色彩、文字层级、按钮状态和弹窗反馈，并校正终端、网站与 QQ 之间的状态和详情显示。"
+            "统一界面色彩、文字层级、按钮状态和弹窗反馈，并校正终端、网页端与 QQ 之间的状态和详情显示。"
         ),
         Triple(
             "0.3.2",
             "跨端状态一致性",
-            "修正网站估时、玩家资料回填、营业状态和登记详情在终端、网站与 QQ 之间显示不一致的问题。"
+            "修正网页端估时、玩家资料回填、营业状态和登记详情在终端、网页端与 QQ 之间显示不一致的问题。"
         ),
         Triple(
             "0.3.1",
             "闭店收尾与个人通知",
-            "闭店后为现有队列保留最多 20 分钟的收尾时间，并统一终端、网站与 QQ Bot 的状态；玩家还可以单独开启或关闭自己的排队通知。"
+            "闭店后为现有队列保留最多 20 分钟的收尾时间，并统一终端、网页端与 QQ Bot 的状态；玩家还可以单独开启或关闭自己的排队通知。"
         ),
         Triple(
             "0.3.0",
@@ -20941,7 +23127,7 @@ private fun VersionHistoryDialog(onDismiss: () -> Unit) {
         Triple(
             "0.2.19",
             "机台停止原因补充",
-            "加入机台维护和其他原因说明，并统一终端、网站与日志中的停止状态。"
+            "加入机台维护和其他原因说明，并统一终端、网页端与日志中的停止状态。"
         ),
         Triple(
             "0.2.18",
@@ -21090,7 +23276,7 @@ private fun CloudSyncInfoDialog(
         HorizontalDivider(color = Separator.copy(alpha = .6f))
         CloudSyncMeaningRow(
             phase = QueueCloudSyncPhase.SYNCED,
-            description = "最新队列状态已经同步到服务端，网站可以显示当前内容。"
+            description = "最新队列状态已经同步到服务端，网页端可以显示当前内容。"
         )
         HorizontalDivider(color = Separator.copy(alpha = .6f))
         CloudSyncMeaningRow(
@@ -21105,7 +23291,7 @@ private fun CloudSyncInfoDialog(
 
         Spacer(Modifier.height(13.dp))
         Text(
-            "网站会显示登记昵称、队列位置、游玩状态、预计等待时间，以及玩家允许网站显示的 QQ。完整的玩家资料不会公开；性别、默认游玩偏好和资料内部编号不会出现在网站的队列或日志中。",
+            "网页端会显示登记昵称、队列位置、游玩状态、预计等待时间，以及玩家允许网页端显示的 QQ。完整的玩家资料不会公开；性别、默认游玩偏好和资料内部编号不会出现在网页端的队列或日志中。",
             color = SecondaryText,
             fontSize = 11.sp,
             lineHeight = 17.sp
@@ -21192,9 +23378,9 @@ private fun AppDetailSectionTitle(title: String) {
 }
 
 @Composable
-private fun AppDetailRow(label: String, value: String) {
+private fun AppDetailRow(label: String, value: String, verticalPadding: Dp = 12.dp) {
     Row(
-        Modifier.fillMaxWidth().padding(vertical = 12.dp),
+        Modifier.fillMaxWidth().padding(vertical = verticalPadding),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(label, color = TertiaryText, fontSize = 12.sp, modifier = Modifier.width(92.dp))
@@ -21209,16 +23395,21 @@ private fun AppDetailRow(label: String, value: String) {
     }
 }
 
+/** A row of 应用详情, which holds more rows and must still fit a 720p screen. */
+@Composable
+private fun AppDetailRowCompact(label: String, value: String) = AppDetailRow(label, value, verticalPadding = 10.dp)
+
 @Composable
 private fun AppDetailLinkRow(
     label: String,
     value: String,
     actionLabel: String,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    verticalPadding: Dp = 12.dp
 ) {
     Row(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable(onClick = onClick)
-            .padding(vertical = 12.dp),
+            .padding(vertical = verticalPadding),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(label, color = TertiaryText, fontSize = 12.sp, modifier = Modifier.width(92.dp))
@@ -21241,39 +23432,49 @@ private fun StopMachineChooser(
     onDismiss: () -> Unit,
     onSelect: (MachineId) -> Unit
 ) {
-    ModalSurface(onDismiss, width = 470.dp) {
+    // One list in the style of 选择要转至的机台 (maintainer, 2026-11-26, usability U14).
+    ModalSurface(onDismiss, width = 560.dp) {
         Text("报告机台停止使用", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(6.dp))
         Text(
             "选择需要停止使用的机台。已停止的机台不能再次选择，现有登记不会被删除。",
             color = SecondaryText,
-            fontSize = 12.sp
+            fontSize = QueueTextSize.Body,
+            lineHeight = 20.sp
         )
-        Spacer(Modifier.height(16.dp))
-        machines.forEachIndexed { index, machine ->
-            if (index > 0) Spacer(Modifier.height(9.dp))
-            MachineStopChoice(machine.name, machine.status) {
-                onSelect(machine.machineId)
+        Spacer(Modifier.height(QueueSpacing.L))
+        FlowListGroup {
+            machines.forEachIndexed { index, machine ->
+                val status = machine.status
+                val queue = machine.queue
+                val waitingPositions = queue.waitingProjection(includeCommonPlayPreview = false).positions.size
+                val stoppedReason = "机台已停止使用：${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}。"
+                FlowListRow(
+                    title = machine.name,
+                    description = when {
+                        !status.isOperational -> stoppedReason
+                        queue.registrationCount == 0 -> "当前没有登记。"
+                        else -> "$waitingPositions 个等待位置·${queue.registrationCount} 份登记"
+                    },
+                    onClick = { onSelect(machine.machineId) },
+                    leading = {
+                        FlowIconTile(enabled = status.isOperational) { color ->
+                            Text(machine.machineId.name, color = color, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    },
+                    dividerInset = FlowTileDividerInset.takeIf { index > 0 },
+                    enabled = status.isOperational,
+                    disabledReason = stoppedReason,
+                    disabledActionTitle = "停止使用 ${machine.name}",
+                    trailing = {
+                        if (status.isOperational) FlowChevron() else FlowGreyBadge("已停止使用")
+                    }
+                )
             }
         }
         Spacer(Modifier.height(13.dp))
         CancelAction(onDismiss)
     }
-}
-
-@Composable
-private fun MachineStopChoice(machineName: String, status: MachineStatus, onClick: () -> Unit) {
-    ActionRow(
-        title = machineName,
-        description = if (status.isOperational) {
-            "选择后继续说明停止使用的原因。"
-        } else {
-            "已停止使用·${machineStopReasonLabel(status.stopReason, status.stopReasonDetail)}"
-        },
-        destructive = status.isOperational,
-        enabled = status.isOperational,
-        onClick = onClick
-    )
 }
 
 @Composable
@@ -21291,7 +23492,7 @@ private fun StopMachineReasonDialog(
             Text("补充其他原因", color = PrimaryText, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(6.dp))
             Text(
-                "可以填写便于现场识别的具体原因。此项为选填；留空时将只显示“其他原因”。",
+                "可以填写便于现场识别的具体原因，机台上会显示填写的内容。此项为选填；留空时显示“其他原因”。",
                 color = SecondaryText,
                 fontSize = 12.sp,
                 lineHeight = 18.sp
@@ -21827,6 +24028,8 @@ private fun ReorderConfirmation(
         Spacer(Modifier.height(16.dp))
         PrimaryButton("保持原有顺序", onKeepOriginal, Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
+        // R2: unticked, the button says what is missing instead of doing nothing (copy table).
+        val reasonContext = LocalContext.current
         Text(
             "确认调整",
             color = if (consentConfirmed) Destructive else TertiaryText,
@@ -21834,7 +24037,12 @@ private fun ReorderConfirmation(
             fontWeight = FontWeight.Medium,
             textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                .background(PageBackground).clickable(enabled = consentConfirmed, onClick = onConfirm).padding(13.dp)
+                .background(PageBackground)
+                .clickable {
+                    if (consentConfirmed) onConfirm()
+                    else showDisabledActionReason(reasonContext, "确认调整", "请先勾选上方的确认项。")
+                }
+                .padding(13.dp)
         )
     }
 }
@@ -21847,7 +24055,9 @@ private fun PositionReorderConfirmation(
     onConfirm: () -> Unit
 ) {
     var consentConfirmed by remember(proposal) { mutableStateOf(false) }
-    val originalPositions = proposal.originalQueue.waitingPositions()
+    // The positions the drag worked on, as the home screen shows and names them.
+    val originalPositions = proposal.positions.positions
+    val labels = proposal.positions.labels
     val movedRegistrations = originalPositions
         .getOrNull(proposal.sourcePositionIndex)
         .orEmpty()
@@ -21861,22 +24071,21 @@ private fun PositionReorderConfirmation(
     } else {
         movedRegistrations
     }
-    val sourceLabel = "${proposal.machineId.name}${proposal.sourcePositionIndex + 1}"
-    val destinationLabel = "${proposal.machineId.name}${proposal.destinationPositionIndex + 1}"
-    val shiftedStart = if (movedForward) {
-        proposal.destinationPositionIndex + 1
-    } else {
-        proposal.sourcePositionIndex + 2
-    }
-    val shiftedEnd = if (movedForward) {
-        proposal.sourcePositionIndex
-    } else {
-        proposal.destinationPositionIndex + 1
-    }
+    fun label(index: Int) = labels.getOrNull(index) ?: "${proposal.machineId.name}${index + 1}"
+    val sourceLabel = label(proposal.sourcePositionIndex)
+    val destinationLabel = label(proposal.destinationPositionIndex)
+    // The positions that make room: from the destination up to the one before the source when
+    // moving forward, from the one after the source up to the destination otherwise.
+    val shiftedStart = label(
+        if (movedForward) proposal.destinationPositionIndex else proposal.sourcePositionIndex + 1
+    )
+    val shiftedEnd = label(
+        if (movedForward) proposal.sourcePositionIndex - 1 else proposal.destinationPositionIndex
+    )
     val shiftedRange = if (shiftedStart == shiftedEnd) {
-        "位置 ${proposal.machineId.name}$shiftedStart"
+        "位置 $shiftedStart"
     } else {
-        "位置 ${proposal.machineId.name}$shiftedStart 至 ${proposal.machineId.name}$shiftedEnd"
+        "位置 $shiftedStart 至 $shiftedEnd"
     }
     val movedNames = movedRegistrations.joinToString("、") { "“${it.displayId}”" }
     val delayedNames = delayedRegistrations.take(3).joinToString("、") { "“${it.displayId}”" }
@@ -21956,6 +24165,8 @@ private fun PositionReorderConfirmation(
         Spacer(Modifier.height(16.dp))
         PrimaryButton("保持原有顺序", onKeepOriginal, Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
+        // R2: unticked, the button says what is missing instead of doing nothing (copy table).
+        val reasonContext = LocalContext.current
         Text(
             "确认调整位置",
             color = if (consentConfirmed) Destructive else TertiaryText,
@@ -21963,7 +24174,12 @@ private fun PositionReorderConfirmation(
             fontWeight = FontWeight.Medium,
             textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                .background(PageBackground).clickable(enabled = consentConfirmed, onClick = onConfirm).padding(13.dp)
+                .background(PageBackground)
+                .clickable {
+                    if (consentConfirmed) onConfirm()
+                    else showDisabledActionReason(reasonContext, "确认调整位置", "请先勾选上方的确认项。")
+                }
+                .padding(13.dp)
         )
     }
 }
@@ -21972,11 +24188,18 @@ private fun PositionReorderConfirmation(
 private fun ModalSurface(
     onDismiss: () -> Unit,
     width: androidx.compose.ui.unit.Dp = 440.dp,
+    /**
+     * False while the dialog must stay open (a countdown): a tap outside or BACK then does
+     * nothing. Checked before the closing animation starts, so a refused close never leaves an
+     * invisible dialog behind that swallows every touch.
+     */
+    dismissible: Boolean = true,
     content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit
 ) {
     val dialogShape = RoundedCornerShape(DialogRadius)
     var shown by remember { mutableStateOf(false) }
     var dismissing by remember { mutableStateOf(false) }
+    val canDismiss by rememberUpdatedState(dismissible)
     val coroutineScope = rememberCoroutineScope()
     val visibilityProgress by animateFloatAsState(
         if (shown) 1f else 0f,
@@ -21984,12 +24207,17 @@ private fun ModalSurface(
         label = "弹窗显隐"
     )
     val dismissWithAnimation = {
-        if (!dismissing) {
+        if (!dismissing && canDismiss) {
             dismissing = true
             shown = false
             coroutineScope.launch {
                 delay(140L)
                 onDismiss()
+                // A caller that does not take the dialog away gets it back: never invisible
+                // and still on top (review 2026-11-27).
+                delay(60L)
+                dismissing = false
+                shown = true
             }
         }
     }
@@ -22670,20 +24898,29 @@ private fun rememberCurrentTimeMillis(): Long {
     return currentTime
 }
 
-/** The width a tile needs for its nickname, within [RegistrationTileMinWidth] and [RegistrationTileMaxWidth]. */
+/**
+ * A rough width for a tile, from the length of its nickname; only a fallback while a dragged
+ * position has not been measured yet. [measureQueuePosition] measures the real width.
+ */
 private fun registrationTileWidth(displayId: String): Dp {
     val visibleId = queueDisplayId(displayId)
     val visibleCharacters = visibleId
         .codePointCount(0, visibleId.length)
         .coerceIn(3, 6)
-    return (40 + visibleCharacters * 17).dp.coerceIn(RegistrationTileMinWidth, RegistrationTileMaxWidth)
+    return (40 + visibleCharacters * 17).dp.coerceAtLeast(RegistrationTileMinWidth)
 }
 
-private fun inlineReorderRegistrationTileWidth(displayId: String): Dp {
-    val visibleId = queueDisplayId(displayId)
-    val visibleCharacters = visibleId
-        .codePointCount(0, visibleId.length)
-        .coerceIn(4, 6)
+/**
+ * Wide enough for the nickname and for the play preference under it (11 sp, one character
+ * narrower per step than the name's scale), so that a short name such as Rin does not cut
+ * 允许他人加入 or 与朋友共同游玩.
+ */
+private fun inlineReorderRegistrationTileWidth(registration: Registration): Dp {
+    val visibleId = queueDisplayId(registration.displayId)
+    val nameCharacters = visibleId.codePointCount(0, visibleId.length)
+    val label = playPreferenceLabel(registration)
+    val labelCharacters = label.codePointCount(0, label.length) - 1
+    val visibleCharacters = maxOf(nameCharacters, labelCharacters).coerceIn(4, 6)
     return (86 + visibleCharacters * 8).dp
 }
 
@@ -23083,11 +25320,47 @@ private fun roundDurationMillis(
     sharedRoundMinutes * 60_000L
 }
 
+/**
+ * A shown wait in words (maintainer, 2026-11-28): below an hour in minutes (约 45 分钟), from an
+ * hour on in hours and minutes without a zero (约 1 小时 15 分钟, 约 2 小时), and above two
+ * hours 2 小时以上, without 约 or 最快. [earliest] puts 最快 before an estimate that is the
+ * earliest time. [minutes] is a value of WaitEstimator.displayMinutes.
+ */
+internal fun formatWaitAmount(minutes: Long, earliest: Boolean = false): String {
+    if (minutes > WaitEstimator.LONG_WAIT_MINUTES) return LONG_WAIT_TEXT
+    val amount = if (minutes >= 60L) {
+        val hours = minutes / 60L
+        val rest = minutes % 60L
+        if (rest == 0L) "$hours 小时" else "$hours 小时 $rest 分钟"
+    } else {
+        "$minutes 分钟"
+    }
+    return if (earliest) "最快约 $amount" else "约 $amount"
+}
+
+/** How a wait of more than two hours is shown (maintainer, 2026-11-28). */
+internal const val LONG_WAIT_TEXT = "2 小时以上"
+
+/** [amount] after a word in Chinese: a space before a leading number, as 这份登记 2 小时以上. */
+private fun afterWord(amount: String): String = if (amount.firstOrNull()?.isDigit() == true) " $amount" else amount
+
 /** The value under 新登记预计等待 on a machine card, so it does not repeat 预计. */
 internal fun formatJoinWaitEstimate(minutes: Long?): String = when {
     minutes == null -> "暂时无法估算"
     minutes <= 0L -> "很快可以游玩"
-    else -> "约 $minutes 分钟"
+    else -> formatWaitAmount(minutes)
+}
+
+/**
+ * The same value while joining with the tick box for the two machines on:
+ * [pairedEarliestMinutes] is the wait at the other machine of the pair. When that is the earlier
+ * one it is shown as the earliest, worded as [formatPositionWaitEstimate] words an uncertain wait.
+ */
+internal fun formatJoinWaitEstimate(minutes: Long?, pairedEarliestMinutes: Long?): String = when {
+    pairedEarliestMinutes == null || (minutes != null && pairedEarliestMinutes >= minutes) ->
+        formatJoinWaitEstimate(minutes)
+    pairedEarliestMinutes <= 0L -> "可能很快可以游玩"
+    else -> formatWaitAmount(pairedEarliestMinutes, earliest = true)
 }
 
 /**
@@ -23097,16 +25370,90 @@ internal fun formatJoinWaitEstimate(minutes: Long?): String = when {
 internal fun formatPositionWaitEstimate(minutes: Long?, uncertain: Boolean = false): String = when {
     minutes == null -> "暂时无法估算"
     minutes <= 0L -> if (uncertain) "可能很快可以游玩" else "预计很快可以游玩"
-    uncertain -> "最快约 $minutes 分钟后可以游玩"
-    else -> "约 $minutes 分钟后可以游玩"
+    else -> "${formatWaitAmount(minutes, earliest = uncertain)}后可以游玩"
+}
+
+/**
+ * Shown under a 最快 wait when the wait if nobody is moved between the two machines lies far
+ * from it (WaitEstimator.rangeUpperMinutes): that time, with its condition. The two times are
+ * named one by one, each with when it applies, not as a range: the wait will be near one of
+ * them, not anywhere in between (maintainer, 2026-11-28: “实际并不是在这个范围内取，而是在每个
+ * 数的邻域”“写出来各种情况，比如‘最快约X分钟。如果XXX，约X分钟’”). [subject] is 这份登记 or
+ * 这个位置. Null when there is no such time.
+ */
+internal fun noArrangementWaitNote(subject: String, minutes: Long?): String? =
+    minutes?.let { "系统未在两台机台之间安排登记时，$subject${afterWord(formatWaitAmount(it))}后可以游玩。" }
+
+/**
+ * Shown when the wait of the registrations [keys] is earlier than that of a position ahead of
+ * them. The screen groups the waiting order as it stands; the estimate counts a registration
+ * ahead that is sure to be arranged to the other machine as gone, and one behind may then pass
+ * and play earlier (review 2026-11-27, X-B1: 10, 25, 40, 40, 25, 50 minutes). The times are
+ * right; this line says why. Passing already shown on screen never causes it, as the screen
+ * groups positions with the same rules. [subject] is 这个位置 or 这份登记.
+ */
+internal fun earlierThanAheadNote(
+    subject: String,
+    estimates: WaitEstimator.Result,
+    positions: List<Set<Int>>,
+    keys: Set<Int>,
+    shownMinutes: Long?
+): String? {
+    if (shownMinutes == null) return null
+    val index = positions.indexOfFirst { position -> position.any { it in keys } }
+    if (index <= 0) return null
+    // Only a registration ahead that may be arranged to the other machine explains it; without
+    // one the line would name a cause that is not there.
+    val moveAhead = (0 until index).any { ahead ->
+        positions[ahead].any { key -> (estimates.moveConfidence[key] ?: 0.0) > 0.0 }
+    }
+    if (!moveAhead) return null
+    val earlier = (0 until index).any { ahead ->
+        val aheadMinutes = shownPositionWait(estimates, positions, positions[ahead])?.minutes
+        aheadMinutes != null && aheadMinutes > shownMinutes
+    }
+    if (!earlier) return null
+    val others = if (subject == "这个位置") "位置" else "登记"
+    return "受系统在两台机台之间安排登记的影响，${subject}预计早于前方的部分${others}游玩。"
+}
+
+/**
+ * Shown under a wait when pending online registrations ahead may not check in. The wait itself
+ * counts them as checking in, as the positions on screen are grouped; this line gives the
+ * earlier time for when they do not (maintainer, 2026-11-26). Null when it would not be shown
+ * earlier than [shownMinutes]. [subject] is 这份登记 or 这个位置.
+ */
+internal fun onlineMissingWaitNote(subject: String, earlierMillis: Long?, shownMinutes: Long?): String? {
+    val earlier = onlineMissingWaitMinutes(earlierMillis, shownMinutes) ?: return null
+    return if (earlier <= 0L) {
+        "前方的线上登记未按时签到时，${subject}可能很快可以游玩。"
+    } else {
+        "前方的线上登记未按时签到时，$subject${afterWord(formatWaitAmount(earlier, earliest = true))}后可以游玩。"
+    }
+}
+
+/**
+ * The minutes of the earlier time for when the pending online registrations ahead do not check
+ * in, rounded down as an earliest time is; null unless that shows earlier than [shownMinutes].
+ * The terminal, the snapshot (and so the website and the QQ Bot) all use it.
+ */
+internal fun onlineMissingWaitMinutes(earlierMillis: Long?, shownMinutes: Long?): Long? {
+    if (earlierMillis == null || shownMinutes == null) return null
+    // Above two hours both read 2 小时以上: nothing earlier to tell.
+    return WaitEstimator.displayMinutes(earlierMillis, roundDown = true)
+        .takeIf { it < shownMinutes && it <= WaitEstimator.LONG_WAIT_MINUTES }
 }
 
 /** Shown with an uncertain wait (docs/releases/wait-estimate-2026-11.md). */
 internal const val UNCERTAIN_WAIT_NOTE =
     "受系统在两台机台之间安排登记的影响，等待时间可能不准确，请以现场实际情况为准。"
 
-/** A waiting position's minutes as shown, and whether they may be wrong. */
-internal data class ShownWait(val minutes: Long, val uncertain: Boolean)
+/**
+ * A waiting position's minutes as shown, and whether they may be wrong. [upperMinutes] is set
+ * for an uncertain wait far from the wait if nobody is moved: those minutes, shown with their
+ * condition by noArrangementWaitNote.
+ */
+internal data class ShownWait(val minutes: Long, val uncertain: Boolean, val upperMinutes: Long? = null)
 
 /**
  * The shown wait of the position holding [keys], on a machine whose waiting positions are
@@ -23117,17 +25464,29 @@ internal fun shownPositionWait(
     positions: List<Set<Int>>,
     keys: Set<Int>
 ): ShownWait? {
-    val positionEstimates = positions.map(estimates::estimate)
-    val minutes = WaitEstimator.displayMinutesInOrder(positionEstimates)
+    // A position shows the first of its registrations to play, wherever that is; no position
+    // shows later than the times at this machine of the positions behind it, so a registration
+    // that may move to the other machine of a pair does not pull the ones before it down
+    // (WaitEstimator.Result.hereEstimate, 2026-11-27).
+    val limits = WaitEstimator.laterLimits(positions.map(estimates::hereEstimate))
     val index = positions.indexOfFirst { it == keys }
         .takeIf { it >= 0 }
         ?: positions.indexOfFirst { position -> position.any { it in keys } }
-    if (index >= 0) {
-        val shown = minutes[index] ?: return null
-        return ShownWait(shown, positionEstimates[index]?.uncertain == true)
-    }
-    val estimate = estimates.estimate(keys) ?: return null
-    return ShownWait(WaitEstimator.displayMinutes(estimate.waitMillis, estimate.uncertain), estimate.uncertain)
+    // One registration of a shared position: its own wait, which its partner's move to the other
+    // machine does not change.
+    val estimate = if (keys.size == 1 && index >= 0 && positions[index] != keys) {
+        estimates.registrations[keys.single()]
+    } else {
+        estimates.estimate(keys)
+    } ?: return null
+    val value = WaitEstimator.displayMinutes(estimate.waitMillis, estimate.uncertain)
+    val limit = limits.getOrNull(index)
+    val shown = limit?.let { minOf(value, it) } ?: value
+    return ShownWait(
+        minutes = shown,
+        uncertain = estimate.uncertain,
+        upperMinutes = WaitEstimator.rangeUpperMinutes(shown, estimate.uncertain, estimates.waitIfNobodyMoves(keys))
+    )
 }
 
 private fun positionWaitEstimateLabel(
@@ -23149,10 +25508,13 @@ private fun randomChinesePlayerId(): String {
 private fun createPositionReorderProposal(
     machineId: MachineId,
     queue: MachineQueue,
+    positions: DragPositions,
     sourceIndex: Int,
-    destinationIndex: Int
+    destinationIndex: Int,
+    /** How the home screen would group this machine's registrations once the order is the given one. */
+    positionsAfter: (proposedQueue: MachineQueue, movedKeys: Set<Int>) -> List<List<Registration>>
 ): PositionReorderProposal? {
-    val currentPositions = queue.waitingPositions()
+    val currentPositions = positions.positions
     if (
         sourceIndex !in currentPositions.indices ||
         destinationIndex !in currentPositions.indices ||
@@ -23163,19 +25525,25 @@ private fun createPositionReorderProposal(
         val movedPosition = removeAt(sourceIndex)
         add(destinationIndex, movedPosition)
     }
-    val proposedQueue = queue.moveWaitingPosition(sourceIndex, destinationIndex)
-    val actualPositions = groupIntoPositions(proposedQueue.waiting)
+    val movedKeys = currentPositions[sourceIndex].mapTo(mutableSetOf()) { it.key }
+    val proposedQueue = queue.withShownPositionMoved(
+        positions = currentPositions.map { position -> position.mapTo(mutableSetOf()) { it.key } },
+        sourceIndex = sourceIndex,
+        destinationIndex = destinationIndex
+    )
+    if (proposedQueue.waiting.map { it.key } == queue.waiting.map { it.key }) return null
     return PositionReorderProposal(
         machineId = machineId,
         originalQueue = queue,
         proposedOrder = proposedQueue.allRegistrations,
+        positions = positions,
         sourcePositionIndex = sourceIndex,
         destinationPositionIndex = destinationIndex,
-        movedRegistrationKeys = currentPositions[sourceIndex].map { it.key }.toSet(),
+        movedRegistrationKeys = movedKeys,
         relationshipChanges = positionRelationshipDescriptions(
             machineId = machineId,
             expectedPositions = expectedPositions,
-            actualPositions = actualPositions
+            actualPositions = positionsAfter(proposedQueue, movedKeys)
         )
     )
 }
@@ -23193,7 +25561,7 @@ private fun positionRelationshipDescriptions(
     repeat(count) { index ->
         if (expectedKeys.getOrNull(index) == actualKeys.getOrNull(index)) return@repeat
         val actualGroup = actualPositions.getOrNull(index)
-        val positionName = "队列位置 ${machineId.name}${index + 1}"
+        val positionName = "位置 ${machineId.name}${index + 1}"
         descriptions += when {
             actualGroup == null -> "$positionName 将不再作为单独的位置显示。"
             actualGroup.size == 1 -> "$positionName 将由“${actualGroup.first().displayId}”单独游玩。"
@@ -23222,7 +25590,7 @@ private fun MachineQueue.registrationPositionName(
 
 private fun playingPositionName(machineId: MachineId): String = "游玩位置 ${machineId.name}"
 
-private fun waitingFrontPositionName(machineId: MachineId): String = "队列位置 ${machineId.name}1"
+private fun waitingFrontPositionName(machineId: MachineId): String = "位置 ${machineId.name}1"
 
 private fun machineStopReasonLabel(
     reason: MachineStopReason?,
@@ -23231,9 +25599,8 @@ private fun machineStopReasonLabel(
     MachineStopReason.NOT_POWERED_ON -> "机台未开机"
     MachineStopReason.NETWORK_DISCONNECTED -> "机台断网"
     MachineStopReason.MAINTENANCE -> "机台维护"
-    MachineStopReason.OTHER -> normalizeMachineStopReasonDetail(reason, reasonDetail)
-        ?.let { "其他原因（$it）" }
-        ?: "其他原因"
+    // The reason written in, when there is one, rather than 其他原因 (maintainer, 2026-11-28).
+    MachineStopReason.OTHER -> normalizeMachineStopReasonDetail(reason, reasonDetail) ?: "其他原因"
     null -> "原因未记录"
 }
 
@@ -23253,7 +25620,11 @@ private fun machineTransferUnavailableReason(
     machineCapacity == 1 && incomingRegistrations.any { it.fixedPartnerKey != null } ->
         "$machineName 仅能容纳一人游玩，请先解除固定组合再转入。"
     queue.registrationCount + incomingRegistrations.size > 20 ->
-        "$machineName 的登记将超过 20 份，无法接收这些登记。"
+        if (incomingRegistrations.size == 1) {
+            "$machineName 的登记将超过 20 份，无法接收这份登记。"
+        } else {
+            "$machineName 的登记将超过 20 份，无法接收这些登记。"
+        }
     else -> null
 }
 
@@ -23362,14 +25733,14 @@ private fun machineTransferAbsenceNotice(
         return if (breaksFixedPair) {
             "转入登记已在队尾，不再轮空；留在原机台的登记仍将轮空一次。"
         } else {
-            "这些登记转入后已在队尾，不再轮空。"
+            if (registrations.size == 1) "这份登记转入后已在队尾，不再轮空。" else "这些登记转入后已在队尾，不再轮空。"
         }
     }
     if (registrations.any { it.absenceStatus == QueueAbsenceStatus.DEFER_ONE_ROUND }) {
         return if (breaksFixedPair) {
             "转入登记不再暂缓；留在原机台的登记仍将暂缓一次。"
         } else {
-            "这些登记转入后不再暂缓。"
+            if (registrations.size == 1) "这份登记转入后不再暂缓。" else "这些登记转入后不再暂缓。"
         }
     }
     return null
@@ -23724,6 +26095,56 @@ private fun PairedMachineHelpButton(onClick: () -> Unit) {
 }
 
 /**
+ * The explanation of letting others pass, for one registration or a fixed pair. It behaves
+ * like the one for two machines below: opened by the question mark it can be closed at once;
+ * opened by itself on first use ([countsDown]) only after five seconds (maintainer,
+ * 2026-11-27: “给这个功能增加和‘系统自动安排’一样的首次使用五秒弹窗”).
+ */
+@Composable
+private fun PassingIntroductionDialog(
+    fixedPair: Boolean,
+    countsDown: Boolean,
+    onDismiss: () -> Unit
+) {
+    var remainingSeconds by remember { mutableStateOf(if (countsDown) 5 else 0) }
+    LaunchedEffect(Unit) {
+        while (remainingSeconds > 0) {
+            delay(1_000L)
+            remainingSeconds--
+        }
+    }
+    ModalSurface(onDismiss, width = 520.dp, dismissible = remainingSeconds <= 0) {
+        Text(
+            PASSING_DETAILS_TITLE,
+            color = PrimaryText,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(Modifier.height(10.dp))
+        passingDetails(fixedPair).forEach { paragraph ->
+            Text(paragraph, color = SecondaryText, fontSize = 14.sp, lineHeight = 20.sp)
+            Spacer(Modifier.height(8.dp))
+        }
+        Spacer(Modifier.height(10.dp))
+        PrimaryButton(
+            text = "我知道了",
+            onClick = onDismiss,
+            modifier = Modifier.fillMaxWidth(),
+            enabled = remainingSeconds <= 0,
+            disabledReason = pairedMachineArrangementCountdown(remainingSeconds)
+        )
+        if (remainingSeconds > 0) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                pairedMachineArrangementCountdown(remainingSeconds),
+                color = TertiaryText,
+                fontSize = 11.sp
+            )
+        }
+    }
+}
+
+/**
  * The explanation of the tick box. Opened by the question mark it can be closed at once; when
  * it opened by itself on first use ([countsDown]) it can only be closed after five seconds.
  */
@@ -23740,7 +26161,7 @@ private fun PairedMachineQueueIntroductionDialog(
             remainingSeconds--
         }
     }
-    ModalSurface({ if (remainingSeconds <= 0) onDismiss() }, width = 520.dp) {
+    ModalSurface(onDismiss, width = 520.dp, dismissible = remainingSeconds <= 0) {
         Text(
             PAIRED_MACHINE_ARRANGEMENT_DETAILS_TITLE,
             color = PrimaryText,

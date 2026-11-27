@@ -108,7 +108,7 @@ internal fun decideManagementQueueAction(
         command.expectedPolicyRevision != null &&
         command.expectedPolicyRevision != state.managementPolicyRevision
     ) {
-        return reject("终端敏感策略已经更新，请刷新管理后台后再操作。")
+        return reject("由管理后台接管的设置已经更新，请刷新管理后台后再操作。")
     }
     if (state.machineStableIds[command.machineId] != command.machineStableId) {
         return reject("目标机台已经变化，请刷新管理后台后再操作。")
@@ -124,8 +124,14 @@ internal fun decideManagementQueueAction(
         publicRegistrationId(state.queueId, registration.key)
 
     val currentPlayingIds = queue.playing.map(::publicId)
-    val currentWaitingPositionIds = queue.waitingPositions().map { position ->
-        position.map(::publicId)
+    // The positions as the snapshot publishes them, which are those of the home screen: what the
+    // management app shows and the server compares with. They are not always the real grouping
+    // (a deferred registration is shown where it will next play, a pending online registration
+    // as if it checks in); compared with that, every command on such a machine was refused as
+    // “现场队列位置已经变化” (found 2026-11-27).
+    val shownWaitingPositionKeys = queue.shownWaitingPositionKeys()
+    val currentWaitingPositionIds = shownWaitingPositionKeys.map { position ->
+        position.map { publicRegistrationId(state.queueId, it) }
     }
     if (
         currentPlayingIds != command.expectedPlayingRegistrationIds ||
@@ -438,11 +444,22 @@ internal fun decideManagementQueueAction(
             )
         }
 
-        ManagementQueueAction.MOVE_WAITING_POSITION -> QueueAction.MoveWaitingPosition(
-            command.machineId,
-            command.sourcePositionIndex ?: return reject("没有指定原等待位置。"),
-            command.destinationPositionIndex ?: return reject("没有指定目标等待位置。")
-        )
+        ManagementQueueAction.MOVE_WAITING_POSITION -> {
+            // The indexes are those of the positions as shown; only that position moves.
+            val source = command.sourcePositionIndex ?: return reject("没有指定原等待位置。")
+            val destination = command.destinationPositionIndex ?: return reject("没有指定目标等待位置。")
+            if (source !in shownWaitingPositionKeys.indices || destination !in shownWaitingPositionKeys.indices) {
+                return reject("现场队列位置已经变化，请刷新管理后台后再操作。")
+            }
+            val desired = shownWaitingPositionKeys.toMutableList().apply { add(destination, removeAt(source)) }
+            val reordered = queue.withShownPositionsReordered(desired)
+                ?: return reject("现场队列位置已经变化，请刷新管理后台后再操作。")
+            QueueAction.ReplaceOrder(
+                command.machineId,
+                reordered.allRegistrations,
+                shownWaitingPositionKeys[source].toSet()
+            )
+        }
 
         ManagementQueueAction.REPLACE_WAITING_POSITIONS -> {
             val desiredPositions = command.desiredWaitingPositionRegistrationIds
@@ -454,12 +471,16 @@ internal fun decideManagementQueueAction(
             ) {
                 return reject("新的等待位置必须完整保留当前每个位置。")
             }
-            val desiredIds = currentPlayingIds + desiredPositions.flatten()
-            val reordered = desiredIds.mapNotNull(registrationsById::get)
-            if (reordered.size != queue.registrationCount) {
-                return reject("新的等待位置包含不存在的登记。")
+            // Only the positions that were moved change place; the real order of the others,
+            // which is not always the order shown, stays as it is.
+            val desiredKeys = desiredPositions.map { position ->
+                position.map { id ->
+                    registrationsById[id]?.key ?: return reject("新的等待位置包含不存在的登记。")
+                }
             }
-            QueueAction.ReplaceOrder(command.machineId, reordered)
+            val reordered = queue.withShownPositionsReordered(desiredKeys)
+                ?: return reject("新的等待位置必须完整保留当前每个位置。")
+            QueueAction.ReplaceOrder(command.machineId, reordered.allRegistrations)
         }
 
         ManagementQueueAction.REPLACE_REGISTRATION_ORDER -> {
@@ -473,11 +494,12 @@ internal fun decideManagementQueueAction(
             ) {
                 return reject("新的登记顺序与当前队列不一致。")
             }
-            val reordered = desiredIds.mapNotNull(registrationsById::get)
-            if (reordered.size != queue.registrationCount) {
-                return reject("新的登记顺序包含不存在的登记。")
+            val desiredWaitingKeys = desiredIds.drop(currentPlayingIds.size).map { id ->
+                registrationsById[id]?.key ?: return reject("新的登记顺序包含不存在的登记。")
             }
-            QueueAction.ReplaceOrder(command.machineId, reordered)
+            val reordered = queue.withShownRegistrationOrder(desiredWaitingKeys)
+                ?: return reject("新的登记顺序与当前队列不一致。")
+            QueueAction.ReplaceOrder(command.machineId, reordered.allRegistrations)
         }
 
         ManagementQueueAction.TRANSFER_REGISTRATIONS -> {
@@ -500,6 +522,7 @@ internal fun decideManagementQueueAction(
         when ((executed as? QueueActionExecution.Rejected)?.failure?.code) {
             QueueActionFailureCode.NO_SHOW_REMOVAL_ONLY -> ONLINE_REGISTRATION_NO_SHOW_REMOVAL_ONLY
             QueueActionFailureCode.DEFER_ONE_ROUND_ALREADY_USED -> DEFER_ONE_ROUND_USED_REASON
+            QueueActionFailureCode.FIXED_PAIR_WHILE_POSTPONED -> FIXED_PAIR_WHILE_POSTPONED_REASON
             else -> "现场终端未执行这项队列操作，请按当前队列重新确认。"
         }
     )
@@ -525,6 +548,10 @@ internal fun decideManagementQueueAction(
         updatedProfile = updatedProfile
     )
 }
+
+/** Told by the management app, which names no single registration (see fixedPairPostponedReason). */
+internal const val FIXED_PAIR_WHILE_POSTPONED_REASON =
+    "将暂缓一次、将轮空一次或暂时离开的登记不能组成固定组合，请先取消该状态。"
 
 /** Why a no-show of a checked-in online registration that has not played yet offers one outcome. */
 internal const val ONLINE_REGISTRATION_NO_SHOW_REMOVAL_ONLY =

@@ -1398,7 +1398,14 @@ class QueueEngineDifferentialTest {
             }
 
             val (action, existingBehavior) = candidates.random(random)
-            val expected = existingBehavior(queue)
+            // The engine also gives a registration its own count of missed turns back once
+            // its fixed pair has ended, whichever action ended it.
+            val expected = existingBehavior(queue).let { result ->
+                result.copy(
+                    playing = result.playing.map(Registration::withOwnSkippedTurnsOutsideAPair),
+                    waiting = result.waiting.map(Registration::withOwnSkippedTurnsOutsideAPair)
+                )
+            }
             val execution = QueueEngine.execute(
                 QueueEngineState.single(machineA, queue),
                 action,

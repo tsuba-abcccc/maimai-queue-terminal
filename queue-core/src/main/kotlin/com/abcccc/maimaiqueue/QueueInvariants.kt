@@ -63,6 +63,9 @@ fun MachineQueue.invariantViolations(): List<String> = buildList {
         ) {
             add("固定组合的暂缓一次或暂时离开状态必须一致")
         }
+        if (registration.allowsPassing != partner.allowsPassing) {
+            add("固定组合两份登记的越过选择必须一致")
+        }
         if (registration.requiresOnSiteCheckIn || partner.requiresOnSiteCheckIn) {
             add("待签到线上登记不能建立固定组合")
         }

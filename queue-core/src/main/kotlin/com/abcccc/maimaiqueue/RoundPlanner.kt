@@ -50,6 +50,19 @@ class RoundPlan internal constructor(
 }
 
 object RoundPlanner {
+    /**
+     * The waiting registrations that would enter an empty playing position now: the first group
+     * that can play, with passing only where the check before a pass allows it. It can differ
+     * from the first available entry of [MachineQueue.waitingPositions], which always shows the
+     * passing the registrations allow (review 2026-11-27).
+     */
+    fun nextWaitingGroup(queue: MachineQueue): List<Registration> =
+        if (queue.waiting.isEmpty()) {
+            emptyList()
+        } else {
+            firstPlayableGroup(queue, groupingForThisOpportunity(queue, emptySet()), emptySet())
+        }
+
     fun enterPlayingPosition(queue: MachineQueue): RoundPlan =
         create(queue, RoundAction.ENTER_PLAYING_POSITION)
 
@@ -184,6 +197,14 @@ object RoundPlanner {
         val projection: WaitingPositionProjection
     )
 
+    /**
+     * For every waiting registration the number of the round in which it first plays, counted
+     * from now, as the home page projects it (pending online registrations check in in time).
+     * A registration that will not play, such as one that is temporarily away, has no entry.
+     */
+    internal fun firstPlayingRounds(queue: MachineQueue): Map<Int, Int> =
+        projectedFirstPlayingTurns(queue).mapValues { (_, turn) -> turn.turnIndex }
+
     private fun projectedFirstPlayingTurns(
         queue: MachineQueue
     ): Map<Int, ProjectedPlayingTurn> {
@@ -287,13 +308,15 @@ object RoundPlanner {
     ): NextPlayingPositionPreview? {
         if (queue.waiting.isEmpty()) return null
 
-        val nominalRegistrations = nominalFirstPosition(queue)
-        val nextRegistrations = opportunityPositions(queue, skippedThisOpportunity)
-            .firstOrNull { position -> position.all { it.canEnterPlayingPosition } }
-            .orEmpty()
-        val unavailableRegistrations = queue.waiting
-            .take(opportunityEndIndex(queue, nominalRegistrations, nextRegistrations) + 1)
-            .filterNot { it.canEnterPlayingPosition }
+        val withoutPassing = queue.withoutPassing()
+        val nominalRegistrations = nominalFirstPosition(withoutPassing)
+        val nextRegistrations = firstPlayableGroup(
+            queue,
+            groupingForThisOpportunity(queue, skippedThisOpportunity),
+            skippedThisOpportunity
+        )
+        val reachedRegistrations = firstPlayableGroup(queue, withoutPassing, skippedThisOpportunity)
+        val unavailableRegistrations = unavailableReachedBy(queue, withoutPassing, reachedRegistrations)
 
         return NextPlayingPositionPreview(
             nominalRegistrations = nominalRegistrations,
@@ -311,23 +334,183 @@ object RoundPlanner {
         skippedThisOpportunity: Set<Int>
     ): MachineQueue {
         if (queue.playing.isNotEmpty() || queue.waiting.isEmpty()) return queue
-
-        val positions = opportunityPositions(queue, skippedThisOpportunity)
-        val nextPlayers = positions.firstOrNull { position ->
-            position.all { it.canEnterPlayingPosition }
-        }.orEmpty()
-        val nextPlayerKeys = nextPlayers.mapTo(mutableSetOf()) { it.key }
-        val opportunityEndIndex = opportunityEndIndex(
-            queue = queue,
-            nominalRegistrations = nominalFirstPosition(queue),
-            nextRegistrations = nextPlayers
+        return advanceQueueGroupedBy(
+            queue,
+            groupingForThisOpportunity(queue, skippedThisOpportunity),
+            atMillis,
+            skippedThisOpportunity
         )
-        val crossedUnavailableKeys = queue.waiting
-            .take(opportunityEndIndex + 1)
-            .filter {
-                !it.canEnterPlayingPosition &&
-                    it.key !in skippedThisOpportunity
+    }
+
+    /**
+     * The queue whose grouping decides who plays at this opportunity: [queue] itself, with the
+     * passing its registrations allow, or the same queue without any passing. A pair formed by
+     * passing is used only when it makes nobody enter a playing position in a later round than
+     * without it (maintainer, 2026-11-26: “应该加上保护，不然开启了这个功能的人会吃亏”). Passing
+     * changes who pairs with whom further back, so without this check a registration behind
+     * could, rarely, lose its partner and wait a round longer.
+     */
+    private fun groupingForThisOpportunity(
+        queue: MachineQueue,
+        skippedThisOpportunity: Set<Int>
+    ): MachineQueue {
+        val withoutPassing = queue.withoutPassing()
+        if (withoutPassing === queue) return queue
+        // The answer depends only on the order and states of the waiting registrations and on
+        // who skips this opportunity, not on names or times; wait estimates replay the same
+        // states many times with different times.
+        val cacheKey = queue.waiting.map(::PassingStateItem) to skippedThisOpportunity
+        // The replays start from an empty playing position, as when this group enters it; with
+        // somebody still playing they would not advance at all and always say yes (review
+        // 2026-11-27). So the answer also depends on nothing outside the key.
+        val passes = synchronized(passingDecisions) { passingDecisions[cacheKey] }
+            ?: passingDelaysNobody(
+                queue.copy(playing = emptyList(), playingStartedAtMillis = null),
+                withoutPassing.copy(playing = emptyList(), playingStartedAtMillis = null),
+                skippedThisOpportunity
+            ).also { decided ->
+                synchronized(passingDecisions) { passingDecisions[cacheKey] = decided }
             }
+        return if (passes) queue else withoutPassing
+    }
+
+    /** What of a waiting registration the decision to pass depends on. */
+    private data class PassingStateItem(
+        val key: Int,
+        val preference: PlayPreference,
+        val absenceStatus: QueueAbsenceStatus,
+        val temporaryAwaySkippedTurns: Int,
+        val fixedPartnerKey: Int?,
+        val requiresOnSiteCheckIn: Boolean,
+        val allowsPassing: Boolean,
+        val deferOneRoundUsed: Boolean,
+        val noShowCount: Int,
+        val lastNoShowActionWasDefer: Boolean,
+        val wasOnlineRegistration: Boolean
+    ) {
+        constructor(registration: Registration) : this(
+            registration.key,
+            registration.preference,
+            registration.absenceStatus,
+            registration.temporaryAwaySkippedTurns,
+            registration.fixedPartnerKey,
+            registration.requiresOnSiteCheckIn,
+            registration.allowsPassing,
+            registration.deferOneRoundUsed,
+            registration.noShowCount,
+            registration.lastNoShowActionWasDefer,
+            registration.wasOnlineRegistration
+        )
+    }
+
+    /** Recent answers of [groupingForThisOpportunity], least recently used dropped first. */
+    private val passingDecisions =
+        object : LinkedHashMap<Pair<List<PassingStateItem>, Set<Int>>, Boolean>(64, .75f, true) {
+            override fun removeEldestEntry(
+                eldest: MutableMap.MutableEntry<Pair<List<PassingStateItem>, Set<Int>>, Boolean>?
+            ) = size > 512
+        }
+
+    private fun passingDelaysNobody(
+        queue: MachineQueue,
+        withoutPassing: MachineQueue,
+        skippedThisOpportunity: Set<Int>
+    ): Boolean {
+        val withPassing = firstPlayableGroup(queue, queue, skippedThisOpportunity)
+        val plain = firstPlayableGroup(queue, withoutPassing, skippedThisOpportunity)
+        if (withPassing.map(Registration::key) == plain.map(Registration::key)) return true
+        val passedFirstRounds = firstRoundsFrom(
+            advanceQueueGroupedBy(queue, queue, 0L, skippedThisOpportunity)
+        )
+        val plainFirstRounds = firstRoundsFrom(
+            advanceQueueGroupedBy(withoutPassing, withoutPassing, 0L, skippedThisOpportunity)
+        )
+        return plainFirstRounds.none { (key, round) ->
+            (passedFirstRounds[key] ?: Int.MAX_VALUE) > round
+        }
+    }
+
+    /**
+     * The group entering the playing position, with the later of two registrations recording
+     * the registrations it passed over in real order (only those that let others pass), and
+     * every other entering registration's record cleared.
+     */
+    private fun recordPasses(queue: MachineQueue, group: List<Registration>): List<Registration> {
+        val indexByKey = queue.waiting.mapIndexed { index, registration -> registration.key to index }.toMap()
+        val ordered = group.sortedBy { indexByKey[it.key] ?: Int.MAX_VALUE }
+        val passed = if (ordered.size == 2) {
+            val from = indexByKey[ordered[0].key]
+            val to = indexByKey[ordered[1].key]
+            if (from != null && to != null && to > from + 1) {
+                queue.waiting.subList(from + 1, to).filter(::isPassedOver).map(Registration::key)
+            } else {
+                emptyList()
+            }
+        } else {
+            emptyList()
+        }
+        return group.map { registration ->
+            val record = if (passed.isNotEmpty() && registration.key == ordered.last().key) passed else emptyList()
+            if (registration.passedOverKeys == record) registration else registration.copy(passedOverKeys = record)
+        }
+    }
+
+    /** The first group of [grouping] that can play now, as the registrations of [queue]. */
+    private fun firstPlayableGroup(
+        queue: MachineQueue,
+        grouping: MachineQueue,
+        skippedThisOpportunity: Set<Int>
+    ): List<Registration> {
+        val originalByKey = queue.waiting.associateBy(Registration::key)
+        return opportunityPositions(grouping, skippedThisOpportunity)
+            .firstOrNull { position -> position.all { it.canEnterPlayingPosition } }
+            .orEmpty()
+            .map { originalByKey.getValue(it.key) }
+    }
+
+    /**
+     * The round in which each registration first plays from [started] on (0 for those playing
+     * in it), with nobody passing in the later rounds. These replays never pass, so they never
+     * run this check again themselves.
+     */
+    private fun firstRoundsFrom(started: MachineQueue): Map<Int, Int> {
+        var queue = started.copy(
+            playing = started.playing.map { it.copy(allowsPassing = false) },
+            waiting = started.waiting.map { it.copy(allowsPassing = false) }
+        )
+        val allKeys = queue.allRegistrations.mapTo(mutableSetOf(), Registration::key)
+        val rounds = mutableMapOf<Int, Int>()
+        queue.playing.forEach { rounds[it.key] = 0 }
+        var atMillis = 1L
+        for (round in 1..(allKeys.size * 3 + 6)) {
+            if (rounds.keys.containsAll(allKeys)) break
+            atMillis += 15L * 60_000L
+            queue = queue.finishRound(atMillis)
+            if (queue.playing.isEmpty() && queue.waiting.isEmpty()) break
+            queue.playing.forEach { rounds.putIfAbsent(it.key, round) }
+        }
+        return rounds
+    }
+
+    private fun advanceQueueGroupedBy(
+        queue: MachineQueue,
+        grouping: MachineQueue,
+        atMillis: Long,
+        skippedThisOpportunity: Set<Int>
+    ): MachineQueue {
+        if (queue.playing.isNotEmpty() || queue.waiting.isEmpty()) return queue
+
+        val nextPlayers = recordPasses(queue, firstPlayableGroup(queue, grouping, skippedThisOpportunity))
+        val nextPlayerKeys = nextPlayers.mapTo(mutableSetOf()) { it.key }
+        // Which registrations this opportunity reaches is decided as if nobody let others pass.
+        // A pair that forms across a registration that lets others pass does not reach, and so
+        // does not use up, the 暂缓一次, 轮空一次 or 暂时离开 of the registrations it passes over;
+        // otherwise such a registration would play earlier and push another one a round back
+        // (docs/releases/solo-pass-plan-2026-11.md).
+        val withoutPassing = queue.withoutPassing()
+        val reachedPlayers = firstPlayableGroup(queue, withoutPassing, skippedThisOpportunity)
+        val crossedUnavailableKeys = unavailableReachedBy(queue, withoutPassing, reachedPlayers)
+            .filter { it.key !in skippedThisOpportunity }
             .mapTo(mutableSetOf()) { it.key }
 
         val retained = mutableListOf<Registration>()
@@ -425,6 +608,14 @@ object RoundPlanner {
         )
     }
 
+    /** The queue with every registration's choice to let others pass turned off. */
+    private fun MachineQueue.withoutPassing(): MachineQueue =
+        if (waiting.none(Registration::allowsPassing)) {
+            this
+        } else {
+            copy(waiting = waiting.map { it.copy(allowsPassing = false) })
+        }
+
     private fun nominalFirstPosition(queue: MachineQueue): List<Registration> =
         groupIntoPositions(
             queue.waiting.map { registration ->
@@ -455,26 +646,45 @@ object RoundPlanner {
     }
 
     /**
-     * One opportunity ends after both its nominal group and the group that can actually play.
-     * An unavailable second open registration still belongs to the first nominal two-player
-     * opportunity even when the available player enters the playing position alone.
+     * The registrations that cannot play now and whose turn this opportunity is, in waiting
+     * order: it is they whose 暂缓一次, 轮空一次 or 暂时离开 is used, and a pending online
+     * registration among them leaves.
+     *
+     * A turn is a registration's own when it would itself have entered the playing position
+     * (maintainer, 2026-11-27: “只有登记自己本该进入游玩位置的那一轮，才算轮到它”):
+     * - it stands ahead of the first registration that enters, so the round went past it; or
+     * - it would have shared the round with that registration: it belongs to the position the
+     *   entering registration would form if everybody behind it could play.
+     *
+     * Two open registrations that pair across a postponed or pending registration do not reach
+     * it. It used to count as reached, so a 暂缓一次 could be used without the player gaining a
+     * round, and a pending registration left a round before the position shown for it.
+     *
+     * When nobody can enter, every waiting registration that cannot play has been reached.
      */
-    private fun opportunityEndIndex(
+    private fun unavailableReachedBy(
         queue: MachineQueue,
-        nominalRegistrations: List<Registration>,
-        nextRegistrations: List<Registration>
-    ): Int {
-        if (nextRegistrations.isEmpty()) return queue.waiting.lastIndex
-
-        fun lastIndexOf(registrations: List<Registration>): Int = registrations
-            .maxOfOrNull { registration ->
-                queue.waiting.indexOfFirst { it.key == registration.key }
+        withoutPassing: MachineQueue,
+        enteringRegistrations: List<Registration>
+    ): List<Registration> {
+        if (enteringRegistrations.isEmpty()) {
+            return queue.waiting.filterNot { it.canEnterPlayingPosition }
+        }
+        val enteringKeys = enteringRegistrations.mapTo(mutableSetOf(), Registration::key)
+        val firstEnteringIndex = queue.waiting.indexOfFirst { it.key in enteringKeys }
+        if (firstEnteringIndex < 0) return queue.waiting.filterNot { it.canEnterPlayingPosition }
+        val sharingKeys = groupIntoPositions(
+            withoutPassing.waiting.drop(firstEnteringIndex).map { registration ->
+                registration.copy(
+                    absenceStatus = QueueAbsenceStatus.NONE,
+                    temporaryAwaySkippedTurns = 0,
+                    requiresOnSiteCheckIn = false
+                )
             }
-            ?: -1
-
-        return maxOf(
-            lastIndexOf(nominalRegistrations),
-            lastIndexOf(nextRegistrations)
-        ).coerceAtLeast(0)
+        ).firstOrNull().orEmpty().mapTo(mutableSetOf(), Registration::key)
+        return queue.waiting.filterIndexed { index, registration ->
+            !registration.canEnterPlayingPosition &&
+                (index < firstEnteringIndex || registration.key in sharingKeys)
+        }
     }
 }

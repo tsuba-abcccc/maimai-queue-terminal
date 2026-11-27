@@ -237,6 +237,55 @@ class BusinessHoursTest {
         assertEquals(settings.normalized(), restored)
     }
 
+    /**
+     * Maintainer, 2026-11-27: a tablet switched off before closing and on again the next day
+     * starts a new queue when nobody answers the restore dialog. Restarting during the same
+     * business day, or late at night after closing, still continues the queue.
+     */
+    @Test
+    fun aQueueFromAnEarlierBusinessDayIsRecognised() {
+        val hours = BusinessHoursSettings(enabled = true, defaultHours = DailyBusinessHours(10 * 60, 22 * 60))
+        fun earlier(saved: Long, now: Long) = savedQueueIsFromEarlierDay(hours, saved, now, zone)
+        // Switched off before closing, on again the next day within business hours.
+        assertTrue(earlier(timestamp(2026, 11, 26, 21, 30), timestamp(2026, 11, 27, 11, 0)))
+        // A restart during the same business day.
+        assertFalse(earlier(timestamp(2026, 11, 26, 15, 0), timestamp(2026, 11, 26, 15, 5)))
+        // After closing but within the grace period: players may still be finishing.
+        assertFalse(earlier(timestamp(2026, 11, 26, 21, 50), timestamp(2026, 11, 26, 22, 10)))
+        // After the grace period of that closing.
+        assertTrue(earlier(timestamp(2026, 11, 26, 21, 50), timestamp(2026, 11, 26, 22, 25)))
+        // Saved after closing, restarted before the next opening: nothing has begun or ended since.
+        assertFalse(earlier(timestamp(2026, 11, 26, 22, 30), timestamp(2026, 11, 27, 9, 30)))
+        // ... and after it.
+        assertTrue(earlier(timestamp(2026, 11, 26, 22, 30), timestamp(2026, 11, 27, 10, 0)))
+        // Review 2026-11-27: registrations taken shortly before the doors open belong to the day
+        // that then begins; a restart just after opening keeps them.
+        assertFalse(earlier(timestamp(2026, 11, 27, 9, 55), timestamp(2026, 11, 27, 10, 2)))
+        assertFalse(earlier(timestamp(2026, 11, 27, 4, 30), timestamp(2026, 11, 27, 10, 30)))
+        // The middle of the closed hours (22:00 to 10:00) is 4:00.
+        assertTrue(earlier(timestamp(2026, 11, 27, 3, 30), timestamp(2026, 11, 27, 10, 30)))
+        // Saved long ago.
+        assertTrue(earlier(timestamp(2026, 10, 1, 12, 0), timestamp(2026, 11, 27, 12, 0)))
+
+        // Overnight hours (12:00 to 02:00): a restart after midnight is the same business day.
+        val overnight = BusinessHoursSettings(enabled = true, defaultHours = DailyBusinessHours(12 * 60, 2 * 60))
+        assertFalse(savedQueueIsFromEarlierDay(overnight, timestamp(2026, 11, 26, 23, 50), timestamp(2026, 11, 27, 0, 30), zone))
+        assertTrue(savedQueueIsFromEarlierDay(overnight, timestamp(2026, 11, 26, 23, 50), timestamp(2026, 11, 27, 13, 0), zone))
+    }
+
+    @Test
+    fun withoutBusinessHoursADayBeginsAtFive() {
+        val none = BusinessHoursSettings(enabled = false)
+        fun earlier(saved: Long, now: Long) = savedQueueIsFromEarlierDay(none, saved, now, zone)
+        assertTrue(earlier(timestamp(2026, 11, 26, 21, 30), timestamp(2026, 11, 27, 11, 0)))
+        // Past midnight but before five: still the same night.
+        assertFalse(earlier(timestamp(2026, 11, 26, 23, 50), timestamp(2026, 11, 27, 0, 30)))
+        assertFalse(earlier(timestamp(2026, 11, 26, 15, 0), timestamp(2026, 11, 26, 15, 5)))
+        assertTrue(earlier(timestamp(2026, 11, 27, 4, 50), timestamp(2026, 11, 27, 5, 10)))
+        // A clock set back never counts as another day.
+        assertFalse(earlier(timestamp(2026, 11, 27, 12, 0), timestamp(2026, 11, 27, 11, 0)))
+    }
+
     private fun timestamp(year: Int, month: Int, day: Int, hour: Int, minute: Int): Long =
         ZonedDateTime.of(year, month, day, hour, minute, 0, 0, zone).toInstant().toEpochMilli()
 }

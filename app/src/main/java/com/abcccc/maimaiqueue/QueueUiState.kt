@@ -2,6 +2,7 @@ package com.abcccc.maimaiqueue
 
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
@@ -84,7 +85,8 @@ internal data class MachineDisplayState(
 
 internal enum class RegistrationActionMode { ACTIONS, PREFERENCE, RENAME }
 internal enum class QueueAbsenceChoice { DEFER_ONE_ROUND, SKIP_ONE_TURN, TEMPORARILY_AWAY }
-internal enum class PlayerProfileContext { JOIN_QUEUE, CLAIM_REGISTRATION, FRIEND_PAIR }
+/** Why the player library is open. BROWSE: from the More menu, to look at and edit profiles (2026-11-28). */
+internal enum class PlayerProfileContext { JOIN_QUEUE, CLAIM_REGISTRATION, FRIEND_PAIR, BROWSE }
 internal enum class FriendPairStep { METHOD, SELECT_EXISTING, CONFIRM_EXISTING, CREATE_FRIEND }
 
 internal data class RegistrationPlayArrangement(
@@ -182,14 +184,89 @@ internal data class HomeSidePanelFeedback(
     val title: String,
     val detail: String,
     val contextLabel: String? = null,
-    val tone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS
+    val tone: HomeSidePanelFeedbackTone = HomeSidePanelFeedbackTone.SUCCESS,
+    /** The machine the banner is about; home turns to it (maintainer, 2026-11-26). */
+    val machineId: MachineId? = null
 )
+
+/** The machine home should bring into view, and what asked for it, so a repeat asks again. */
+internal data class HomeScrollTarget(val machineId: MachineId, val key: String)
 
 internal data class NewRegistrationHomeRequest(
     val highlight: NewRegistrationHighlight,
     val enterPlayingConfirmation: MachineId? = null,
     val forceImmediateHome: Boolean = false
 )
+
+/** What the terminal does with a registration that arrived from the website, the Bot or a phone. */
+internal enum class NewRegistrationArrivalHandling {
+    /** Home with nothing open (or the phone that scanned this terminal): clear and show it. */
+    RETURN_HOME,
+
+    /** Home is shown with something open over it: only the highlight is set. */
+    HIGHLIGHT_ONLY,
+
+    /** Kept until the terminal is idle again. */
+    HOLD
+}
+
+/**
+ * An arrival never takes away what the operator is doing (approved 2026-11-26): a form or another
+ * screen holds it; a dialog, a menu or an adjustment on home stays and only the highlight is set.
+ * One that asks whether the machine is free waits until nothing else is open.
+ */
+internal fun newRegistrationArrivalHandling(
+    forceImmediateHome: Boolean,
+    formOpen: Boolean,
+    homeScreenShown: Boolean,
+    terminalIdle: Boolean,
+    raisesConfirmation: Boolean
+): NewRegistrationArrivalHandling = when {
+    forceImmediateHome -> NewRegistrationArrivalHandling.RETURN_HOME
+    formOpen -> NewRegistrationArrivalHandling.HOLD
+    terminalIdle -> NewRegistrationArrivalHandling.RETURN_HOME
+    homeScreenShown && !raisesConfirmation -> NewRegistrationArrivalHandling.HIGHLIGHT_ONLY
+    else -> NewRegistrationArrivalHandling.HOLD
+}
+
+/**
+ * What home showed when arrivals began to be held. Anything else found there when they are
+ * applied was produced by the action that closed the form, and is kept.
+ */
+internal class HeldNewRegistrationArrivals {
+    var held = false
+        private set
+    private var highlightRequestId: String? = null
+    private var feedbackId: Long? = null
+    private var undoId: Long? = null
+
+    fun hold(highlightRequestId: String?, feedbackId: Long?, undoId: Long?) {
+        if (held) return
+        held = true
+        this.highlightRequestId = highlightRequestId
+        this.feedbackId = feedbackId
+        this.undoId = undoId
+    }
+
+    fun clear() {
+        held = false
+        highlightRequestId = null
+        feedbackId = null
+        undoId = null
+    }
+
+    fun localResultShown(
+        highlightRequestId: String?,
+        feedbackId: Long?,
+        undoId: Long?,
+        confirmationOpen: Boolean
+    ): Boolean = held && (
+        confirmationOpen ||
+            (highlightRequestId != null && highlightRequestId != this.highlightRequestId) ||
+            (feedbackId != null && feedbackId != this.feedbackId) ||
+            (undoId != null && undoId != this.undoId)
+        )
+}
 
 internal data class QueueOperationConfirmationRequest(
     val machineId: MachineId,
@@ -226,6 +303,13 @@ internal data class QueueUndoAction(
     /** The orders shared across paired machines before the action, by machine name. */
     val beforePairedOrders: Map<String, List<Int>>? = null,
     val beforePairedArrangements: Map<Int, PairedArrangementRecord>? = null
+)
+
+/** A play preference chosen in 更改游玩偏好 for one of a fixed pair; applied once confirmed. */
+internal data class FixedPairPreferenceChange(
+    val selection: SelectedRegistration,
+    val partnerKey: Int,
+    val preference: PlayPreference
 )
 
 internal data class PositionSelection(
@@ -285,8 +369,13 @@ internal fun MachineQueue.matchesExactPosition(selection: PositionSelection): Bo
     if (expectedKeys.isEmpty() || expectedKeys.size != selection.registrationKeys.size) return false
     val currentPosition = if (selection.isPlayingPosition) {
         playing
+    } else if (selection.waitingPositionIndex == null) {
+        // A position as the home screen shows it that is not one real position (beside a
+        // pending online registration or a preview): it still stands for these registrations
+        // as long as all of them are waiting here.
+        return expectedKeys.all { key -> waiting.any { it.key == key } }
     } else {
-        selection.waitingPositionIndex?.let { waitingPositions().getOrNull(it) }
+        waitingPositions().getOrNull(selection.waitingPositionIndex)
     } ?: return false
     return currentPosition.size == expectedKeys.size && currentPosition.all { it.key in expectedKeys }
 }
@@ -299,8 +388,12 @@ internal fun MachineQueue.matchesFixedPairPosition(selection: PositionSelection)
         registrations[1].fixedPartnerKey == registrations[0].key
 }
 
-internal fun MachineQueue.matchesNoShowLocation(selection: SelectedRegistration): Boolean {
-    if (!canMarkNoShow(selection.registrationKey)) return false
+/** [nextGroupKeys]: the next group as the engine sees it on a machine of a pair; see canMarkNoShow. */
+internal fun MachineQueue.matchesNoShowLocation(
+    selection: SelectedRegistration,
+    nextGroupKeys: Set<Int>? = null
+): Boolean {
+    if (!canMarkNoShow(selection.registrationKey, nextGroupKeys)) return false
     val isCurrentlyPlaying = playing.any { it.key == selection.registrationKey }
     return if (selection.fromPlayingPosition) isCurrentlyPlaying else !isCurrentlyPlaying
 }
@@ -354,10 +447,24 @@ internal data class MenuAction(
     val explained: Boolean = false
 )
 
+/**
+ * The waiting positions a drag of a position works on: this machine's registrations grouped as
+ * the home screen shows them (pending online registrations as if they check in, without a pass
+ * the check refuses, around the previews of the other machine of a pair), in their real order.
+ * [labels] are the names the home screen gives them, such as B2. They need not be the positions
+ * of MachineQueue.waitingPositions.
+ */
+internal data class DragPositions(
+    val positions: List<List<Registration>>,
+    val labels: List<String>
+)
+
 internal data class PositionReorderProposal(
     val machineId: MachineId,
     val originalQueue: MachineQueue,
     val proposedOrder: List<Registration>,
+    /** The positions the drag worked on; the two indexes below are into them. */
+    val positions: DragPositions,
     val sourcePositionIndex: Int,
     val destinationPositionIndex: Int,
     val movedRegistrationKeys: Set<Int>,
@@ -412,6 +519,120 @@ internal class GlobalDragOverlayController {
     }
 }
 
+/** Registrations being dragged from one machine, which may be dropped on another to move them. */
+internal data class DragTransfer(val sourceMachineId: MachineId, val registrationKeys: List<Int>)
+
+/**
+ * The machines on the home page as places to drop a dragged registration or position
+ * (drag-transfer-mockup.html, maintainer 2026-11-26). Each machine reports where it is on
+ * screen; while a drag is under way, the machine under the pointer, other than the one the drag
+ * started on, shows a mask, and releasing there opens the confirmation of 转至其他机台. Its
+ * positions do not make room.
+ */
+internal class MachineDropTargets(
+    private val unavailableReason: (DragTransfer, MachineId) -> String?,
+    private val onTransfer: (DragTransfer, MachineId) -> Unit,
+    /** How many machines the venue has, on all group pages. */
+    private val machineCount: () -> Int = { 0 }
+) {
+    /**
+     * Where each machine is on screen, in root coordinates, clipped to what is visible. A machine
+     * of another group page is composed too (so a drag survives turning the page) but has no
+     * entry while it is out of sight.
+     */
+    val bounds = mutableStateMapOf<MachineId, Rect>()
+
+    /** Whether the venue has another machine to drag registrations to, on any group page. */
+    val otherMachinesExist: Boolean
+        get() = machineCount() > 1
+    var active by mutableStateOf<DragTransfer?>(null)
+        private set
+    var pointer by mutableStateOf<Offset?>(null)
+        private set
+
+    /** The machine under the pointer while dragging, other than the one the drag started on. */
+    val hovered: MachineId?
+        get() {
+            val drag = active ?: return null
+            val at = pointer ?: return null
+            return bounds.entries.firstOrNull { (machineId, area) ->
+                machineId != drag.sourceMachineId && area.contains(at)
+            }?.key
+        }
+
+    /** Whether the pointer is still over the machine the drag started on. */
+    val overSource: Boolean
+        get() {
+            val drag = active ?: return false
+            val at = pointer ?: return false
+            return bounds[drag.sourceMachineId]?.contains(at) == true
+        }
+
+    fun report(machineId: MachineId, area: Rect) {
+        if (area.width <= 0f || area.height <= 0f) {
+            bounds.remove(machineId)
+        } else if (bounds[machineId] != area) {
+            bounds[machineId] = area
+        }
+    }
+
+    /**
+     * Whether the machine the drag started on is on screen. After turning to another group page
+     * it is not: the drag no longer reorders it, and ending there puts it back
+     * ([DragDropResult.RETURNED]).
+     */
+    val sourceVisible: Boolean
+        get() = active?.let { bounds[it.sourceMachineId] != null } == true
+
+    fun forget(machineId: MachineId) {
+        bounds.remove(machineId)
+    }
+
+    /** Why the dragged registrations cannot go to [machineId], or null when they can. */
+    fun reasonFor(machineId: MachineId): String? = active?.let { unavailableReason(it, machineId) }
+
+    fun begin(drag: DragTransfer, at: Offset) {
+        active = drag
+        pointer = at
+    }
+
+    fun move(at: Offset) {
+        if (active != null) pointer = at
+    }
+
+    /**
+     * Ends the drag. When it ended on another machine the caller puts the registrations back
+     * where they were: the confirmation then opens ([DragDropResult.TRANSFER]) unless that machine
+     * cannot take them ([DragDropResult.REFUSED]).
+     */
+    fun finish(): DragDropResult {
+        val drag = active
+        val target = hovered
+        active = null
+        pointer = null
+        if (drag == null) return DragDropResult.NONE
+        if (target == null) {
+            return if (bounds[drag.sourceMachineId] == null) DragDropResult.RETURNED else DragDropResult.NONE
+        }
+        if (unavailableReason(drag, target) != null) return DragDropResult.REFUSED
+        onTransfer(drag, target)
+        return DragDropResult.TRANSFER
+    }
+
+    fun cancel() {
+        active = null
+        pointer = null
+    }
+}
+
+/**
+ * How a drag ended: not on another machine, on one that cannot take it, on one that can, or on a
+ * group page without the machine it started on and without another machine under the pointer.
+ */
+internal enum class DragDropResult { NONE, REFUSED, TRANSFER, RETURNED }
+
+internal val LocalMachineDropTargets = staticCompositionLocalOf<MachineDropTargets?> { null }
+
 internal val LocalGlobalDragOverlayController = staticCompositionLocalOf<GlobalDragOverlayController> {
     error("GlobalDragOverlayController is not available")
 }
@@ -437,4 +658,33 @@ internal fun GlobalDragOverlay(controller: GlobalDragOverlayController) {
             overlay.content()
         }
     }
+}
+
+/**
+ * Why a registration that is postponed cannot form a fixed pair (maintainer, 2026-11-27): the
+ * state has to be cancelled first. [ending] says what it cannot do: 组成固定组合 for a registration
+ * chosen as the friend, 与朋友共同游玩 for the one that starts. Null when it is not postponed.
+ */
+internal fun fixedPairPostponedReason(absenceStatus: QueueAbsenceStatus, ending: String): String? =
+    when (absenceStatus) {
+        QueueAbsenceStatus.NONE -> null
+        QueueAbsenceStatus.DEFER_ONE_ROUND -> "这份登记将暂缓一次，取消后才能$ending。"
+        QueueAbsenceStatus.SKIP_ONE_TURN -> "这份登记将轮空一次，取消后才能$ending。"
+        QueueAbsenceStatus.TEMPORARILY_AWAY -> "这份登记处于暂时离开状态，取消后才能$ending。"
+    }
+
+/**
+ * Where a machine's queue row is scrolled to. The row's content is replaced whenever the queue
+ * changes; kept inside that content, the position went back to the start each time somebody
+ * joined (review 2026-11-27). It still goes back when other players enter the playing
+ * position, which stands at the start of the row and is what matters then.
+ */
+internal class QueueRowScrollMemory {
+    var index = 0
+    var offset = 0
+    var secondRowOffset = 0
+    /** The registrations last seen in the playing position; null before the first look. */
+    var playingKeys: List<Int>? = null
+    /** The return-to-start request that has been carried out, so that new content does not repeat it. */
+    var handledResetToken: Int? = null
 }

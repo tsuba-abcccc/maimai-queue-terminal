@@ -211,7 +211,7 @@ onBeforeUnmount(() => {})
             </div></fieldset>
             <label><span>账户密码</span><input v-model="draft.password" type="password" minlength="8" maxlength="128" autocomplete="new-password" placeholder="至少 8 个字符" /><small>请设置本人能够记住的密码；忘记密码时，需要联系管理员重置。</small></label>
             <label><span>再次输入密码</span><input v-model="draft.password_confirmation" type="password" minlength="8" maxlength="128" autocomplete="new-password" placeholder="再次输入账户密码" /></label>
-            <p class="profile-creation-fixed-note">绑定网页账户后，QQ 号会显示在网站的登记详情中，现场终端默认不能编辑这份玩家资料；之后可以登录网页账户更改这两项设置。</p>
+            <p class="profile-creation-fixed-note">绑定网页账户后，QQ 号会显示在网页端的登记详情中，现场终端默认不能编辑这份玩家资料；之后可以登录网页账户更改这两项设置。</p>
             <MobileProfileSettings :settings="draft" :show-visibility="false" @change="updateSetting" />
             <p v-if="errorDetail" class="profile-form-error" role="alert">{{ errorDetail }}</p>
             <button class="profile-primary" type="submit" :disabled="!formValid || submitting"><Check :size="17" />确认创建并绑定</button>
