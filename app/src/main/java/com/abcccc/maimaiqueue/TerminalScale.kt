@@ -12,10 +12,16 @@ import androidx.compose.ui.unit.Density
 internal const val TERMINAL_DESIGN_WIDTH_DP = 1280
 internal const val TERMINAL_DESIGN_HEIGHT_DP = 720
 
+private const val MIN_TERMINAL_SCALE = 0.5f
+private const val MAX_TERMINAL_SCALE = 3f
+
 /**
- * How much the whole terminal is enlarged on this screen. A 1080P or 2K panel whose system
- * density leaves more room than the design screen shows the same layout, larger in proportion;
- * a screen at or below the design size is not shrunk.
+ * How much the whole terminal is scaled on this screen, so that every screen shows the layout of
+ * the design screen. A 1080P or 2K panel whose system density leaves more room is enlarged in
+ * proportion. A screen that leaves less room, because the tablet's density is high or the system
+ * 显示大小 is set larger, is reduced in proportion: left at its size, the layout made for 1280 ×
+ * 720 was crowded and too large there (maintainer, 2026-11-28: “缩放比例不正常，内容过大，缩成
+ * 一坨”, on a 1920 × 1168 terminal). Bounded to 0.5–3 against odd values.
  */
 internal fun terminalScaleFactor(screenWidthDp: Int, screenHeightDp: Int): Float {
     if (screenWidthDp <= 0 || screenHeightDp <= 0) return 1f
@@ -23,12 +29,12 @@ internal fun terminalScaleFactor(screenWidthDp: Int, screenHeightDp: Int): Float
         screenWidthDp / TERMINAL_DESIGN_WIDTH_DP.toFloat(),
         screenHeightDp / TERMINAL_DESIGN_HEIGHT_DP.toFloat()
     )
-    return proportional.coerceIn(1f, 3f)
+    return proportional.coerceIn(MIN_TERMINAL_SCALE, MAX_TERMINAL_SCALE)
 }
 
 /**
- * Enlarges everything inside in proportion, as lowering Android's 最小宽度 would, but for this app
- * only and without touching the device settings. Text, controls and spacing keep their ratios, so
+ * Scales everything inside in proportion, as setting Android's 最小宽度 to 720 would, but for this
+ * app only and without touching the device settings. Text, controls and spacing keep their ratios, so
  * the layout checked at 1280 × 720 is what every screen shows. The configuration seen inside is
  * the enlarged one, so code that reads the screen size stays consistent with the drawing.
  */

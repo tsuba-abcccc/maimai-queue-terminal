@@ -20,8 +20,12 @@ class TerminalScaleTest {
     }
 
     @Test
-    fun smallerScreensAreNotShrunkAndTheFactorIsBounded() {
-        assertEquals(1f, terminalScaleFactor(1024, 600), 0f)
+    fun smallerScreensAreReducedInProportionAndTheFactorIsBounded() {
+        // 2026-11-28: a screen with less room than 1280 × 720 dp shows the same layout, smaller,
+        // instead of a crowded one. The maintainer's terminal, 1920 × 1168 px at density 320:
+        assertEquals(0.75f, terminalScaleFactor(960, 584), 0.001f)
+        assertEquals(0.8f, terminalScaleFactor(1024, 600), 0.001f)
+        assertEquals(0.5f, terminalScaleFactor(400, 200), 0f)
         assertEquals(3f, terminalScaleFactor(7680, 4320), 0f)
         assertEquals(1f, terminalScaleFactor(0, 0), 0f)
     }
